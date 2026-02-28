@@ -2393,6 +2393,10 @@ pub struct RuntimeConfig {
     #[serde(default)]
     pub docker: DockerRuntimeConfig,
 
+    /// WASM sandbox runtime settings (used when `--features runtime-wasm` is enabled).
+    #[serde(default)]
+    pub wasm: WasmRuntimeConfig,
+
     /// Global reasoning override for providers that expose explicit controls.
     /// - `None`: provider default behavior
     /// - `Some(true)`: request reasoning/thinking when supported
@@ -2467,11 +2471,68 @@ impl Default for DockerRuntimeConfig {
     }
 }
 
+/// WASM sandbox runtime configuration (`[runtime.wasm]` section).
+///
+/// Controls the sandboxed WASM execution environment. Only active when
+/// `--features runtime-wasm` is compiled in.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct WasmRuntimeConfig {
+    /// Workspace-relative directory that stores `.wasm` modules.
+    #[serde(default = "default_wasm_tools_dir")]
+    pub tools_dir: String,
+
+    /// Fuel limit per invocation (instruction budget).
+    #[serde(default = "default_runtime_wasm_fuel_limit")]
+    pub fuel_limit: u64,
+
+    /// Memory limit per invocation in MB.
+    #[serde(default = "default_runtime_wasm_memory_limit_mb")]
+    pub memory_limit_mb: u64,
+
+    /// Allow reading files from workspace inside WASM host calls.
+    #[serde(default)]
+    pub allow_workspace_read: bool,
+
+    /// Allow writing files to workspace inside WASM host calls.
+    #[serde(default)]
+    pub allow_workspace_write: bool,
+
+    /// Explicit host allowlist for outbound HTTP from WASM modules.
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
+}
+
+fn default_wasm_tools_dir() -> String {
+    "tools/wasm".into()
+}
+
+fn default_runtime_wasm_fuel_limit() -> u64 {
+    1_000_000
+}
+
+fn default_runtime_wasm_memory_limit_mb() -> u64 {
+    64
+}
+
+impl Default for WasmRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            tools_dir: default_wasm_tools_dir(),
+            fuel_limit: default_runtime_wasm_fuel_limit(),
+            memory_limit_mb: default_runtime_wasm_memory_limit_mb(),
+            allow_workspace_read: false,
+            allow_workspace_write: false,
+            allowed_hosts: Vec::new(),
+        }
+    }
+}
+
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
             kind: default_runtime_kind(),
             docker: DockerRuntimeConfig::default(),
+            wasm: WasmRuntimeConfig::default(),
             reasoning_enabled: None,
         }
     }

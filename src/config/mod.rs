@@ -17,6 +17,7 @@ pub use schema::{
     SecurityRoleConfig,
     SkillsConfig, SkillsPromptInjectionMode, SlackConfig, StorageConfig, StorageProviderConfig,
     StorageProviderSection, StreamMode, TelegramConfig, TranscriptionConfig, TtsConfig, TunnelConfig,
+    WasmRuntimeConfig,
     WebFetchConfig, WebSearchConfig, WebhookConfig,
     parse_hhmm, is_within_active_hours,
     ResearchPhaseConfig, ResearchTrigger,

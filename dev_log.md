@@ -2,6 +2,52 @@
 
 ---
 
+## 2026-03-01 — Phase 4 完成：Android 客户端 + Android FFI + Web 前端 + 插件示例
+
+**涉及文件**：
+- `clients/android/`（22文件，新建）— Android 客户端（Kotlin/Jetpack Compose）
+- `clients/android-bridge/`（3文件，新建）— UniFFI/JNI Rust 桥接
+- `site/`（10文件，新建）— React + Vite Web 前端（GitHub Pages）
+- `extensions/hello-world/`（2文件，新建）— 插件示例
+
+### 改动内容
+
+#### 4.6 Android 客户端 (`clients/android/`)
+- `app/build.gradle.kts`：Android 应用构建配置（SDK 34、Compose、NDK）
+- `app/src/main/AndroidManifest.xml`：权限声明、Activity/Service/Receiver 注册
+- `app/src/main/java/ai/zeroclaw/android/MainActivity.kt`：聊天 UI（Compose，含 ChatBubble/EmptyState/StatusIndicator）
+- `app/src/main/java/ai/zeroclaw/android/ZeroClawApp.kt`：Application 类，创建通知渠道
+- `app/src/main/java/ai/zeroclaw/android/bridge/ZeroClawBridge.kt`：JNI 桥接 stub，等待 UniFFI 生成
+- `app/src/main/java/ai/zeroclaw/android/receiver/BootReceiver.kt`：开机自启广播接收器
+- `app/src/main/java/ai/zeroclaw/android/service/ZeroClawService.kt`：前台服务，StateFlow 状态管理
+- `app/src/main/java/ai/zeroclaw/android/ui/SettingsScreen.kt`：设置 UI（Provider/Model/APIKey/AutoStart）
+- `app/src/main/java/ai/zeroclaw/android/ui/theme/Theme.kt`：Material 3 主题（ZeroClawOrange + 暗色方案）
+- `app/src/main/res/`：XML 资源（drawable/values）
+- `build.gradle.kts`、`settings.gradle.kts`、`gradle.properties`、`gradle/wrapper/gradle-wrapper.properties`
+
+#### 4.7 Android FFI 桥接 (`clients/android-bridge/`)
+- `Cargo.toml`：独立 crate（cdylib，依赖 uniffi 0.27 + tokio）
+- `src/lib.rs`：UniFFI 绑定（`ZeroClawController`、`AgentStatus` enum、`ZeroClawConfig/ChatMessage/SendResult` record）
+- `uniffi-bindgen.rs`：uniffi 代码生成入口
+
+#### 4.8 Web 前端 (`site/`)
+- `index.html`、`src/main.tsx`：React 入口
+- `src/App.tsx`：完整 Docs Navigator（全文搜索 + 分类过滤 + 命令面板 + i18n + 主题 + TOC）
+- `src/styles.css`：设计系统（CSS 变量 + 响应式布局）
+- `src/generated/docs-manifest.json`：从仓库 Markdown 生成的文档清单
+- `scripts/generate-docs-manifest.mjs`：构建时自动生成清单脚本
+- `package.json`、`tsconfig.json`、`vite.config.ts`：构建配置
+
+#### 4.9 插件示例 (`extensions/hello-world/`)
+- `zeroclaw.plugin.toml`：插件元数据（id/name/description/version）
+- `src/lib.rs`：示例插件（实现 `Plugin` trait，注册 `HelloTool` 工具和 `HelloHook` 钩子）
+
+### 验证结果
+- `cargo check --lib` — 零 error，13 warnings（全部为预存在告警）
+- 主 Rust 项目完全不受影响（Android/site 均为独立项目）
+
+---
+
 ## 2026-03-01 — 移植上游 providers 模块改进（reliable + compatible + mod）
 
 **涉及文件**：
