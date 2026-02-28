@@ -783,6 +783,7 @@ async fn main() -> Result<()> {
             temperature,
             peripheral,
             true,
+            None,
         )
         .await
         .map(|_| ()),

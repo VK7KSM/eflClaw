@@ -80,6 +80,11 @@ pub struct Config {
     /// Default model routed through the selected provider (e.g. `"anthropic/claude-sonnet-4-6"`).
     #[serde(alias = "model")]
     pub default_model: Option<String>,
+    /// Lightweight model for background tasks like chat log summarization.
+    /// Uses the same provider and API key as `default_provider`.
+    /// When unset, falls back to `default_model`.
+    #[serde(default)]
+    pub summary_model: Option<String>,
     /// Optional named provider profiles keyed by id (Codex app-server compatible layout).
     #[serde(default)]
     pub model_providers: HashMap<String, ModelProviderConfig>,
@@ -217,6 +222,14 @@ pub struct Config {
     /// Voice transcription configuration (Whisper API via Groq).
     #[serde(default)]
     pub transcription: TranscriptionConfig,
+
+    /// Text-to-Speech configuration (Microsoft Edge TTS).
+    #[serde(default)]
+    pub tts: TtsConfig,
+
+    /// Chat log persistence and summarization (`[chat_log]`).
+    #[serde(default)]
+    pub chat_log: ChatLogConfig,
 }
 
 /// Named provider profile definition compatible with Codex app-server style config.
@@ -245,9 +258,13 @@ pub struct DelegateAgentConfig {
     pub provider: String,
     /// Model name
     pub model: String,
-    /// Optional system prompt for the sub-agent
+    /// Optional system prompt for the sub-agent (inline)
     #[serde(default)]
     pub system_prompt: Option<String>,
+    /// Optional path to a file containing the system prompt (relative to workspace dir).
+    /// When set, takes precedence over `system_prompt`.
+    #[serde(default)]
+    pub system_prompt_file: Option<String>,
     /// Optional API key override
     #[serde(default)]
     pub api_key: Option<String>,
@@ -388,6 +405,81 @@ impl Default for TranscriptionConfig {
             model: default_transcription_model(),
             language: None,
             max_duration_secs: default_transcription_max_duration_secs(),
+        }
+    }
+}
+
+/// Text-to-Speech configuration (Microsoft Edge Read Aloud API).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct TtsConfig {
+    /// Enable TTS — when enabled, text responses are also sent as voice messages.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Microsoft Edge TTS voice name (e.g. "zh-TW-YunJheNeural", "en-US-AriaNeural").
+    #[serde(default = "default_tts_voice")]
+    pub voice: String,
+    /// Speaking rate adjustment in percent (e.g. 0 = normal, -10 = slower, 20 = faster).
+    #[serde(default)]
+    pub rate: i32,
+    /// Pitch adjustment in Hz (e.g. 0 = normal, -5 = lower, 5 = higher).
+    #[serde(default)]
+    pub pitch: i32,
+    /// Maximum text length (chars) to synthesize. Longer texts are sent as text only.
+    #[serde(default = "default_tts_max_chars")]
+    pub max_chars: usize,
+    /// Telegram bot token (reuse from channels_config.telegram.bot_token).
+    /// Required for sending voice messages via Telegram.
+    #[serde(default)]
+    pub bot_token: Option<String>,
+}
+
+fn default_tts_voice() -> String {
+    "zh-TW-YunJheNeural".into()
+}
+fn default_tts_max_chars() -> usize {
+    2000
+}
+
+impl Default for TtsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            voice: default_tts_voice(),
+            rate: 0,
+            pitch: 0,
+            max_chars: default_tts_max_chars(),
+            bot_token: None,
+        }
+    }
+}
+
+// ── Chat Log Persistence ────────────────────────────────────────
+
+/// Chat log persistence and summarization configuration (`[chat_log]` section).
+///
+/// Saves all channel conversations to local JSON files for history
+/// recall across restarts and cross-user context awareness.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ChatLogConfig {
+    /// Enable chat log persistence. Default: `true`.
+    #[serde(default = "default_chat_log_enabled")]
+    pub enabled: bool,
+    /// Owner username — only this user can view cross-user chat logs.
+    /// Must match the Telegram username (without `@`).
+    /// When unset, cross-user chat log queries are disabled for all users.
+    #[serde(default)]
+    pub owner: Option<String>,
+}
+
+fn default_chat_log_enabled() -> bool {
+    true
+}
+
+impl Default for ChatLogConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_chat_log_enabled(),
+            owner: None,
         }
     }
 }
@@ -2193,6 +2285,9 @@ pub struct ReliabilityConfig {
     /// Base backoff (ms) for provider retry delay.
     #[serde(default = "default_provider_backoff_ms")]
     pub provider_backoff_ms: u64,
+    /// Maximum backoff (ms) cap for provider retry delay.
+    #[serde(default = "default_provider_max_backoff_ms")]
+    pub provider_max_backoff_ms: u64,
     /// Fallback provider chain (e.g. `["anthropic", "openai"]`).
     #[serde(default)]
     pub fallback_providers: Vec<String>,
@@ -2219,11 +2314,15 @@ pub struct ReliabilityConfig {
 }
 
 fn default_provider_retries() -> u32 {
-    2
+    5
 }
 
 fn default_provider_backoff_ms() -> u64 {
-    500
+    1_000
+}
+
+fn default_provider_max_backoff_ms() -> u64 {
+    60_000
 }
 
 fn default_channel_backoff_secs() -> u64 {
@@ -2247,6 +2346,7 @@ impl Default for ReliabilityConfig {
         Self {
             provider_retries: default_provider_retries(),
             provider_backoff_ms: default_provider_backoff_ms(),
+            provider_max_backoff_ms: default_provider_max_backoff_ms(),
             fallback_providers: Vec::new(),
             api_keys: Vec::new(),
             model_fallbacks: std::collections::HashMap::new(),
@@ -2272,6 +2372,9 @@ pub struct SchedulerConfig {
     /// Maximum tasks executed per scheduler polling cycle.
     #[serde(default = "default_scheduler_max_concurrent")]
     pub max_concurrent: usize,
+    /// Maximum tool-call iterations for cron agent jobs. Default: `25`.
+    #[serde(default = "default_scheduler_max_tool_iterations")]
+    pub max_tool_iterations: usize,
 }
 
 fn default_scheduler_enabled() -> bool {
@@ -2286,12 +2389,17 @@ fn default_scheduler_max_concurrent() -> usize {
     4
 }
 
+fn default_scheduler_max_tool_iterations() -> usize {
+    25
+}
+
 impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
             enabled: default_scheduler_enabled(),
             max_tasks: default_scheduler_max_tasks(),
             max_concurrent: default_scheduler_max_concurrent(),
+            max_tool_iterations: default_scheduler_max_tool_iterations(),
         }
     }
 }
@@ -2410,6 +2518,15 @@ pub struct HeartbeatConfig {
     /// Optional delivery recipient/chat identifier (required when `target` is set).
     #[serde(default, alias = "recipient")]
     pub to: Option<String>,
+    /// Start of active hours in `HH:MM` format (local time). Heartbeat is skipped outside this window. Default: `"06:30"`.
+    #[serde(default = "default_active_hours_start")]
+    pub active_hours_start: String,
+    /// End of active hours in `HH:MM` format (local time). Default: `"23:00"`.
+    #[serde(default = "default_active_hours_end")]
+    pub active_hours_end: String,
+    /// Maximum tool-call iterations for heartbeat agent turns. Default: `25`.
+    #[serde(default = "default_heartbeat_max_tool_iterations")]
+    pub max_tool_iterations: usize,
 }
 
 impl Default for HeartbeatConfig {
@@ -2420,7 +2537,45 @@ impl Default for HeartbeatConfig {
             message: None,
             target: None,
             to: None,
+            active_hours_start: default_active_hours_start(),
+            active_hours_end: default_active_hours_end(),
+            max_tool_iterations: default_heartbeat_max_tool_iterations(),
         }
+    }
+}
+
+fn default_active_hours_start() -> String {
+    "06:30".into()
+}
+
+fn default_active_hours_end() -> String {
+    "23:00".into()
+}
+
+fn default_heartbeat_max_tool_iterations() -> usize {
+    25
+}
+
+/// Parse `"HH:MM"` into total minutes since midnight. Returns `None` on invalid input.
+pub fn parse_hhmm(s: &str) -> Option<u32> {
+    let (h, m) = s.trim().split_once(':')?;
+    let h: u32 = h.parse().ok()?;
+    let m: u32 = m.parse().ok()?;
+    if h < 24 && m < 60 {
+        Some(h * 60 + m)
+    } else {
+        None
+    }
+}
+
+/// Check whether `current` (minutes since midnight) falls within `[start, end)`.
+/// Handles overnight ranges where `start > end` (e.g. 22:00–06:00).
+pub fn is_within_active_hours(current: u32, start: u32, end: u32) -> bool {
+    if start <= end {
+        current >= start && current < end
+    } else {
+        // overnight: active if current >= start OR current < end
+        current >= start || current < end
     }
 }
 
@@ -3594,6 +3749,7 @@ impl Default for Config {
             api_url: None,
             default_provider: Some("openrouter".to_string()),
             default_model: Some("anthropic/claude-sonnet-4.6".to_string()),
+            summary_model: None,
             model_providers: HashMap::new(),
             default_temperature: 0.7,
             observability: ObservabilityConfig::default(),
@@ -3629,6 +3785,8 @@ impl Default for Config {
             hardware: HardwareConfig::default(),
             query_classification: QueryClassificationConfig::default(),
             transcription: TranscriptionConfig::default(),
+            tts: TtsConfig::default(),
+            chat_log: ChatLogConfig::default(),
         }
     }
 }
@@ -5108,6 +5266,7 @@ default_temperature = 0.7
                 message: Some("Check London time".into()),
                 target: Some("telegram".into()),
                 to: Some("123456".into()),
+                ..Default::default()
             },
             cron: CronConfig::default(),
             channels_config: ChannelsConfig {
@@ -5161,6 +5320,9 @@ default_temperature = 0.7
             hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
             transcription: TranscriptionConfig::default(),
+            tts: TtsConfig::default(),
+            summary_model: None,
+            chat_log: ChatLogConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -5343,6 +5505,9 @@ tool_dispatcher = "xml"
             hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
             transcription: TranscriptionConfig::default(),
+            tts: TtsConfig::default(),
+            summary_model: None,
+            chat_log: ChatLogConfig::default(),
         };
 
         config.save().await.unwrap();
@@ -5386,6 +5551,7 @@ tool_dispatcher = "xml"
                 provider: "openrouter".into(),
                 model: "model-test".into(),
                 system_prompt: None,
+                system_prompt_file: None,
                 api_key: Some("agent-credential".into()),
                 temperature: None,
                 max_depth: 3,

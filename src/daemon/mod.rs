@@ -1,6 +1,6 @@
 use crate::config::Config;
 use anyhow::Result;
-use chrono::Utc;
+use chrono::{Timelike, Utc};
 use std::future::Future;
 use std::path::PathBuf;
 use tokio::task::JoinHandle;
@@ -174,54 +174,94 @@ where
 }
 
 async fn run_heartbeat_worker(config: Config) -> Result<()> {
-    let observer: std::sync::Arc<dyn crate::observability::Observer> =
-        std::sync::Arc::from(crate::observability::create_observer(&config.observability));
-    let engine = crate::heartbeat::engine::HeartbeatEngine::new(
-        config.heartbeat.clone(),
-        config.workspace_dir.clone(),
-        observer,
-    );
     let delivery = heartbeat_delivery_target(&config)?;
 
     let interval_mins = config.heartbeat.interval_minutes.max(5);
     let mut interval = tokio::time::interval(Duration::from_secs(u64::from(interval_mins) * 60));
+    interval.tick().await; // consume the instant first tick — first real execution waits full interval
+
+    let heartbeat_path = config.workspace_dir.join("HEARTBEAT.md");
 
     loop {
         interval.tick().await;
 
-        let file_tasks = engine.collect_tasks().await?;
-        let tasks = heartbeat_tasks_for_tick(file_tasks, config.heartbeat.message.as_deref());
-        if tasks.is_empty() {
+        // ── activeHours: skip outside configured window ──
+        let now = chrono::Local::now();
+        let current_minutes = now.hour() * 60 + now.minute();
+        let start = crate::config::parse_hhmm(&config.heartbeat.active_hours_start)
+            .unwrap_or(6 * 60 + 30); // fallback 06:30
+        let end = crate::config::parse_hhmm(&config.heartbeat.active_hours_end)
+            .unwrap_or(23 * 60); // fallback 23:00
+        if !crate::config::is_within_active_hours(current_minutes, start, end) {
+            tracing::debug!(
+                "Heartbeat skipped: outside active hours ({:02}:{:02}, window {}–{})",
+                now.hour(), now.minute(),
+                config.heartbeat.active_hours_start, config.heartbeat.active_hours_end
+            );
+            crate::health::mark_component_ok("heartbeat");
             continue;
         }
 
-        for task in tasks {
-            let prompt = format!("[Heartbeat Task] {task}");
-            let temp = config.default_temperature;
-            match crate::agent::run(
-                config.clone(),
-                Some(prompt),
-                None,
-                None,
-                temp,
-                vec![],
-                false,
-            )
-            .await
-            {
-                Ok(output) => {
-                    crate::health::mark_component_ok("heartbeat");
-                    let announcement = if output.trim().is_empty() {
-                        "heartbeat task executed".to_string()
-                    } else {
-                        output
-                    };
+        // ── Read entire HEARTBEAT.md ──
+        let content = match tokio::fs::read_to_string(&heartbeat_path).await {
+            Ok(c) => c,
+            Err(_) => {
+                tracing::debug!("Heartbeat skipped: HEARTBEAT.md not found");
+                crate::health::mark_component_ok("heartbeat");
+                continue;
+            }
+        };
+
+        // ── Skip if effectively empty (only headers/blank lines) ──
+        if is_heartbeat_content_empty(&content) {
+            tracing::debug!("Heartbeat skipped: HEARTBEAT.md is effectively empty");
+            crate::health::mark_component_ok("heartbeat");
+            continue;
+        }
+
+        // ── Build whole-file prompt (one agent turn) ──
+        let now = chrono::Local::now().format("%Y-%m-%d %H:%M %Z");
+        let prompt = format!(
+            "[Heartbeat] 当前时间: {now}\n\n\
+             以下是 HEARTBEAT.md 的完整内容：\n\n\
+             {content}\n\n\
+             请执行以下步骤：\n\
+             1. 用 cron_list 检查现有新闻推送 Cron 任务是否与上面的时间表一致\n\
+             2. 如果不一致，用 cron_add/cron_update/cron_remove 同步（delivery 设为 announce 到 telegram）\n\
+             3. 检查是否有其他需要汇报的事项\n\
+             4. 如果一切正常且无需汇报，回复 HEARTBEAT_OK"
+        );
+
+        let temp = config.default_temperature;
+        match crate::agent::run(
+            config.clone(),
+            Some(prompt),
+            None,
+            None,
+            temp,
+            vec![],
+            false,
+            Some(config.heartbeat.max_tool_iterations),
+        )
+        .await
+        {
+            Ok(output) => {
+                crate::health::mark_component_ok("heartbeat");
+
+                // ── HEARTBEAT_OK suppression ──
+                if contains_heartbeat_ok(&output) {
+                    tracing::debug!("Heartbeat: HEARTBEAT_OK — no delivery");
+                    continue;
+                }
+
+                // Only deliver when the agent has something to report
+                if !output.trim().is_empty() {
                     if let Some((channel, target)) = &delivery {
                         if let Err(e) = crate::cron::scheduler::deliver_announcement(
                             &config,
                             channel,
                             target,
-                            &announcement,
+                            &output,
                         )
                         .await
                         {
@@ -233,15 +273,47 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                         }
                     }
                 }
-                Err(e) => {
-                    crate::health::mark_component_error("heartbeat", e.to_string());
-                    tracing::warn!("Heartbeat task failed: {e}");
+            }
+            Err(e) => {
+                crate::health::mark_component_error("heartbeat", e.to_string());
+                tracing::warn!("Heartbeat task failed: {e}");
+            }
+        }
+
+        // ── Chat log summarization (silent, never blocks heartbeat) ──
+        if config.chat_log.enabled {
+            match crate::channels::chat_summarizer::summarize_chat_logs(&config).await {
+                Ok(report) if report.processed > 0 => {
+                    tracing::info!(
+                        "Chat summarization: {} processed, {} skipped, {} errors",
+                        report.processed, report.skipped, report.errors.len()
+                    );
                 }
+                Ok(_) => {} // all skipped — nothing to log
+                Err(e) => tracing::warn!("Chat summarization failed: {e}"),
             }
         }
     }
 }
 
+/// Check whether `HEARTBEAT_OK` appears at the start or end of the agent reply.
+/// Matches the OpenClaw suppression contract: the token at start/end means "nothing to report".
+fn contains_heartbeat_ok(output: &str) -> bool {
+    const TOKEN: &str = "HEARTBEAT_OK";
+    let trimmed = output.trim();
+    trimmed.starts_with(TOKEN) || trimmed.ends_with(TOKEN)
+}
+
+/// A HEARTBEAT.md file is "effectively empty" if every line is blank or a markdown header.
+/// In that case we skip the API call to save tokens (mirrors OpenClaw behaviour).
+fn is_heartbeat_content_empty(content: &str) -> bool {
+    content.lines().all(|line| {
+        let t = line.trim();
+        t.is_empty() || t.starts_with('#')
+    })
+}
+
+// Legacy helper retained for existing tests; no longer called from the main heartbeat loop.
 fn heartbeat_tasks_for_tick(
     file_tasks: Vec<String>,
     fallback_message: Option<&str>,

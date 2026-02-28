@@ -39,11 +39,11 @@ struct OAuthTokenState {
 /// Resolved credential — the variant determines both the HTTP auth method
 /// and the diagnostic label returned by `auth_source()`.
 enum GeminiAuth {
-    /// Explicit API key from config: sent as `?key=` query parameter.
+    /// Explicit API key from config: sent as `x-goog-api-key` header.
     ExplicitKey(String),
-    /// API key from `GEMINI_API_KEY` env var: sent as `?key=`.
+    /// API key from `GEMINI_API_KEY` env var: sent as `x-goog-api-key` header.
     EnvGeminiKey(String),
-    /// API key from `GOOGLE_API_KEY` env var: sent as `?key=`.
+    /// API key from `GOOGLE_API_KEY` env var: sent as `x-goog-api-key` header.
     EnvGoogleKey(String),
     /// OAuth access token from Gemini CLI: sent as `Authorization: Bearer`.
     /// Wrapped in a Mutex to allow runtime token refresh.
@@ -89,6 +89,46 @@ struct GenerateContentRequest {
     system_instruction: Option<Content>,
     #[serde(rename = "generationConfig")]
     generation_config: GenerationConfig,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<GeminiTool>>,
+    #[serde(rename = "toolConfig", skip_serializing_if = "Option::is_none")]
+    tool_config: Option<ToolConfig>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct FunctionDeclaration {
+    name: String,
+    description: String,
+    parameters: serde_json::Value,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct GeminiTool {
+    #[serde(rename = "functionDeclarations")]
+    function_declarations: Vec<FunctionDeclaration>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct ToolConfig {
+    #[serde(rename = "functionCallingConfig")]
+    function_calling_config: FunctionCallingConfig,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct FunctionCallingConfig {
+    mode: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct RequestFunctionCall {
+    name: String,
+    args: serde_json::Value,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct FunctionResponse {
+    name: String,
+    response: serde_json::Value,
 }
 
 /// Request envelope for the internal cloudcode-pa API.
@@ -125,6 +165,8 @@ struct InternalGenerateContentRequest {
     system_instruction: Option<Content>,
     #[serde(rename = "generationConfig", skip_serializing_if = "Option::is_none")]
     generation_config: Option<GenerationConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<GeminiTool>>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -136,7 +178,40 @@ struct Content {
 
 #[derive(Debug, Serialize, Clone)]
 struct Part {
-    text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<String>,
+    #[serde(rename = "inlineData", skip_serializing_if = "Option::is_none")]
+    inline_data: Option<InlineData>,
+    #[serde(rename = "functionCall", skip_serializing_if = "Option::is_none")]
+    function_call: Option<RequestFunctionCall>,
+    #[serde(rename = "functionResponse", skip_serializing_if = "Option::is_none")]
+    function_response: Option<FunctionResponse>,
+    /// True for thought/reasoning parts from Gemini thinking models.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thought: Option<bool>,
+    /// Opaque signature that must be round-tripped for Gemini thinking model tool calls.
+    #[serde(rename = "thoughtSignature", skip_serializing_if = "Option::is_none")]
+    thought_signature: Option<String>,
+}
+
+impl Part {
+    fn text(s: impl Into<String>) -> Self {
+        Self {
+            text: Some(s.into()),
+            inline_data: None,
+            function_call: None,
+            function_response: None,
+            thought: None,
+            thought_signature: None,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct InlineData {
+    #[serde(rename = "mimeType")]
+    mime_type: String,
+    data: String,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -183,46 +258,78 @@ struct CandidateContent {
 }
 
 #[derive(Debug, Deserialize)]
+struct FunctionCallResponse {
+    name: String,
+    args: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
 struct ResponsePart {
     #[serde(default)]
     text: Option<String>,
     /// Thinking models (e.g. gemini-3-pro-preview) mark reasoning parts with `thought: true`.
     #[serde(default)]
     thought: bool,
+    /// Function call requested by the model.
+    #[serde(rename = "functionCall", default)]
+    function_call: Option<FunctionCallResponse>,
+    /// Gemini 2.5+/3.x: opaque thinking signature, must be round-tripped in multi-turn conversations.
+    /// Phase 1: captured for future use, not yet written back to history.
+    #[serde(rename = "thoughtSignature", default)]
+    thought_signature: Option<String>,
 }
 
 impl CandidateContent {
-    /// Extract effective text, skipping thinking/signature parts.
+    /// Extract text and function calls from response parts.
     ///
-    /// Gemini thinking models (e.g. gemini-3-pro-preview) return parts like:
+    /// Gemini thinking models return parts like:
     /// - `{"thought": true, "text": "reasoning..."}` — internal reasoning
     /// - `{"text": "actual answer"}` — the real response
-    /// - `{"thoughtSignature": "..."}` — opaque signature (no text field)
+    /// - `{"functionCall": {"name": "...", "args": {...}}}` — tool invocation
     ///
-    /// Returns the non-thinking text, falling back to thinking text only when
-    /// no non-thinking content is available.
-    fn effective_text(self) -> Option<String> {
+    /// Returns non-thinking text (falling back to thinking text), plus any tool calls.
+    fn extract_tool_calls(
+        self,
+    ) -> (Option<String>, Vec<crate::providers::traits::ToolCall>) {
         let mut answer_parts: Vec<String> = Vec::new();
         let mut first_thinking: Option<String> = None;
+        let mut tool_calls: Vec<crate::providers::traits::ToolCall> = Vec::new();
+        // Accumulate thought_signature from thought parts; claimed by the next functionCall part.
+        let mut pending_thought_sig: Option<String> = None;
 
         for part in self.parts {
-            if let Some(text) = part.text {
-                if text.is_empty() {
-                    continue;
+            // Capture thought_signature from thought parts before functionCall parts.
+            if part.thought {
+                if let Some(sig) = part.thought_signature {
+                    pending_thought_sig = Some(sig);
                 }
-                if !part.thought {
-                    answer_parts.push(text);
-                } else if first_thinking.is_none() {
-                    first_thinking = Some(text);
+            }
+
+            if let Some(fc) = part.function_call {
+                tool_calls.push(crate::providers::traits::ToolCall {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    name: fc.name,
+                    arguments: fc.args.to_string(),
+                    thought_signature: pending_thought_sig.take(),
+                });
+            } else if let Some(text) = part.text {
+                if !text.is_empty() {
+                    if !part.thought {
+                        answer_parts.push(text);
+                    } else if first_thinking.is_none() {
+                        first_thinking = Some(text);
+                    }
                 }
             }
         }
 
-        if answer_parts.is_empty() {
+        let final_text = if answer_parts.is_empty() {
             first_thinking
         } else {
             Some(answer_parts.join(""))
-        }
+        };
+
+        (final_text, tool_calls)
     }
 }
 
@@ -784,13 +891,7 @@ impl GeminiProvider {
             }
             _ => {
                 let model_name = Self::format_model_name(model);
-                let base_url = format!("{PUBLIC_API_ENDPOINT}/{model_name}:generateContent");
-
-                if auth.is_api_key() {
-                    format!("{base_url}?key={}", auth.api_key_credential())
-                } else {
-                    base_url
-                }
+                format!("{PUBLIC_API_ENDPOINT}/{model_name}:generateContent")
             }
         }
     }
@@ -898,6 +999,7 @@ impl GeminiProvider {
                         } else {
                             None
                         },
+                        tools: request.tools.clone(),
                     },
                 };
                 self.http_client()
@@ -905,7 +1007,13 @@ impl GeminiProvider {
                     .json(&internal_request)
                     .bearer_auth(token)
             }
-            _ => req,
+            _ => {
+                if auth.is_api_key() {
+                    req.header("x-goog-api-key", auth.api_key_credential())
+                } else {
+                    req
+                }
+            }
         }
     }
 
@@ -931,13 +1039,22 @@ impl GeminiProvider {
 }
 
 impl GeminiProvider {
+    fn parse_data_uri(uri: &str) -> Option<(String, String)> {
+        // Parses "data:<mime>;base64,<data>" → (mime, data)
+        let rest = uri.strip_prefix("data:")?;
+        let (mime_and_enc, data) = rest.split_once(',')?;
+        let mime = mime_and_enc.strip_suffix(";base64")?;
+        Some((mime.to_string(), data.to_string()))
+    }
+
     async fn send_generate_content(
         &self,
         contents: Vec<Content>,
         system_instruction: Option<Content>,
         model: &str,
         temperature: f64,
-    ) -> anyhow::Result<(String, Option<TokenUsage>)> {
+        tools: Option<Vec<GeminiTool>>,
+    ) -> anyhow::Result<(Option<String>, Vec<crate::providers::traits::ToolCall>, Option<TokenUsage>)> {
         let auth = self.auth.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
                 "Gemini API key not found. Options:\n\
@@ -980,6 +1097,16 @@ impl GeminiProvider {
             _ => (None, None),
         };
 
+        let tool_config = if tools.is_some() {
+            Some(ToolConfig {
+                function_calling_config: FunctionCallingConfig {
+                    mode: "AUTO".to_string(),
+                },
+            })
+        } else {
+            None
+        };
+
         let request = GenerateContentRequest {
             contents,
             system_instruction,
@@ -987,6 +1114,8 @@ impl GeminiProvider {
                 temperature,
                 max_output_tokens: 8192,
             },
+            tools,
+            tool_config,
         };
 
         let url = Self::build_generate_content_url(model, auth);
@@ -1130,19 +1259,45 @@ impl GeminiProvider {
             output_tokens: u.candidates_token_count,
         });
 
-        let text = result
+        let (text, tool_calls) = result
             .candidates
             .and_then(|c| c.into_iter().next())
             .and_then(|c| c.content)
-            .and_then(|c| c.effective_text())
-            .ok_or_else(|| anyhow::anyhow!("No response from Gemini"))?;
+            .map(|c| c.extract_tool_calls())
+            .unwrap_or_else(|| (None, Vec::new()));
 
-        Ok((text, usage))
+        // If no text and no tool calls, something is wrong
+        if text.is_none() && tool_calls.is_empty() {
+            anyhow::bail!("No response from Gemini");
+        }
+
+        Ok((text, tool_calls, usage))
     }
 }
 
 #[async_trait]
 impl Provider for GeminiProvider {
+    fn capabilities(&self) -> crate::providers::traits::ProviderCapabilities {
+        crate::providers::traits::ProviderCapabilities {
+            native_tool_calling: true,
+            vision: true,
+        }
+    }
+
+    fn convert_tools(&self, tools: &[crate::tools::ToolSpec]) -> crate::providers::traits::ToolsPayload {
+        let function_declarations: Vec<serde_json::Value> = tools
+            .iter()
+            .map(|t| {
+                serde_json::json!({
+                    "name": t.name,
+                    "description": t.description,
+                    "parameters": crate::tools::SchemaCleanr::clean_for_gemini(t.parameters.clone()),
+                })
+            })
+            .collect();
+        crate::providers::traits::ToolsPayload::Gemini { function_declarations }
+    }
+
     async fn chat_with_system(
         &self,
         system_prompt: Option<&str>,
@@ -1152,22 +1307,18 @@ impl Provider for GeminiProvider {
     ) -> anyhow::Result<String> {
         let system_instruction = system_prompt.map(|sys| Content {
             role: None,
-            parts: vec![Part {
-                text: sys.to_string(),
-            }],
+            parts: vec![Part::text(sys)],
         });
 
         let contents = vec![Content {
             role: Some("user".to_string()),
-            parts: vec![Part {
-                text: message.to_string(),
-            }],
+            parts: vec![Part::text(message)],
         }];
 
-        let (text, _usage) = self
-            .send_generate_content(contents, system_instruction, model, temperature)
+        let (text, _tool_calls, _usage) = self
+            .send_generate_content(contents, system_instruction, model, temperature, None)
             .await?;
-        Ok(text)
+        Ok(text.unwrap_or_default())
     }
 
     async fn chat_with_history(
@@ -1187,18 +1338,14 @@ impl Provider for GeminiProvider {
                 "user" => {
                     contents.push(Content {
                         role: Some("user".to_string()),
-                        parts: vec![Part {
-                            text: msg.content.clone(),
-                        }],
+                        parts: vec![Part::text(&msg.content)],
                     });
                 }
                 "assistant" => {
                     // Gemini API uses "model" role instead of "assistant"
                     contents.push(Content {
                         role: Some("model".to_string()),
-                        parts: vec![Part {
-                            text: msg.content.clone(),
-                        }],
+                        parts: vec![Part::text(&msg.content)],
                     });
                 }
                 _ => {}
@@ -1210,16 +1357,14 @@ impl Provider for GeminiProvider {
         } else {
             Some(Content {
                 role: None,
-                parts: vec![Part {
-                    text: system_parts.join("\n\n"),
-                }],
+                parts: vec![Part::text(system_parts.join("\n\n"))],
             })
         };
 
-        let (text, _usage) = self
-            .send_generate_content(contents, system_instruction, model, temperature)
+        let (text, _tool_calls, _usage) = self
+            .send_generate_content(contents, system_instruction, model, temperature, None)
             .await?;
-        Ok(text)
+        Ok(text.unwrap_or_default())
     }
 
     async fn chat(
@@ -1230,22 +1375,187 @@ impl Provider for GeminiProvider {
     ) -> anyhow::Result<ChatResponse> {
         let mut system_parts: Vec<&str> = Vec::new();
         let mut contents: Vec<Content> = Vec::new();
+        // Maps tool_call_id → tool_name for building functionResponse parts.
+        let mut tool_id_to_name: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
 
         for msg in request.messages {
             match msg.role.as_str() {
                 "system" => system_parts.push(&msg.content),
-                "user" => contents.push(Content {
-                    role: Some("user".to_string()),
-                    parts: vec![Part {
-                        text: msg.content.clone(),
-                    }],
-                }),
-                "assistant" => contents.push(Content {
-                    role: Some("model".to_string()),
-                    parts: vec![Part {
-                        text: msg.content.clone(),
-                    }],
-                }),
+                "user" => {
+                    let (cleaned_text, image_refs) =
+                        crate::multimodal::parse_image_markers(&msg.content);
+                    let mut parts: Vec<Part> = Vec::new();
+                    let trimmed = cleaned_text.trim();
+                    if !trimmed.is_empty() {
+                        parts.push(Part::text(trimmed));
+                    }
+                    for img_ref in &image_refs {
+                        if let Some((mime_type, data)) = Self::parse_data_uri(img_ref) {
+                            parts.push(Part {
+                                text: None,
+                                inline_data: Some(InlineData { mime_type, data }),
+                                function_call: None,
+                                function_response: None,
+                                thought: None,
+                                thought_signature: None,
+                            });
+                        }
+                    }
+                    if parts.is_empty() {
+                        parts.push(Part::text(&msg.content));
+                    }
+                    contents.push(Content {
+                        role: Some("user".to_string()),
+                        parts,
+                    });
+                }
+                "assistant" => {
+                    // Try to parse as native tool-call history JSON produced by the agent loop:
+                    // {"tool_calls": [...], "content": "..."}
+                    if let Ok(parsed) =
+                        serde_json::from_str::<serde_json::Value>(&msg.content)
+                    {
+                        if let Some(tool_calls) = parsed.get("tool_calls").and_then(|v| v.as_array()) {
+                            // Check if ALL tool calls have thought_signature (new history).
+                            // Old history (saved before the thought_signature fix) won't have it,
+                            // and Gemini thinking models reject functionCall without thought_signature.
+                            let all_have_signature = tool_calls.iter().all(|tc| {
+                                tc.get("thought_signature")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| !s.is_empty())
+                                    .unwrap_or(false)
+                            });
+
+                            if !all_have_signature && !tool_calls.is_empty() {
+                                // Degrade: convert old tool call history to a compact single-line
+                                // summary to avoid Gemini "thought_signature missing" error
+                                // and prevent [Used tool: xxx] spam in context.
+                                let summary = match parsed.get("content").and_then(|v| v.as_str()) {
+                                    Some(text) if !text.trim().is_empty() => text.to_string(),
+                                    _ => "(Continued from previous tool interaction)".to_string(),
+                                };
+                                contents.push(Content {
+                                    role: Some("model".to_string()),
+                                    parts: vec![Part::text(&summary)],
+                                });
+                                // Mark these tool call IDs as degraded so tool results are also skipped
+                                for tc in tool_calls {
+                                    let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                    tool_id_to_name.insert(id, "__degraded__".to_string());
+                                }
+                                continue;
+                            }
+
+                            // Normal path: all tool calls have thought_signature (new history)
+                            let mut parts: Vec<Part> = Vec::new();
+                            // Optional text alongside tool calls
+                            if let Some(text) = parsed.get("content").and_then(|v| v.as_str()) {
+                                if !text.is_empty() {
+                                    parts.push(Part::text(text));
+                                }
+                            }
+                            for tc in tool_calls {
+                                let id = tc
+                                    .get("id")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let name = tc
+                                    .get("name")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let args: serde_json::Value = tc
+                                    .get("arguments")
+                                    .and_then(|v| v.as_str())
+                                    .and_then(|s| serde_json::from_str(s).ok())
+                                    .unwrap_or(serde_json::Value::Object(Default::default()));
+                                tool_id_to_name.insert(id.clone(), name.clone());
+                                // If a thought_signature was stored with this tool call,
+                                // insert a thought Part before the functionCall Part.
+                                // Gemini thinking models require this for multi-turn history.
+                                if let Some(sig) = tc
+                                    .get("thought_signature")
+                                    .and_then(|v| v.as_str())
+                                {
+                                    parts.push(Part {
+                                        text: Some(String::new()),
+                                        inline_data: None,
+                                        function_call: None,
+                                        function_response: None,
+                                        thought: Some(true),
+                                        thought_signature: Some(sig.to_string()),
+                                    });
+                                }
+                                parts.push(Part {
+                                    text: None,
+                                    inline_data: None,
+                                    function_call: Some(RequestFunctionCall {
+                                        name,
+                                        args,
+                                    }),
+                                    function_response: None,
+                                    thought: None,
+                                    thought_signature: None,
+                                });
+                            }
+                            contents.push(Content {
+                                role: Some("model".to_string()),
+                                parts,
+                            });
+                            continue;
+                        }
+                    }
+                    // Plain text assistant message
+                    contents.push(Content {
+                        role: Some("model".to_string()),
+                        parts: vec![Part::text(&msg.content)],
+                    });
+                }
+                "tool" => {
+                    // Parse tool result: {"tool_call_id": "...", "content": "..."}
+                    if let Ok(parsed) =
+                        serde_json::from_str::<serde_json::Value>(&msg.content)
+                    {
+                        let tool_call_id = parsed
+                            .get("tool_call_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let content = parsed
+                            .get("content")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        // Look up the tool name from the assistant history
+                        let tool_name = tool_id_to_name
+                            .get(&tool_call_id)
+                            .cloned()
+                            .unwrap_or_else(|| "unknown_tool".to_string());
+                        // Skip tool results for degraded (old history without thought_signature)
+                        // tool calls — Gemini supports consecutive same-role Contents, so this
+                        // won't break role alternation.
+                        if tool_name == "__degraded__" {
+                            continue;
+                        }
+                        // Gemini requires functionResponse role = "user"
+                        contents.push(Content {
+                            role: Some("user".to_string()),
+                            parts: vec![Part {
+                                text: None,
+                                inline_data: None,
+                                function_call: None,
+                                function_response: Some(FunctionResponse {
+                                    name: tool_name,
+                                    response: serde_json::json!({ "output": content }),
+                                }),
+                                thought: None,
+                                thought_signature: None,
+                            }],
+                        });
+                    }
+                }
                 _ => {}
             }
         }
@@ -1255,19 +1565,43 @@ impl Provider for GeminiProvider {
         } else {
             Some(Content {
                 role: None,
-                parts: vec![Part {
-                    text: system_parts.join("\n\n"),
-                }],
+                parts: vec![Part::text(system_parts.join("\n\n"))],
             })
         };
 
-        let (text, usage) = self
-            .send_generate_content(contents, system_instruction, model, temperature)
+        // Convert ToolSpec slice to Gemini's functionDeclarations format
+        let gemini_tools = request.tools.and_then(|specs| {
+            if specs.is_empty() {
+                return None;
+            }
+            let declarations: Vec<FunctionDeclaration> = specs
+                .iter()
+                .map(|t| FunctionDeclaration {
+                    name: t.name.clone(),
+                    description: t.description.clone(),
+                    parameters: crate::tools::SchemaCleanr::clean_for_gemini(
+                        t.parameters.clone(),
+                    ),
+                })
+                .collect();
+            Some(vec![GeminiTool {
+                function_declarations: declarations,
+            }])
+        });
+
+        let (text, tool_calls, usage) = self
+            .send_generate_content(
+                contents,
+                system_instruction,
+                model,
+                temperature,
+                gemini_tools,
+            )
             .await?;
 
         Ok(ChatResponse {
-            text: Some(text),
-            tool_calls: Vec::new(),
+            text,
+            tool_calls,
             usage,
             reasoning_content: None,
         })
@@ -1303,20 +1637,12 @@ impl Provider for GeminiProvider {
                 }
                 _ => {
                     // API key path — verify with public API models endpoint.
-                    let url = if auth.is_api_key() {
-                        format!(
-                            "https://generativelanguage.googleapis.com/v1beta/models?key={}",
-                            auth.api_key_credential()
-                        )
-                    } else {
-                        "https://generativelanguage.googleapis.com/v1beta/models".to_string()
-                    };
-
-                    self.http_client()
-                        .get(&url)
-                        .send()
-                        .await?
-                        .error_for_status()?;
+                    let url = "https://generativelanguage.googleapis.com/v1beta/models";
+                    let mut req = self.http_client().get(url);
+                    if auth.is_api_key() {
+                        req = req.header("x-goog-api-key", auth.api_key_credential());
+                    }
+                    req.send().await?.error_for_status()?;
                 }
             }
         }
@@ -1542,9 +1868,7 @@ mod tests {
         let body = GenerateContentRequest {
             contents: vec![Content {
                 role: Some("user".into()),
-                parts: vec![Part {
-                    text: "hello".into(),
-                }],
+                parts: vec![Part::text("hello")],
             }],
             system_instruction: None,
             generation_config: GenerationConfig {
@@ -1583,9 +1907,7 @@ mod tests {
         let body = GenerateContentRequest {
             contents: vec![Content {
                 role: Some("user".into()),
-                parts: vec![Part {
-                    text: "hello".into(),
-                }],
+                parts: vec![Part::text("hello")],
             }],
             system_instruction: None,
             generation_config: GenerationConfig {
@@ -1627,9 +1949,7 @@ mod tests {
         let body = GenerateContentRequest {
             contents: vec![Content {
                 role: Some("user".into()),
-                parts: vec![Part {
-                    text: "hello".into(),
-                }],
+                parts: vec![Part::text("hello")],
             }],
             system_instruction: None,
             generation_config: GenerationConfig {
@@ -1659,15 +1979,11 @@ mod tests {
         let request = GenerateContentRequest {
             contents: vec![Content {
                 role: Some("user".to_string()),
-                parts: vec![Part {
-                    text: "Hello".to_string(),
-                }],
+                parts: vec![Part::text("Hello")],
             }],
             system_instruction: Some(Content {
                 role: None,
-                parts: vec![Part {
-                    text: "You are helpful".to_string(),
-                }],
+                parts: vec![Part::text("You are helpful")],
             }),
             generation_config: GenerationConfig {
                 temperature: 0.7,
@@ -1693,9 +2009,7 @@ mod tests {
             request: InternalGenerateContentRequest {
                 contents: vec![Content {
                     role: Some("user".to_string()),
-                    parts: vec![Part {
-                        text: "Hello".to_string(),
-                    }],
+                    parts: vec![Part::text("Hello")],
                 }],
                 system_instruction: None,
                 generation_config: Some(GenerationConfig {
@@ -1725,9 +2039,7 @@ mod tests {
             request: InternalGenerateContentRequest {
                 contents: vec![Content {
                     role: Some("user".to_string()),
-                    parts: vec![Part {
-                        text: "Hello".to_string(),
-                    }],
+                    parts: vec![Part::text("Hello")],
                 }],
                 system_instruction: None,
                 generation_config: None,
@@ -1748,9 +2060,7 @@ mod tests {
             request: InternalGenerateContentRequest {
                 contents: vec![Content {
                     role: Some("user".to_string()),
-                    parts: vec![Part {
-                        text: "Hello".to_string(),
-                    }],
+                    parts: vec![Part::text("Hello")],
                 }],
                 system_instruction: None,
                 generation_config: None,

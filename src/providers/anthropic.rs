@@ -83,6 +83,10 @@ enum NativeContentOut {
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControl>,
     },
+    #[serde(rename = "image")]
+    Image {
+        source: ImageSource,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -106,6 +110,14 @@ impl CacheControl {
             cache_type: "ephemeral".to_string(),
         }
     }
+}
+
+#[derive(Debug, Serialize)]
+struct ImageSource {
+    #[serde(rename = "type")]
+    source_type: String,
+    media_type: String,
+    data: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -155,6 +167,21 @@ struct NativeContentIn {
 }
 
 impl AnthropicProvider {
+    /// Parse a `data:mime;base64,payload` URI into `(media_type, base64_data)`.
+    /// Returns `None` for invalid or truncated data URIs (safe to skip).
+    fn parse_data_uri(uri: &str) -> Option<(String, String)> {
+        let stripped = uri.strip_prefix("data:")?;
+        let semi = stripped.find(';')?;
+        let media_type = stripped[..semi].to_string();
+        let rest = &stripped[semi..];
+        let comma = rest.find(',')?;
+        let data = rest[comma + 1..].trim().to_string();
+        if data.is_empty() {
+            return None;
+        }
+        Some((media_type, data))
+    }
+
     pub fn new(credential: Option<&str>) -> Self {
         Self::with_base_url(credential, None)
     }
@@ -210,7 +237,8 @@ impl AnthropicProvider {
                     | NativeContentOut::ToolResult { cache_control, .. } => {
                         *cache_control = Some(CacheControl::ephemeral());
                     }
-                    NativeContentOut::ToolUse { .. } => {}
+                    NativeContentOut::ToolUse { .. }
+                    | NativeContentOut::Image { .. } => {}
                 }
             }
         }
@@ -309,10 +337,19 @@ impl AnthropicProvider {
                             content: blocks,
                         });
                     } else {
+                        // Guard: replace empty assistant messages with placeholder to
+                        // avoid Anthropic "text content blocks must be non-empty" error.
+                        // IMPORTANT: Do NOT use `continue` here — skipping would break
+                        // role alternation and cause "roles must alternate" 400 error.
+                        let text = if msg.content.trim().is_empty() {
+                            "(thinking)".to_string()
+                        } else {
+                            msg.content.trim().to_string()
+                        };
                         native_messages.push(NativeMessage {
                             role: "assistant".to_string(),
                             content: vec![NativeContentOut::Text {
-                                text: msg.content.clone(),
+                                text,
                                 cache_control: None,
                             }],
                         });
@@ -322,22 +359,61 @@ impl AnthropicProvider {
                     if let Some(tool_result) = Self::parse_tool_result_message(&msg.content) {
                         native_messages.push(tool_result);
                     } else {
+                        // Guard: replace empty tool messages with placeholder to
+                        // avoid Anthropic "text content blocks must be non-empty" error.
+                        let text = if msg.content.trim().is_empty() {
+                            "(empty tool result)".to_string()
+                        } else {
+                            msg.content.trim().to_string()
+                        };
                         native_messages.push(NativeMessage {
                             role: "user".to_string(),
                             content: vec![NativeContentOut::Text {
-                                text: msg.content.clone(),
+                                text,
                                 cache_control: None,
                             }],
                         });
                     }
                 }
                 _ => {
+                    let (cleaned, image_refs) =
+                        crate::multimodal::parse_image_markers(&msg.content);
+                    let mut blocks = Vec::new();
+                    let trimmed = cleaned.trim();
+                    if !trimmed.is_empty() {
+                        blocks.push(NativeContentOut::Text {
+                            text: trimmed.to_string(),
+                            cache_control: None,
+                        });
+                    }
+                    for img_ref in image_refs {
+                        if let Some((media_type, data)) = Self::parse_data_uri(&img_ref) {
+                            blocks.push(NativeContentOut::Image {
+                                source: ImageSource {
+                                    source_type: "base64".to_string(),
+                                    media_type,
+                                    data,
+                                },
+                            });
+                        }
+                    }
+                    if blocks.is_empty() {
+                        let fallback = msg.content.trim();
+                        if !fallback.is_empty() {
+                            blocks.push(NativeContentOut::Text {
+                                text: fallback.to_string(),
+                                cache_control: None,
+                            });
+                        }
+                        // If still empty (content was stripped image-only), skip this message
+                        // entirely to avoid an empty text block that Anthropic API rejects.
+                        if blocks.is_empty() {
+                            continue;
+                        }
+                    }
                     native_messages.push(NativeMessage {
                         role: "user".to_string(),
-                        content: vec![NativeContentOut::Text {
-                            text: msg.content.clone(),
-                            cache_control: None,
-                        }],
+                        content: blocks,
                     });
                 }
             }
@@ -398,6 +474,7 @@ impl AnthropicProvider {
                         id: block.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
                         name,
                         arguments: arguments.to_string(),
+                        thought_signature: None,
                     });
                 }
                 _ => {}
@@ -423,6 +500,13 @@ impl AnthropicProvider {
 
 #[async_trait]
 impl Provider for AnthropicProvider {
+    fn capabilities(&self) -> crate::providers::traits::ProviderCapabilities {
+        crate::providers::traits::ProviderCapabilities {
+            native_tool_calling: true,
+            vision: true,
+        }
+    }
+
     async fn chat_with_system(
         &self,
         system_prompt: Option<&str>,

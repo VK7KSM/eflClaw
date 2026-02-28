@@ -1057,6 +1057,7 @@ impl OpenAiCompatibleProvider {
                     id: tc.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
                     name,
                     arguments: normalized_arguments,
+                    thought_signature: None,
                 })
             })
             .collect::<Vec<_>>();
@@ -1440,6 +1441,7 @@ impl Provider for OpenAiCompatibleProvider {
                     id: uuid::Uuid::new_v4().to_string(),
                     name,
                     arguments,
+                    thought_signature: None,
                 })
             })
             .collect::<Vec<_>>();

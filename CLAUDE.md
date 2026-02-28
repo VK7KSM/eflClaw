@@ -3,6 +3,13 @@
 This file defines the default working protocol for Claude agents in this repository.
 Scope: entire repository.
 
+## 0) 最高优先级规则（必须遵守）
+
+1. **始终使用中文与用户对话。** 所有回复、解释、提问都必须使用中文。代码注释和变量名保持英文。
+2. **每次开始工作前，先阅读 `dev_log.md`** 了解项目近期修改内容和设计决策。
+3. **每完成一步修改后，立即将修改内容追加到 `dev_log.md`**，包括：改了什么文件、为什么改、改动要点。如果 `dev_log.md` 不存在，创建它。
+4. **架构参考**：阅读 `Research.md` 了解 ZeroClaw 与 OpenClaw 的完整文件目录、二次开发现状、以及待改进的活跃时间逻辑和渠道路由抽象方案。
+
 ## 1) Project Snapshot (Read First)
 
 ZeroClaw is a Rust-first autonomous agent runtime optimized for:
@@ -481,3 +488,195 @@ When working in fast iterative mode:
 - Prefer deterministic behavior over clever shortcuts.
 - Do not “ship and hope” on security-sensitive paths.
 - If uncertain, leave a concrete TODO with verification context, not a hidden guess.
+
+## 13) CodeGraph — Semantic Code Intelligence (MCP)
+
+This project has a `.codegraph/` directory with a pre-built semantic index. Use CodeGraph MCP tools for **faster, smarter code exploration** instead of raw file scanning.
+
+### 13.1 Index Overview
+
+| Metric | Value |
+|--------|-------|
+| Files indexed | 312 |
+| Nodes | 10,862 (functions: 7,415 / structs: 709 / enums: 106 / traits: 23 / methods: 47) |
+| Edges | 17,243 |
+| Languages | Rust 259, Python 17, TSX 15, TypeScript 12, JavaScript 9 |
+
+### 13.2 Available Tools
+
+| Tool | Purpose | When to Use |
+|------|---------|-------------|
+| `codegraph_context` | Build comprehensive context for a task | **Start here** — returns entry points, related symbols, and key code for a given task description |
+| `codegraph_search` | Find symbols by name | Quick lookup of functions, classes, types, structs by name or partial name |
+| `codegraph_files` | Get project file structure | **Use instead of filesystem scanning** — much faster, includes metadata |
+| `codegraph_callers` | Find all callers of a symbol | Trace upstream references — who calls this function? |
+| `codegraph_callees` | Find all callees of a symbol | Trace downstream dependencies — what does this function call? |
+| `codegraph_impact` | Analyze change blast radius | **Use before making changes** — shows what code could be affected |
+| `codegraph_node` | Get details for a specific symbol | Retrieve signature, location, and optionally full source code |
+| `codegraph_status` | Show index statistics | Verify index health and coverage |
+
+### 13.3 Usage Protocol
+
+1. **Explore structure first**: Use `codegraph_files` instead of glob/filesystem for project navigation.
+2. **Build context before coding**: Use `codegraph_context` with a task description to get relevant entry points and code.
+3. **Check impact before editing**: Use `codegraph_impact` on symbols you plan to modify.
+4. **Trace call graphs**: Use `codegraph_callers` / `codegraph_callees` to understand code flow.
+5. **Quick symbol lookup**: Use `codegraph_search` instead of grep for finding functions, structs, traits.
+
+### 13.4 Keeping the Index Fresh
+
+If source files have changed significantly since last indexing, run:
+
+```bash
+npx -y @colbymchenry/codegraph sync
+```
+
+For a full re-index:
+
+```bash
+npx -y @colbymchenry/codegraph index --force
+```
+
+### 13.5 MCP Server Configuration & Multi-Project Usage
+
+**The MCP server itself is project-agnostic** — do NOT hardcode `--path` in the server startup args, as that would break all other projects.
+
+**Correct MCP server config** (no path binding):
+
+```json
+{
+  "mcpServers": {
+    "codegraph": {
+      "command": "npx",
+      "args": ["-y", "@colbymchenry/codegraph", "serve", "--mcp"]
+    }
+  }
+}
+```
+
+**How to use with a specific project**: Always pass `projectPath` explicitly in every tool call.
+
+```
+codegraph_status(projectPath: "C:\\Dev\\zeroclaw")
+codegraph_files(projectPath: "C:\\Dev\\zeroclaw")
+codegraph_context(task: "...", projectPath: "C:\\Dev\\zeroclaw")
+```
+
+If `projectPath` is omitted, the server falls back to its working directory — which is usually wrong. **Always pass it.**
+
+**Prerequisites**: The target project must have a `.codegraph/` directory. Run the following to initialize a new project:
+
+```bash
+npx -y @colbymchenry/codegraph init --index "C:\path\to\other-project"
+```
+
+## 14) Email Monitor → Telegram Notification (Session 2026-02-25)
+
+### 14.1 Feature Goal
+
+Email channel in `monitor` mode should:
+1. Detect new emails via IMAP IDLE
+2. Agent analyzes and classifies (important vs junk)
+3. Agent uses `send_telegram` tool to notify user on Telegram
+4. **User decides** what to do (ignore / ask agent to draft reply / ask agent to send reply)
+5. Agent must **NOT** send any email unless explicitly instructed by user
+
+### 14.2 Changes Made (This Session)
+
+#### `src/channels/email_channel.rs`
+- **Self-email filter** (line ~301): `fetch_unseen()` skips emails where sender == `from_address` to prevent infinite self-reply loops.
+- **Digest prompt** (line ~540): Simplified to: analyze, classify, summarize in Chinese, notify user. Rule: do NOT use `send_email` tool.
+- **ChannelMessage sender** (line ~585): Changed from `"email-monitor (username)"` to `reply_target` (user's chat_id). This ensures the digest message shares the user's existing Telegram conversation history via `conversation_history_key()`.
+
+#### `src/tools/send_telegram.rs` [NEW]
+- New `SendTelegramTool` implementing the `Tool` trait.
+- Uses Telegram Bot API `sendMessage` with `bot_token` from `TelegramConfig`.
+- Supports Markdown formatting with plain-text fallback.
+- Parameters: `chat_id` (required), `message` (required).
+
+#### `src/tools/mod.rs`
+- Added `send_telegram` module declaration and `pub use`.
+- Conditionally registers `SendTelegramTool` in `all_tools_with_runtime()` when telegram channel is configured.
+
+#### `src/channels/mod.rs`
+- **Tool exclusion for email digests** (line ~1732-1770): When `msg.id.starts_with("email-digest-")`, `send_email` is added to `excluded_tools` so the LLM cannot see or call it during digest processing.
+
+### 14.3 Bug Status — ✅ FIXED (2026-02-27)
+
+~~**`notify_channel` and `notify_to` are not configured in the actual config file.**~~
+
+**已修复**：`资料/config.toml` 第 191-192 行已正确配置：
+
+```toml
+notify_channel = "telegram"
+notify_to = "495916105"
+```
+
+`src/channels/email_channel.rs:565-596` 中的 `process_unseen_monitor()` 正确读取这两个字段并将 ChannelMessage 路由到 Telegram。`send_email` 工具在 email-digest 处理期间被正确排除（`src/channels/mod.rs:1785-1821`）。整个流程已验证正确。
+
+### 14.4 Architecture Notes
+
+- `conversation_history_key()` at line 272 uses format `{channel}_{sender}` — sender MUST match the user's identity for shared conversation context.
+- `channel_delivery_instructions()` at line 400 adds Telegram formatting rules to the system prompt when `channel == "telegram"`.
+- `build_channel_system_prompt()` at line 420 injects `channel=<name>, reply_target=<id>` into the system prompt.
+- `run_tool_call_loop()` at line 2091 filters `excluded_tools` from `tool_specs` before sending to LLM — the LLM never sees excluded tools.
+- `EmailChannel.send()` at line 689 sends via SMTP. `TelegramChannel.send()` at line 2419 sends via Bot API. Which one is called depends entirely on `target_channel = channels_by_name.get(msg.channel)`.
+
+### 14.5 Correct Flow (After Config Fix)
+
+```
+Email arrives (IMAP IDLE)
+    ↓
+fetch_unseen() — filters out self-sent emails
+    ↓
+process_unseen_monitor() — builds digest
+    ↓
+ChannelMessage{channel: "telegram", reply_target: "495916105", sender: "495916105"}
+    ↓
+process_channel_message() picks it up
+    ↓
+target_channel = channels_by_name["telegram"] → TelegramChannel
+    ↓
+Agent processes digest (send_email tool excluded)
+    ↓
+Agent uses send_telegram tool OR text reply → both go to Telegram
+    ↓
+User sees notification on Telegram → decides next action
+```
+
+## 15) 架构债务记录（2026-02-27 分析）
+
+> 这些问题目前不影响功能，但需要在后续整体重构时解决。详细改造方案见 `Research.md` 第五、六节。
+
+### 15.1 孤儿文件：`src/heartbeat/engine.rs`
+
+该文件包含完整的 `HeartbeatEngine` 实现（`run()`、`tick()`、`collect_tasks()`、`parse_tasks()`），
+但生产代码中这些方法**完全未被调用**——仅在测试代码中使用。
+
+实际的 heartbeat 逻辑已被独立重写在 `src/daemon/mod.rs:run_heartbeat_worker()` 中。
+`engine.rs` 的唯一生产用途是 `ensure_heartbeat_file()`（daemon 启动时建文件，`daemon/mod.rs:22`）。
+
+**结论**：`engine.rs` 是孤儿文件。重构时可将 `ensure_heartbeat_file()` 移到 daemon 内或 util 模块，然后删除整个 `src/heartbeat/` 目录。
+
+### 15.2 活跃时间硬编码 — ✅ FIXED (2026-02-27)
+
+~~位置：`src/daemon/mod.rs:188-194`~~
+**已修复**：引入了分钟精度的可配置化检查。
+
+- `HeartbeatConfig` 新增了 `active_hours_start` 和 `active_hours_end` 字段（`HH:MM` 格式）
+- 支持配置文件 `[heartbeat]` 设置，并支持跨午夜时间段
+- `daemon/mod.rs` 现读取配置进行过滤
+
+### 15.3 渠道路由架构割裂
+
+Heartbeat/Cron 投递路径（`deliver_announcement`）与普通消息路径（`channels_by_name.get()`）是两套独立代码：
+
+| 对比项 | 普通消息 | Heartbeat/Cron |
+|--------|---------|----------------|
+| 渠道查找 | `channels_by_name.get()` HashMap | `match channel` 硬编码 |
+| Channel 实例化 | 启动时统一创建 | 每次投递时重新 `::new()` |
+| 支持渠道数 | 全部已配置渠道 | 仅 telegram/discord/slack/mattermost |
+| 代码位置 | `channels/mod.rs` | `daemon/mod.rs:347` + `scheduler.rs:308` |
+
+重构时应统一为单一投递路径，通过 `Channel` trait 发送，消除硬编码 match。
+

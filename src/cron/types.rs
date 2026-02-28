@@ -112,6 +112,7 @@ pub struct CronJob {
     pub job_type: JobType,
     pub session_target: SessionTarget,
     pub model: Option<String>,
+    pub delegate_to: Option<String>,  // sub-agent name; if set, runner wraps prompt as delegate call
     pub enabled: bool,
     pub delivery: DeliveryConfig,
     pub delete_after_run: bool,
@@ -144,6 +145,7 @@ pub struct CronJobPatch {
     pub model: Option<String>,
     pub session_target: Option<SessionTarget>,
     pub delete_after_run: Option<bool>,
+    pub delegate_to: Option<String>,
 }
 
 #[cfg(test)]

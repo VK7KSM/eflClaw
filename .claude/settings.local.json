@@ -1,0 +1,29 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__codegraph__codegraph_files",
+      "Bash(tail:*)",
+      "WebSearch",
+      "WebFetch(domain:github.com)",
+      "Bash(find:*)",
+      "mcp__codegraph__codegraph_status",
+      "mcp__codegraph__codegraph_search",
+      "mcp__codegraph__codegraph_node",
+      "mcp__codegraph__codegraph_context",
+      "Bash(while read f)",
+      "Bash(do ls -lh \"$f\")",
+      "Bash(find 'C:\\\\Dev\\\\zeroclaw' -type f -name \"*.db\" -o -type f -name \"*.sqlite*\" 2>/dev/null | xargs -I {} ls -lh {} 2>/dev/null)",
+      "Bash(cd /c/Dev/zeroclaw && cargo build --release 2>&1)",
+      "WebFetch(domain:ai.google.dev)",
+      "Bash(grep:*)",
+      "Bash(head:*)",
+      "mcp__codegraph__codegraph_callers",
+      "Bash(git clone:*)",
+      "Bash(comm:*)",
+      "Bash(wc:*)",
+      "Bash(cat:*)",
+      "Bash(xargs:*)",
+      "Bash(cd:*)"
+    ]
+  }
+}

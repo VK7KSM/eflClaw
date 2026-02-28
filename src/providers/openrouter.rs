@@ -284,6 +284,7 @@ impl OpenRouterProvider {
                 id: tc.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
                 name: tc.function.name,
                 arguments: tc.function.arguments,
+                thought_signature: None,
             })
             .collect::<Vec<_>>();
 

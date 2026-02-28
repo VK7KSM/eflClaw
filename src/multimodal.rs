@@ -97,6 +97,64 @@ pub fn contains_image_markers(messages: &[ChatMessage]) -> bool {
     count_image_markers(messages) > 0
 }
 
+/// Strip [IMAGE:...] markers from all user messages except the last one.
+/// Each image is sent to the provider only in the turn it was received;
+/// historical images are not re-transmitted in subsequent API calls.
+pub fn strip_history_image_markers(messages: &[ChatMessage]) -> Vec<ChatMessage> {
+    let last_user_idx = messages.iter().rposition(|m| m.role == "user");
+    messages
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            if m.role == "user" && Some(i) != last_user_idx {
+                let (cleaned, refs) = parse_image_markers(&m.content);
+                // Use a placeholder if the message was image-only, to prevent empty content blocks
+                // that cause Anthropic/other providers to return 400 errors.
+                let content = if cleaned.trim().is_empty() && !refs.is_empty() {
+                    "（此消息包含图片）".to_string()
+                } else {
+                    cleaned
+                };
+                ChatMessage { role: m.role.clone(), content }
+            } else {
+                m.clone()
+            }
+        })
+        .collect()
+}
+
+/// Strip [IMAGE:...] markers from ALL user messages (including the current one).
+/// If the most recent user message contained images, a human-readable note is appended
+/// so the agent can respond naturally (e.g. "I can't see the images you sent").
+/// Raw error messages are never exposed to the user; the agent handles it gracefully.
+pub fn strip_all_image_markers_with_note(messages: &[ChatMessage]) -> Vec<ChatMessage> {
+    let last_user_idx = messages.iter().rposition(|m| m.role == "user");
+    messages
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            if m.role == "user" {
+                let (cleaned, refs) = parse_image_markers(&m.content);
+                let content = if Some(i) == last_user_idx && !refs.is_empty() {
+                    format!(
+                        "{}\n（此消息包含 {} 张图片，当前模型不支持图片识别，图片内容已忽略）",
+                        cleaned.trim(),
+                        refs.len()
+                    )
+                } else if cleaned.trim().is_empty() && !refs.is_empty() {
+                    // Historical message was image-only; use placeholder to prevent empty content blocks.
+                    "（此消息包含图片）".to_string()
+                } else {
+                    cleaned
+                };
+                ChatMessage { role: m.role.clone(), content }
+            } else {
+                m.clone()
+            }
+        })
+        .collect()
+}
+
 pub fn extract_ollama_image_payload(image_ref: &str) -> Option<String> {
     if image_ref.starts_with("data:") {
         let comma_idx = image_ref.find(',')?;

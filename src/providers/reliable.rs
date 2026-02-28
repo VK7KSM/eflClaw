@@ -226,6 +226,7 @@ pub struct ReliableProvider {
     providers: Vec<(String, Box<dyn Provider>)>,
     max_retries: u32,
     base_backoff_ms: u64,
+    max_backoff_ms: u64,
     /// Extra API keys for rotation (index tracks round-robin position).
     api_keys: Vec<String>,
     key_index: AtomicUsize,
@@ -238,11 +239,13 @@ impl ReliableProvider {
         providers: Vec<(String, Box<dyn Provider>)>,
         max_retries: u32,
         base_backoff_ms: u64,
+        max_backoff_ms: u64,
     ) -> Self {
         Self {
             providers,
             max_retries,
             base_backoff_ms: base_backoff_ms.max(50),
+            max_backoff_ms: max_backoff_ms.max(base_backoff_ms),
             api_keys: Vec::new(),
             key_index: AtomicUsize::new(0),
             model_fallbacks: HashMap::new(),
@@ -399,7 +402,7 @@ impl Provider for ReliableProvider {
                                     "Provider call failed, retrying"
                                 );
                                 tokio::time::sleep(Duration::from_millis(wait)).await;
-                                backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
+                                backoff_ms = (backoff_ms.saturating_mul(2)).min(self.max_backoff_ms);
                             }
                         }
                     }
@@ -517,7 +520,7 @@ impl Provider for ReliableProvider {
                                     "Provider call failed, retrying"
                                 );
                                 tokio::time::sleep(Duration::from_millis(wait)).await;
-                                backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
+                                backoff_ms = (backoff_ms.saturating_mul(2)).min(self.max_backoff_ms);
                             }
                         }
                     }
@@ -641,7 +644,7 @@ impl Provider for ReliableProvider {
                                     "Provider call failed, retrying"
                                 );
                                 tokio::time::sleep(Duration::from_millis(wait)).await;
-                                backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
+                                backoff_ms = (backoff_ms.saturating_mul(2)).min(self.max_backoff_ms);
                             }
                         }
                     }
@@ -752,7 +755,7 @@ impl Provider for ReliableProvider {
                                     "Provider call failed, retrying"
                                 );
                                 tokio::time::sleep(Duration::from_millis(wait)).await;
-                                backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
+                                backoff_ms = (backoff_ms.saturating_mul(2)).min(self.max_backoff_ms);
                             }
                         }
                     }
@@ -1682,6 +1685,7 @@ mod tests {
             id: "call_1".to_string(),
             name: "shell".to_string(),
             arguments: r#"{"command":"date"}"#.to_string(),
+            thought_signature: None,
         };
         let provider = ReliableProvider::new(
             vec![(
@@ -1718,6 +1722,7 @@ mod tests {
             id: "call_1".to_string(),
             name: "shell".to_string(),
             arguments: r#"{"command":"date"}"#.to_string(),
+            thought_signature: None,
         };
         let provider = ReliableProvider::new(
             vec![(

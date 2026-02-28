@@ -8,6 +8,7 @@ use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -33,6 +34,8 @@ pub struct DelegateTool {
     parent_tools: Arc<Vec<Arc<dyn Tool>>>,
     /// Inherited multimodal handling config for sub-agent loops.
     multimodal_config: crate::config::MultimodalConfig,
+    /// Workspace directory for resolving system_prompt_file paths.
+    workspace_dir: Option<PathBuf>,
 }
 
 impl DelegateTool {
@@ -63,6 +66,7 @@ impl DelegateTool {
             depth: 0,
             parent_tools: Arc::new(Vec::new()),
             multimodal_config: crate::config::MultimodalConfig::default(),
+            workspace_dir: None,
         }
     }
 
@@ -99,6 +103,7 @@ impl DelegateTool {
             depth,
             parent_tools: Arc::new(Vec::new()),
             multimodal_config: crate::config::MultimodalConfig::default(),
+            workspace_dir: None,
         }
     }
 
@@ -112,6 +117,40 @@ impl DelegateTool {
     pub fn with_multimodal_config(mut self, config: crate::config::MultimodalConfig) -> Self {
         self.multimodal_config = config;
         self
+    }
+
+    /// Attach workspace directory for resolving system_prompt_file paths.
+    pub fn with_workspace_dir(mut self, dir: PathBuf) -> Self {
+        self.workspace_dir = Some(dir);
+        self
+    }
+
+    /// Resolve the system prompt for a delegate agent. If `system_prompt_file` is
+    /// set, load from that file (relative to workspace_dir). Otherwise use the
+    /// inline `system_prompt`. Returns None if neither is set.
+    fn resolve_system_prompt(&self, agent_config: &DelegateAgentConfig) -> Option<String> {
+        // File takes precedence over inline
+        if let Some(ref file_path) = agent_config.system_prompt_file {
+            let resolved = if let Some(ref ws) = self.workspace_dir {
+                ws.join(file_path)
+            } else {
+                PathBuf::from(file_path)
+            };
+            match std::fs::read_to_string(&resolved) {
+                Ok(content) => {
+                    tracing::debug!(path = %resolved.display(), "Loaded system prompt from file");
+                    return Some(content);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        path = %resolved.display(),
+                        error = %e,
+                        "Failed to load system_prompt_file, falling back to inline"
+                    );
+                }
+            }
+        }
+        agent_config.system_prompt.clone()
     }
 }
 
@@ -289,10 +328,11 @@ impl Tool for DelegateTool {
         }
 
         // Wrap the provider call in a timeout to prevent indefinite blocking
+        let resolved_prompt = self.resolve_system_prompt(agent_config);
         let result = tokio::time::timeout(
             Duration::from_secs(DELEGATE_TIMEOUT_SECS),
             provider.chat_with_system(
-                agent_config.system_prompt.as_deref(),
+                resolved_prompt.as_deref(),
                 &full_prompt,
                 &agent_config.model,
                 temperature,
@@ -385,8 +425,8 @@ impl DelegateTool {
         }
 
         let mut history = Vec::new();
-        if let Some(system_prompt) = agent_config.system_prompt.as_ref() {
-            history.push(ChatMessage::system(system_prompt.clone()));
+        if let Some(system_prompt) = self.resolve_system_prompt(agent_config) {
+            history.push(ChatMessage::system(system_prompt));
         }
         history.push(ChatMessage::user(full_prompt.to_string()));
 
@@ -513,6 +553,7 @@ mod tests {
                 provider: "ollama".to_string(),
                 model: "llama3".to_string(),
                 system_prompt: Some("You are a research assistant.".to_string()),
+                system_prompt_file: None,
                 api_key: None,
                 temperature: Some(0.3),
                 max_depth: 3,
@@ -527,6 +568,7 @@ mod tests {
                 provider: "openrouter".to_string(),
                 model: "anthropic/claude-sonnet-4-20250514".to_string(),
                 system_prompt: None,
+                system_prompt_file: None,
                 api_key: Some("delegate-test-credential".to_string()),
                 temperature: None,
                 max_depth: 2,
@@ -680,6 +722,7 @@ mod tests {
             provider: "openrouter".to_string(),
             model: "model-test".to_string(),
             system_prompt: Some("You are agentic.".to_string()),
+            system_prompt_file: None,
             api_key: Some("delegate-test-credential".to_string()),
             temperature: Some(0.2),
             max_depth: 3,
@@ -788,6 +831,7 @@ mod tests {
                 provider: "totally-invalid-provider".to_string(),
                 model: "model".to_string(),
                 system_prompt: None,
+                system_prompt_file: None,
                 api_key: None,
                 temperature: None,
                 max_depth: 3,
@@ -894,6 +938,7 @@ mod tests {
                 provider: "invalid-for-test".to_string(),
                 model: "test-model".to_string(),
                 system_prompt: None,
+                system_prompt_file: None,
                 api_key: None,
                 temperature: None,
                 max_depth: 3,
@@ -929,6 +974,7 @@ mod tests {
                 provider: "invalid-for-test".to_string(),
                 model: "test-model".to_string(),
                 system_prompt: None,
+                system_prompt_file: None,
                 api_key: None,
                 temperature: None,
                 max_depth: 3,

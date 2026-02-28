@@ -14,6 +14,9 @@
 //! To add a new channel, implement [`Channel`] in a new submodule and wire it into
 //! [`start_channels`]. See `AGENTS.md` §7.2 for the full change playbook.
 
+pub mod chat_log;
+pub mod chat_index;
+pub mod chat_summarizer;
 pub mod clawdtalk;
 pub mod cli;
 pub mod dingtalk;
@@ -35,6 +38,7 @@ pub mod slack;
 pub mod telegram;
 pub mod traits;
 pub mod transcription;
+pub mod tts;
 pub mod wati;
 pub mod whatsapp;
 #[cfg(feature = "whatsapp-web")]
@@ -42,7 +46,7 @@ pub mod whatsapp_storage;
 #[cfg(feature = "whatsapp-web")]
 pub mod whatsapp_web;
 
-pub use clawdtalk::{ClawdTalkChannel, ClawdTalkConfig};
+pub use clawdtalk::ClawdTalkChannel;
 pub use cli::CliChannel;
 pub use dingtalk::DingTalkChannel;
 pub use discord::DiscordChannel;
@@ -224,6 +228,8 @@ struct ChannelRuntimeContext {
     multimodal: crate::config::MultimodalConfig,
     hooks: Option<Arc<crate::hooks::HookRunner>>,
     non_cli_excluded_tools: Arc<Vec<String>>,
+    tts_config: crate::config::TtsConfig,
+    chat_log_config: crate::config::ChatLogConfig,
 }
 
 #[derive(Clone)]
@@ -440,6 +446,15 @@ fn build_channel_system_prompt(
         );
         prompt.push_str(&context);
     }
+
+    // Inject fresh current time so the LLM knows the exact moment,
+    // overriding any stale startup-time baked into the base prompt.
+    let now = chrono::Local::now();
+    prompt.push_str(&format!(
+        "\n\n## Current Date & Time\n\n{} ({})\n",
+        now.format("%Y-%m-%d %H:%M:%S"),
+        now.format("%Z")
+    ));
 
     prompt
 }
@@ -1057,7 +1072,7 @@ async fn handle_runtime_command_if_needed(
         }
         ChannelRuntimeCommand::NewSession => {
             clear_sender_history(ctx, &sender_key);
-            "Conversation history cleared. Starting fresh.".to_string()
+            "对话历史已清空。系统摘要保留，我仍记得近期对话概况。发消息开始新对话。".to_string()
         }
     };
 
@@ -1605,6 +1620,26 @@ async fn process_channel_message(
     // Preserve user turn before the LLM call so interrupted requests keep context.
     append_sender_turn(ctx.as_ref(), &history_key, ChatMessage::user(&msg.content));
 
+    // Persist user turn to local chat log
+    if ctx.chat_log_config.enabled && msg.channel == "telegram" {
+        let chat_id = msg.reply_target.split(':').next().unwrap_or(&msg.reply_target);
+        let turn = if msg.content.starts_with("[Voice] ") {
+            let stt = msg.content.strip_prefix("[Voice] ").unwrap_or(&msg.content);
+            chat_log::voice_turn_user(stt)
+        } else if msg.content.starts_with("[IMAGE:") {
+            let path = msg.content
+                .strip_prefix("[IMAGE:")
+                .and_then(|s| s.strip_suffix(']'))
+                .unwrap_or(&msg.content);
+            chat_log::image_turn(&msg.content, path)
+        } else {
+            chat_log::text_turn("user", &msg.content)
+        };
+        if let Err(e) = chat_log::append_turn(ctx.workspace_dir.as_path(), chat_id, &msg.sender, turn) {
+            tracing::warn!("chat_log: failed to persist user turn: {e}");
+        }
+    }
+
     // Build history from per-sender conversation cache.
     let prior_turns_raw = ctx
         .conversation_histories
@@ -1627,8 +1662,58 @@ async fn process_channel_message(
         }
     }
 
-    let system_prompt =
+    let mut system_prompt =
         build_channel_system_prompt(ctx.system_prompt.as_str(), &msg.channel, &msg.reply_target);
+
+    // Inject cross-user chat summaries for the owner only
+    if ctx.chat_log_config.enabled && msg.channel == "telegram" {
+        let is_owner = ctx
+            .chat_log_config
+            .owner
+            .as_ref()
+            .is_some_and(|o| o.eq_ignore_ascii_case(&msg.sender));
+
+        if is_owner {
+            if let Ok(index) = chat_index::ChatIndex::open(ctx.workspace_dir.as_path()) {
+                if let Ok(summaries) = index.get_recent_cross_user_summaries(&msg.sender, 5) {
+                    if !summaries.is_empty() {
+                        system_prompt.push_str("\n\n## 其他用户的近期对话摘要\n");
+                        for s in &summaries {
+                            let topics = s.topics.as_deref().unwrap_or("-");
+                            system_prompt.push_str(&format!(
+                                "- {} ({}): {} [话题: {}]\n",
+                                s.chat_name, s.date, s.summary, topics
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Inject current user's own historical summaries for continuity across restarts
+    if ctx.chat_log_config.enabled && msg.channel == "telegram" {
+        if let Ok(index) = chat_index::ChatIndex::open(ctx.workspace_dir.as_path()) {
+            if let Ok(summaries) = index.get_user_summaries(&msg.sender, 7) {
+                if !summaries.is_empty() {
+                    system_prompt.push_str("\n\n## 你与此用户的近期对话记录摘要\n");
+                    for s in &summaries {
+                        let topics = s.topics.as_deref().unwrap_or("-");
+                        system_prompt.push_str(&format!(
+                            "- {} ({}条消息): {} [话题: {}]\n",
+                            s.date, s.msg_count, s.summary, topics
+                        ));
+                    }
+                    system_prompt.push_str(
+                        "如需回忆更多细节，可使用 search_chat_log 工具搜索。\n",
+                    );
+                }
+            }
+        }
+    }
+
+    // Save system prompt for potential context-overflow retry
+    let system_prompt_for_retry = system_prompt.clone();
     let mut history = vec![ChatMessage::system(system_prompt)];
     history.extend(prior_turns);
     let use_streaming = target_channel
@@ -1727,6 +1812,16 @@ async fn process_channel_message(
         Cancelled,
     }
 
+    // Build the excluded tools list for email digest messages: include both
+    // the normal non-CLI exclusions AND send_email to prevent auto-replies.
+    let email_digest_excluded_tools: Vec<String> = {
+        let mut excluded = ctx.non_cli_excluded_tools.as_ref().clone();
+        if !excluded.iter().any(|t| t == "send_email") {
+            excluded.push("send_email".to_string());
+        }
+        excluded
+    };
+
     let timeout_budget_secs =
         channel_message_timeout_budget_secs(ctx.message_timeout_secs, ctx.max_tool_iterations);
     let llm_result = tokio::select! {
@@ -1751,6 +1846,11 @@ async fn process_channel_message(
                 ctx.hooks.as_deref(),
                 if msg.channel == "cli" {
                     &[]
+                } else if msg.id.starts_with("email-digest-") {
+                    // Email monitor digests: exclude send_email so the agent only
+                    // reports to the user and doesn't auto-reply to emails.
+                    // User decides what to do after seeing the notification.
+                    &email_digest_excluded_tools
                 } else {
                     ctx.non_cli_excluded_tools.as_ref()
                 },
@@ -1900,13 +2000,28 @@ async fn process_channel_message(
                 &history_key,
                 ChatMessage::assistant(&history_response),
             );
+
+            // Persist assistant turn to local chat log
+            if ctx.chat_log_config.enabled && msg.channel == "telegram" {
+                let chat_id = msg.reply_target.split(':').next().unwrap_or(&msg.reply_target);
+                let turn = chat_log::text_turn("assistant", &delivered_response);
+                if let Err(e) = chat_log::append_turn(ctx.workspace_dir.as_path(), chat_id, &msg.sender, turn) {
+                    tracing::warn!("chat_log: failed to persist assistant turn: {e}");
+                }
+            }
             println!(
                 "  🤖 Reply ({}ms): {}",
                 started_at.elapsed().as_millis(),
                 truncate_with_ellipsis(&delivered_response, 80)
             );
             if let Some(channel) = target_channel.as_ref() {
-                if let Some(ref draft_id) = draft_message_id {
+                if delivered_response.trim().is_empty() {
+                    tracing::debug!(
+                        channel = %msg.channel,
+                        sender = %msg.sender,
+                        "Agent returned empty response after tool calls; skipping send to avoid channel API error"
+                    );
+                } else if let Some(ref draft_id) = draft_message_id {
                     if let Err(e) = channel
                         .finalize_draft(&msg.reply_target, draft_id, &delivered_response)
                         .await
@@ -1921,13 +2036,15 @@ async fn process_channel_message(
                     }
                 } else if let Err(e) = channel
                     .send(
-                        &SendMessage::new(delivered_response, &msg.reply_target)
+                        &SendMessage::new(&delivered_response, &msg.reply_target)
                             .in_thread(msg.thread_ts.clone()),
                     )
                     .await
                 {
                     eprintln!("  ❌ Failed to reply on {}: {e}", channel.name());
                 }
+                // TTS is now agent-controlled via the `send_voice` tool.
+                // The agent decides when to send voice vs text replies.
             }
         }
         LlmExecutionResult::Completed(Ok(Err(e))) => {
@@ -1959,16 +2076,11 @@ async fn process_channel_message(
                     }
                 }
             } else if is_context_window_overflow_error(&e) {
-                let compacted = compact_sender_history(ctx.as_ref(), &history_key);
-                let error_text = if compacted {
-                    "⚠️ Context window exceeded for this conversation. I compacted recent history and kept the latest context. Please resend your last message."
-                } else {
-                    "⚠️ Context window exceeded for this conversation. Please resend your last message."
-                };
+                // Auto-retry with compacted/cleared history instead of asking user to resend.
+                // System prompt still contains chat summaries, so the agent retains context.
                 eprintln!(
-                    "  ⚠️ Context window exceeded after {}ms; sender history compacted={}",
-                    started_at.elapsed().as_millis(),
-                    compacted
+                    "  ⚠️ Context overflow after {}ms; attempting auto-recovery",
+                    started_at.elapsed().as_millis()
                 );
                 runtime_trace::record_event(
                     "channel_message_error",
@@ -1977,22 +2089,133 @@ async fn process_channel_message(
                     Some(route.model.as_str()),
                     None,
                     Some(false),
-                    Some("context window exceeded"),
+                    Some("context window exceeded – auto-retry"),
                     serde_json::json!({
                         "sender": msg.sender,
                         "elapsed_ms": started_at.elapsed().as_millis(),
-                        "history_compacted": compacted,
                     }),
                 );
+
+                // Notify user that recovery is in progress
                 if let Some(channel) = target_channel.as_ref() {
-                    if let Some(ref draft_id) = draft_message_id {
-                        let _ = channel
-                            .finalize_draft(&msg.reply_target, draft_id, error_text)
-                            .await;
+                    let _ = channel
+                        .send(
+                            &SendMessage::new(
+                                "⚠️ 上下文过载，正在压缩后重试...",
+                                &msg.reply_target,
+                            )
+                            .in_thread(msg.thread_ts.clone()),
+                        )
+                        .await;
+                }
+
+                // Try up to 2 recovery attempts: compact first, then clear
+                let mut recovered = false;
+                for attempt in 1u8..=2 {
+                    if attempt == 1 {
+                        compact_sender_history(ctx.as_ref(), &history_key);
                     } else {
+                        clear_sender_history(ctx.as_ref(), &history_key);
+                    }
+
+                    // Rebuild history from the (now compacted/cleared) conversation state
+                    let retry_turns = ctx
+                        .conversation_histories
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get(&history_key)
+                        .cloned()
+                        .unwrap_or_default();
+                    let mut retry_history =
+                        vec![ChatMessage::system(system_prompt_for_retry.clone())];
+                    retry_history.extend(retry_turns);
+                    // If history was fully cleared, re-add the current user message
+                    if attempt == 2 {
+                        retry_history.push(ChatMessage::user(&msg.content));
+                    }
+
+                    eprintln!(
+                        "  🔄 Context retry attempt {attempt}: {} history turns",
+                        retry_history.len() - 1
+                    );
+
+                    let excluded = if msg.channel == "cli" {
+                        &[] as &[String]
+                    } else if msg.id.starts_with("email-digest-") {
+                        &email_digest_excluded_tools
+                    } else {
+                        ctx.non_cli_excluded_tools.as_ref()
+                    };
+
+                    match run_tool_call_loop(
+                        active_provider.as_ref(),
+                        &mut retry_history,
+                        ctx.tools_registry.as_ref(),
+                        ctx.observer.as_ref(),
+                        route.provider.as_str(),
+                        route.model.as_str(),
+                        runtime_defaults.temperature,
+                        true,
+                        None,
+                        msg.channel.as_str(),
+                        &ctx.multimodal,
+                        ctx.max_tool_iterations,
+                        None, // no cancellation for retry
+                        None, // no streaming for retry
+                        ctx.hooks.as_deref(),
+                        excluded,
+                    )
+                    .await
+                    {
+                        Ok(response) => {
+                            let sanitized =
+                                sanitize_channel_response(&response, ctx.tools_registry.as_ref());
+                            let delivered = if sanitized.is_empty()
+                                && !response.trim().is_empty()
+                            {
+                                "I encountered malformed tool-call output and could not produce a safe reply. Please try again.".to_string()
+                            } else {
+                                sanitized
+                            };
+
+                            // Persist assistant turn
+                            append_sender_turn(
+                                ctx.as_ref(),
+                                &history_key,
+                                ChatMessage::assistant(&delivered),
+                            );
+
+                            if !delivered.trim().is_empty() {
+                                if let Some(channel) = target_channel.as_ref() {
+                                    let _ = channel
+                                        .send(
+                                            &SendMessage::new(&delivered, &msg.reply_target)
+                                                .in_thread(msg.thread_ts.clone()),
+                                        )
+                                        .await;
+                                }
+                            }
+                            recovered = true;
+                            break;
+                        }
+                        Err(e2) if is_context_window_overflow_error(&e2) && attempt < 2 => {
+                            eprintln!("  ⚠️ Still overflowing after compact; will clear and retry");
+                            continue;
+                        }
+                        Err(e2) => {
+                            eprintln!("  ❌ Retry attempt {attempt} failed: {e2}");
+                            break;
+                        }
+                    }
+                }
+
+                if !recovered {
+                    let fallback = "⚠️ 上下文窗口溢出，自动压缩后仍无法恢复。对话历史已清空，请重新发送消息。";
+                    clear_sender_history(ctx.as_ref(), &history_key);
+                    if let Some(channel) = target_channel.as_ref() {
                         let _ = channel
                             .send(
-                                &SendMessage::new(error_text, &msg.reply_target)
+                                &SendMessage::new(fallback, &msg.reply_target)
                                     .in_thread(msg.thread_ts.clone()),
                             )
                             .await;
@@ -3302,7 +3525,45 @@ pub async fn start_channels(config: Config) -> Result<()> {
         auto_save_memory: config.memory.auto_save,
         max_tool_iterations: config.agent.max_tool_iterations,
         min_relevance_score: config.memory.min_relevance_score,
-        conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+        conversation_histories: {
+            // Pre-populate from recent chat logs for restart continuity.
+            // Only load the last few turns (not entire day) to avoid
+            // context bloat that can confuse the model.
+            const STARTUP_RESTORE_RECENT_TURNS: usize = 8;
+            let mut seed: HashMap<String, Vec<ChatMessage>> = HashMap::new();
+            if config.chat_log.enabled {
+                for username in chat_log::list_chat_users(&config.workspace_dir).unwrap_or_default() {
+                    match chat_log::load_recent_messages(
+                        &config.workspace_dir,
+                        &username,
+                        STARTUP_RESTORE_RECENT_TURNS,
+                    ) {
+                        Ok(recent) if !recent.is_empty() => {
+                            let history_key = format!("telegram_{username}");
+                            let messages: Vec<ChatMessage> = recent
+                                .into_iter()
+                                .map(|t| ChatMessage {
+                                    role: t.role,
+                                    content: t.content,
+                                })
+                                .collect();
+                            println!(
+                                "  📂 Restored {} messages for {username}",
+                                messages.len()
+                            );
+                            seed.insert(history_key, messages);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "chat_log: failed to load recent messages for {username}: {e}"
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Arc::new(Mutex::new(seed))
+        },
         provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
         route_overrides: Arc::new(Mutex::new(HashMap::new())),
         api_key: config.api_key.clone(),
@@ -3323,6 +3584,8 @@ pub async fn start_channels(config: Config) -> Result<()> {
             None
         },
         non_cli_excluded_tools: Arc::new(config.autonomy.non_cli_excluded_tools.clone()),
+        tts_config: config.tts.clone(),
+        chat_log_config: config.chat_log.clone(),
     });
 
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
@@ -3536,6 +3799,8 @@ mod tests {
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            tts_config: Default::default(),
+            chat_log_config: Default::default(),
         };
 
         assert!(compact_sender_history(&ctx, &sender));
@@ -3585,6 +3850,8 @@ mod tests {
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            tts_config: Default::default(),
+            chat_log_config: Default::default(),
         };
 
         append_sender_turn(&ctx, &sender, ChatMessage::user("hello"));
@@ -3637,6 +3904,8 @@ mod tests {
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            tts_config: Default::default(),
+            chat_log_config: Default::default(),
         };
 
         assert!(rollback_orphan_user_turn(&ctx, &sender, "pending"));
@@ -4110,6 +4379,8 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            tts_config: Default::default(),
+            chat_log_config: Default::default(),
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
         });
@@ -4169,6 +4440,8 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            tts_config: Default::default(),
+            chat_log_config: Default::default(),
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
         });
@@ -4244,6 +4517,8 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            tts_config: Default::default(),
+            chat_log_config: Default::default(),
         });
 
         process_channel_message(
@@ -4303,6 +4578,8 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            tts_config: Default::default(),
+            chat_log_config: Default::default(),
         });
 
         process_channel_message(
@@ -4371,6 +4648,8 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            tts_config: Default::default(),
+            chat_log_config: Default::default(),
         });
 
         process_channel_message(
@@ -4460,6 +4739,8 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            tts_config: Default::default(),
+            chat_log_config: Default::default(),
         });
 
         process_channel_message(
@@ -4531,6 +4812,8 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            tts_config: Default::default(),
+            chat_log_config: Default::default(),
         });
 
         process_channel_message(
@@ -4617,6 +4900,8 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            tts_config: Default::default(),
+            chat_log_config: Default::default(),
         });
 
         process_channel_message(
@@ -4688,6 +4973,8 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            tts_config: Default::default(),
+            chat_log_config: Default::default(),
         });
 
         process_channel_message(
@@ -4748,6 +5035,8 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            tts_config: Default::default(),
+            chat_log_config: Default::default(),
         });
 
         process_channel_message(
@@ -4919,6 +5208,8 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            tts_config: Default::default(),
+            chat_log_config: Default::default(),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
@@ -4999,6 +5290,8 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            tts_config: Default::default(),
+            chat_log_config: Default::default(),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -5091,6 +5384,8 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            tts_config: Default::default(),
+            chat_log_config: Default::default(),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -5165,6 +5460,8 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            tts_config: Default::default(),
+            chat_log_config: Default::default(),
         });
 
         process_channel_message(
@@ -5224,6 +5521,8 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            tts_config: Default::default(),
+            chat_log_config: Default::default(),
         });
 
         process_channel_message(
@@ -5740,6 +6039,8 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            tts_config: Default::default(),
+            chat_log_config: Default::default(),
         });
 
         process_channel_message(
@@ -5825,6 +6126,8 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            tts_config: Default::default(),
+            chat_log_config: Default::default(),
         });
 
         process_channel_message(
@@ -5910,6 +6213,8 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            tts_config: Default::default(),
+            chat_log_config: Default::default(),
         });
 
         process_channel_message(
@@ -6459,6 +6764,8 @@ This is an example JSON object for profile settings."#;
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            tts_config: Default::default(),
+            chat_log_config: Default::default(),
         });
 
         // Simulate a photo attachment message with [IMAGE:] marker.
@@ -6525,6 +6832,8 @@ This is an example JSON object for profile settings."#;
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            tts_config: Default::default(),
+            chat_log_config: Default::default(),
         });
 
         process_channel_message(

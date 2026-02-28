@@ -640,6 +640,7 @@ impl Provider for OllamaProvider {
                         name,
                         arguments: serde_json::to_string(&args)
                             .unwrap_or_else(|_| "{}".to_string()),
+                        thought_signature: None,
                     }
                 })
                 .collect();

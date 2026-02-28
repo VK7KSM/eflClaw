@@ -3,9 +3,7 @@ use crate::config::Config;
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::multimodal;
 use crate::observability::{self, runtime_trace, Observer, ObserverEvent};
-use crate::providers::{
-    self, ChatMessage, ChatRequest, Provider, ProviderCapabilityError, ToolCall,
-};
+use crate::providers::{self, ChatMessage, ChatRequest, Provider, ToolCall};
 use crate::runtime;
 use crate::security::SecurityPolicy;
 use crate::tools::{self, Tool};
@@ -26,6 +24,12 @@ const STREAM_CHUNK_MIN_CHARS: usize = 80;
 /// Default maximum agentic tool-use iterations per user message to prevent runaway loops.
 /// Used as a safe fallback when `max_tool_iterations` is unset or configured as zero.
 const DEFAULT_MAX_TOOL_ITERATIONS: usize = 10;
+
+/// Maximum characters per tool result stored in history. Prevents context
+/// overflow from large tool outputs (e.g. RSS feeds, web scrapes). The LLM
+/// already sees the full result in the current iteration; this cap only
+/// affects history replay in subsequent iterations.
+const MAX_TOOL_RESULT_IN_HISTORY_CHARS: usize = 8_000;
 
 /// Minimum user-message length (in chars) for auto-save to memory.
 /// Matches the channel-side constant in `channels/mod.rs`.
@@ -1749,11 +1753,15 @@ fn build_native_assistant_history(
     let calls_json: Vec<serde_json::Value> = tool_calls
         .iter()
         .map(|tc| {
-            serde_json::json!({
+            let mut call = serde_json::json!({
                 "id": tc.id,
                 "name": tc.name,
                 "arguments": tc.arguments,
-            })
+            });
+            if let Some(sig) = &tc.thought_signature {
+                call["thought_signature"] = serde_json::Value::String(sig.clone());
+            }
+            call
         })
         .collect();
 
@@ -2096,6 +2104,7 @@ pub(crate) async fn run_tool_call_loop(
     let use_native_tools = provider.supports_native_tools() && !tool_specs.is_empty();
     let turn_id = Uuid::new_v4().to_string();
     let mut seen_tool_signatures: HashSet<(String, String)> = HashSet::new();
+    let mut last_response_text = String::new();
 
     for iteration in 0..max_iterations {
         if cancellation_token
@@ -2105,20 +2114,32 @@ pub(crate) async fn run_tool_call_loop(
             return Err(ToolLoopCancelled.into());
         }
 
-        let image_marker_count = multimodal::count_image_markers(history);
-        if image_marker_count > 0 && !provider.supports_vision() {
-            return Err(ProviderCapabilityError {
-                provider: provider_name.to_string(),
-                capability: "vision".to_string(),
-                message: format!(
-                    "received {image_marker_count} image marker(s), but this provider does not support vision input"
-                ),
+        // Build effective history for this provider:
+        // • For vision-capable providers: keep current message images, strip only historical ones
+        //   (each image sent once, not re-transmitted in every subsequent request).
+        // • For non-vision providers: strip ALL images (incl. current); append a human-readable
+        //   note to the current message so the agent responds naturally. Raw capability errors
+        //   are never surfaced to the user.
+        let stripped: Vec<ChatMessage> = if provider.supports_vision() {
+            multimodal::strip_history_image_markers(history)
+        } else {
+            let cur_images = history
+                .iter()
+                .rev()
+                .find(|m| m.role == "user")
+                .map(|m| multimodal::parse_image_markers(&m.content).1.len())
+                .unwrap_or(0);
+            if cur_images > 0 {
+                tracing::warn!(
+                    provider = provider_name,
+                    image_count = cur_images,
+                    "Provider does not support vision; stripping images from current message; agent will respond with friendly message"
+                );
             }
-            .into());
-        }
-
+            multimodal::strip_all_image_markers_with_note(history)
+        };
         let prepared_messages =
-            multimodal::prepare_messages_for_provider(history, multimodal_config).await?;
+            multimodal::prepare_messages_for_provider(&stripped, multimodal_config).await?;
 
         // ── Progress: LLM thinking ────────────────────────────
         if let Some(ref tx) = on_delta {
@@ -2321,6 +2342,11 @@ pub(crate) async fn run_tool_call_loop(
             parsed_text
         };
 
+        // Track the last non-empty LLM response for graceful exhaustion fallback
+        if !display_text.trim().is_empty() {
+            last_response_text = display_text.clone();
+        }
+
         // ── Progress: LLM responded ─────────────────────────────
         if let Some(ref tx) = on_delta {
             let llm_secs = llm_started_at.elapsed().as_secs();
@@ -2375,7 +2401,24 @@ pub(crate) async fn run_tool_call_loop(
                     let _ = tx.send(chunk).await;
                 }
             }
-            history.push(ChatMessage::assistant(response_text.clone()));
+            // Guard: never persist empty assistant messages into history.
+            // Thinking models may return empty response_text (thinking-only),
+            // which causes Anthropic "text content blocks must be non-empty" errors
+            // when the history is replayed later.
+            let history_text = if response_text.trim().is_empty() {
+                "(thinking)".to_string()
+            } else {
+                response_text.clone()
+            };
+            history.push(ChatMessage::assistant(history_text));
+            if display_text.trim().is_empty() {
+                tracing::warn!(
+                    provider = provider_name,
+                    model = model,
+                    iteration = iteration + 1,
+                    "LLM returned empty final response (thinking-only response?); channel will suppress empty send"
+                );
+            }
             return Ok(display_text);
         }
 
@@ -2625,13 +2668,20 @@ pub(crate) async fn run_tool_call_loop(
             ordered_results[*idx] = Some((call.name.clone(), call.tool_call_id.clone(), outcome));
         }
 
+
         for entry in ordered_results {
             if let Some((tool_name, tool_call_id, outcome)) = entry {
-                individual_results.push((tool_call_id, outcome.output.clone()));
+                // Cap tool output stored in history to prevent context overflow.
+                let capped_output = if outcome.output.chars().count() > MAX_TOOL_RESULT_IN_HISTORY_CHARS {
+                    truncate_with_ellipsis(&outcome.output, MAX_TOOL_RESULT_IN_HISTORY_CHARS)
+                } else {
+                    outcome.output.clone()
+                };
+                individual_results.push((tool_call_id, capped_output.clone()));
                 let _ = writeln!(
                     tool_results,
-                    "<tool_result name=\"{}\">\n{}\n</tool_result>",
-                    tool_name, outcome.output
+                    "<tool_result name=\"{}\">{}</tool_result>",
+                    tool_name, capped_output
                 );
             }
         }
@@ -2683,7 +2733,20 @@ pub(crate) async fn run_tool_call_loop(
             "max_iterations": max_iterations,
         }),
     );
-    anyhow::bail!("Agent exceeded maximum tool iterations ({max_iterations})")
+
+    // Graceful degradation: return partial results instead of bailing.
+    // Side-effects from already-executed tools (file writes, message sends, etc.)
+    // have already taken effect — treating this as an error loses that work.
+    let exhausted_notice = format!(
+        "\n\n⚠️ [已达到工具调用上限 ({max_iterations} 次)，以上是已完成的部分结果]"
+    );
+    if last_response_text.is_empty() {
+        last_response_text = format!(
+            "任务执行了 {max_iterations} 轮工具调用后被截断。已执行的工具操作（文件写入、消息发送等）仍然有效。"
+        );
+    }
+    last_response_text.push_str(&exhausted_notice);
+    Ok(last_response_text)
 }
 
 /// Build the tool instruction block for the system prompt so the LLM knows
@@ -2731,6 +2794,7 @@ pub async fn run(
     temperature: f64,
     peripheral_overrides: Vec<String>,
     interactive: bool,
+    max_tool_iterations_override: Option<usize>,
 ) -> Result<String> {
     // ── Wire up agnostic subsystems ──────────────────────────────
     let base_observer = observability::create_observer(&config.observability);
@@ -2960,6 +3024,8 @@ pub async fn run(
     } else {
         None
     };
+    let effective_max_tool_iterations =
+        max_tool_iterations_override.unwrap_or(config.agent.max_tool_iterations);
     let native_tools = provider.supports_native_tools();
     let mut system_prompt = crate::channels::build_system_prompt_with_mode(
         &config.workspace_dir,
@@ -3032,7 +3098,7 @@ pub async fn run(
             approval_manager.as_ref(),
             channel_name,
             &config.multimodal,
-            config.agent.max_tool_iterations,
+            effective_max_tool_iterations,
             None,
             None,
             None,
@@ -3154,7 +3220,7 @@ pub async fn run(
                 approval_manager.as_ref(),
                 channel_name,
                 &config.multimodal,
-                config.agent.max_tool_iterations,
+                effective_max_tool_iterations,
                 None,
                 None,
                 None,

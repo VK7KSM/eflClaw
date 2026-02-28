@@ -371,6 +371,7 @@ impl CopilotProvider {
                     .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
                 name: tool_call.function.name,
                 arguments: tool_call.function.arguments,
+                thought_signature: None,
             })
             .collect();
 

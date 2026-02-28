@@ -1337,6 +1337,7 @@ pub fn create_resilient_provider_with_options(
         providers,
         reliability.provider_retries,
         reliability.provider_backoff_ms,
+        reliability.provider_max_backoff_ms,
     )
     .with_api_keys(reliability.api_keys.clone())
     .with_model_fallbacks(reliability.model_fallbacks.clone());

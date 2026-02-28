@@ -67,6 +67,20 @@ pub struct EmailConfig {
     /// Allowed sender addresses/domains (empty = deny all, ["*"] = allow all)
     #[serde(default)]
     pub allowed_senders: Vec<String>,
+    /// Operating mode: "monitor" = read-only inbox monitoring with notifications to another channel;
+    /// "interactive" = legacy behaviour (auto-reply via email).  Default: "monitor".
+    #[serde(default = "default_email_mode")]
+    pub mode: String,
+    /// Channel name to forward email notifications to (e.g. "telegram").  Only used in monitor mode.
+    #[serde(default)]
+    pub notify_channel: Option<String>,
+    /// Recipient/chat-id on the notify channel (e.g. Telegram chat_id).  Only used in monitor mode.
+    #[serde(default)]
+    pub notify_to: Option<String>,
+    /// On startup, only process emails received within the last N minutes (default: 5).
+    /// Prevents processing hundreds of old unread emails.
+    #[serde(default = "default_startup_lookback")]
+    pub startup_lookback_minutes: u64,
 }
 
 impl crate::config::traits::ChannelConfig for EmailConfig {
@@ -93,6 +107,12 @@ fn default_idle_timeout() -> u64 {
 fn default_true() -> bool {
     true
 }
+fn default_email_mode() -> String {
+    "monitor".into()
+}
+fn default_startup_lookback() -> u64 {
+    5
+}
 
 impl Default for EmailConfig {
     fn default() -> Self {
@@ -108,6 +128,10 @@ impl Default for EmailConfig {
             from_address: String::new(),
             idle_timeout_secs: default_idle_timeout(),
             allowed_senders: Vec::new(),
+            mode: default_email_mode(),
+            notify_channel: None,
+            notify_to: None,
+            startup_lookback_minutes: default_startup_lookback(),
         }
     }
 }
@@ -118,14 +142,26 @@ type ImapSession = Session<TlsStream<TcpStream>>;
 pub struct EmailChannel {
     pub config: EmailConfig,
     seen_messages: Arc<Mutex<HashSet<String>>>,
+    /// Timestamp (epoch seconds) when the channel was started — used to skip historical emails.
+    started_at: u64,
 }
 
 impl EmailChannel {
     pub fn new(config: EmailConfig) -> Self {
+        let started_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         Self {
             config,
             seen_messages: Arc::new(Mutex::new(HashSet::new())),
+            started_at,
         }
+    }
+
+    /// Check if the channel is in read-only monitor mode.
+    fn is_monitor_mode(&self) -> bool {
+        self.config.mode == "monitor"
     }
 
     /// Check if a sender email is in the allowlist
@@ -263,6 +299,15 @@ impl EmailChannel {
             if let Some(body) = msg.body() {
                 if let Some(parsed) = MessageParser::default().parse(body) {
                     let sender = Self::extract_sender(&parsed);
+
+                    // CRITICAL: Skip emails from our own address to prevent self-reply loops.
+                    // When we send via SMTP, Gmail delivers a copy to our inbox as unseen,
+                    // which would create an infinite processing loop.
+                    if sender.to_lowercase() == self.config.from_address.to_lowercase() {
+                        debug!("Skipping self-sent email (from: {})", sender);
+                        continue;
+                    }
+
                     let subject = parsed.subject().unwrap_or("(no subject)").to_string();
                     let body_text = Self::extract_text(&parsed);
                     let content = format!("Subject: {}\n\n{}", subject, body_text);
@@ -300,6 +345,7 @@ impl EmailChannel {
                         _uid: uid,
                         msg_id,
                         sender,
+                        subject,
                         content,
                         timestamp: ts,
                     });
@@ -436,7 +482,137 @@ impl EmailChannel {
         tx: &mpsc::Sender<ChannelMessage>,
     ) -> Result<()> {
         let messages = self.fetch_unseen(session).await?;
+        if messages.is_empty() {
+            return Ok(());
+        }
 
+        if self.is_monitor_mode() {
+            self.process_unseen_monitor(messages, tx).await
+        } else {
+            self.process_unseen_interactive(messages, tx).await
+        }
+    }
+
+    /// Monitor mode: batch emails into a structured digest and route to the notify channel.
+    /// Emails older than `startup_lookback_minutes` are silently skipped (marked seen by fetch_unseen).
+    async fn process_unseen_monitor(
+        &self,
+        messages: Vec<ParsedEmail>,
+        tx: &mpsc::Sender<ChannelMessage>,
+    ) -> Result<()> {
+        let lookback_secs = self.config.startup_lookback_minutes * 60;
+        let cutoff = self.started_at.saturating_sub(lookback_secs);
+
+        // Only process emails newer than the lookback window
+        let recent: Vec<&ParsedEmail> = messages
+            .iter()
+            .filter(|e| e.timestamp >= cutoff || e.timestamp == 0)
+            .collect();
+
+        let skipped = messages.len() - recent.len();
+        if skipped > 0 {
+            info!(
+                "Monitor mode: skipped {} old emails (before startup lookback window)",
+                skipped
+            );
+        }
+
+        if recent.is_empty() {
+            return Ok(());
+        }
+
+        // Deduplicate
+        let mut unique_emails = Vec::new();
+        for email in &recent {
+            let is_new = {
+                let mut seen = self.seen_messages.lock().await;
+                seen.insert(email.msg_id.clone())
+            };
+            if is_new {
+                unique_emails.push(*email);
+            }
+        }
+
+        if unique_emails.is_empty() {
+            return Ok(());
+        }
+
+        // Build a structured digest for the AI agent to analyze
+        let mut digest = String::from(
+            "📧 [Email Monitor] New emails received.\n\
+             Analyze each email: classify as important or junk/marketing, \
+             summarize important ones in Chinese, and notify the user.\n\
+             RULE: Do NOT use the send_email tool. Do NOT reply to any email.\n\n",
+        );
+
+        for (i, email) in unique_emails.iter().enumerate() {
+            use std::fmt::Write;
+            let _ = write!(
+                digest,
+                "--- Email #{} ---\nFrom: {}\nSubject: {}\nContent:\n{}\n\n",
+                i + 1,
+                email.sender,
+                email.subject,
+                // Truncate long emails to avoid token explosion
+                if email.content.len() > 2000 {
+                    &email.content[..2000]
+                } else {
+                    &email.content
+                }
+            );
+        }
+
+        // Determine routing channel and recipient
+        let (channel, reply_target) = match (
+            self.config.notify_channel.as_deref(),
+            self.config.notify_to.as_deref(),
+        ) {
+            (Some(ch), Some(to)) => (ch.to_string(), to.to_string()),
+            _ => {
+                // Fallback: route as an email channel message but with a special sender
+                // so the agent knows not to reply via email
+                warn!(
+                    "Email monitor mode: notify_channel/notify_to not configured, \
+                     falling back to email channel (replies will still go via email!)"
+                );
+                ("email".to_string(), self.config.from_address.clone())
+            }
+        };
+
+        let msg = ChannelMessage {
+            id: format!("email-digest-{}", Uuid::new_v4()),
+            reply_target: reply_target.clone(),
+            // Use the notify_to (user's chat ID) as sender so this message joins
+            // the user's existing conversation history. This ensures the agent has
+            // full context about who it's talking to and responds via the correct channel.
+            sender: reply_target,
+            content: digest,
+            channel,
+            timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            thread_ts: None,
+        };
+
+        info!(
+            "Monitor mode: forwarding {} email(s) as digest notification",
+            unique_emails.len()
+        );
+
+        if tx.send(msg).await.is_err() {
+            return Ok(());
+        }
+
+        Ok(())
+    }
+
+    /// Interactive mode (legacy): send each email as a separate ChannelMessage, agent auto-replies.
+    async fn process_unseen_interactive(
+        &self,
+        messages: Vec<ParsedEmail>,
+        tx: &mpsc::Sender<ChannelMessage>,
+    ) -> Result<()> {
         for email in messages {
             // Check allowlist
             if !self.is_sender_allowed(&email.sender) {
@@ -463,7 +639,6 @@ impl EmailChannel {
             };
 
             if tx.send(msg).await.is_err() {
-                // Channel closed, exit cleanly
                 return Ok(());
             }
         }
@@ -493,6 +668,7 @@ struct ParsedEmail {
     _uid: u32,
     msg_id: String,
     sender: String,
+    subject: String,
     content: String,
     timestamp: u64,
 }
@@ -635,6 +811,7 @@ mod tests {
             from_address: "bot@example.com".to_string(),
             idle_timeout_secs: 1200,
             allowed_senders: vec!["allowed@example.com".to_string()],
+            ..Default::default()
         };
         assert_eq!(config.imap_host, "imap.example.com");
         assert_eq!(config.imap_folder, "Archive");
@@ -655,6 +832,7 @@ mod tests {
             from_address: "bot@test.com".to_string(),
             idle_timeout_secs: 1740,
             allowed_senders: vec!["*".to_string()],
+            ..Default::default()
         };
         let cloned = config.clone();
         assert_eq!(cloned.imap_host, config.imap_host);
@@ -900,6 +1078,7 @@ mod tests {
             from_address: "bot@example.com".to_string(),
             idle_timeout_secs: 1740,
             allowed_senders: vec!["allowed@example.com".to_string()],
+            ..Default::default()
         };
 
         let json = serde_json::to_string(&config).unwrap();
