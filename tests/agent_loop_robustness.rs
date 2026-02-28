@@ -231,6 +231,7 @@ async fn agent_recovers_from_text_with_xml_residue() {
 async fn agent_handles_tool_call_with_empty_arguments() {
     let provider = Box::new(MockProvider::new(vec![
         tool_response(vec![ToolCall {
+            thought_signature: None,
             id: "tc1".into(),
             name: "echo".into(),
             arguments: "{}".into(),
@@ -248,6 +249,7 @@ async fn agent_handles_tool_call_with_empty_arguments() {
 async fn agent_handles_nonexistent_tool_gracefully() {
     let provider = Box::new(MockProvider::new(vec![
         tool_response(vec![ToolCall {
+            thought_signature: None,
             id: "tc1".into(),
             name: "absolutely_nonexistent_tool".into(),
             arguments: "{}".into(),
@@ -272,6 +274,7 @@ async fn agent_handles_nonexistent_tool_gracefully() {
 async fn agent_handles_failing_tool() {
     let provider = Box::new(MockProvider::new(vec![
         tool_response(vec![ToolCall {
+            thought_signature: None,
             id: "tc1".into(),
             name: "failing_tool".into(),
             arguments: "{}".into(),
@@ -293,11 +296,13 @@ async fn agent_handles_mixed_tool_success_and_failure() {
     let provider = Box::new(MockProvider::new(vec![
         tool_response(vec![
             ToolCall {
+                thought_signature: None,
                 id: "tc1".into(),
                 name: "echo".into(),
                 arguments: r#"{"message": "success"}"#.into(),
             },
             ToolCall {
+                thought_signature: None,
                 id: "tc2".into(),
                 name: "failing_tool".into(),
                 arguments: "{}".into(),
@@ -325,6 +330,7 @@ async fn agent_respects_max_tool_iterations() {
     let mut responses: Vec<ChatResponse> = (0..20)
         .map(|i| {
             tool_response(vec![ToolCall {
+                thought_signature: None,
                 id: format!("tc_{i}"),
                 name: "counter".into(),
                 arguments: "{}".into(),
@@ -400,6 +406,7 @@ async fn agent_handles_whitespace_only_response() {
 async fn agent_handles_unicode_tool_arguments() {
     let provider = Box::new(MockProvider::new(vec![
         tool_response(vec![ToolCall {
+            thought_signature: None,
             id: "tc1".into(),
             name: "echo".into(),
             arguments: r#"{"message": "こんにちは世界 🌍"}"#.into(),
@@ -417,6 +424,7 @@ async fn agent_handles_unicode_tool_arguments() {
 async fn agent_handles_nested_json_tool_arguments() {
     let provider = Box::new(MockProvider::new(vec![
         tool_response(vec![ToolCall {
+            thought_signature: None,
             id: "tc1".into(),
             name: "echo".into(),
             arguments: r#"{"message": "{\"nested\": true, \"deep\": {\"level\": 3}}"}"#.into(),
@@ -434,6 +442,7 @@ async fn agent_handles_nested_json_tool_arguments() {
 async fn agent_handles_sequential_tool_then_text() {
     let provider = Box::new(MockProvider::new(vec![
         tool_response(vec![ToolCall {
+            thought_signature: None,
             id: "tc1".into(),
             name: "echo".into(),
             arguments: r#"{"message": "step 1"}"#.into(),

@@ -1836,10 +1836,12 @@ mod tests {
     }
 
     #[test]
-    fn api_key_url_includes_key_query_param() {
+    fn api_key_url_does_not_include_key_query_param() {
+        // After security fix: API key is sent via x-goog-api-key header, not URL
         let auth = GeminiAuth::ExplicitKey("api-key-123".into());
         let url = GeminiProvider::build_generate_content_url("gemini-2.0-flash", &auth);
-        assert!(url.contains(":generateContent?key=api-key-123"));
+        assert!(!url.contains("key="), "API key must not appear in URL");
+        assert!(url.contains(":generateContent"));
     }
 
     #[test]
@@ -1875,6 +1877,8 @@ mod tests {
                 temperature: 0.7,
                 max_output_tokens: 8192,
             },
+            tools: None,
+            tool_config: None,
         };
 
         let request = provider
@@ -1914,6 +1918,8 @@ mod tests {
                 temperature: 0.7,
                 max_output_tokens: 8192,
             },
+            tools: None,
+            tool_config: None,
         };
 
         let request = provider
@@ -1956,6 +1962,8 @@ mod tests {
                 temperature: 0.7,
                 max_output_tokens: 8192,
             },
+            tools: None,
+            tool_config: None,
         };
 
         let request = provider
@@ -1989,6 +1997,8 @@ mod tests {
                 temperature: 0.7,
                 max_output_tokens: 8192,
             },
+            tools: None,
+            tool_config: None,
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -2016,6 +2026,7 @@ mod tests {
                     temperature: 0.7,
                     max_output_tokens: 8192,
                 }),
+                tools: None,
             },
         };
 
@@ -2043,6 +2054,7 @@ mod tests {
                 }],
                 system_instruction: None,
                 generation_config: None,
+                tools: None,
             },
         };
 
@@ -2064,6 +2076,7 @@ mod tests {
                 }],
                 system_instruction: None,
                 generation_config: None,
+                tools: None,
             },
         };
 
@@ -2256,7 +2269,7 @@ mod tests {
 
         let response: GenerateContentResponse = serde_json::from_str(json).unwrap();
         let candidate = response.candidates.unwrap().into_iter().next().unwrap();
-        let text = candidate.content.unwrap().effective_text();
+        let text = candidate.content.unwrap().extract_tool_calls().0;
         assert_eq!(text, Some("The answer is 42.".to_string()));
     }
 
@@ -2272,7 +2285,7 @@ mod tests {
 
         let response: GenerateContentResponse = serde_json::from_str(json).unwrap();
         let candidate = response.candidates.unwrap().into_iter().next().unwrap();
-        let text = candidate.content.unwrap().effective_text();
+        let text = candidate.content.unwrap().extract_tool_calls().0;
         assert_eq!(text, Some("Hello there!".to_string()));
     }
 
@@ -2291,7 +2304,7 @@ mod tests {
 
         let response: GenerateContentResponse = serde_json::from_str(json).unwrap();
         let candidate = response.candidates.unwrap().into_iter().next().unwrap();
-        let text = candidate.content.unwrap().effective_text();
+        let text = candidate.content.unwrap().extract_tool_calls().0;
         assert_eq!(text, Some("I need more context...".to_string()));
     }
 
@@ -2307,7 +2320,7 @@ mod tests {
 
         let response: GenerateContentResponse = serde_json::from_str(json).unwrap();
         let candidate = response.candidates.unwrap().into_iter().next().unwrap();
-        let text = candidate.content.unwrap().effective_text();
+        let text = candidate.content.unwrap().extract_tool_calls().0;
         assert_eq!(text, None);
     }
 
@@ -2326,7 +2339,7 @@ mod tests {
 
         let response: GenerateContentResponse = serde_json::from_str(json).unwrap();
         let candidate = response.candidates.unwrap().into_iter().next().unwrap();
-        let text = candidate.content.unwrap().effective_text();
+        let text = candidate.content.unwrap().extract_tool_calls().0;
         assert_eq!(text, Some("Part one. Part two.".to_string()));
     }
 
@@ -2344,7 +2357,7 @@ mod tests {
 
         let response: GenerateContentResponse = serde_json::from_str(json).unwrap();
         let candidate = response.candidates.unwrap().into_iter().next().unwrap();
-        let text = candidate.content.unwrap().effective_text();
+        let text = candidate.content.unwrap().extract_tool_calls().0;
         assert_eq!(text, None);
     }
 
@@ -2366,7 +2379,7 @@ mod tests {
         let response: GenerateContentResponse = serde_json::from_str(json).unwrap();
         let effective = response.into_effective_response();
         let candidate = effective.candidates.unwrap().into_iter().next().unwrap();
-        let text = candidate.content.unwrap().effective_text();
+        let text = candidate.content.unwrap().extract_tool_calls().0;
         assert_eq!(text, Some("final answer".to_string()));
     }
 

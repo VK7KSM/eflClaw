@@ -23,7 +23,15 @@
       "Bash(wc:*)",
       "Bash(cat:*)",
       "Bash(xargs:*)",
-      "Bash(cd:*)"
+      "Bash(cd:*)",
+      "Bash(git:*)",
+      "Bash(printf %s\\\\n:*)",
+      "Bash(grep missing field:*)",
+      "Bash(grep ^error:*)",
+      "Bash(grep provider_max_backoff_ms:*)",
+      "Bash(cd /c/Dev/zeroclaw && cargo test --lib 2>&1 | grep -E \"\\(error\\\\[E0063\\\\]|-->\\)\" 2>&1)",
+      "Bash(cmp:*)",
+      "Bash(test:*)"
     ]
   }
 }

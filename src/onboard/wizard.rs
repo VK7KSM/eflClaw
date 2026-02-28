@@ -172,6 +172,9 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         transcription: crate::config::TranscriptionConfig::default(),
         tts: crate::config::TtsConfig::default(),
         chat_log: crate::config::ChatLogConfig::default(),
+        research: crate::config::ResearchPhaseConfig::default(),
+        goal_loop: crate::config::GoalLoopConfig::default(),
+        plugins: crate::config::PluginsConfig::default(),
     };
 
     println!(
@@ -526,6 +529,9 @@ async fn run_quick_setup_with_home(
         transcription: crate::config::TranscriptionConfig::default(),
         tts: crate::config::TtsConfig::default(),
         chat_log: crate::config::ChatLogConfig::default(),
+        research: crate::config::ResearchPhaseConfig::default(),
+        goal_loop: crate::config::GoalLoopConfig::default(),
+        plugins: crate::config::PluginsConfig::default(),
     };
 
     config.save().await?;
@@ -3624,6 +3630,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     draft_update_interval_ms: 1000,
                     interrupt_on_new_message: false,
                     mention_only: false,
+                    base_url: None,
                 });
             }
             ChannelMenuChoice::Discord => {

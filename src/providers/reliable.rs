@@ -942,6 +942,7 @@ mod tests {
             )],
             2,
             1,
+            60_000,
         );
 
         let result = provider.simple_chat("hello", "test", 0.0).await.unwrap();
@@ -964,6 +965,7 @@ mod tests {
             )],
             2,
             1,
+            60_000,
         );
 
         let result = provider.simple_chat("hello", "test", 0.0).await.unwrap();
@@ -999,6 +1001,7 @@ mod tests {
             ],
             1,
             1,
+            60_000,
         );
 
         let result = provider.simple_chat("hello", "test", 0.0).await.unwrap();
@@ -1032,6 +1035,7 @@ mod tests {
             ],
             0,
             1,
+            60_000,
         );
 
         let err = provider
@@ -1100,6 +1104,7 @@ mod tests {
             )],
             4,
             1,
+            60_000,
         )
         .with_model_fallbacks(model_fallbacks);
 
@@ -1129,6 +1134,7 @@ mod tests {
             )],
             3,
             1,
+            60_000,
         );
 
         let err = provider
@@ -1171,6 +1177,7 @@ mod tests {
             ],
             3,
             1,
+            60_000,
         );
 
         let result = provider.simple_chat("hello", "test", 0.0).await.unwrap();
@@ -1195,6 +1202,7 @@ mod tests {
             )],
             2,
             1,
+            60_000,
         );
 
         let messages = vec![ChatMessage::system("system"), ChatMessage::user("hello")];
@@ -1234,6 +1242,7 @@ mod tests {
             ],
             1,
             1,
+            60_000,
         );
 
         let messages = vec![ChatMessage::user("hello")];
@@ -1268,6 +1277,7 @@ mod tests {
             )],
             0, // no retries — force immediate model failover
             1,
+            60_000,
         )
         .with_model_fallbacks(fallbacks);
 
@@ -1303,6 +1313,7 @@ mod tests {
             vec![("p1".into(), Box::new(mock.clone()) as Box<dyn Provider>)],
             0,
             1,
+            60_000,
         )
         .with_model_fallbacks(fallbacks);
 
@@ -1331,6 +1342,7 @@ mod tests {
             )],
             2,
             1,
+            60_000,
         );
         // No model_fallbacks set — should work exactly as before
         let result = provider.simple_chat("hello", "test", 0.0).await.unwrap();
@@ -1354,6 +1366,7 @@ mod tests {
             )],
             0,
             1,
+            60_000,
         )
         .with_api_keys(vec!["key-a".into(), "key-b".into(), "key-c".into()]);
 
@@ -1364,7 +1377,7 @@ mod tests {
 
     #[tokio::test]
     async fn auth_rotation_returns_none_when_empty() {
-        let provider = ReliableProvider::new(vec![], 0, 1);
+        let provider = ReliableProvider::new(vec![], 0, 1, 60_000);
         assert!(provider.rotate_key().is_none());
     }
 
@@ -1435,21 +1448,21 @@ mod tests {
 
     #[test]
     fn compute_backoff_uses_retry_after() {
-        let provider = ReliableProvider::new(vec![], 0, 500);
+        let provider = ReliableProvider::new(vec![], 0, 500, 60_000);
         let err = anyhow::anyhow!("429 Retry-After: 3");
         assert_eq!(provider.compute_backoff(500, &err), 3_000);
     }
 
     #[test]
     fn compute_backoff_caps_at_30s() {
-        let provider = ReliableProvider::new(vec![], 0, 500);
+        let provider = ReliableProvider::new(vec![], 0, 500, 60_000);
         let err = anyhow::anyhow!("429 Retry-After: 120");
         assert_eq!(provider.compute_backoff(500, &err), 30_000);
     }
 
     #[test]
     fn compute_backoff_falls_back_to_base() {
-        let provider = ReliableProvider::new(vec![], 0, 500);
+        let provider = ReliableProvider::new(vec![], 0, 500, 60_000);
         let err = anyhow::anyhow!("500 Server Error");
         assert_eq!(provider.compute_backoff(500, &err), 500);
     }
@@ -1577,6 +1590,7 @@ mod tests {
             )],
             5,
             1,
+            60_000,
         );
 
         let result = provider.simple_chat("hello", "test", 0.0).await;
@@ -1603,6 +1617,7 @@ mod tests {
             )],
             5,
             1,
+            60_000,
         );
 
         let result = provider.simple_chat("hello", "test", 0.0).await;
@@ -1700,6 +1715,7 @@ mod tests {
             )],
             2,
             1,
+            60_000,
         );
 
         let messages = vec![ChatMessage::user("what time is it?")];
@@ -1737,6 +1753,7 @@ mod tests {
             )],
             3,
             1,
+            60_000,
         );
 
         let messages = vec![ChatMessage::user("test")];
@@ -1769,6 +1786,7 @@ mod tests {
             )],
             2,
             1,
+            60_000,
         );
 
         assert!(
@@ -1808,6 +1826,7 @@ mod tests {
             ],
             0,
             1,
+            60_000,
         );
 
         let messages = vec![ChatMessage::user("hello")];
@@ -1923,6 +1942,7 @@ mod tests {
             )],
             0, // no retries — force immediate model failover
             1,
+            60_000,
         )
         .with_model_fallbacks(fallbacks);
 
@@ -1972,6 +1992,7 @@ mod tests {
             ],
             3,
             1,
+            60_000,
         );
 
         let messages = vec![ChatMessage::user("hello")];

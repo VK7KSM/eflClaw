@@ -73,6 +73,7 @@ fn chat_message_json_roundtrip() {
 #[test]
 fn tool_call_has_required_fields() {
     let tc = ToolCall {
+        thought_signature: None,
         id: "call_abc123".into(),
         name: "web_search".into(),
         arguments: r#"{"query": "rust programming"}"#.into(),
@@ -93,6 +94,7 @@ fn tool_call_has_required_fields() {
 #[test]
 fn tool_call_id_preserved_in_serialization() {
     let tc = ToolCall {
+        thought_signature: None,
         id: "call_deepseek_42".into(),
         name: "shell".into(),
         arguments: r#"{"command": "ls"}"#.into(),
@@ -111,6 +113,7 @@ fn tool_call_id_preserved_in_serialization() {
 #[test]
 fn tool_call_arguments_contain_valid_json() {
     let tc = ToolCall {
+        thought_signature: None,
         id: "call_1".into(),
         name: "file_write".into(),
         arguments: r#"{"path": "/tmp/test.txt", "content": "hello"}"#.into(),
@@ -166,6 +169,7 @@ fn chat_response_with_tool_calls() {
     let resp = ChatResponse {
         text: Some(String::new()),
         tool_calls: vec![ToolCall {
+            thought_signature: None,
             id: "tc_1".into(),
             name: "echo".into(),
             arguments: "{}".into(),
@@ -197,11 +201,13 @@ fn chat_response_multiple_tool_calls() {
         text: None,
         tool_calls: vec![
             ToolCall {
+                thought_signature: None,
                 id: "tc_1".into(),
                 name: "shell".into(),
                 arguments: r#"{"command": "ls"}"#.into(),
             },
             ToolCall {
+                thought_signature: None,
                 id: "tc_2".into(),
                 name: "file_read".into(),
                 arguments: r#"{"path": "test.txt"}"#.into(),

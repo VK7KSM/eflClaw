@@ -2,6 +2,7 @@ pub mod backend;
 pub mod chunker;
 pub mod cli;
 pub mod embeddings;
+pub mod hybrid;
 pub mod hygiene;
 pub mod lucid;
 pub mod markdown;
@@ -26,6 +27,7 @@ pub use none::NoneMemory;
 #[cfg(feature = "memory-postgres")]
 pub use postgres::PostgresMemory;
 pub use qdrant::QdrantMemory;
+pub use hybrid::SqliteQdrantHybridMemory;
 pub use response_cache::ResponseCache;
 pub use sqlite::SqliteMemory;
 pub use traits::Memory;

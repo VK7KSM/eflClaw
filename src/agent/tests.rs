@@ -388,6 +388,7 @@ async fn turn_executes_single_tool_then_returns() {
             id: "tc1".into(),
             name: "echo".into(),
             arguments: r#"{"message": "hello from tool"}"#.into(),
+            thought_signature: None,
         }]),
         text_response("I ran the tool"),
     ]));
@@ -418,16 +419,19 @@ async fn turn_handles_multi_step_tool_chain() {
             id: "tc1".into(),
             name: "counter".into(),
             arguments: "{}".into(),
+            thought_signature: None,
         }]),
         tool_response(vec![ToolCall {
             id: "tc2".into(),
             name: "counter".into(),
             arguments: "{}".into(),
+            thought_signature: None,
         }]),
         tool_response(vec![ToolCall {
             id: "tc3".into(),
             name: "counter".into(),
             arguments: "{}".into(),
+            thought_signature: None,
         }]),
         text_response("Done after 3 calls"),
     ]));
@@ -460,6 +464,7 @@ async fn turn_bails_out_at_max_iterations() {
             id: format!("tc{i}"),
             name: "echo".into(),
             arguments: r#"{"message": "loop"}"#.into(),
+            thought_signature: None,
         }]));
     }
 
@@ -492,6 +497,7 @@ async fn turn_handles_unknown_tool_gracefully() {
             id: "tc1".into(),
             name: "nonexistent_tool".into(),
             arguments: "{}".into(),
+            thought_signature: None,
         }]),
         text_response("I couldn't find that tool"),
     ]));
@@ -532,6 +538,7 @@ async fn turn_recovers_from_tool_failure() {
             id: "tc1".into(),
             name: "fail".into(),
             arguments: "{}".into(),
+            thought_signature: None,
         }]),
         text_response("Tool failed but I recovered"),
     ]));
@@ -556,6 +563,7 @@ async fn turn_recovers_from_tool_error() {
             id: "tc1".into(),
             name: "panicker".into(),
             arguments: "{}".into(),
+            thought_signature: None,
         }]),
         text_response("I recovered from the error"),
     ]));
@@ -781,6 +789,7 @@ async fn turn_preserves_text_alongside_tool_calls() {
                 id: "tc1".into(),
                 name: "echo".into(),
                 arguments: r#"{"message": "hi"}"#.into(),
+                thought_signature: None,
             }],
             usage: None,
             reasoning_content: None,
@@ -822,16 +831,19 @@ async fn turn_handles_multiple_tools_in_one_response() {
                 id: "tc1".into(),
                 name: "counter".into(),
                 arguments: "{}".into(),
+                thought_signature: None,
             },
             ToolCall {
                 id: "tc2".into(),
                 name: "counter".into(),
                 arguments: "{}".into(),
+                thought_signature: None,
             },
             ToolCall {
                 id: "tc3".into(),
                 name: "counter".into(),
                 arguments: "{}".into(),
+                thought_signature: None,
             },
         ]),
         text_response("All 3 done"),
@@ -914,6 +926,7 @@ async fn history_contains_all_expected_entries_after_tool_loop() {
             id: "tc1".into(),
             name: "echo".into(),
             arguments: r#"{"message": "tool-out"}"#.into(),
+            thought_signature: None,
         }]),
         text_response("final answer"),
     ]));
@@ -1019,6 +1032,7 @@ async fn native_dispatcher_handles_stringified_arguments() {
             id: "tc1".into(),
             name: "echo".into(),
             arguments: r#"{"message": "hello"}"#.into(),
+            thought_signature: None,
         }],
         usage: None,
         reasoning_content: None,
@@ -1107,6 +1121,7 @@ fn conversation_message_serialization_roundtrip() {
                 id: "tc1".into(),
                 name: "shell".into(),
                 arguments: "{}".into(),
+                thought_signature: None,
             }],
             reasoning_content: None,
         },
@@ -1232,6 +1247,7 @@ fn xml_dispatcher_converts_history_to_provider_messages() {
                 id: "tc1".into(),
                 name: "shell".into(),
                 arguments: "{}".into(),
+                thought_signature: None,
             }],
             reasoning_content: None,
         },

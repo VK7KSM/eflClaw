@@ -2443,6 +2443,7 @@ mod tests {
         let reliability = crate::config::ReliabilityConfig {
             provider_retries: 1,
             provider_backoff_ms: 100,
+            provider_max_backoff_ms: 60_000,
             fallback_providers: vec![
                 "openrouter".into(),
                 "nonexistent-provider".into(),
@@ -2487,6 +2488,7 @@ mod tests {
         let reliability = crate::config::ReliabilityConfig {
             provider_retries: 1,
             provider_backoff_ms: 100,
+            provider_max_backoff_ms: 60_000,
             fallback_providers: vec!["lmstudio".into(), "ollama".into()],
             api_keys: Vec::new(),
             model_fallbacks: std::collections::HashMap::new(),
@@ -2509,6 +2511,7 @@ mod tests {
         let reliability = crate::config::ReliabilityConfig {
             provider_retries: 1,
             provider_backoff_ms: 100,
+            provider_max_backoff_ms: 60_000,
             fallback_providers: vec!["custom:http://host.docker.internal:1234/v1".into()],
             api_keys: Vec::new(),
             model_fallbacks: std::collections::HashMap::new(),
@@ -2530,6 +2533,7 @@ mod tests {
         let reliability = crate::config::ReliabilityConfig {
             provider_retries: 1,
             provider_backoff_ms: 100,
+            provider_max_backoff_ms: 60_000,
             fallback_providers: vec![
                 "deepseek".into(),
                 "custom:http://localhost:8080/v1".into(),
@@ -2567,6 +2571,7 @@ mod tests {
         let reliability = crate::config::ReliabilityConfig {
             provider_retries: 1,
             provider_backoff_ms: 100,
+            provider_max_backoff_ms: 60_000,
             fallback_providers: vec!["osaurus".into(), "lmstudio".into()],
             api_keys: Vec::new(),
             model_fallbacks: std::collections::HashMap::new(),
@@ -2860,6 +2865,7 @@ mod tests {
         let reliability = crate::config::ReliabilityConfig {
             provider_retries: 1,
             provider_backoff_ms: 100,
+            provider_max_backoff_ms: 60_000,
             fallback_providers: vec!["openai-codex:second".into()],
             api_keys: Vec::new(),
             model_fallbacks: std::collections::HashMap::new(),
@@ -2884,6 +2890,7 @@ mod tests {
         let reliability = crate::config::ReliabilityConfig {
             provider_retries: 1,
             provider_backoff_ms: 100,
+            provider_max_backoff_ms: 60_000,
             fallback_providers: vec![
                 "openai-codex:second".into(),
                 "custom:http://localhost:8080/v1".into(),
