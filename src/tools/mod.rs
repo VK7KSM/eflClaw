@@ -72,6 +72,8 @@ pub mod mcp_tool;
 pub mod mcp_transport;
 pub mod traits;
 pub mod url_validation;
+pub mod wasm_module;
+pub mod wasm_tool;
 pub mod web_fetch;
 pub mod web_search_tool;
 
@@ -132,6 +134,8 @@ pub use task_plan::TaskPlanTool;
 pub use traits::Tool;
 #[allow(unused_imports)]
 pub use traits::{ToolResult, ToolSpec};
+pub use wasm_module::WasmModuleTool;
+pub use wasm_tool::{WasmManifest, WasmTool, load_wasm_tools_from_skills, wasm_tool_names_from_skills};
 pub use web_fetch::WebFetchTool;
 pub use web_search_tool::WebSearchTool;
 
@@ -367,6 +371,25 @@ pub fn all_tools_with_runtime(
     // PDF extraction (feature-gated at compile time via rag-pdf)
     tool_arcs.push(Arc::new(PdfReadTool::new(security.clone())));
     tool_arcs.push(Arc::new(DocxReadTool::new(security.clone())));
+
+    // WASM module sandbox tool (active when runtime.kind = "wasm")
+    {
+        use crate::runtime::WasmRuntime;
+        let wasm_runtime = if root_config.runtime.kind == "wasm" {
+            Some(Arc::new(WasmRuntime::new(root_config.runtime.wasm.clone())))
+        } else {
+            None
+        };
+        tool_arcs.push(Arc::new(WasmModuleTool::new(security.clone(), wasm_runtime)));
+    }
+
+    // WASM skill tools loaded from the skills directory
+    {
+        let skills_dir = workspace_dir.join("skills");
+        for wasm_tool in load_wasm_tools_from_skills(&skills_dir) {
+            tool_arcs.push(Arc::from(wasm_tool));
+        }
+    }
 
     // Vision tools are always available
     tool_arcs.push(Arc::new(ScreenshotTool::new(security.clone())));
