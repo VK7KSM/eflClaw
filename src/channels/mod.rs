@@ -3251,6 +3251,53 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
     Ok(())
 }
 
+/// Deliver a plain-text announcement to any configured channel by name.
+///
+/// Unlike the hardcoded `deliver_announcement` in `cron/scheduler.rs`, this
+/// function uses the unified `collect_configured_channels()` path and therefore
+/// supports **all** configured channels (Telegram, Discord, Slack, Mattermost,
+/// Signal, WhatsApp, IRC, Email, etc.) without special-casing.
+///
+/// # Arguments
+/// * `config` — Full runtime config (used to instantiate the channel)
+/// * `channel` — Channel name, case-insensitive (e.g. `"telegram"`, `"discord"`)
+/// * `target` — Delivery target (chat_id, channel_id, email address, etc.)
+/// * `text` — Plain-text message body
+///
+/// # Errors
+/// Returns an error if:
+/// - No channel matching `channel` is configured
+/// - The channel's `send()` method fails
+pub async fn deliver_to_channel(
+    config: &Config,
+    channel: &str,
+    target: &str,
+    text: &str,
+) -> anyhow::Result<()> {
+    let channels = collect_configured_channels(config, "deliver_to_channel");
+    let needle = channel.to_ascii_lowercase();
+    let found = channels
+        .iter()
+        .find(|c| c.display_name.to_ascii_lowercase() == needle);
+
+    match found {
+        Some(c) => {
+            c.channel
+                .send(&crate::channels::traits::SendMessage::new(text, target))
+                .await
+        }
+        None => anyhow::bail!(
+            "no channel named '{}' is configured; available: {}",
+            channel,
+            channels
+                .iter()
+                .map(|c| c.display_name.to_ascii_lowercase())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
 /// Start all configured channels and route messages to the agent
 #[allow(clippy::too_many_lines)]
 pub async fn start_channels(config: Config) -> Result<()> {
