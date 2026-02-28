@@ -162,7 +162,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
         // ── AI Models ───────────────────────────────────────────
         IntegrationEntry {
             name: "OpenRouter",
-            description: "200+ models, 1 API key",
+            description: "Claude Sonnet 4.6, GPT-5.2, Gemini 3.1 Pro",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
                 if c.default_provider.as_deref() == Some("openrouter") && c.api_key.is_some() {
@@ -174,7 +174,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
         },
         IntegrationEntry {
             name: "Anthropic",
-            description: "Claude 3.5/4 Sonnet & Opus",
+            description: "Claude Sonnet 4.6, Claude Opus 4.6",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
                 if c.default_provider.as_deref() == Some("anthropic") {
@@ -186,7 +186,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
         },
         IntegrationEntry {
             name: "OpenAI",
-            description: "GPT-4o, GPT-5, o1",
+            description: "GPT-5.2, GPT-5.2-Codex, o3",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
                 if c.default_provider.as_deref() == Some("openai") {

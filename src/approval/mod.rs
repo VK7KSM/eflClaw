@@ -2,13 +2,18 @@
 //!
 //! Provides a pre-execution hook that prompts the user before tool calls,
 //! with session-scoped "Always" allowlists and audit logging.
+//!
+//! For non-CLI channels (Telegram, Discord, etc.), approval requests are
+//! stored as pending items with a 30-minute expiry. The channel handler sends
+//! a prompt to the user; when the user responds, `resolve_non_cli_request` is
+//! called to record the decision and unblock the waiting tool call.
 
 use crate::config::AutonomyConfig;
 use crate::security::AutonomyLevel;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, BufRead, Write};
 
 // ── Types ────────────────────────────────────────────────────────
@@ -42,6 +47,63 @@ pub struct ApprovalLogEntry {
     pub channel: String,
 }
 
+/// A pending approval request for non-CLI channels (Telegram, Discord, etc.).
+///
+/// Created when a supervised tool call is requested while the user is not at
+/// a CLI. The request has a 30-minute expiry; if no response is received
+/// before expiry, the tool call is auto-denied.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingNonCliApprovalRequest {
+    /// Unique ID for this pending request (UUID-like random string).
+    pub request_id: String,
+    /// Tool name being requested.
+    pub tool_name: String,
+    /// Tool arguments.
+    pub arguments: serde_json::Value,
+    /// Channel name (e.g. `"telegram"`, `"discord"`).
+    pub channel: String,
+    /// Channel-specific reply target (e.g. Telegram chat_id).
+    pub reply_target: String,
+    /// When this request was created.
+    pub created_at: DateTime<Utc>,
+    /// When this request expires (created_at + 30 minutes).
+    pub expires_at: DateTime<Utc>,
+}
+
+impl PendingNonCliApprovalRequest {
+    /// Returns true if this request has passed its expiry time.
+    pub fn is_expired(&self) -> bool {
+        Utc::now() > self.expires_at
+    }
+
+    /// Returns the remaining time until expiry in seconds (0 if expired).
+    pub fn remaining_secs(&self) -> i64 {
+        let diff = (self.expires_at - Utc::now()).num_seconds();
+        diff.max(0)
+    }
+}
+
+/// Error returned when a pending non-CLI approval request cannot be resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingApprovalError {
+    /// No request with the given ID exists.
+    NotFound,
+    /// The request existed but has already expired.
+    Expired,
+    /// The channel of the resolution does not match the request.
+    ChannelMismatch,
+}
+
+impl std::fmt::Display for PendingApprovalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound => write!(f, "pending approval request not found"),
+            Self::Expired => write!(f, "pending approval request has expired"),
+            Self::ChannelMismatch => write!(f, "channel mismatch for pending approval request"),
+        }
+    }
+}
+
 // ── ApprovalManager ──────────────────────────────────────────────
 
 /// Manages the interactive approval workflow.
@@ -49,6 +111,7 @@ pub struct ApprovalLogEntry {
 /// - Checks config-level `auto_approve` / `always_ask` lists
 /// - Maintains a session-scoped "always" allowlist
 /// - Records an audit trail of all decisions
+/// - For non-CLI channels: manages pending approval requests with expiry
 pub struct ApprovalManager {
     /// Tools that never need approval (from config).
     auto_approve: HashSet<String>,
@@ -60,6 +123,8 @@ pub struct ApprovalManager {
     session_allowlist: Mutex<HashSet<String>>,
     /// Audit trail of approval decisions.
     audit_log: Mutex<Vec<ApprovalLogEntry>>,
+    /// Pending non-CLI approval requests (keyed by request_id).
+    pending_non_cli: Mutex<HashMap<String, PendingNonCliApprovalRequest>>,
 }
 
 impl ApprovalManager {
@@ -71,6 +136,7 @@ impl ApprovalManager {
             autonomy_level: config.level,
             session_allowlist: Mutex::new(HashSet::new()),
             audit_log: Mutex::new(Vec::new()),
+            pending_non_cli: Mutex::new(HashMap::new()),
         }
     }
 
@@ -151,6 +217,122 @@ impl ApprovalManager {
     /// approval is only supported on CLI for now).
     pub fn prompt_cli(&self, request: &ApprovalRequest) -> ApprovalResponse {
         prompt_cli_interactive(request)
+    }
+
+    // ── Non-CLI pending approval ──────────────────────────────────
+
+    /// Create a new pending non-CLI approval request.
+    ///
+    /// Returns the `request_id` which should be embedded in the approval
+    /// message sent to the user so they can reference it in their response.
+    pub fn create_non_cli_request(
+        &self,
+        tool_name: &str,
+        arguments: serde_json::Value,
+        channel: &str,
+        reply_target: &str,
+    ) -> String {
+        // Generate a compact random ID using timestamp + random bytes.
+        let now = Utc::now();
+        let nonce: u32 = {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut h = DefaultHasher::new();
+            now.timestamp_nanos_opt().unwrap_or_default().hash(&mut h);
+            tool_name.hash(&mut h);
+            channel.hash(&mut h);
+            h.finish() as u32
+        };
+        let request_id = format!("apr_{:016x}_{nonce:08x}", now.timestamp_micros());
+
+        // Expire after 30 minutes.
+        let expires_at = now + chrono::Duration::minutes(30);
+
+        let request = PendingNonCliApprovalRequest {
+            request_id: request_id.clone(),
+            tool_name: tool_name.to_string(),
+            arguments,
+            channel: channel.to_string(),
+            reply_target: reply_target.to_string(),
+            created_at: now,
+            expires_at,
+        };
+
+        let mut pending = self.pending_non_cli.lock();
+        pending.insert(request_id.clone(), request);
+
+        request_id
+    }
+
+    /// Attempt to resolve a pending non-CLI approval request.
+    ///
+    /// On success, records the decision in the audit log and removes the
+    /// pending request. Returns the resolved request for the caller to use.
+    ///
+    /// Fails if the request is not found, expired, or the channel doesn't match.
+    pub fn resolve_non_cli_request(
+        &self,
+        request_id: &str,
+        decision: ApprovalResponse,
+        resolving_channel: &str,
+    ) -> Result<PendingNonCliApprovalRequest, PendingApprovalError> {
+        let mut pending = self.pending_non_cli.lock();
+
+        let req = pending
+            .get(request_id)
+            .ok_or(PendingApprovalError::NotFound)?
+            .clone();
+
+        if req.is_expired() {
+            pending.remove(request_id);
+            return Err(PendingApprovalError::Expired);
+        }
+
+        if req.channel != resolving_channel {
+            return Err(PendingApprovalError::ChannelMismatch);
+        }
+
+        pending.remove(request_id);
+        drop(pending); // Release lock before recording decision.
+
+        self.record_decision(&req.tool_name, &req.arguments, decision, &req.channel);
+
+        Ok(req)
+    }
+
+    /// Look up a pending non-CLI request by ID without consuming it.
+    pub fn get_pending_non_cli_request(
+        &self,
+        request_id: &str,
+    ) -> Option<PendingNonCliApprovalRequest> {
+        self.pending_non_cli.lock().get(request_id).cloned()
+    }
+
+    /// Return all pending (non-expired) requests for a given channel.
+    pub fn pending_requests_for_channel(&self, channel: &str) -> Vec<PendingNonCliApprovalRequest> {
+        self.pending_non_cli
+            .lock()
+            .values()
+            .filter(|r| r.channel == channel && !r.is_expired())
+            .cloned()
+            .collect()
+    }
+
+    /// Remove all expired pending non-CLI requests.
+    ///
+    /// Should be called periodically (e.g. once per heartbeat tick).
+    pub fn expire_stale_requests(&self) {
+        let mut pending = self.pending_non_cli.lock();
+        pending.retain(|_, req| !req.is_expired());
+    }
+
+    /// Return the count of currently pending (non-expired) non-CLI requests.
+    pub fn pending_non_cli_count(&self) -> usize {
+        self.pending_non_cli
+            .lock()
+            .values()
+            .filter(|r| !r.is_expired())
+            .count()
     }
 }
 
@@ -422,5 +604,158 @@ mod tests {
         let json = serde_json::to_string(&req).unwrap();
         let parsed: ApprovalRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.tool_name, "shell");
+    }
+
+    // ── PendingNonCliApprovalRequest ──────────────────────────────
+
+    #[test]
+    fn pending_non_cli_create_and_resolve() {
+        let mgr = ApprovalManager::from_config(&supervised_config());
+        let request_id = mgr.create_non_cli_request(
+            "shell",
+            serde_json::json!({"command": "ls"}),
+            "telegram",
+            "123456",
+        );
+        assert!(!request_id.is_empty());
+
+        // Should appear in pending list.
+        let pending = mgr.pending_requests_for_channel("telegram");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].tool_name, "shell");
+
+        // Resolve it.
+        let resolved = mgr
+            .resolve_non_cli_request(&request_id, ApprovalResponse::Yes, "telegram")
+            .unwrap();
+        assert_eq!(resolved.tool_name, "shell");
+        assert_eq!(resolved.channel, "telegram");
+
+        // Should no longer be pending.
+        let pending = mgr.pending_requests_for_channel("telegram");
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn pending_non_cli_not_found() {
+        let mgr = ApprovalManager::from_config(&supervised_config());
+        let result =
+            mgr.resolve_non_cli_request("nonexistent_id", ApprovalResponse::Yes, "telegram");
+        assert_eq!(result.unwrap_err(), PendingApprovalError::NotFound);
+    }
+
+    #[test]
+    fn pending_non_cli_channel_mismatch() {
+        let mgr = ApprovalManager::from_config(&supervised_config());
+        let request_id = mgr.create_non_cli_request(
+            "file_write",
+            serde_json::json!({}),
+            "telegram",
+            "123",
+        );
+
+        // Trying to resolve on a different channel should fail.
+        let result = mgr.resolve_non_cli_request(&request_id, ApprovalResponse::No, "discord");
+        assert_eq!(result.unwrap_err(), PendingApprovalError::ChannelMismatch);
+
+        // Request should still be pending after channel mismatch.
+        assert_eq!(mgr.pending_non_cli_count(), 1);
+    }
+
+    #[test]
+    fn pending_non_cli_always_adds_to_session_allowlist() {
+        let mgr = ApprovalManager::from_config(&supervised_config());
+        let request_id = mgr.create_non_cli_request(
+            "file_write",
+            serde_json::json!({"path": "out.txt"}),
+            "telegram",
+            "123",
+        );
+
+        mgr.resolve_non_cli_request(&request_id, ApprovalResponse::Always, "telegram")
+            .unwrap();
+
+        // file_write should now be in session allowlist.
+        assert!(!mgr.needs_approval("file_write"));
+    }
+
+    #[test]
+    fn pending_non_cli_expire_stale_removes_expired() {
+        let mgr = ApprovalManager::from_config(&supervised_config());
+
+        // Manually insert an already-expired request.
+        {
+            let past = Utc::now() - chrono::Duration::hours(1);
+            let req = PendingNonCliApprovalRequest {
+                request_id: "expired_req".into(),
+                tool_name: "shell".into(),
+                arguments: serde_json::json!({}),
+                channel: "telegram".into(),
+                reply_target: "123".into(),
+                created_at: past,
+                expires_at: past, // already expired
+            };
+            mgr.pending_non_cli.lock().insert("expired_req".into(), req);
+        }
+
+        assert_eq!(mgr.pending_non_cli_count(), 0); // is_expired() filters it
+        mgr.expire_stale_requests(); // Should not panic; removes the entry.
+
+        assert!(mgr.pending_non_cli.lock().is_empty());
+    }
+
+    #[test]
+    fn pending_non_cli_get_by_id() {
+        let mgr = ApprovalManager::from_config(&supervised_config());
+        let request_id = mgr.create_non_cli_request(
+            "http_request",
+            serde_json::json!({"url": "https://example.com"}),
+            "discord",
+            "ch_999",
+        );
+
+        let fetched = mgr.get_pending_non_cli_request(&request_id).unwrap();
+        assert_eq!(fetched.tool_name, "http_request");
+        assert_eq!(fetched.reply_target, "ch_999");
+        assert!(!fetched.is_expired());
+        assert!(fetched.remaining_secs() > 1700); // > 28 minutes remaining
+    }
+
+    #[test]
+    fn pending_non_cli_resolve_records_audit_log() {
+        let mgr = ApprovalManager::from_config(&supervised_config());
+        let request_id = mgr.create_non_cli_request(
+            "shell",
+            serde_json::json!({"command": "echo hello"}),
+            "telegram",
+            "999",
+        );
+
+        mgr.resolve_non_cli_request(&request_id, ApprovalResponse::No, "telegram")
+            .unwrap();
+
+        let log = mgr.audit_log();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].tool_name, "shell");
+        assert_eq!(log[0].decision, ApprovalResponse::No);
+        assert_eq!(log[0].channel, "telegram");
+    }
+
+    // ── PendingApprovalError display ──────────────────────────────
+
+    #[test]
+    fn pending_approval_error_display() {
+        assert_eq!(
+            PendingApprovalError::NotFound.to_string(),
+            "pending approval request not found"
+        );
+        assert_eq!(
+            PendingApprovalError::Expired.to_string(),
+            "pending approval request has expired"
+        );
+        assert_eq!(
+            PendingApprovalError::ChannelMismatch.to_string(),
+            "channel mismatch for pending approval request"
+        );
     }
 }

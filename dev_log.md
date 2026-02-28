@@ -1463,3 +1463,51 @@ owner = "e1vix"
 - `cargo test heartbeat --lib` — 29 passed
 - `cargo test send_voice --lib` — 6 passed
 - `cargo build --release` — 成功
+
+---
+
+## 2026-03-01 — Phase 4 完成：Approval 系统、配置增强、Dispatcher XML 正规化
+
+**涉及文件**：
+- `src/approval/mod.rs`（扩展：426 → ~650 行，添加非 CLI 审批系统）
+- `src/config/schema.rs`（添加：`NonCliNaturalLanguageApprovalMode` 枚举 + AutonomyConfig 3 个新字段）
+- `src/config/mod.rs`（添加：`NonCliNaturalLanguageApprovalMode` 重新导出）
+- `src/agent/dispatcher.rs`（修改：添加 XML 标签正规化）
+- `src/integrations/registry.rs`（修改：更新模型描述）
+
+### 改动内容
+
+#### `src/approval/mod.rs`
+- 添加 `PendingNonCliApprovalRequest` struct：非 CLI 渠道的待审批请求，含 30 分钟超时
+- 添加 `PendingApprovalError` enum：`NotFound`/`Expired`/`ChannelMismatch`
+- `ApprovalManager` 新增 `pending_non_cli: Mutex<HashMap<String, PendingNonCliApprovalRequest>>` 字段
+- 新增方法：
+  - `create_non_cli_request()` — 创建待审批请求，返回 request_id
+  - `resolve_non_cli_request()` — 解析（消费）请求并记录决策
+  - `get_pending_non_cli_request()` — 按 ID 查询（不消费）
+  - `pending_requests_for_channel()` — 返回某渠道的所有活跃请求
+  - `expire_stale_requests()` — 清理已过期请求
+  - `pending_non_cli_count()` — 活跃请求计数
+- 新增 7 个测试覆盖所有新功能
+
+#### `src/config/schema.rs`
+- 新增 `NonCliNaturalLanguageApprovalMode` enum（Disabled / RequestConfirm / Direct）
+- `AutonomyConfig` 新增 3 个字段：
+  - `non_cli_approval_approvers: Vec<String>` — 可批准的用户 ID 列表
+  - `non_cli_natural_language_approval_mode: NonCliNaturalLanguageApprovalMode` — 默认 RequestConfirm
+  - `non_cli_natural_language_approval_mode_by_channel: HashMap<String, NonCliNaturalLanguageApprovalMode>` — 按渠道覆盖
+- 修复测试中的 AutonomyConfig 初始化，添加 `..AutonomyConfig::default()`
+
+#### `src/agent/dispatcher.rs`
+- `parse_xml_tool_calls()` 中添加 XML 标签正规化：
+  - `<toolcall>` → `<tool_call>`
+  - `<tool-call>` → `<tool_call>`
+  - `<invoke>` → `<tool_call>`
+  - 对应闭合标签同样处理
+- 兼容不同 fine-tuned 模型的 XML 输出格式
+
+#### `src/integrations/registry.rs`
+- 更新模型描述：
+  - OpenRouter: "200+ models, 1 API key" → "Claude Sonnet 4.6, GPT-5.2, Gemini 3.1 Pro"
+  - Anthropic: "Claude 3.5/4 Sonnet & Opus" → "Claude Sonnet 4.6, Claude Opus 4.6"
+  - OpenAI: "GPT-4o, GPT-5, o1" → "GPT-5.2, GPT-5.2-Codex, o3"
