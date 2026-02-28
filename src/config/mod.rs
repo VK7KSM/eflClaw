@@ -14,10 +14,15 @@ pub use schema::{
     OtpConfig, OtpMethod, PeripheralBoardConfig, PeripheralsConfig, ProxyConfig, ProxyScope,
     QdrantConfig, QueryClassificationConfig, ReliabilityConfig, ResourceLimitsConfig,
     RuntimeConfig, SandboxBackend, SandboxConfig, SchedulerConfig, SecretsConfig, SecurityConfig,
+    SecurityRoleConfig,
     SkillsConfig, SkillsPromptInjectionMode, SlackConfig, StorageConfig, StorageProviderConfig,
     StorageProviderSection, StreamMode, TelegramConfig, TranscriptionConfig, TtsConfig, TunnelConfig,
     WebFetchConfig, WebSearchConfig, WebhookConfig,
     parse_hhmm, is_within_active_hours,
+    ResearchPhaseConfig, ResearchTrigger,
+    GoalLoopConfig,
+    PluginsConfig, PluginEntryConfig,
+    UrlAccessConfig,
 };
 
 pub fn name_and_presence<T: traits::ChannelConfig>(channel: &Option<T>) -> (&'static str, bool) {
@@ -46,6 +51,7 @@ mod tests {
             draft_update_interval_ms: 1000,
             interrupt_on_new_message: false,
             mention_only: false,
+            base_url: None,
         };
 
         let discord = DiscordConfig {

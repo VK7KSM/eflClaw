@@ -6,6 +6,7 @@ mod schedule;
 mod store;
 mod types;
 
+pub mod consolidation;
 pub mod scheduler;
 
 #[allow(unused_imports)]

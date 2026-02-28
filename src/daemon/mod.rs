@@ -476,6 +476,7 @@ mod tests {
             draft_update_interval_ms: 1000,
             interrupt_on_new_message: false,
             mention_only: false,
+            base_url: None,
         });
         assert!(has_supervised_channels(&config));
     }
@@ -608,6 +609,7 @@ mod tests {
             draft_update_interval_ms: 1000,
             interrupt_on_new_message: false,
             mention_only: false,
+            base_url: None,
         });
 
         let target = heartbeat_delivery_target(&config).unwrap();

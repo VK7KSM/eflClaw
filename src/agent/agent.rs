@@ -37,6 +37,7 @@ pub struct Agent {
     classification_config: crate::config::QueryClassificationConfig,
     available_hints: Vec<String>,
     route_model_by_hint: HashMap<String, String>,
+    research_config: crate::config::ResearchPhaseConfig,
 }
 
 pub struct AgentBuilder {
@@ -58,6 +59,7 @@ pub struct AgentBuilder {
     classification_config: Option<crate::config::QueryClassificationConfig>,
     available_hints: Option<Vec<String>>,
     route_model_by_hint: Option<HashMap<String, String>>,
+    research_config: Option<crate::config::ResearchPhaseConfig>,
 }
 
 impl AgentBuilder {
@@ -81,6 +83,7 @@ impl AgentBuilder {
             classification_config: None,
             available_hints: None,
             route_model_by_hint: None,
+            research_config: None,
         }
     }
 
@@ -180,6 +183,14 @@ impl AgentBuilder {
         self
     }
 
+    pub fn research_config(
+        mut self,
+        research_config: crate::config::ResearchPhaseConfig,
+    ) -> Self {
+        self.research_config = Some(research_config);
+        self
+    }
+
     pub fn build(self) -> Result<Agent> {
         let tools = self
             .tools
@@ -223,6 +234,7 @@ impl AgentBuilder {
             classification_config: self.classification_config.unwrap_or_default(),
             available_hints: self.available_hints.unwrap_or_default(),
             route_model_by_hint: self.route_model_by_hint.unwrap_or_default(),
+            research_config: self.research_config.unwrap_or_default(),
         })
     }
 }
@@ -335,6 +347,7 @@ impl Agent {
             .classification_config(config.query_classification.clone())
             .available_hints(available_hints)
             .route_model_by_hint(route_model_by_hint)
+            .research_config(config.research.clone())
             .identity_config(config.identity.clone())
             .skills(crate::skills::load_skills_with_config(
                 &config.workspace_dir,
@@ -487,8 +500,46 @@ impl Agent {
             .unwrap_or_default();
 
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
-        let enriched = if context.is_empty() {
+
+        // Research phase: proactively gather context before main response
+        let research_context = if super::research::should_trigger(&self.research_config, user_message) {
+            match super::research::run_research_phase(
+                &self.research_config,
+                self.provider.as_ref(),
+                &self.tools,
+                user_message,
+                &self.model_name,
+                self.temperature,
+                self.observer.clone(),
+            )
+            .await
+            {
+                Ok(result) if !result.context.is_empty() => {
+                    tracing::info!(
+                        tool_calls = result.tool_call_count,
+                        duration_ms = result.duration.as_millis(),
+                        "Research phase completed"
+                    );
+                    Some(result.context)
+                }
+                Ok(_) => None,
+                Err(e) => {
+                    tracing::warn!(error = %e, "Research phase failed, continuing without context");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let enriched = if context.is_empty() && research_context.is_none() {
             format!("[{now}] {user_message}")
+        } else if let Some(ref rc) = research_context {
+            if context.is_empty() {
+                format!("[{now}] {user_message}\n\n---\n{rc}")
+            } else {
+                format!("{context}[{now}] {user_message}\n\n---\n{rc}")
+            }
         } else {
             format!("{context}[{now}] {user_message}")
         };
@@ -798,6 +849,7 @@ mod tests {
                         id: "tc1".into(),
                         name: "echo".into(),
                         arguments: "{}".into(),
+                        thought_signature: None,
                     }],
                     usage: None,
                     reasoning_content: None,

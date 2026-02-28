@@ -321,6 +321,7 @@ async fn e2e_single_tool_call_cycle() {
             id: "tc1".into(),
             name: "echo".into(),
             arguments: r#"{"message": "hello from tool"}"#.into(),
+            thought_signature: None,
         }]),
         text_response("Tool executed successfully"),
     ]));
@@ -343,11 +344,13 @@ async fn e2e_multi_step_tool_chain() {
             id: "tc1".into(),
             name: "counter".into(),
             arguments: "{}".into(),
+            thought_signature: None,
         }]),
         tool_response(vec![ToolCall {
             id: "tc2".into(),
             name: "counter".into(),
             arguments: "{}".into(),
+            thought_signature: None,
         }]),
         text_response("Done after 2 tool calls"),
     ]));
@@ -418,6 +421,7 @@ async fn e2e_unknown_tool_recovery() {
             id: "tc1".into(),
             name: "nonexistent_tool".into(),
             arguments: "{}".into(),
+            thought_signature: None,
         }]),
         text_response("Recovered from unknown tool"),
     ]));
@@ -441,11 +445,13 @@ async fn e2e_parallel_tool_dispatch() {
                 id: "tc1".into(),
                 name: "counter".into(),
                 arguments: "{}".into(),
+                thought_signature: None,
             },
             ToolCall {
                 id: "tc2".into(),
                 name: "counter".into(),
                 arguments: "{}".into(),
+                thought_signature: None,
             },
         ]),
         text_response("Both tools ran"),

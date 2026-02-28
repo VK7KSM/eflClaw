@@ -16,6 +16,7 @@
 //! [`all_tools_with_runtime`]. See `AGENTS.md` §7.3 for the full change playbook.
 
 pub mod browser;
+pub mod apply_patch;
 pub mod browser_open;
 pub mod cli_discovery;
 pub mod composio;
@@ -46,6 +47,7 @@ pub mod memory_recall;
 pub mod memory_store;
 pub mod model_routing_config;
 pub mod pdf_read;
+pub mod process;
 pub mod proxy_config;
 pub mod pushover;
 pub mod schedule;
@@ -56,11 +58,19 @@ pub mod send_email;
 pub mod send_telegram;
 pub mod send_voice;
 pub mod shell;
+pub mod subagent_list;
+pub mod subagent_manage;
+pub mod subagent_registry;
+pub mod subagent_spawn;
+pub mod task_plan;
+pub mod docx_read;
 pub mod traits;
+pub mod url_validation;
 pub mod web_fetch;
 pub mod web_search_tool;
 
 pub use browser::{BrowserTool, ComputerUseConfig};
+pub use apply_patch::ApplyPatchTool;
 pub use browser_open::BrowserOpenTool;
 pub use composio::ComposioTool;
 pub use content_search::ContentSearchTool;
@@ -90,6 +100,8 @@ pub use memory_recall::MemoryRecallTool;
 pub use memory_store::MemoryStoreTool;
 pub use model_routing_config::ModelRoutingConfigTool;
 pub use pdf_read::PdfReadTool;
+pub use docx_read::DocxReadTool;
+pub use process::ProcessTool;
 pub use proxy_config::ProxyConfigTool;
 pub use pushover::PushoverTool;
 pub use schedule::ScheduleTool;
@@ -101,6 +113,11 @@ pub use send_email::SendEmailTool;
 pub use send_telegram::SendTelegramTool;
 pub use send_voice::SendVoiceTool;
 pub use shell::ShellTool;
+pub use subagent_list::SubAgentListTool;
+pub use subagent_manage::SubAgentManageTool;
+pub use subagent_registry::SubAgentRegistry;
+pub use subagent_spawn::SubAgentSpawnTool;
+pub use task_plan::TaskPlanTool;
 pub use traits::Tool;
 #[allow(unused_imports)]
 pub use traits::{ToolResult, ToolSpec};
@@ -220,7 +237,8 @@ pub fn all_tools_with_runtime(
     root_config: &crate::config::Config,
 ) -> Vec<Box<dyn Tool>> {
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
-        Arc::new(ShellTool::new(security.clone(), runtime)),
+        Arc::new(ShellTool::new(security.clone(), runtime.clone())),
+        Arc::new(ProcessTool::new(security.clone(), runtime)),
         Arc::new(FileReadTool::new(security.clone())),
         Arc::new(FileWriteTool::new(security.clone())),
         Arc::new(FileEditTool::new(security.clone())),
@@ -246,6 +264,8 @@ pub fn all_tools_with_runtime(
             security.clone(),
             workspace_dir.to_path_buf(),
         )),
+        Arc::new(ApplyPatchTool::new()),
+        Arc::new(TaskPlanTool::new(security.clone())),
         Arc::new(PushoverTool::new(
             security.clone(),
             workspace_dir.to_path_buf(),
@@ -335,6 +355,7 @@ pub fn all_tools_with_runtime(
 
     // PDF extraction (feature-gated at compile time via rag-pdf)
     tool_arcs.push(Arc::new(PdfReadTool::new(security.clone())));
+    tool_arcs.push(Arc::new(DocxReadTool::new(security.clone())));
 
     // Vision tools are always available
     tool_arcs.push(Arc::new(ScreenshotTool::new(security.clone())));
@@ -369,6 +390,34 @@ pub fn all_tools_with_runtime(
             (!trimmed_value.is_empty()).then(|| trimmed_value.to_owned())
         });
         let parent_tools = Arc::new(tool_arcs.clone());
+
+        // Sub-agent spawn/list/manage tools (async background delegation)
+        let subagent_registry = Arc::new(SubAgentRegistry::new());
+        let subagent_parent_tools = parent_tools.clone();
+        tool_arcs.push(Arc::new(SubAgentSpawnTool::new(
+            delegate_agents.clone(),
+            delegate_fallback_credential.clone(),
+            security.clone(),
+            crate::providers::ProviderRuntimeOptions {
+                auth_profile_override: None,
+                provider_api_url: root_config.api_url.clone(),
+                zeroclaw_dir: root_config
+                    .config_path
+                    .parent()
+                    .map(std::path::PathBuf::from),
+                secrets_encrypt: root_config.secrets.encrypt,
+                reasoning_enabled: root_config.runtime.reasoning_enabled,
+            },
+            subagent_registry.clone(),
+            subagent_parent_tools,
+            root_config.multimodal.clone(),
+        )));
+        tool_arcs.push(Arc::new(SubAgentListTool::new(subagent_registry.clone())));
+        tool_arcs.push(Arc::new(SubAgentManageTool::new(
+            subagent_registry,
+            security.clone(),
+        )));
+
         let delegate_tool = DelegateTool::new_with_options(
             delegate_agents,
             delegate_fallback_credential,

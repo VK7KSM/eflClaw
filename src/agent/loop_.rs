@@ -464,6 +464,67 @@ fn is_xml_meta_tag(tag: &str) -> bool {
     )
 }
 
+// ── Deferred action detection (upstream 1a0bb175) ──────────────────────────
+// When the LLM responds with language implying it's about to take action
+// ("let me check", "让我查看") but emits no tool call, we inject a correction
+// prompt and retry once.
+
+/// English deferred-action pattern: "I'll/let me/let's/we will" + action verb.
+static DEFERRED_ACTION_WITHOUT_TOOL_CALL_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?ix)
+        \b(
+            i(?:'ll|\s+will)|
+            i\s+am\s+going\s+to|
+            let\s+me|
+            let(?:'s|\s+us)|
+            we(?:'ll|\s+will)
+        )\b
+        [^.!?\n]{0,160}
+        \b(
+            check|look|search|browse|open|read|write|run|execute|call|
+            inspect|analy(?:s|z)e|verify|list|fetch|try|see|continue
+        )\b",
+    )
+    .unwrap()
+});
+
+/// CJK cue phrases: "让我" (let me), "我来" (I'll), "我会" (I will), etc.
+static CJK_DEFERRED_ACTION_CUE_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(让我|我来|我会|我们来|我们会|我先|先让我|马上)").unwrap());
+
+/// CJK action verbs that correspond to tool-backed operations.
+static CJK_DEFERRED_ACTION_VERB_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(查看|检查|搜索|查找|浏览|打开|读取|写入|运行|执行|调用|分析|验证|列出|获取|尝试|试试|继续|处理|修复|看看|看一看|看一下)").unwrap()
+});
+
+/// Fast pre-filter: any CJK script character (Han / Hiragana / Katakana / Hangul).
+static CJK_SCRIPT_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]").unwrap()
+});
+
+/// Correction prompt injected when deferred-action text is detected without a tool call.
+const MISSING_TOOL_CALL_RETRY_PROMPT: &str = "Internal correction: your last reply indicated you were about to take an action, but no valid tool call was emitted. If a tool is needed, emit it now using the required <tool_call>...</tool_call> format. If no tool is needed, provide the complete final answer now and do not defer action.";
+
+/// Returns true if the LLM response text looks like it's promising an action
+/// (e.g., "let me check", "让我查看") but didn't emit a tool call.
+fn looks_like_deferred_action_without_tool_call(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    // English pattern (fast path)
+    if DEFERRED_ACTION_WITHOUT_TOOL_CALL_REGEX.is_match(trimmed) {
+        return true;
+    }
+
+    // CJK pattern: all three conditions must hold
+    CJK_SCRIPT_REGEX.is_match(trimmed)
+        && CJK_DEFERRED_ACTION_CUE_REGEX.is_match(trimmed)
+        && CJK_DEFERRED_ACTION_VERB_REGEX.is_match(trimmed)
+}
+
 /// Match opening XML tags: `<tag_name>`.  Does NOT use backreferences.
 static XML_OPEN_TAG_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"<([a-zA-Z_][a-zA-Z0-9_-]*)>").unwrap());
@@ -1100,14 +1161,9 @@ fn parse_glm_style_tool_calls(text: &str) -> Vec<(String, serde_json::Value, Opt
             }
         }
 
-        // Plain URL
-        if let Some(command) = build_curl_command(line) {
-            calls.push((
-                "shell".to_string(),
-                serde_json::json!({ "command": command }),
-                Some(line.to_string()),
-            ));
-        }
+        // Plain URLs are intentionally NOT converted to shell commands.
+        // Agents must use explicit tool calls (http_request, shell, etc.)
+        // to fetch URLs. See upstream security fix dedb59a4.
     }
 
     calls
@@ -2105,6 +2161,8 @@ pub(crate) async fn run_tool_call_loop(
     let turn_id = Uuid::new_v4().to_string();
     let mut seen_tool_signatures: HashSet<(String, String)> = HashSet::new();
     let mut last_response_text = String::new();
+    let mut missing_tool_call_retry_used = false;
+    let mut missing_tool_call_retry_prompt: Option<String> = None;
 
     for iteration in 0..max_iterations {
         if cancellation_token
@@ -2140,6 +2198,13 @@ pub(crate) async fn run_tool_call_loop(
         };
         let prepared_messages =
             multimodal::prepare_messages_for_provider(&stripped, multimodal_config).await?;
+        let mut request_messages = prepared_messages.messages.clone();
+
+        // Inject deferred-action correction prompt if the previous iteration
+        // looked like the LLM was about to act but emitted no tool call.
+        if let Some(prompt) = missing_tool_call_retry_prompt.take() {
+            request_messages.push(ChatMessage::user(prompt));
+        }
 
         // ── Progress: LLM thinking ────────────────────────────
         if let Some(ref tx) = on_delta {
@@ -2187,7 +2252,7 @@ pub(crate) async fn run_tool_call_loop(
 
         let chat_future = provider.chat(
             ChatRequest {
-                messages: &prepared_messages.messages,
+                messages: &request_messages,
                 tools: request_tools,
             },
             model,
@@ -2361,6 +2426,37 @@ pub(crate) async fn run_tool_call_loop(
         }
 
         if tool_calls.is_empty() {
+            // ── Deferred-action retry (upstream 1a0bb175) ──────────────
+            // If the LLM promised an action but emitted no tool call, inject
+            // a correction prompt and retry once before treating as final.
+            let should_retry_missing_tool_call = !missing_tool_call_retry_used
+                && iteration + 1 < max_iterations
+                && !tool_specs.is_empty()
+                && looks_like_deferred_action_without_tool_call(&display_text);
+            if should_retry_missing_tool_call {
+                missing_tool_call_retry_used = true;
+                missing_tool_call_retry_prompt =
+                    Some(MISSING_TOOL_CALL_RETRY_PROMPT.to_string());
+                runtime_trace::record_event(
+                    "tool_call_followthrough_retry",
+                    Some(channel_name),
+                    Some(provider_name),
+                    Some(model),
+                    Some(&turn_id),
+                    Some(true),
+                    Some(
+                        "llm response implied follow-up action but emitted no tool call",
+                    ),
+                    serde_json::json!({
+                        "iteration": iteration + 1,
+                        "reason": "deferred_action_text_detected",
+                        "response_excerpt": truncate_with_ellipsis(
+                            &scrub_credentials(&display_text), 600),
+                    }),
+                );
+                continue; // retry this iteration with correction prompt
+            }
+
             runtime_trace::record_event(
                 "turn_final_response",
                 Some(channel_name),
@@ -5131,11 +5227,56 @@ Done."#;
 
     #[test]
     fn parse_glm_style_plain_url() {
+        // Security: plain URLs must NOT be auto-converted to shell commands
         let response = "https://example.com/api";
         let calls = parse_glm_style_tool_calls(response);
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "shell");
-        assert!(calls[0].1["command"].as_str().unwrap().contains("curl"));
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn parse_glm_style_ignores_urls_in_text() {
+        let response = "Google homepage:\nhttps://www.google.com";
+        let calls = parse_glm_style_tool_calls(response);
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn parse_tool_calls_does_not_convert_plain_url_to_shell() {
+        let response = "Google homepage:\nhttps://www.google.com";
+        let (_text, calls) = parse_tool_calls(response);
+        assert!(calls.is_empty());
+    }
+
+    // ── Deferred-action detection tests (upstream 1a0bb175) ────────
+
+    #[test]
+    fn deferred_action_detects_english_action_promises() {
+        assert!(looks_like_deferred_action_without_tool_call(
+            "Webpage opened, let's see what's new here."
+        ));
+        assert!(looks_like_deferred_action_without_tool_call(
+            "It seems absolute paths are blocked. Let me try using a relative path."
+        ));
+    }
+
+    #[test]
+    fn deferred_action_detects_cjk_action_promises() {
+        assert!(looks_like_deferred_action_without_tool_call(
+            "看起来绝对路径不可用，让我尝试使用当前目录的相对路径。"
+        ));
+        assert!(looks_like_deferred_action_without_tool_call(
+            "页面已打开，让我获取快照查看详细信息。"
+        ));
+    }
+
+    #[test]
+    fn deferred_action_ignores_final_answers() {
+        assert!(!looks_like_deferred_action_without_tool_call(
+            "The latest update is already shown above."
+        ));
+        assert!(!looks_like_deferred_action_without_tool_call(
+            "最新结果已经在上面整理完成。"
+        ));
     }
 
     #[test]
@@ -5609,6 +5750,7 @@ Let me check the result."#;
             id: "call_1".into(),
             name: "shell".into(),
             arguments: "{}".into(),
+            thought_signature: None,
         }];
         let result = build_native_assistant_history("answer", &calls, Some("thinking step"));
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
@@ -5623,6 +5765,7 @@ Let me check the result."#;
             id: "call_1".into(),
             name: "shell".into(),
             arguments: "{}".into(),
+            thought_signature: None,
         }];
         let result = build_native_assistant_history("answer", &calls, None);
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();

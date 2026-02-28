@@ -135,6 +135,14 @@ pub struct Config {
     #[serde(default)]
     pub query_classification: QueryClassificationConfig,
 
+    /// Research phase configuration (`[research]`). Proactive information gathering.
+    #[serde(default)]
+    pub research: ResearchPhaseConfig,
+
+    /// Goal loop configuration for autonomous long-term goal execution (`[goal_loop]`).
+    #[serde(default)]
+    pub goal_loop: GoalLoopConfig,
+
     /// Heartbeat configuration for periodic health pings (`[heartbeat]`).
     #[serde(default)]
     pub heartbeat: HeartbeatConfig,
@@ -230,6 +238,10 @@ pub struct Config {
     /// Chat log persistence and summarization (`[chat_log]`).
     #[serde(default)]
     pub chat_log: ChatLogConfig,
+
+    /// Plugin system configuration (`[plugins]`). Enable/disable third-party plugins.
+    #[serde(default)]
+    pub plugins: PluginsConfig,
 }
 
 /// Named provider profile definition compatible with Codex app-server style config.
@@ -571,6 +583,67 @@ impl Default for SkillsConfig {
             open_skills_enabled: false,
             open_skills_dir: None,
             prompt_injection_mode: SkillsPromptInjectionMode::default(),
+        }
+    }
+}
+
+/// Plugin system configuration (`[plugins]` section).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct PluginsConfig {
+    /// Master switch — set to `false` to disable all plugin loading. Default: `true`.
+    #[serde(default = "default_plugins_enabled")]
+    pub enabled: bool,
+
+    /// Allowlist — if non-empty, only plugins with these IDs are loaded.
+    /// An empty list means all discovered plugins are eligible.
+    #[serde(default)]
+    pub allow: Vec<String>,
+
+    /// Denylist — plugins with these IDs are never loaded, even if in the allowlist.
+    #[serde(default)]
+    pub deny: Vec<String>,
+
+    /// Extra directories to scan for plugins (in addition to the standard locations).
+    #[serde(default)]
+    pub load_paths: Vec<String>,
+
+    /// Per-plugin configuration entries.
+    #[serde(default)]
+    pub entries: std::collections::HashMap<String, PluginEntryConfig>,
+}
+
+fn default_plugins_enabled() -> bool {
+    true
+}
+
+impl Default for PluginsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            allow: Vec::new(),
+            deny: Vec::new(),
+            load_paths: Vec::new(),
+            entries: std::collections::HashMap::new(),
+        }
+    }
+}
+
+/// Per-plugin configuration entry (`[plugins.entries.<id>]`).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct PluginEntryConfig {
+    /// Override the plugin's enabled state.
+    pub enabled: Option<bool>,
+
+    /// Plugin-specific configuration table, passed to `PluginApi::plugin_config()`.
+    #[serde(default)]
+    pub config: serde_json::Value,
+}
+
+impl Default for PluginEntryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: None,
+            config: serde_json::Value::Object(serde_json::Map::new()),
         }
     }
 }
@@ -2500,6 +2573,136 @@ pub struct ClassificationRule {
     pub priority: i32,
 }
 
+// ── Research Phase ───────────────────────────────────────────────
+
+/// Research phase trigger mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ResearchTrigger {
+    /// Never trigger research phase.
+    #[default]
+    Never,
+    /// Always trigger research phase before responding.
+    Always,
+    /// Trigger when message contains configured keywords.
+    Keywords,
+    /// Trigger when message exceeds minimum length.
+    Length,
+    /// Trigger when message contains a question mark.
+    Question,
+}
+
+/// Research phase configuration (`[research]` section).
+///
+/// When enabled, the agent proactively gathers information using tools
+/// before generating its main response.
+///
+/// ```toml
+/// [research]
+/// enabled = true
+/// trigger = "keywords"
+/// keywords = ["find", "search", "check", "investigate"]
+/// max_iterations = 5
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ResearchPhaseConfig {
+    /// Enable the research phase.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// When to trigger research phase.
+    #[serde(default)]
+    pub trigger: ResearchTrigger,
+
+    /// Keywords that trigger research phase (when `trigger = "keywords"`).
+    #[serde(default = "default_research_keywords")]
+    pub keywords: Vec<String>,
+
+    /// Minimum message length to trigger research (when `trigger = "length"`).
+    #[serde(default = "default_research_min_length")]
+    pub min_message_length: usize,
+
+    /// Maximum tool call iterations during research phase.
+    #[serde(default = "default_research_max_iterations")]
+    pub max_iterations: usize,
+
+    /// Show detailed progress during research (tool calls, results).
+    #[serde(default = "default_true")]
+    pub show_progress: bool,
+
+    /// Custom system prompt prefix for research phase.
+    /// If empty, uses default research instructions.
+    #[serde(default)]
+    pub system_prompt_prefix: String,
+}
+
+impl Default for ResearchPhaseConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            trigger: ResearchTrigger::default(),
+            keywords: default_research_keywords(),
+            min_message_length: default_research_min_length(),
+            max_iterations: default_research_max_iterations(),
+            show_progress: true,
+            system_prompt_prefix: String::new(),
+        }
+    }
+}
+
+fn default_research_keywords() -> Vec<String> {
+    vec![
+        "find".into(),
+        "search".into(),
+        "check".into(),
+        "investigate".into(),
+        "look".into(),
+        "analyze".into(),
+    ]
+}
+
+fn default_research_min_length() -> usize {
+    50
+}
+
+fn default_research_max_iterations() -> usize {
+    5
+}
+
+// ── Goal Loop ────────────────────────────────────────────────────
+
+/// Configuration for the autonomous goal loop engine (`[goal_loop]`).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct GoalLoopConfig {
+    /// Enable autonomous goal execution. Default: `false`.
+    pub enabled: bool,
+    /// Interval in minutes between goal loop cycles. Default: `10`.
+    pub interval_minutes: u32,
+    /// Timeout in seconds for a single step execution. Default: `120`.
+    pub step_timeout_secs: u64,
+    /// Maximum steps to execute per cycle. Default: `3`.
+    pub max_steps_per_cycle: u32,
+    /// Optional channel to deliver goal events to (e.g. "telegram").
+    #[serde(default)]
+    pub channel: Option<String>,
+    /// Optional recipient/chat_id for goal event delivery.
+    #[serde(default)]
+    pub target: Option<String>,
+}
+
+impl Default for GoalLoopConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval_minutes: 10,
+            step_timeout_secs: 120,
+            max_steps_per_cycle: 3,
+            channel: None,
+            target: None,
+        }
+    }
+}
+
 // ── Heartbeat ────────────────────────────────────────────────────
 
 /// Heartbeat configuration for periodic health pings (`[heartbeat]` section).
@@ -2916,6 +3119,11 @@ pub struct TelegramConfig {
     /// Direct messages are always processed.
     #[serde(default)]
     pub mention_only: bool,
+    /// Optional custom base URL for Telegram-compatible APIs.
+    /// Defaults to "https://api.telegram.org" when omitted.
+    /// Example for Bale messenger: "https://tapi.bale.ai"
+    #[serde(default)]
+    pub base_url: Option<String>,
 }
 
 impl ChannelConfig for TelegramConfig {
@@ -3393,6 +3601,38 @@ impl ChannelConfig for FeishuConfig {
 
 // ── Security Config ─────────────────────────────────────────────────
 
+/// URL access control configuration (private IP blocking, CIDR/domain allowlists).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct UrlAccessConfig {
+    /// Block private/local IPs and hostnames by default.
+    #[serde(default = "default_true")]
+    pub block_private_ip: bool,
+
+    /// Explicit CIDR ranges that bypass private/local-IP blocking.
+    #[serde(default)]
+    pub allow_cidrs: Vec<String>,
+
+    /// Explicit domain patterns that bypass private/local-IP blocking.
+    /// Supports exact, `*.example.com`, and `*`.
+    #[serde(default)]
+    pub allow_domains: Vec<String>,
+
+    /// Allow loopback host/IP access (`localhost`, `127.0.0.1`, `::1`).
+    #[serde(default)]
+    pub allow_loopback: bool,
+}
+
+impl Default for UrlAccessConfig {
+    fn default() -> Self {
+        Self {
+            block_private_ip: true,
+            allow_cidrs: Vec::new(),
+            allow_domains: Vec::new(),
+            allow_loopback: false,
+        }
+    }
+}
+
 /// Security configuration for sandboxing, resource limits, and audit logging
 #[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema)]
 pub struct SecurityConfig {
@@ -3415,6 +3655,45 @@ pub struct SecurityConfig {
     /// Emergency-stop state machine configuration.
     #[serde(default)]
     pub estop: EstopConfig,
+
+    /// RBAC role definitions (extends built-in roles: owner/admin/operator/viewer/guest).
+    #[serde(default)]
+    pub roles: Vec<SecurityRoleConfig>,
+}
+
+/// Role-based access control definition for a named security role.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema)]
+pub struct SecurityRoleConfig {
+    /// Stable role name used by user records.
+    pub name: String,
+
+    /// Optional human-readable description.
+    #[serde(default)]
+    pub description: String,
+
+    /// Explicit allowlist of tools for this role (use `"*"` for all).
+    #[serde(default)]
+    pub allowed_tools: Vec<String>,
+
+    /// Explicit denylist of tools for this role.
+    #[serde(default)]
+    pub denied_tools: Vec<String>,
+
+    /// Tool names requiring OTP validation for this role.
+    #[serde(default)]
+    pub totp_gated: Vec<String>,
+
+    /// Optional parent role name for inheritance.
+    #[serde(default)]
+    pub inherits: Option<String>,
+
+    /// Role-scoped domain patterns requiring OTP.
+    #[serde(default)]
+    pub gated_domains: Vec<String>,
+
+    /// Role-scoped domain categories requiring OTP.
+    #[serde(default)]
+    pub gated_domain_categories: Vec<String>,
 }
 
 /// OTP validation strategy.
@@ -3784,9 +4063,12 @@ impl Default for Config {
             hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
             query_classification: QueryClassificationConfig::default(),
+            research: ResearchPhaseConfig::default(),
+            goal_loop: GoalLoopConfig::default(),
             transcription: TranscriptionConfig::default(),
             tts: TtsConfig::default(),
             chat_log: ChatLogConfig::default(),
+            plugins: PluginsConfig::default(),
         }
     }
 }
@@ -5278,6 +5560,7 @@ default_temperature = 0.7
                     draft_update_interval_ms: default_draft_update_interval_ms(),
                     interrupt_on_new_message: false,
                     mention_only: false,
+                    base_url: None,
                 }),
                 discord: None,
                 slack: None,
@@ -5323,6 +5606,9 @@ default_temperature = 0.7
             tts: TtsConfig::default(),
             summary_model: None,
             chat_log: ChatLogConfig::default(),
+            research: ResearchPhaseConfig::default(),
+            goal_loop: GoalLoopConfig::default(),
+            plugins: PluginsConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -5508,6 +5794,9 @@ tool_dispatcher = "xml"
             tts: TtsConfig::default(),
             summary_model: None,
             chat_log: ChatLogConfig::default(),
+            research: ResearchPhaseConfig::default(),
+            goal_loop: GoalLoopConfig::default(),
+            plugins: PluginsConfig::default(),
         };
 
         config.save().await.unwrap();
@@ -5656,6 +5945,7 @@ tool_dispatcher = "xml"
             draft_update_interval_ms: 500,
             interrupt_on_new_message: true,
             mention_only: false,
+            base_url: None,
         };
         let json = serde_json::to_string(&tc).unwrap();
         let parsed: TelegramConfig = serde_json::from_str(&json).unwrap();

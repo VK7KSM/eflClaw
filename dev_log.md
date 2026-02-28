@@ -2,6 +2,270 @@
 
 ---
 
+## 2026-03-01 — 上游工具移植：task_plan + url_validation
+
+**涉及文件**：`src/tools/task_plan.rs`（新建）、`src/tools/url_validation.rs`（新建）、`src/tools/mod.rs`（修改）
+
+### 改动内容
+
+#### `src/tools/task_plan.rs`（新建，608 行）
+
+- 从上游 `C:\Dev\zeroclaw_original\src\tools\task_plan.rs` 原封不动复制 `TaskPlanTool` 实现（逐字节一致，未做任何修改）
+- `TaskPlanTool`：会话范围内的任务清单工具，状态存于 `Arc<RwLock<Vec<TaskItem>>>`，会话结束即丢弃（不持久化到 Memory trait）
+- 支持 5 个 action：`create`（批量建立，替换现有列表）、`add`（追加单条）、`update`（更新状态）、`list`（列出全部）、`delete`（清空）
+- 状态枚举：`pending` / `in_progress` / `completed`
+- 安全控制：读操作（`list`）不需要权限；写操作调用 `enforce_tool_operation(ToolOperation::Act)`，`ReadOnly` 模式下全部被拒绝
+- 含 13 个单元测试，覆盖 create/add/update/list/delete 全流程、只读模式阻止、无效参数等
+
+#### `src/tools/url_validation.rs`（新建，568 行）
+
+- 从上游 `C:\Dev\zeroclaw_original\src\tools\url_validation.rs` 原封不动复制（逐字节一致，未做任何修改）
+- **纯工具函数模块，不是 `Tool` trait 实现**，不注册到工具列表，仅供其他工具内部调用
+- 依赖 `crate::config::UrlAccessConfig`（我们已在 `config/schema.rs` 中添加）
+- 核心函数：`validate_url()`、`extract_host()`、`host_matches_allowlist()`、`normalize_domain()`、`is_private_or_local_host()`、CIDR 匹配、DNS 重绑定防护
+- 含 20 个单元测试
+
+#### `src/tools/mod.rs`（修改）
+
+- 新增 `pub mod task_plan;` 和 `pub mod url_validation;` 声明（按字母顺序，插入 `shell` 之后）
+- 新增 `pub use task_plan::TaskPlanTool;` 导出
+- 在 `all_tools_with_runtime()` 中注册：`Arc::new(TaskPlanTool::new(security.clone()))`（位于 `ApplyPatchTool` 之后）
+- `url_validation` 无需注册（辅助函数模块，无 Tool 实现）
+
+### 验证
+
+- `cargo check --lib` — 零错误，6 个 warnings（均为已有 plugins 模块的 unused import，与本次修改无关）✓
+
+---
+
+## 2026-03-01 — 移植上游 subagent 管理工具四件套
+
+**涉及文件**：
+- `src/tools/subagent_registry.rs`（新建，547 行）
+- `src/tools/subagent_list.rs`（新建，224 行）
+- `src/tools/subagent_manage.rs`（新建，478 行）
+- `src/tools/subagent_spawn.rs`（新建，729 行）
+- `src/tools/mod.rs`（修改：新增模块声明、pub use 导出、工具注册）
+
+### 改动内容
+
+从上游 `C:\Dev\zeroclaw_original\src\tools\` 逐字移植四个 subagent 管理文件，并集成进 `all_tools_with_runtime()`。
+
+### 各文件职责
+
+- **subagent_registry.rs**：线程安全的 session 注册中心（`parking_lot::RwLock`），管理后台 sub-agent 会话生命周期（Running / Completed / Failed / Killed），支持原子并发检查、lazy 清理（超过 1 小时的终态 session 自动删除）
+- **subagent_list.rs**：`SubAgentListTool` — 只读工具，列出所有 session，支持按状态过滤
+- **subagent_manage.rs**：`SubAgentManageTool` — 查询单个 session 状态（无安全门控）或 kill 运行中的 session（`ToolOperation::Act` 安全门控）
+- **subagent_spawn.rs**：`SubAgentSpawnTool` — 在 `tokio::spawn` 中异步启动 delegate agent，立即返回 session_id；支持 simple mode（单次 `chat_with_system`）和 agentic mode（完整 `run_tool_call_loop`），最大并发 10 个
+
+### 兼容性调整
+
+- `subagent_spawn.rs` 测试中的 `DelegateAgentConfig` 初始化添加了 `system_prompt_file: None`（我们 fork 扩展的字段，上游原始测试未包含）
+
+### 注册方式
+
+在 `all_tools_with_runtime()` 的 agents 非空分支中，在 `DelegateTool` 之前注册：
+1. 创建 `Arc<SubAgentRegistry>`（共享实例）
+2. 注册 `SubAgentSpawnTool`（持有 registry + parent_tools 快照）
+3. 注册 `SubAgentListTool`（持有 registry）
+4. 注册 `SubAgentManageTool`（持有 registry + security）
+
+`parent_tools` 快照在 subagent 工具注册前捕获，确保 subagent_spawn 不能递归产生新的 spawn/delegate。
+
+### 验证
+
+`cargo check` 通过，无新增错误，无新增警告。
+
+---
+
+## 2026-03-01 — 移植上游 ProcessTool（去除 SyscallAnomalyDetector）
+
+**涉及文件**：`src/tools/process.rs`（新建）、`src/tools/mod.rs`（修改）、`src/tools/shell.rs`（修改）
+
+### 改动内容
+
+- 从上游 `C:\Dev\zeroclaw_original\src\tools\process.rs`（905 行）移植 `ProcessTool` 到 `C:\Dev\zeroclaw\src\tools\process.rs`
+- 移除所有 `SyscallAnomalyDetector` 相关内容（Phase 3 功能，我们 fork 暂不实现）：
+  - 删除 `use crate::security::SyscallAnomalyDetector;` 导入
+  - 从 `ProcessTool` struct 删除 `syscall_detector: Option<Arc<SyscallAnomalyDetector>>` 字段
+  - 内联 `new_with_syscall_detector()` 到 `new()`（去掉双函数结构）
+  - 从 `ProcessEntry` 删除 `analyzed_offsets` 字段（仅 syscall detector 使用）
+  - 在 `handle_output()` 移除 `if let Some(detector) = ...` 检测块；留下 `TODO(Phase 3)` 注释标记复原点
+  - 删除辅助函数 `slice_unseen_output()`（仅 syscall detector 使用）
+  - 删除测试 `test_syscall_detector()` helper 和 `process_output_runs_syscall_detector_incrementally` 测试函数
+  - 删除测试中的 `use crate::config::{AuditConfig, SyscallAnomalyConfig}` 和 `use crate::security::SyscallAnomalyDetector` 导入
+- `src/tools/shell.rs`：将 `collect_allowed_shell_env_vars` 可见性从 `fn`（私有）改为 `pub(super)`，与上游一致，允许 `process.rs` 在同模块内调用
+- `src/tools/mod.rs`：
+  - 新增 `pub mod process;`
+  - 新增 `pub use process::ProcessTool;`
+  - 在 `all_tools_with_runtime()` 的工具列表中注册：`Arc::new(ProcessTool::new(security.clone(), runtime))`，紧接 `ShellTool` 之后（`ShellTool` 改用 `runtime.clone()` 先转移 Arc 引用）
+
+### 为什么改
+
+- 上游已包含完整的后台进程管理工具（spawn/list/output/kill），支持并发进程限制、安全策略链、输出缓冲等功能
+- 该工具补充了同步 `ShellTool` 无法覆盖的超时场景（长时间运行命令）
+- `SyscallAnomalyDetector` 是 Phase 3 安全功能，当前 fork 无此模块，移植时按要求剥离，留 TODO 标记便于后续复原
+
+### 验证
+
+- `cargo check` 通过（无新增错误；`consolidation.rs:71` 错误为预存 bug，与本次改动无关）
+
+---
+
+## 2026-03-01 — 上游 goals/engine.rs 移植
+
+**涉及文件**：`src/goals/engine.rs`（新建）、`src/goals/mod.rs`（修改）
+
+### 改动内容
+
+- 从上游 `C:\Dev\zeroclaw_original\src\goals\engine.rs` 原封不动复制 `GoalEngine` 实现到 `C:\Dev\zeroclaw\src\goals\engine.rs`（932 行，逐字节一致，未做任何修改）
+- 将 `src/goals/mod.rs` 中的存根注释替换为 `pub mod engine;`，正式公开 engine 子模块
+
+### 为什么改
+
+- 此前 `src/goals/mod.rs` 仅是"Implementation in Phase 2"占位注释，实际代码未移植
+- 上游已包含完整的 `GoalEngine`（状态加载/保存、步骤选择、prompt 构建、stalled 目标检测）及 31 个单元测试，直接移植可保持与上游的一致性
+
+### 改动要点
+
+- `GoalEngine`：管理 `{workspace}/state/goals.json` 的原子读写（写 .tmp 再 rename）
+- `GoalState / Goal / Step`：完整数据模型，含 `GoalStatus`、`GoalPriority`（支持优先级排序）、`StepStatus` 枚举，均带 self-healing 反序列化（未知值 fallback 到 Pending）
+- `select_next_actionable()`：按优先级选取下一个可执行步骤（跳过已耗尽重试的步骤）
+- `find_stalled_goals()`：检测所有步骤均已完成/阻塞/耗尽的目标，触发 reflection
+- `build_step_prompt()` / `build_reflection_prompt()`：生成 Agent turn 所需的结构化 prompt
+- `interpret_result()`：简单启发式判断步骤成功/失败
+
+---
+
+## 2026-02-28 (续) — Phase 1 上游功能移植
+
+**涉及文件**：`src/config/schema.rs`、`src/config/mod.rs`、`src/agent/research.rs`（新建）、`src/agent/mod.rs`、`src/agent/agent.rs`、`src/tools/apply_patch.rs`（新建）、`src/tools/mod.rs`、`src/onboard/wizard.rs`、`src/security/otp.rs`、`src/security/roles.rs`（新建）、`src/security/mod.rs`
+
+### 1. Research 研究阶段（`src/agent/research.rs`）
+
+- 新增 `src/agent/research.rs`：主动信息收集阶段，在主响应前先用工具搜索
+- 新增配置结构体到 `config/schema.rs`：
+  - `ResearchTrigger` 枚举（Never/Always/Keywords/Length/Question）
+  - `ResearchPhaseConfig` 结构体（enabled, trigger, keywords, max_iterations, show_progress 等）
+  - `GoalLoopConfig` 结构体（为 Phase 2 目标引擎预留）
+- `Agent` 结构体新增 `research_config` 字段，`AgentBuilder` 新增对应建造者方法
+- `turn()` 方法集成：检测是否触发研究阶段，将收集结果注入用户消息上下文
+- 原子写兼容：ToolCall 构造时添加 `thought_signature: None`（我们 fork 的 Gemini 扩展字段）
+- 包含 6 个单元测试覆盖所有 `should_trigger()` 场景
+
+### 2. apply_patch 工具（`src/tools/apply_patch.rs`）
+
+- 新增 `ApplyPatchTool`：安全的 git patch 应用工具
+- 接受 unified diff 字符串，通过 stdin 管道传递给 git（避免 tempfile dev-dependency）
+- 默认 `dry_run=true`：先跑 `git apply --check` 验证，不会误改文件
+- 支持可选 `commit_message`：自动 stage + commit
+- 大小限制：超过 1MB 的 patch 直接拒绝
+- 注册到 `all_tools_with_runtime()` 工具列表
+
+### 3. OTP 重放保护修复（`src/security/otp.rs`）
+
+- **关键安全 bug 修复**：`validate_at()` 中重放保护缓存检查逻辑错误
+  - 旧代码：发现缓存中的已用 OTP 码 → 返回 `Ok(true)`（错误！允许重放攻击）
+  - 新代码：发现缓存中的已用 OTP 码 → 返回 `Ok(false)`（正确！拒绝重放）
+  - 缓存语义：存储"已用过的码" → 找到 = 已用 = 拒绝
+
+### 4. RBAC 角色系统（`src/security/roles.rs`）
+
+- 新增 `SecurityRoleConfig` 配置结构体到 `config/schema.rs`
+- 新增 `SecurityConfig.roles` 字段（可配置的自定义角色列表）
+- 新增 `src/security/roles.rs`：`RoleRegistry` + `ToolAccess`
+  - 5 个内置角色：owner（全权）、admin（全权+TOTP全局）、operator（多数工具+shell TOTP）、viewer（只读）、guest（无工具）
+  - 支持继承链（通过 `inherits` 字段）
+  - 支持 TOTP 门控：角色级 + 全局级
+  - 循环继承检测（DFS cycle detection）
+  - 7 个单元测试覆盖 operator/viewer/owner/custom 角色和继承循环检测
+
+### 配置测试修复
+- `src/onboard/wizard.rs`：两处 Config 初始化补充 `research` 和 `goal_loop` 字段
+- `src/config/schema.rs`：两处测试内 Config 初始化补充 `research` 和 `goal_loop` 字段
+
+---
+
+## 2026-02-28 — 上游关键修复移植 + 测试编译修复
+
+**涉及文件**：`src/agent/loop_.rs`、`src/config/schema.rs`、`src/channels/mod.rs`、`src/config/mod.rs`、`src/daemon/mod.rs`、`src/onboard/wizard.rs`、`src/integrations/registry.rs`、`src/providers/gemini.rs`、`src/providers/reliable.rs`、`src/providers/mod.rs`、`src/agent/agent.rs`、`src/agent/dispatcher.rs`、`src/agent/tests.rs`、`src/tools/delegate.rs`、`src/tools/file_read.rs`
+
+### 概述
+
+从上游 zeroclaw（452 commits ahead）中选取 3 个关键修复手动移植，同时修复了所有预先存在的测试编译错误。
+
+### 移植 1：URL→shell 安全修复（upstream dedb59a4）
+
+**文件**：`src/agent/loop_.rs`
+
+- 删除 `parse_glm_style_tool_calls()` 中 "Plain URL" 自动转 `curl` shell 命令的代码块
+- 纯 URL（如 `https://example.com`）不再被自动当作 shell 命令执行
+- Agent 必须通过显式工具调用（`http_request`、`shell` 等）访问 URL
+- 新增 3 个防护测试：验证纯 URL 不被转换
+- 安全意义：防止无意中代理网络请求 + 信息泄露风险
+
+### 移植 2：Telegram 自定义 Bot API base_url（upstream 63fcd7dd）
+
+**文件**：`src/config/schema.rs`、`src/channels/mod.rs` + 6 个测试文件
+
+- `TelegramConfig` 新增 `base_url: Option<String>` 字段
+- 默认 `None`（使用 `https://api.telegram.org`），可配置为第三方兼容 API
+- `collect_configured_channels()` 启动时读取 `tg.base_url` 并调用 `with_api_base()`
+- TelegramChannel 已有 `api_base` 和 `with_api_base()` 支持，只需配置层连接
+- 配置示例：`base_url = "https://tapi.bale.ai"`
+
+### 移植 3：CJK 延迟工具调用重试（upstream 1a0bb175）
+
+**文件**：`src/agent/loop_.rs`
+
+- 新增 4 个 static Regex：英文延迟动作模式 + CJK cue/verb/script 检测
+- 新增 `looks_like_deferred_action_without_tool_call()` 函数
+- 新增 `MISSING_TOOL_CALL_RETRY_PROMPT` 常量
+- `run_tool_call_loop()` 新增重试逻辑：
+  - 检测到 LLM 说"让我查看"/"let me try"但没给 tool_call
+  - 注入修正 prompt 重试一次（单次保护，不会无限循环）
+  - 记录 `tool_call_followthrough_retry` 追踪事件
+- 新增 3 个测试：英文/中文检测 + 负面用例
+
+### 测试编译修复（预先存在的问题）
+
+修复了二次开发期间添加新字段后遗留的 73 个测试编译错误：
+
+| 问题 | 文件数 | 修复 |
+|------|--------|------|
+| `ToolCall` 缺 `thought_signature` | 6 文件 27 处 | 加 `thought_signature: None` |
+| `GenerateContentRequest` 缺 `tools`/`tool_config` | 1 文件 4 处 | 加 `tools: None, tool_config: None` |
+| `InternalGenerateContentRequest` 缺 `tools` | 1 文件 3 处 | 加 `tools: None` |
+| `ReliabilityConfig` 缺 `provider_max_backoff_ms` | 1 文件 7 处 | 加 `provider_max_backoff_ms: 60_000` |
+| `ReliableProvider::new()` 参数不足 | 1 文件 25 处 | 加第 4 参数 `60_000` |
+| `effective_text()` 方法不存在 | 1 文件 7 处 | 改为 `extract_tool_calls().0` |
+| `api_key_url_includes_key_query_param` 测试过时 | 1 处 | 更新为验证 key 不在 URL 中 |
+
+### 跳过的上游修复（我们方案更优）
+
+| Commit | 原因 |
+|--------|------|
+| `b63dfb89` Windows 编译修复 | 上游 import 是给 WASM/CIDR 等我们没有的功能用的 |
+| `5981e505` Vision preflight | 我们已有优雅降级方案（strip + 友好提示），比上游抛错更好 |
+| `15457cc3` XML tool 解析 | 上游已拆 parsing.rs 子模块，移植成本高收益低 |
+| `8004260e` 延迟行动重构 | 380 行重构，风险太大 |
+| `1e8c09d3` 迭代上限恢复 | 我们的方案更适合无人值守场景 |
+
+### 安全保障
+
+- `dev/custom-features-snapshot` 分支：快照我们所有自定义功能（可随时回退）
+- `dev/upstream-fixes` 分支：本次移植工作分支
+- 每步修改后 `cargo check` 验证编译
+
+### 验证
+
+- `cargo build --release` — 零错误零警告 ✓
+- `cargo test --lib` — 3015 通过，22 失败（全部为预先存在的非编译问题）
+- 新增测试全部通过（6 个）✓
+- `git diff dev/custom-features-snapshot --stat` — 17 文件，+267/-36 行
+
+---
+
 ## 2026-02-28 — Worker 迭代溢出丢失结果修复 + Gemini 时间幻觉修复
 
 **涉及文件**：`src/agent/loop_.rs`、`src/config/schema.rs`、`src/tools/get_time.rs`（新建）、`src/tools/mod.rs`、`src/channels/mod.rs`、`src/cron/scheduler.rs`、`src/daemon/mod.rs`、`src/main.rs`

@@ -5,6 +5,7 @@ use parking_lot::Mutex;
 use ring::hmac;
 use std::collections::HashMap;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -76,7 +77,8 @@ impl OtpValidator {
                 .get(normalized)
                 .is_some_and(|expiry| *expiry >= now_secs)
             {
-                return Ok(true);
+                // Code already used within the replay-protection window.
+                return Ok(false);
             }
         }
 
@@ -132,18 +134,43 @@ fn write_secret_file(path: &Path, value: &str) -> Result<()> {
     }
 
     let temp_path = path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
-    fs::write(&temp_path, value).with_context(|| {
+    let mut temp_file = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temp_path)
+        .with_context(|| {
+            format!(
+                "Failed to create temporary OTP secret {}",
+                temp_path.display()
+            )
+        })?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        temp_file
+            .set_permissions(fs::Permissions::from_mode(0o600))
+            .with_context(|| {
+                format!(
+                    "Failed to set permissions on temporary OTP secret {}",
+                    temp_path.display()
+                )
+            })?;
+    }
+
+    temp_file.write_all(value.as_bytes()).with_context(|| {
         format!(
             "Failed to write temporary OTP secret {}",
             temp_path.display()
         )
     })?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&temp_path, fs::Permissions::from_mode(0o600));
-    }
+    temp_file.sync_all().with_context(|| {
+        format!(
+            "Failed to fsync temporary OTP secret {}",
+            temp_path.display()
+        )
+    })?;
+    drop(temp_file);
 
     fs::rename(&temp_path, path).with_context(|| {
         format!(
@@ -151,6 +178,17 @@ fn write_secret_file(path: &Path, value: &str) -> Result<()> {
             path.display()
         )
     })?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).with_context(|| {
+            format!(
+                "Failed to enforce permissions on OTP secret file {}",
+                path.display()
+            )
+        })?;
+    }
     Ok(())
 }
 
