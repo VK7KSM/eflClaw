@@ -2,6 +2,145 @@
 
 ---
 
+## 2026-03-01 — 移植上游 providers 模块改进（reliable + compatible + mod）
+
+**涉及文件**：
+- `src/providers/reliable.rs`（修改：添加 provider 级别 fallback 和 vision_override）
+- `src/providers/compatible.rs`（修改：添加 CompatibleApiMode、WebSocket 支持）
+- `src/providers/mod.rs`（修改：新常量、新别名、扩展 ProviderRuntimeOptions、扩展 secret scrubbing）
+- `src/agent/loop_.rs`（修改：ProviderRuntimeOptions 初始化添加 ..default()）
+
+### 改动内容
+
+#### `src/providers/reliable.rs`
+- 导入 `HashSet`（从 `HashMap` 改为 `{HashMap, HashSet}`）
+- `ReliableProvider` struct 新增两个字段：
+  - `provider_model_fallbacks: HashMap<String, Vec<String>>` — provider 级别的 model 映射
+  - `vision_override: Option<bool>` — vision 支持配置覆盖
+- `new()` 初始化新增两字段
+- `with_model_fallbacks()` 重写：根据 provider 名称将 fallback key 路由到对应 map（provider 级别 vs. model 级别）
+- 新增 `with_vision_override()` builder 方法
+- 新增 `provider_model_chain()` 私有方法：返回特定 provider 应尝试的 model 列表
+- `supports_vision()` 更新：使用 `vision_override` 覆盖逻辑
+- 更新所有 5 个 Provider trait 方法的循环（`chat_with_system`, `chat_with_history`, `chat_with_tools`, `chat`, `stream_chat_with_system`）使用 `enumerate()` 和 `provider_model_chain()`
+- 保留了我们原有的 `max_backoff_ms` 字段（上游移除但我们保留）
+
+#### `src/providers/compatible.rs`
+- 新增 WebSocket 导入：`SinkExt`, `tokio_tungstenite`, `connect_async`, `IntoClientRequest`, `HeaderName`, `AUTHORIZATION`, `WsHeaderValue`, `WsMessage`
+- 新增 `serde_json::Value` 导入
+- `OpenAiCompatibleProvider` struct 新增两个字段：
+  - `api_mode: CompatibleApiMode` — API 协议模式
+  - `max_tokens_override: Option<u32>` — 最大 token 覆盖
+- 新增 `CompatibleApiMode` enum（`OpenAiChatCompletions` | `OpenAiResponses`）
+- 所有构造函数更新为传递新参数（默认值：`OpenAiChatCompletions, None`）
+- 新增 `new_custom_with_mode()` 构造函数
+- `ResponsesRequest` 新增 `max_output_tokens`, `tools`, `tool_choice` 字段
+- `ResponsesResponse` 改为 `Clone`，新增 `id` 字段
+- `ResponsesOutput` 改为 `Clone`，新增 `kind`, `name`, `arguments`, `call_id` 字段
+- `ResponsesContent` 改为 `Clone`
+- 新增 `ResponsesWebSocketCreateEvent` struct
+- 新增 `ResponsesWebSocketAccumulator` struct（含 `apply_event()`, `fallback_response()`, `record_output_item()`, `final_text()`）
+- 新增 `extract_responses_stream_error_message()` 函数
+- 新增 `extract_responses_stream_text_event()` 函数
+- 新增 `extract_responses_tool_calls()` 函数
+- 新增 `parse_responses_chat_response()` 函数
+- `extract_responses_text()` 签名改为取引用 `&ResponsesResponse`（更新所有调用点含测试）
+- 新增 WebSocket 方法：`should_use_responses_mode()`, `effective_max_tokens()`, `should_try_responses_websocket()`, `responses_websocket_url()`, `apply_auth_header_ws()`, `send_responses_websocket_request()`, `send_responses_http_request()`, `send_responses_request()`
+- `chat_via_responses()` 重构为委托给 `send_responses_request()`
+
+#### `src/providers/mod.rs`
+- 新增常量 `QWEN_CODING_PLAN_BASE_URL = "https://coding.dashscope.aliyuncs.com/v1"`
+- 新增函数 `is_qwen_coding_plan_alias(name)` → `matches!(name, "qwen-coding-plan")`
+- `is_qwen_alias()` 更新：包含 `is_qwen_coding_plan_alias`
+- `qwen_base_url()` 更新：优先检查 `is_qwen_coding_plan_alias`
+- `list_providers()` 中 qwen 别名添加 `"qwen-coding-plan"`
+- 测试中别名列表添加 `"qwen-coding-plan"`
+- 新增 `pub use compatible::CompatibleApiMode;` re-export
+- `ProviderRuntimeOptions` 新增 4 个字段：`reasoning_level`, `custom_provider_api_mode`, `max_tokens_override`, `model_support_vision`
+- `Default` impl 初始化新字段为 `None`
+- `scrub_secret_patterns()` 扩展：从 7 个前缀扩展到 26 个 `(&str, usize)` 元组，新增 `AIza`, `AKIA`, JSON token 模式, `Bearer` 前缀
+
+#### `src/agent/loop_.rs`
+- 修复 2 处 `ProviderRuntimeOptions` 初始化（添加 `..providers::ProviderRuntimeOptions::default()`）
+
+### 验证结果
+- `cargo build --lib` 无错误（Finished in 0.84s）
+
+---
+
+
+
+**涉及文件**：
+- `src/skills/templates.rs`（新建，171 行，逐字节与上游一致）
+- `src/skills/audit.rs`（修改：同步上游差异）
+- `src/skills/mod.rs`（修改：添加 `mod templates;` 声明）
+- `templates/`（新建目录：从上游复制所有模板文件）
+
+### 改动内容
+
+#### `src/skills/templates.rs`（新建）
+- 从上游 `zeroclaw_original` 逐字复制
+- 定义 `TemplateFile`、`SkillTemplate` struct
+- 5 个内置模板：`weather_lookup`（Rust）、`calculator`（Rust）、`hello_world`（TypeScript）、`word_count`（Go）、`text_transform`（Python）
+- 使用 `include_str!` 宏引用 `templates/` 目录下的文件内容
+- 提供 `find(name)` 和 `apply(content, name, bin_name)` 公共函数
+
+#### `templates/`（新建）
+- 从上游复制 4 个语言的模板目录：`rust/`、`typescript/`、`go/`、`python/`
+- `templates.rs` 中的 `include_str!` 宏依赖这些文件
+
+#### `src/skills/audit.rs`（同步上游）
+- 新增 `use zip::ZipArchive;`（zip crate 已在 Cargo.toml 中）
+- 新增 `SkillAuditOptions { allow_scripts: bool }` struct（pub，Copy，Default）
+- `audit_skill_directory` 重构为包装器，逻辑移入 `audit_skill_directory_with_options`
+- 新增 `audit_skill_directory_with_options(skill_dir, options)` 公共函数
+- 内部 `audit_path` 增加 `options: SkillAuditOptions` 参数，`allow_scripts` 控制脚本文件检查
+- 新增 `audit_zip_bytes(bytes)` 函数：zip 存档安全审计
+- 新增辅助函数：`is_native_binary_zip_entry`、`is_text_zip_entry`
+- 新增 zip 安全审计常量
+- 新增测试：`audit_allows_shell_script_files_when_enabled` 以及 9 个 zip 审计测试
+
+#### `src/skills/mod.rs`（修改）
+- 第 10 行新增 `mod templates;` 声明
+
+**编译结果**：`cargo check --lib` 零错误，7 个 warnings（均为 unused imports，已有预存）
+
+---
+
+## 2026-03-01 — 移植上游 WebSocket gateway（ws.rs）
+
+**涉及文件**：
+- `src/gateway/ws.rs`（重写：167 行 → 547 行）
+- `src/channels/mod.rs`（修改：`sanitize_channel_response` 可见性 `fn` → `pub(crate)`）
+
+### 改动内容
+
+**上游 ws.rs（510 行）vs 我们（167 行）的差异**：
+- 上游有完整的 session history 管理、response sanitization、tool output fallback
+- 上游认证方式：`Authorization: Bearer <token>` 或 `Sec-WebSocket-Protocol: bearer.<token>` header
+- 上游使用 `run_tool_call_loop` 直接调用 agent loop（需要 `tools_registry_exec: Arc<Vec<Box<dyn Tool>>>`）
+- 上游有 `build_ws_system_prompt`、`sanitize_ws_response`、`finalize_ws_response` 等辅助函数
+
+**兼容性适配**：
+1. 上游依赖 `state.tools_registry_exec`（`Arc<Vec<Box<dyn Tool>>>`），我们的 `AppState` 只有 `tools_registry: Arc<Vec<ToolSpec>>`。解决方案：`build_ws_system_prompt` 接收 `&[ToolSpec]` 而非 `&[Box<dyn Tool>]`；`finalize_ws_response` 传入空 `&[]`（sanitization 仍可剥离裸 XML tool-call 块）
+2. 上游依赖 `build_tool_instructions_from_specs` 和 `build_shell_policy_instructions`（不存在于我们的代码库）。解决方案：内联工具协议 block，从 `ToolSpec` 直接构建
+3. 认证方式完全移植：从 `?token=<bearer>` query param 改为 header-based（`Authorization: Bearer` 或 `Sec-WebSocket-Protocol: bearer.<token>`）
+4. 保留了对 `super::run_gateway_chat_with_tools` 的调用（我们没有 `tools_registry_exec` 所以无法直接用 `run_tool_call_loop`）
+
+**新增内容**：
+- `sanitize_ws_response` / `normalize_prompt_tool_results` / `extract_latest_tool_output` / `finalize_ws_response`：response 后处理
+- `build_ws_system_prompt`：基于 `ToolSpec` 构建系统提示，包含工具协议说明
+- `extract_ws_bearer_token`：解析 header-based 认证
+- 对 `crate::security::detect_adversarial_suffix` 的 perplexity filter 检查
+- 完整 session history 维护（`Vec<ChatMessage>`）
+- 9 个单测（token 提取、response sanitization、prompt 构建、finalize fallback）
+
+**channels/mod.rs**：`sanitize_channel_response` 由 `fn`（私有）改为 `pub(crate)` 以供 ws.rs 调用。
+
+**编译结果**：`cargo build --lib` 零错误，7 个预存在警告（unused imports）
+
+---
+
 ## 2026-03-01 — Phase 3 编译修复与提交
 
 **涉及文件**：

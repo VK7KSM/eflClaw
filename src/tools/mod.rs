@@ -441,6 +441,7 @@ pub fn all_tools_with_runtime(
                     .map(std::path::PathBuf::from),
                 secrets_encrypt: root_config.secrets.encrypt,
                 reasoning_enabled: root_config.runtime.reasoning_enabled,
+                ..Default::default()
             },
             subagent_registry.clone(),
             subagent_parent_tools,
@@ -465,6 +466,7 @@ pub fn all_tools_with_runtime(
                     .map(std::path::PathBuf::from),
                 secrets_encrypt: root_config.secrets.encrypt,
                 reasoning_enabled: root_config.runtime.reasoning_enabled,
+                ..Default::default()
             },
         )
         .with_parent_tools(parent_tools)

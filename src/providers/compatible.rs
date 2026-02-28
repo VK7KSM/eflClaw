@@ -9,12 +9,22 @@ use crate::providers::traits::{
     ToolCall as ProviderToolCall,
 };
 use async_trait::async_trait;
-use futures_util::{stream, StreamExt};
+use futures_util::{stream, SinkExt, StreamExt};
 use reqwest::{
     header::{HeaderMap, HeaderValue, USER_AGENT},
     Client,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::{
+        client::IntoClientRequest,
+        http::header::{HeaderName, AUTHORIZATION},
+        http::HeaderValue as WsHeaderValue,
+        Message as WsMessage,
+    },
+};
 
 /// A provider that speaks the OpenAI-compatible chat completions API.
 /// Used by: Venice, Vercel AI Gateway, Cloudflare AI Gateway, Moonshot,
@@ -37,6 +47,10 @@ pub struct OpenAiCompatibleProvider {
     /// Whether this provider supports OpenAI-style native tool calling.
     /// When false, tools are injected into the system prompt as text.
     native_tool_calling: bool,
+    /// Selects the primary protocol for this compatible endpoint.
+    api_mode: CompatibleApiMode,
+    /// Optional max token cap propagated to outbound requests.
+    max_tokens_override: Option<u32>,
 }
 
 /// How the provider expects the API key to be sent.
@@ -50,6 +64,15 @@ pub enum AuthStyle {
     Custom(String),
 }
 
+/// API mode for OpenAI-compatible endpoints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompatibleApiMode {
+    /// Default mode: call chat-completions first and optionally fallback.
+    OpenAiChatCompletions,
+    /// Responses-first mode: call `/responses` directly.
+    OpenAiResponses,
+}
+
 impl OpenAiCompatibleProvider {
     pub fn new(
         name: &str,
@@ -58,7 +81,16 @@ impl OpenAiCompatibleProvider {
         auth_style: AuthStyle,
     ) -> Self {
         Self::new_with_options(
-            name, base_url, credential, auth_style, false, true, None, false,
+            name,
+            base_url,
+            credential,
+            auth_style,
+            false,
+            true,
+            None,
+            false,
+            CompatibleApiMode::OpenAiChatCompletions,
+            None,
         )
     }
 
@@ -78,6 +110,8 @@ impl OpenAiCompatibleProvider {
             true,
             None,
             false,
+            CompatibleApiMode::OpenAiChatCompletions,
+            None,
         )
     }
 
@@ -90,7 +124,16 @@ impl OpenAiCompatibleProvider {
         auth_style: AuthStyle,
     ) -> Self {
         Self::new_with_options(
-            name, base_url, credential, auth_style, false, false, None, false,
+            name,
+            base_url,
+            credential,
+            auth_style,
+            false,
+            false,
+            None,
+            false,
+            CompatibleApiMode::OpenAiChatCompletions,
+            None,
         )
     }
 
@@ -114,6 +157,8 @@ impl OpenAiCompatibleProvider {
             true,
             Some(user_agent),
             false,
+            CompatibleApiMode::OpenAiChatCompletions,
+            None,
         )
     }
 
@@ -134,6 +179,8 @@ impl OpenAiCompatibleProvider {
             true,
             Some(user_agent),
             false,
+            CompatibleApiMode::OpenAiChatCompletions,
+            None,
         )
     }
 
@@ -146,7 +193,40 @@ impl OpenAiCompatibleProvider {
         auth_style: AuthStyle,
     ) -> Self {
         Self::new_with_options(
-            name, base_url, credential, auth_style, false, false, None, true,
+            name,
+            base_url,
+            credential,
+            auth_style,
+            false,
+            false,
+            None,
+            true,
+            CompatibleApiMode::OpenAiChatCompletions,
+            None,
+        )
+    }
+
+    /// Constructor used by `custom:` providers to choose explicit protocol mode.
+    pub fn new_custom_with_mode(
+        name: &str,
+        base_url: &str,
+        credential: Option<&str>,
+        auth_style: AuthStyle,
+        supports_vision: bool,
+        api_mode: CompatibleApiMode,
+        max_tokens_override: Option<u32>,
+    ) -> Self {
+        Self::new_with_options(
+            name,
+            base_url,
+            credential,
+            auth_style,
+            supports_vision,
+            true,
+            None,
+            false,
+            api_mode,
+            max_tokens_override,
         )
     }
 
@@ -159,6 +239,8 @@ impl OpenAiCompatibleProvider {
         supports_responses_fallback: bool,
         user_agent: Option<&str>,
         merge_system_into_user: bool,
+        api_mode: CompatibleApiMode,
+        max_tokens_override: Option<u32>,
     ) -> Self {
         Self {
             name: name.to_string(),
@@ -170,6 +252,8 @@ impl OpenAiCompatibleProvider {
             user_agent: user_agent.map(ToString::to_string),
             merge_system_into_user,
             native_tool_calling: !merge_system_into_user,
+            api_mode,
+            max_tokens_override: max_tokens_override.filter(|value| *value > 0),
         }
     }
 
@@ -533,7 +617,13 @@ struct ResponsesRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     instructions: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    max_output_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -542,25 +632,56 @@ struct ResponsesInput {
     content: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct ResponsesResponse {
+    #[serde(default)]
+    id: Option<String>,
     #[serde(default)]
     output: Vec<ResponsesOutput>,
     #[serde(default)]
     output_text: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct ResponsesOutput {
+    #[serde(rename = "type")]
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
+    #[serde(default)]
+    call_id: Option<String>,
     #[serde(default)]
     content: Vec<ResponsesContent>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct ResponsesContent {
     #[serde(rename = "type")]
     kind: Option<String>,
     text: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ResponsesWebSocketCreateEvent {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    previous_response_id: Option<String>,
+    input: Vec<ResponsesInput>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    instructions: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    store: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_output_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<String>,
 }
 
 // ---------------------------------------------------------------
@@ -757,7 +878,7 @@ fn build_responses_prompt(messages: &[ChatMessage]) -> (Option<String>, Vec<Resp
     (instructions, input)
 }
 
-fn extract_responses_text(response: ResponsesResponse) -> Option<String> {
+fn extract_responses_text(response: &ResponsesResponse) -> Option<String> {
     if let Some(text) = first_nonempty(response.output_text.as_deref()) {
         return Some(text);
     }
@@ -781,6 +902,181 @@ fn extract_responses_text(response: ResponsesResponse) -> Option<String> {
     }
 
     None
+}
+
+fn extract_responses_tool_calls(response: &ResponsesResponse) -> Vec<ProviderToolCall> {
+    response
+        .output
+        .iter()
+        .filter(|item| item.kind.as_deref() == Some("function_call"))
+        .filter_map(|item| {
+            let name = item.name.clone()?;
+            let arguments = item.arguments.clone().unwrap_or_else(|| "{}".to_string());
+            Some(ProviderToolCall {
+                id: item
+                    .call_id
+                    .clone()
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                name,
+                arguments,
+                thought_signature: None,
+            })
+        })
+        .collect()
+}
+
+fn parse_responses_chat_response(response: ResponsesResponse) -> ProviderChatResponse {
+    let text = extract_responses_text(&response);
+    let tool_calls = extract_responses_tool_calls(&response);
+    ProviderChatResponse {
+        text,
+        tool_calls,
+        usage: None,
+        reasoning_content: None,
+    }
+}
+
+fn extract_responses_stream_error_message(event: &Value) -> Option<String> {
+    let event_type = event.get("type").and_then(Value::as_str);
+
+    if event_type == Some("error") {
+        return first_nonempty(
+            event
+                .get("message")
+                .and_then(Value::as_str)
+                .or_else(|| event.get("code").and_then(Value::as_str))
+                .or_else(|| {
+                    event
+                        .get("error")
+                        .and_then(|error| error.get("message"))
+                        .and_then(Value::as_str)
+                }),
+        );
+    }
+
+    if event_type == Some("response.failed") {
+        return first_nonempty(
+            event
+                .get("response")
+                .and_then(|response| response.get("error"))
+                .and_then(|error| error.get("message"))
+                .and_then(Value::as_str),
+        );
+    }
+
+    None
+}
+
+fn extract_responses_stream_text_event(event: &Value, saw_delta: bool) -> Option<String> {
+    let event_type = event.get("type").and_then(Value::as_str);
+    match event_type {
+        Some("response.output_text.delta") => {
+            first_nonempty(event.get("delta").and_then(Value::as_str))
+        }
+        Some("response.output_text.done") if !saw_delta => {
+            first_nonempty(event.get("text").and_then(Value::as_str))
+        }
+        Some("response.completed" | "response.done") => event
+            .get("response")
+            .and_then(|value| serde_json::from_value::<ResponsesResponse>(value.clone()).ok())
+            .and_then(|response| extract_responses_text(&response)),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Default)]
+struct ResponsesWebSocketAccumulator {
+    saw_delta: bool,
+    delta_accumulator: String,
+    fallback_text: Option<String>,
+    latest_response_id: Option<String>,
+    output_items: Vec<ResponsesOutput>,
+}
+
+impl ResponsesWebSocketAccumulator {
+    fn final_text(&self) -> Option<String> {
+        if self.saw_delta {
+            first_nonempty(Some(&self.delta_accumulator))
+        } else {
+            self.fallback_text.clone()
+        }
+    }
+
+    fn fallback_response(&self) -> Option<ResponsesResponse> {
+        let output_text = self.final_text();
+        if output_text.is_none() && self.output_items.is_empty() {
+            return None;
+        }
+
+        Some(ResponsesResponse {
+            id: self.latest_response_id.clone(),
+            output: self.output_items.clone(),
+            output_text,
+        })
+    }
+
+    fn record_output_item(&mut self, event: &Value) {
+        let Some(event_type) = event.get("type").and_then(Value::as_str) else {
+            return;
+        };
+
+        if event_type != "response.output_item.done" {
+            return;
+        }
+
+        let item = event
+            .get("item")
+            .or_else(|| event.get("output_item"))
+            .cloned();
+        if let Some(item) = item {
+            if let Ok(parsed) = serde_json::from_value::<ResponsesOutput>(item) {
+                self.output_items.push(parsed);
+            }
+        }
+    }
+
+    fn apply_event(&mut self, event: &Value) -> anyhow::Result<Option<ResponsesResponse>> {
+        if let Some(message) = extract_responses_stream_error_message(event) {
+            anyhow::bail!("{}", message.trim());
+        }
+
+        self.record_output_item(event);
+
+        let event_type = event.get("type").and_then(Value::as_str);
+        if let Some(id) = event
+            .get("response")
+            .and_then(|response| response.get("id"))
+            .and_then(Value::as_str)
+        {
+            self.latest_response_id = Some(id.to_string());
+        }
+
+        if let Some(text) = extract_responses_stream_text_event(event, self.saw_delta) {
+            if event_type == Some("response.output_text.delta") {
+                self.saw_delta = true;
+                self.delta_accumulator.push_str(&text);
+            } else if self.fallback_text.is_none() {
+                self.fallback_text = Some(text);
+            }
+        }
+
+        if event_type == Some("response.completed") || event_type == Some("response.done") {
+            if let Some(value) = event.get("response").cloned() {
+                if let Ok(mut parsed) = serde_json::from_value::<ResponsesResponse>(value) {
+                    if parsed.output_text.is_none() {
+                        parsed.output_text = self.final_text();
+                    }
+                    if parsed.output.is_empty() && !self.output_items.is_empty() {
+                        parsed.output = self.output_items.clone();
+                    }
+                    return Ok(Some(parsed));
+                }
+            }
+            return Ok(self.fallback_response());
+        }
+
+        Ok(None)
+    }
 }
 
 fn compact_sanitized_body_snippet(body: &str) -> String {
@@ -812,6 +1108,229 @@ fn parse_responses_response_body(
 }
 
 impl OpenAiCompatibleProvider {
+    fn should_use_responses_mode(&self) -> bool {
+        self.api_mode == CompatibleApiMode::OpenAiResponses
+    }
+
+    fn effective_max_tokens(&self) -> Option<u32> {
+        self.max_tokens_override.filter(|value| *value > 0)
+    }
+
+    fn should_try_responses_websocket(&self) -> bool {
+        if let Ok(raw) = std::env::var("ZEROCLAW_RESPONSES_WEBSOCKET") {
+            let normalized = raw.trim().to_ascii_lowercase();
+            if matches!(normalized.as_str(), "0" | "false" | "off" | "no") {
+                return false;
+            }
+            if matches!(normalized.as_str(), "1" | "true" | "on" | "yes") {
+                return true;
+            }
+        }
+
+        reqwest::Url::parse(&self.responses_url())
+            .ok()
+            .and_then(|url| {
+                url.host_str()
+                    .map(|host| host.eq_ignore_ascii_case("api.openai.com"))
+            })
+            .unwrap_or(false)
+    }
+
+    fn responses_websocket_url(&self, model: &str) -> anyhow::Result<String> {
+        let mut url = reqwest::Url::parse(&self.responses_url())?;
+        let next_scheme: &'static str = match url.scheme() {
+            "https" | "wss" => "wss",
+            "http" | "ws" => "ws",
+            other => {
+                anyhow::bail!(
+                    "{} Responses API websocket transport does not support URL scheme: {}",
+                    self.name,
+                    other
+                );
+            }
+        };
+
+        url.set_scheme(next_scheme)
+            .map_err(|()| anyhow::anyhow!("failed to set websocket URL scheme"))?;
+
+        if !url.query_pairs().any(|(k, _)| k == "model") {
+            url.query_pairs_mut().append_pair("model", model);
+        }
+
+        Ok(url.into())
+    }
+
+    fn apply_auth_header_ws(
+        &self,
+        request: &mut tokio_tungstenite::tungstenite::http::Request<()>,
+        credential: &str,
+    ) -> anyhow::Result<()> {
+        let headers = request.headers_mut();
+        match &self.auth_header {
+            AuthStyle::Bearer => {
+                let value = WsHeaderValue::from_str(&format!("Bearer {credential}"))?;
+                headers.insert(AUTHORIZATION, value);
+            }
+            AuthStyle::XApiKey => {
+                headers.insert("x-api-key", WsHeaderValue::from_str(credential)?);
+            }
+            AuthStyle::Custom(header) => {
+                let name = HeaderName::from_bytes(header.as_bytes())?;
+                headers.insert(name, WsHeaderValue::from_str(credential)?);
+            }
+        }
+
+        if let Some(ua) = self.user_agent.as_deref() {
+            headers.insert(USER_AGENT, WsHeaderValue::from_str(ua)?);
+        }
+
+        Ok(())
+    }
+
+    async fn send_responses_websocket_request(
+        &self,
+        credential: &str,
+        messages: &[ChatMessage],
+        model: &str,
+        tools: Option<Vec<Value>>,
+    ) -> anyhow::Result<ResponsesResponse> {
+        let (instructions, input) = build_responses_prompt(messages);
+        if input.is_empty() {
+            anyhow::bail!(
+                "{} Responses API websocket mode requires at least one non-system message",
+                self.name
+            );
+        }
+
+        let tools = tools.filter(|items| !items.is_empty());
+        let payload = ResponsesWebSocketCreateEvent {
+            kind: "response.create",
+            model: model.to_string(),
+            previous_response_id: None,
+            input,
+            instructions,
+            store: Some(false),
+            max_output_tokens: self.effective_max_tokens(),
+            tool_choice: tools.as_ref().map(|_| "auto".to_string()),
+            tools,
+        };
+
+        let ws_url = self.responses_websocket_url(model)?;
+        let mut request = ws_url
+            .into_client_request()
+            .map_err(|error| anyhow::anyhow!("invalid websocket request URL: {error}"))?;
+        self.apply_auth_header_ws(&mut request, credential)?;
+
+        let (mut ws_stream, _) = connect_async(request).await?;
+        ws_stream
+            .send(WsMessage::Text(serde_json::to_string(&payload)?.into()))
+            .await?;
+
+        let mut accumulator = ResponsesWebSocketAccumulator::default();
+        while let Some(frame) = ws_stream.next().await {
+            let frame = frame?;
+            match frame {
+                WsMessage::Text(text) => {
+                    let event: Value = serde_json::from_str(text.as_ref())?;
+                    if let Some(response) = accumulator.apply_event(&event)? {
+                        let _ = ws_stream.close(None).await;
+                        return Ok(response);
+                    }
+                }
+                WsMessage::Binary(binary) => {
+                    let text = String::from_utf8(binary.to_vec()).map_err(|error| {
+                        anyhow::anyhow!("invalid UTF-8 websocket frame from Responses API: {error}")
+                    })?;
+                    let event: Value = serde_json::from_str(&text)?;
+                    if let Some(response) = accumulator.apply_event(&event)? {
+                        let _ = ws_stream.close(None).await;
+                        return Ok(response);
+                    }
+                }
+                WsMessage::Ping(payload) => {
+                    ws_stream.send(WsMessage::Pong(payload)).await?;
+                }
+                WsMessage::Close(_) => break,
+                _ => {}
+            }
+        }
+
+        if let Some(response) = accumulator.fallback_response() {
+            return Ok(response);
+        }
+
+        anyhow::bail!("No response from {} Responses websocket stream", self.name)
+    }
+
+    async fn send_responses_http_request(
+        &self,
+        credential: &str,
+        messages: &[ChatMessage],
+        model: &str,
+        tools: Option<Vec<Value>>,
+    ) -> anyhow::Result<ResponsesResponse> {
+        let (instructions, input) = build_responses_prompt(messages);
+        if input.is_empty() {
+            anyhow::bail!(
+                "{} Responses API fallback requires at least one non-system message",
+                self.name
+            );
+        }
+
+        let tools = tools.filter(|items| !items.is_empty());
+        let request = ResponsesRequest {
+            model: model.to_string(),
+            input,
+            instructions,
+            max_output_tokens: self.effective_max_tokens(),
+            stream: Some(false),
+            tool_choice: tools.as_ref().map(|_| "auto".to_string()),
+            tools,
+        };
+
+        let url = self.responses_url();
+
+        let response = self
+            .apply_auth_header(self.http_client().post(&url).json(&request), credential)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let error = response.text().await?;
+            anyhow::bail!("{} Responses API error: {error}", self.name);
+        }
+
+        let body = response.text().await?;
+        parse_responses_response_body(&self.name, &body)
+    }
+
+    async fn send_responses_request(
+        &self,
+        credential: &str,
+        messages: &[ChatMessage],
+        model: &str,
+        tools: Option<Vec<Value>>,
+    ) -> anyhow::Result<ResponsesResponse> {
+        if self.should_try_responses_websocket() {
+            match self
+                .send_responses_websocket_request(credential, messages, model, tools.clone())
+                .await
+            {
+                Ok(response) => return Ok(response),
+                Err(error) => {
+                    tracing::warn!(
+                        provider = %self.name,
+                        error = %error,
+                        "Responses websocket request failed; falling back to HTTP"
+                    );
+                }
+            }
+        }
+
+        self.send_responses_http_request(credential, messages, model, tools)
+            .await
+    }
+
     fn apply_auth_header(
         &self,
         req: reqwest::RequestBuilder,
@@ -830,37 +1349,10 @@ impl OpenAiCompatibleProvider {
         messages: &[ChatMessage],
         model: &str,
     ) -> anyhow::Result<String> {
-        let (instructions, input) = build_responses_prompt(messages);
-        if input.is_empty() {
-            anyhow::bail!(
-                "{} Responses API fallback requires at least one non-system message",
-                self.name
-            );
-        }
-
-        let request = ResponsesRequest {
-            model: model.to_string(),
-            input,
-            instructions,
-            stream: Some(false),
-        };
-
-        let url = self.responses_url();
-
-        let response = self
-            .apply_auth_header(self.http_client().post(&url).json(&request), credential)
-            .send()
+        let responses = self
+            .send_responses_request(credential, messages, model, None)
             .await?;
-
-        if !response.status().is_success() {
-            let error = response.text().await?;
-            anyhow::bail!("{} Responses API error: {error}", self.name);
-        }
-
-        let body = response.text().await?;
-        let responses = parse_responses_response_body(&self.name, &body)?;
-
-        extract_responses_text(responses)
+        extract_responses_text(&responses)
             .ok_or_else(|| anyhow::anyhow!("No response from {} Responses API", self.name))
     }
 
@@ -1868,7 +2360,7 @@ mod tests {
         let json = r#"{"output_text":"Hello from top-level","output":[]}"#;
         let response: ResponsesResponse = serde_json::from_str(json).unwrap();
         assert_eq!(
-            extract_responses_text(response).as_deref(),
+            extract_responses_text(&response).as_deref(),
             Some("Hello from top-level")
         );
     }
@@ -1879,7 +2371,7 @@ mod tests {
             r#"{"output":[{"content":[{"type":"output_text","text":"Hello from nested"}]}]}"#;
         let response: ResponsesResponse = serde_json::from_str(json).unwrap();
         assert_eq!(
-            extract_responses_text(response).as_deref(),
+            extract_responses_text(&response).as_deref(),
             Some("Hello from nested")
         );
     }
@@ -1889,7 +2381,7 @@ mod tests {
         let json = r#"{"output":[{"content":[{"type":"message","text":"Fallback text"}]}]}"#;
         let response: ResponsesResponse = serde_json::from_str(json).unwrap();
         assert_eq!(
-            extract_responses_text(response).as_deref(),
+            extract_responses_text(&response).as_deref(),
             Some("Fallback text")
         );
     }
