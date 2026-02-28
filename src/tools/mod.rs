@@ -30,6 +30,7 @@ pub mod delegate;
 pub mod file_edit;
 pub mod file_read;
 pub mod file_write;
+pub mod get_time;
 pub mod git_operations;
 pub mod glob_search;
 #[cfg(feature = "hardware")]
@@ -50,6 +51,10 @@ pub mod pushover;
 pub mod schedule;
 pub mod schema;
 pub mod screenshot;
+pub mod search_chat_log;
+pub mod send_email;
+pub mod send_telegram;
+pub mod send_voice;
 pub mod shell;
 pub mod traits;
 pub mod web_fetch;
@@ -69,6 +74,7 @@ pub use delegate::DelegateTool;
 pub use file_edit::FileEditTool;
 pub use file_read::FileReadTool;
 pub use file_write::FileWriteTool;
+pub use get_time::GetCurrentTimeTool;
 pub use git_operations::GitOperationsTool;
 pub use glob_search::GlobSearchTool;
 #[cfg(feature = "hardware")]
@@ -90,6 +96,10 @@ pub use schedule::ScheduleTool;
 #[allow(unused_imports)]
 pub use schema::{CleaningStrategy, SchemaCleanr};
 pub use screenshot::ScreenshotTool;
+pub use search_chat_log::SearchChatLogTool;
+pub use send_email::SendEmailTool;
+pub use send_telegram::SendTelegramTool;
+pub use send_voice::SendVoiceTool;
 pub use shell::ShellTool;
 pub use traits::Tool;
 #[allow(unused_imports)]
@@ -226,6 +236,7 @@ pub fn all_tools_with_runtime(
         Arc::new(MemoryRecallTool::new(memory.clone())),
         Arc::new(MemoryForgetTool::new(memory, security.clone())),
         Arc::new(ScheduleTool::new(security.clone(), root_config.clone())),
+        Arc::new(GetCurrentTimeTool),
         Arc::new(ModelRoutingConfigTool::new(
             config.clone(),
             security.clone(),
@@ -240,6 +251,31 @@ pub fn all_tools_with_runtime(
             workspace_dir.to_path_buf(),
         )),
     ];
+
+    // Add send_email tool when email channel is configured
+    if let Some(ref email_cfg) = root_config.channels_config.email {
+        tool_arcs.push(Arc::new(SendEmailTool::new(
+            security.clone(),
+            email_cfg.clone(),
+        )));
+    }
+
+    // Add send_telegram tool when telegram channel is configured
+    if let Some(ref tg_cfg) = root_config.channels_config.telegram {
+        tool_arcs.push(Arc::new(SendTelegramTool::new(
+            security.clone(),
+            tg_cfg.bot_token.clone(),
+        )));
+
+        // Add send_voice tool when TTS is enabled
+        if root_config.tts.enabled {
+            tool_arcs.push(Arc::new(SendVoiceTool::new(
+                security.clone(),
+                root_config.tts.clone(),
+                tg_cfg.bot_token.clone(),
+            )));
+        }
+    }
 
     if browser_config.enabled {
         // Add legacy browser_open tool for simple URL opening
@@ -304,6 +340,14 @@ pub fn all_tools_with_runtime(
     tool_arcs.push(Arc::new(ScreenshotTool::new(security.clone())));
     tool_arcs.push(Arc::new(ImageInfoTool::new(security.clone())));
 
+    // Chat log search tool (owner-gated)
+    if root_config.chat_log.enabled {
+        tool_arcs.push(Arc::new(SearchChatLogTool::new(
+            workspace_dir.to_path_buf(),
+            root_config.chat_log.owner.clone(),
+        )));
+    }
+
     if let Some(key) = composio_key {
         if !key.is_empty() {
             tool_arcs.push(Arc::new(ComposioTool::new(
@@ -341,7 +385,8 @@ pub fn all_tools_with_runtime(
             },
         )
         .with_parent_tools(parent_tools)
-        .with_multimodal_config(root_config.multimodal.clone());
+        .with_multimodal_config(root_config.multimodal.clone())
+        .with_workspace_dir(std::path::PathBuf::from(&root_config.workspace_dir));
         tool_arcs.push(Arc::new(delegate_tool));
     }
 
@@ -572,6 +617,7 @@ mod tests {
                 provider: "ollama".to_string(),
                 model: "llama3".to_string(),
                 system_prompt: None,
+                system_prompt_file: None,
                 api_key: None,
                 temperature: None,
                 max_depth: 3,

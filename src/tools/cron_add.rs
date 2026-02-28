@@ -86,6 +86,10 @@ impl Tool for CronAddTool {
                     }
                 },
                 "delete_after_run": { "type": "boolean" },
+                "delegate_to": {
+                    "type": ["string", "null"],
+                    "description": "Name of a configured sub-agent (from [agents.*]) to delegate this job to. When set, the job's prompt is automatically routed to that agent via the delegate tool instead of being executed by the main agent."
+                },
                 "approved": {
                     "type": "boolean",
                     "description": "Set true to explicitly approve medium/high-risk shell commands in supervised mode",
@@ -235,6 +239,11 @@ impl Tool for CronAddTool {
                     return Ok(blocked);
                 }
 
+                let delegate_to = args
+                    .get("delegate_to")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned);
+
                 cron::add_agent_job(
                     &self.config,
                     name,
@@ -244,6 +253,7 @@ impl Tool for CronAddTool {
                     model,
                     delivery,
                     delete_after_run,
+                    delegate_to,
                 )
             }
         };

@@ -134,6 +134,7 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         api_url: provider_api_url,
         default_provider: Some(provider),
         default_model: Some(model),
+        summary_model: None,
         model_providers: std::collections::HashMap::new(),
         default_temperature: 0.7,
         observability: ObservabilityConfig::default(),
@@ -169,6 +170,8 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         hardware: hardware_config,
         query_classification: crate::config::QueryClassificationConfig::default(),
         transcription: crate::config::TranscriptionConfig::default(),
+        tts: crate::config::TtsConfig::default(),
+        chat_log: crate::config::ChatLogConfig::default(),
     };
 
     println!(
@@ -485,6 +488,7 @@ async fn run_quick_setup_with_home(
         api_url: None,
         default_provider: Some(provider_name.clone()),
         default_model: Some(model.clone()),
+        summary_model: None,
         model_providers: std::collections::HashMap::new(),
         default_temperature: 0.7,
         observability: ObservabilityConfig::default(),
@@ -520,6 +524,8 @@ async fn run_quick_setup_with_home(
         hardware: crate::config::HardwareConfig::default(),
         query_classification: crate::config::QueryClassificationConfig::default(),
         transcription: crate::config::TranscriptionConfig::default(),
+        tts: crate::config::TtsConfig::default(),
+        chat_log: crate::config::ChatLogConfig::default(),
     };
 
     config.save().await?;

@@ -162,7 +162,16 @@ async fn run_agent_job(
     }
     let name = job.name.clone().unwrap_or_else(|| "cron-job".to_string());
     let prompt = job.prompt.clone().unwrap_or_default();
-    let prefixed_prompt = format!("[cron:{} {name}] {prompt}", job.id);
+    let prefixed_prompt = if let Some(ref agent_name) = job.delegate_to {
+        // Escape inner prompt for safe embedding in the instruction string
+        let escaped = prompt.replace('\\', "\\\\").replace('"', "\\\"");
+        format!(
+            "[cron:{} {name}] Use the delegate tool now: delegate(agent=\"{agent_name}\", prompt=\"{escaped}\")",
+            job.id
+        )
+    } else {
+        format!("[cron:{} {name}] {prompt}", job.id)
+    };
     let model_override = job.model.clone();
 
     let run_result = match job.session_target {
@@ -175,6 +184,7 @@ async fn run_agent_job(
                 config.default_temperature,
                 vec![],
                 false,
+                Some(config.scheduler.max_tool_iterations),
             )
             .await
         }
@@ -496,6 +506,7 @@ mod tests {
             job_type: JobType::Shell,
             session_target: SessionTarget::Isolated,
             model: None,
+            delegate_to: None,
             enabled: true,
             delivery: DeliveryConfig::default(),
             delete_after_run: false,
@@ -820,6 +831,7 @@ mod tests {
             None,
             None,
             true,
+            None,
         )
         .unwrap();
         let started = Utc::now();
@@ -845,6 +857,7 @@ mod tests {
             None,
             None,
             true,
+            None,
         )
         .unwrap();
         let started = Utc::now();
@@ -911,6 +924,7 @@ mod tests {
                 best_effort: false,
             }),
             false,
+            None,
         )
         .unwrap();
         let started = Utc::now();
@@ -949,6 +963,7 @@ mod tests {
                 best_effort: true,
             }),
             false,
+            None,
         )
         .unwrap();
         let started = Utc::now();
@@ -980,6 +995,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         )
         .unwrap();
         assert!(!job.delete_after_run);

@@ -264,6 +264,7 @@ impl ModelRoutingConfigTool {
                     "provider": agent.provider,
                     "model": agent.model,
                     "system_prompt": agent.system_prompt,
+                    "system_prompt_file": agent.system_prompt_file,
                     "api_key_configured": agent
                         .api_key
                         .as_ref()
@@ -610,6 +611,7 @@ impl ModelRoutingConfigTool {
         let model = Self::parse_non_empty_string(args, "model")?;
 
         let system_prompt_update = Self::parse_optional_string_update(args, "system_prompt")?;
+        let system_prompt_file_update = Self::parse_optional_string_update(args, "system_prompt_file")?;
         let api_key_update = Self::parse_optional_string_update(args, "api_key")?;
         let temperature_update = Self::parse_optional_f64_update(args, "temperature")?;
         let max_depth_update = Self::parse_optional_u32_update(args, "max_depth")?;
@@ -632,6 +634,7 @@ impl ModelRoutingConfigTool {
                 provider: provider.clone(),
                 model: model.clone(),
                 system_prompt: None,
+                system_prompt_file: None,
                 api_key: None,
                 temperature: None,
                 max_depth: DEFAULT_AGENT_MAX_DEPTH,
@@ -646,6 +649,12 @@ impl ModelRoutingConfigTool {
         match system_prompt_update {
             MaybeSet::Set(value) => next_agent.system_prompt = Some(value),
             MaybeSet::Null => next_agent.system_prompt = None,
+            MaybeSet::Unset => {}
+        }
+
+        match system_prompt_file_update {
+            MaybeSet::Set(value) => next_agent.system_prompt_file = Some(value),
+            MaybeSet::Null => next_agent.system_prompt_file = None,
             MaybeSet::Unset => {}
         }
 
@@ -825,7 +834,11 @@ impl Tool for ModelRoutingConfigTool {
                 },
                 "system_prompt": {
                     "type": ["string", "null"],
-                    "description": "Optional system prompt override for delegate agent"
+                    "description": "Optional inline system prompt override for delegate agent"
+                },
+                "system_prompt_file": {
+                    "type": ["string", "null"],
+                    "description": "Optional path to system prompt file (relative to workspace dir, takes precedence over system_prompt)"
                 },
                 "max_depth": {
                     "type": ["integer", "null"],
