@@ -242,6 +242,14 @@ pub struct Config {
     /// Plugin system configuration (`[plugins]`). Enable/disable third-party plugins.
     #[serde(default)]
     pub plugins: PluginsConfig,
+
+    /// MCP (Model Context Protocol) client configuration (`[mcp]`).
+    #[serde(default)]
+    pub mcp: McpConfig,
+
+    /// Inter-process agent communication configuration (`[agents_ipc]`).
+    #[serde(default)]
+    pub agents_ipc: AgentsIpcConfig,
 }
 
 /// Named provider profile definition compatible with Codex app-server style config.
@@ -644,6 +652,90 @@ impl Default for PluginEntryConfig {
         Self {
             enabled: None,
             config: serde_json::Value::Object(serde_json::Map::new()),
+        }
+    }
+}
+
+/// MCP transport type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum McpTransport {
+    /// Spawn a local process and communicate over stdin/stdout.
+    #[default]
+    Stdio,
+    /// Connect via HTTP POST.
+    Http,
+    /// Connect via HTTP + Server-Sent Events.
+    Sse,
+}
+
+/// Configuration for a single external MCP server.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct McpServerConfig {
+    /// Display name used as a tool prefix (`<server>__<tool>`).
+    pub name: String,
+    /// Transport type (default: stdio).
+    #[serde(default)]
+    pub transport: McpTransport,
+    /// URL for HTTP/SSE transports.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Executable to spawn for stdio transport.
+    #[serde(default)]
+    pub command: String,
+    /// Command arguments for stdio transport.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Optional environment variables for stdio transport.
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    /// Optional HTTP headers for HTTP/SSE transports.
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+    /// Optional per-call timeout in seconds.
+    #[serde(default)]
+    pub tool_timeout_secs: Option<u64>,
+}
+
+/// External MCP client configuration (`[mcp]` section).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct McpConfig {
+    /// Enable MCP tool loading.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Configured MCP servers.
+    #[serde(default, alias = "mcpServers")]
+    pub servers: Vec<McpServerConfig>,
+}
+
+fn default_agents_ipc_db_path() -> String {
+    "~/.zeroclaw/agents.db".into()
+}
+
+fn default_agents_ipc_staleness_secs() -> u64 {
+    300
+}
+
+/// Inter-process agent communication configuration (`[agents_ipc]` section).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AgentsIpcConfig {
+    /// Enable inter-process agent communication tools.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Path to shared SQLite database (all agents on this host share one file).
+    #[serde(default = "default_agents_ipc_db_path")]
+    pub db_path: String,
+    /// Agents not seen within this window are considered offline (seconds).
+    #[serde(default = "default_agents_ipc_staleness_secs")]
+    pub staleness_secs: u64,
+}
+
+impl Default for AgentsIpcConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            db_path: default_agents_ipc_db_path(),
+            staleness_secs: default_agents_ipc_staleness_secs(),
         }
     }
 }
@@ -3601,6 +3693,116 @@ impl ChannelConfig for FeishuConfig {
 
 // ── Security Config ─────────────────────────────────────────────────
 
+/// Adversarial suffix (perplexity-based) filter configuration (`[security.perplexity_filter]`).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct PerplexityFilterConfig {
+    /// Enable probabilistic adversarial suffix filtering before provider calls.
+    #[serde(default)]
+    pub enable_perplexity_filter: bool,
+    /// Character-class bigram perplexity threshold for anomaly blocking.
+    #[serde(default = "default_perplexity_threshold")]
+    pub perplexity_threshold: f64,
+    /// Number of trailing characters sampled for suffix anomaly scoring.
+    #[serde(default = "default_perplexity_suffix_window_chars")]
+    pub suffix_window_chars: usize,
+    /// Minimum input length before running the perplexity filter.
+    #[serde(default = "default_perplexity_min_prompt_chars")]
+    pub min_prompt_chars: usize,
+    /// Minimum punctuation ratio in the sampled suffix required to block.
+    #[serde(default = "default_perplexity_symbol_ratio_threshold")]
+    pub symbol_ratio_threshold: f64,
+}
+
+fn default_perplexity_threshold() -> f64 { 18.0 }
+fn default_perplexity_suffix_window_chars() -> usize { 64 }
+fn default_perplexity_min_prompt_chars() -> usize { 32 }
+fn default_perplexity_symbol_ratio_threshold() -> f64 { 0.20 }
+
+impl Default for PerplexityFilterConfig {
+    fn default() -> Self {
+        Self {
+            enable_perplexity_filter: false,
+            perplexity_threshold: default_perplexity_threshold(),
+            suffix_window_chars: default_perplexity_suffix_window_chars(),
+            min_prompt_chars: default_perplexity_min_prompt_chars(),
+            symbol_ratio_threshold: default_perplexity_symbol_ratio_threshold(),
+        }
+    }
+}
+
+/// Syscall anomaly detection configuration (`[security.syscall_anomaly]`).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SyscallAnomalyConfig {
+    /// Enable syscall anomaly detection.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Treat denied syscall lines as anomalies even when syscall is in baseline.
+    #[serde(default)]
+    pub strict_mode: bool,
+    /// Emit anomaly alerts when a syscall appears outside the expected baseline.
+    #[serde(default = "default_true")]
+    pub alert_on_unknown_syscall: bool,
+    /// Allowed denied-syscall events per rolling minute before triggering an alert.
+    #[serde(default = "default_syscall_max_denied")]
+    pub max_denied_events_per_minute: u32,
+    /// Allowed total syscall telemetry events per rolling minute before triggering an alert.
+    #[serde(default = "default_syscall_max_total")]
+    pub max_total_events_per_minute: u32,
+    /// Maximum anomaly alerts emitted per rolling minute (global guardrail).
+    #[serde(default = "default_syscall_max_alerts")]
+    pub max_alerts_per_minute: u32,
+    /// Cooldown between identical anomaly alerts (seconds).
+    #[serde(default = "default_syscall_cooldown_secs")]
+    pub alert_cooldown_secs: u64,
+    /// Path to syscall anomaly log file (relative to ~/.zeroclaw unless absolute).
+    #[serde(default = "default_syscall_log_path")]
+    pub log_path: String,
+    /// Expected syscall baseline.
+    #[serde(default = "default_syscall_baseline")]
+    pub baseline_syscalls: Vec<String>,
+}
+
+fn default_syscall_max_denied() -> u32 { 5 }
+fn default_syscall_max_total() -> u32 { 120 }
+fn default_syscall_max_alerts() -> u32 { 30 }
+fn default_syscall_cooldown_secs() -> u64 { 20 }
+fn default_syscall_log_path() -> String { "syscall-anomalies.log".to_string() }
+fn default_syscall_baseline() -> Vec<String> {
+    ["read","write","open","openat","close","stat","fstat","newfstatat","lseek",
+     "mmap","mprotect","munmap","brk","rt_sigaction","rt_sigprocmask","ioctl",
+     "fcntl","access","pipe2","dup","dup2","dup3","epoll_create1","epoll_ctl",
+     "epoll_wait","poll","ppoll","select","futex","clock_gettime","nanosleep",
+     "exit_group","socket","connect","sendto","recvfrom","sendmsg","recvmsg",
+     "bind","getsockname","getpeername","setsockopt","getsockopt","listen",
+     "accept","accept4","clone","fork","execve","wait4","waitid","getpid",
+     "getppid","getuid","geteuid","getgid","getegid","getcwd","chdir",
+     "mkdir","mkdirat","unlink","unlinkat","rename","renameat","renameat2",
+     "readlink","readlinkat","lstat","getdents","getdents64","pread64",
+     "pwrite64","fallocate","ftruncate","truncate","fsync","fdatasync",
+     "sendfile","splice","copy_file_range","inotify_init1","inotify_add_watch",
+     "inotify_rm_watch","timerfd_create","timerfd_settime","timerfd_gettime",
+     "eventfd","eventfd2","memfd_create","mlock","munlock","set_robust_list",
+     "get_robust_list","prctl","seccomp","arch_prctl","set_tid_address",
+     "rseq","getrandom","sched_getaffinity","sched_setaffinity","sched_yield",
+     "getrlimit","setrlimit","prlimit64","uname","kill","tgkill","tkill",
+    ].iter().map(|s| s.to_string()).collect()
+}
+
+impl Default for SyscallAnomalyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            strict_mode: false,
+            alert_on_unknown_syscall: true,
+            max_denied_events_per_minute: default_syscall_max_denied(),
+            max_total_events_per_minute: default_syscall_max_total(),
+            max_alerts_per_minute: default_syscall_max_alerts(),
+            alert_cooldown_secs: default_syscall_cooldown_secs(),
+            log_path: default_syscall_log_path(),
+            baseline_syscalls: default_syscall_baseline(),
+        }
+    }
+}
 /// URL access control configuration (private IP blocking, CIDR/domain allowlists).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct UrlAccessConfig {
@@ -3659,6 +3861,14 @@ pub struct SecurityConfig {
     /// RBAC role definitions (extends built-in roles: owner/admin/operator/viewer/guest).
     #[serde(default)]
     pub roles: Vec<SecurityRoleConfig>,
+
+    /// Syscall anomaly detection configuration.
+    #[serde(default)]
+    pub syscall_anomaly: SyscallAnomalyConfig,
+
+    /// Adversarial suffix (perplexity-based) filter configuration.
+    #[serde(default)]
+    pub perplexity_filter: PerplexityFilterConfig,
 }
 
 /// Role-based access control definition for a named security role.
@@ -4069,6 +4279,8 @@ impl Default for Config {
             tts: TtsConfig::default(),
             chat_log: ChatLogConfig::default(),
             plugins: PluginsConfig::default(),
+            mcp: McpConfig::default(),
+            agents_ipc: AgentsIpcConfig::default(),
         }
     }
 }
@@ -5609,6 +5821,8 @@ default_temperature = 0.7
             research: ResearchPhaseConfig::default(),
             goal_loop: GoalLoopConfig::default(),
             plugins: PluginsConfig::default(),
+            mcp: McpConfig::default(),
+            agents_ipc: AgentsIpcConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -5797,6 +6011,8 @@ tool_dispatcher = "xml"
             research: ResearchPhaseConfig::default(),
             goal_loop: GoalLoopConfig::default(),
             plugins: PluginsConfig::default(),
+            mcp: McpConfig::default(),
+            agents_ipc: AgentsIpcConfig::default(),
         };
 
         config.save().await.unwrap();

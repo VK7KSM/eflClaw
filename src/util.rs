@@ -43,6 +43,21 @@ pub fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
     }
 }
 
+/// Find the largest byte index ≤ `max_bytes` that is a valid UTF-8 character boundary.
+///
+/// Returns 0 if `max_bytes` is 0 or if the string is empty.
+/// Returns `s.len()` if `max_bytes >= s.len()`.
+pub fn floor_utf8_char_boundary(s: &str, max_bytes: usize) -> usize {
+    if max_bytes >= s.len() {
+        return s.len();
+    }
+    let mut idx = max_bytes;
+    while idx > 0 && !s.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
+}
+
 /// Utility enum for handling optional values.
 pub enum MaybeSet<T> {
     Set(T),

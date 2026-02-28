@@ -8,6 +8,8 @@
 //! - Header sanitization (handled by axum/hyper)
 
 pub mod api;
+pub(crate) mod openclaw_compat;
+pub(crate) mod openai_compat;
 pub mod sse;
 pub mod static_files;
 pub mod ws;
@@ -591,6 +593,9 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         println!("  POST /nextcloud-talk — Nextcloud Talk bot webhook");
     }
     println!("  GET  /api/*     — REST API (bearer token required)");
+    println!("  POST /api/chat  — {{\"message\": \"...\", \"context\": [...]}} (tools-enabled, OpenClaw compat)");
+    println!("  POST /v1/chat/completions — OpenAI-compatible (full agent loop)");
+    println!("  GET  /v1/models — list available models");
     println!("  GET  /ws/chat   — WebSocket agent chat");
     println!("  GET  /health    — health check");
     println!("  GET  /metrics   — Prometheus metrics");
@@ -652,6 +657,23 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/config", put(api::handle_api_config_put))
         .layer(RequestBodyLimitLayer::new(1_048_576));
 
+    // The OpenAI-compatible endpoints use a larger body limit (512KB) because
+    // chat histories can be much bigger than the default 64KB webhook limit.
+    // They get their own nested router with a separate body limit layer.
+    //
+    // NOTE: The /v1/chat/completions handler routes through the full agent loop
+    // (run_gateway_chat_with_tools) via openclaw_compat, giving OpenClaw callers
+    // tools + memory support. The original simple-chat handler is preserved in
+    // openai_compat.rs for reference.
+    let openai_compat_routes = Router::new()
+        .route(
+            "/v1/chat/completions",
+            post(openclaw_compat::handle_v1_chat_completions_with_tools),
+        )
+        .layer(RequestBodyLimitLayer::new(
+            openai_compat::CHAT_COMPLETIONS_MAX_BODY_SIZE,
+        ));
+
     // Build router with middleware
     let app = Router::new()
         // ── Existing routes ──
@@ -665,6 +687,11 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/wati", get(handle_wati_verify))
         .route("/wati", post(handle_wati_webhook))
         .route("/nextcloud-talk", post(handle_nextcloud_talk_webhook))
+        // ── OpenClaw migration: tools-enabled chat endpoint ──
+        .route("/api/chat", post(openclaw_compat::handle_api_chat))
+        // ── OpenAI-compatible endpoints ──
+        .route("/v1/models", get(openai_compat::handle_v1_models))
+        .merge(openai_compat_routes)
         // ── Web Dashboard API routes ──
         .route("/api/status", get(api::handle_api_status))
         .route("/api/config", get(api::handle_api_config_get))

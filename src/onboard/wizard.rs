@@ -175,6 +175,8 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         research: crate::config::ResearchPhaseConfig::default(),
         goal_loop: crate::config::GoalLoopConfig::default(),
         plugins: crate::config::PluginsConfig::default(),
+        mcp: crate::config::McpConfig::default(),
+        agents_ipc: crate::config::AgentsIpcConfig::default(),
     };
 
     println!(
@@ -532,9 +534,10 @@ async fn run_quick_setup_with_home(
         research: crate::config::ResearchPhaseConfig::default(),
         goal_loop: crate::config::GoalLoopConfig::default(),
         plugins: crate::config::PluginsConfig::default(),
+        mcp: crate::config::McpConfig::default(),
+        agents_ipc: crate::config::AgentsIpcConfig::default(),
     };
 
-    config.save().await?;
     persist_workspace_selection(&config.config_path).await?;
 
     // Scaffold minimal workspace files

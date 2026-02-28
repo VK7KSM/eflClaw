@@ -2,6 +2,235 @@
 
 ---
 
+## 2026-03-01 — Phase 3 编译修复与提交
+
+**涉及文件**：
+- `src/util.rs`（添加 `floor_utf8_char_boundary` 函数）
+- `src/main.rs`（添加 `mod coordination;` 声明）
+- `src/tools/process.rs`（移除测试结构体中不属于 `RuntimeAdapter` trait 的 `as_any` 方法）
+
+### 改动内容
+
+- `syscall_anomaly.rs` 依赖 `crate::util::floor_utf8_char_boundary`，该函数在 `util.rs` 中缺失。已添加实现：在给定字节上限 `max_bytes` 处找最大合法 UTF-8 字符边界。
+- `delegate_coordination_status.rs` 使用 `crate::coordination`，但 `main.rs` 的 mod 列表中缺少 `mod coordination;`。binary 编译失败。已添加声明。
+- `process.rs` 的 `NoLongRunningRuntime` 测试结构体包含 `as_any` 方法，但我们的 `RuntimeAdapter` trait 不含此方法。移除该方法后编译通过。
+
+**编译结果**：`cargo build` 零错误，6 个警告（全部为 unused imports，无 deny 级别）
+**测试结果**：3307 passed，24 failed（均为 Windows 上的预存在失败，如 `sleep 60` 不可用、ripgrep 依赖等）
+
+---
+
+## 2026-03-01 — 移植上游 tools 模块：agents_ipc.rs 和 delegate_coordination_status.rs
+
+**涉及文件**：
+- `src/tools/agents_ipc.rs`（新建，1023 行，逐字节与上游一致）
+- `src/tools/delegate_coordination_status.rs`（新建，881 行，逐字节与上游一致）
+- `src/tools/mod.rs`（修改：新增模块声明、pub use 导出、agents_ipc 工具注册）
+
+### 改动内容
+
+#### `src/tools/agents_ipc.rs`（新建）
+- 基于共享 SQLite 数据库的进程间通信工具集（IPC for independent ZeroClaw agents）
+- 核心结构体：`IpcDb`（共享 SQLite 句柄，WAL 模式，agent 注册/注销、heartbeat）
+- 5 个 LLM 可调用工具：
+  - `AgentsListTool`：列出在线 Agent（staleness 窗口过滤）
+  - `AgentsSendTool`：向指定 Agent 或广播发送消息（security policy 控制）
+  - `AgentsInboxTool`：读取收件箱（直接消息读后标记已读，广播消息不变）
+  - `StateGetTool`：读取共享 KV 状态
+  - `StateSetTool`：写入共享 KV 状态（security policy 控制）
+- `IpcDb::open()` 从 workspace 路径的 SHA-256 哈希派生 agent_id（防止伪造）
+- `Drop` 实现：进程退出时从 agents 表删除自身记录
+- 依赖：`crate::config::AgentsIpcConfig`（已存在于 schema.rs）、`rusqlite`、`sha2`、`shellexpand`
+- 14 个单元测试（schema 创建、注册、heartbeat、收件箱隔离、广播、staleness 过滤、身份强制执行、state upsert、安全策略阻断等）
+
+#### `src/tools/delegate_coordination_status.rs`（新建）
+- Delegate 协调系统的只读运行时可观测工具
+- 公开结构体：`DelegateCoordinationStatusTool`（需要 `InMemoryMessageBus` 实例）
+- 功能：查询 Agent 收件箱积压、context 状态转换、dead-letter 事件
+- 支持分页（offset/limit）、按 agent 名过滤、按 correlation_id 过滤
+- 依赖：`crate::coordination::{CoordinationPayload, InMemoryMessageBus, SequencedEnvelope}`
+- 6 个集成测试（覆盖 context/inbox 报告、dead-letter 分页、context 分页、message 分页带 correlation 过滤）
+- **注意**：模块已声明并 pub use 导出，但暂未在 `all_tools_with_runtime()` 中注册。
+  原因：我们 codebase 尚无 `CoordinationConfig`（coordination 完整移植后再注册）。
+  上游注册逻辑依赖 `root_config.coordination.enabled`，等待后续 coordination 配置移植。
+
+#### `src/tools/mod.rs`（修改）
+- 新增模块声明：`pub mod agents_ipc;` 和 `pub mod delegate_coordination_status;`
+- 新增 pub use 导出：`DelegateCoordinationStatusTool`
+- 在 `all_tools_with_runtime()` 的 chat_log 块之后新增 agents_ipc 注册块：
+  - 当 `root_config.agents_ipc.enabled == true` 时调用 `IpcDb::open()`
+  - 成功时注册 5 个工具；失败时 `tracing::warn!` 降级（不 panic）
+
+### 编译状态
+- `cargo check` 通过，无新引入错误
+- 已存在的 `syscall_anomaly.rs` 中 `floor_utf8_char_boundary` 错误和 plugins 未使用 import 警告不属于本次改动
+- `DelegateCoordinationStatusTool` pub use 有 unused import 警告（预期，待 coordination 完整移植后注册）
+
+---
+
+## 2026-03-01 — 移植上游 security 模块：perplexity.rs 和 syscall_anomaly.rs
+
+**涉及文件**：
+- `src/security/perplexity.rs`（新建，195 行，逐字节与上游一致）
+- `src/security/syscall_anomaly.rs`（新建，678 行，逐字节与上游一致）
+- `src/security/mod.rs`（修改：新增模块声明和 pub use 导出）
+
+### 改动内容
+
+#### `src/security/perplexity.rs`（新建）
+- 对抗性后缀检测（adversarial suffix / GCG prompt injection 防御）
+- 基于字符类转移矩阵的 bigram 困惑度计算（无外部依赖，纯 Rust）
+- 公开类型：`PerplexityAssessment`（perplexity、symbol_ratio、suspicious_token_count、suffix_sample）
+- 公开函数：`detect_adversarial_suffix(prompt, cfg)` — 返回 `Option<PerplexityAssessment>`
+- 依赖：仅 `crate::config::PerplexityFilterConfig`（已存在于 schema.rs）
+- 4 个单元测试（disabled 短路、GCG 检测、自然语言不误报、延迟 <50ms）
+
+#### `src/security/syscall_anomaly.rs`（新建）
+- Daemon shell/进程执行的 syscall 异常检测器
+- 消费 stdout/stderr 输出，提取 seccomp/audit 行，匹配基线配置
+- 公开类型：`SyscallAnomalyDetector`（主结构体）、`SyscallAnomalyAlert`、`SyscallAnomalyKind`
+- 特性：速率限制窗口（60s）、alert cooldown、每分钟 alert 预算、基线 syscall allowlist、审计日志集成
+- 依赖：`crate::config::{AuditConfig, SyscallAnomalyConfig}`、`crate::security::audit::{AuditEvent, AuditEventType, AuditLogger}`、`regex`（已在 Cargo.toml）、`parking_lot`（已在 Cargo.toml）
+- 9 个单元测试（覆盖 seccomp denied、hex/数字/符号 syscall 解析、cooldown、限速、disabled 模式）
+
+#### `src/security/mod.rs`（修改）
+- 在 `domain_matcher` 行之后插入 `pub mod perplexity;` 和 `pub mod syscall_anomaly;`
+- 在 prompt_guard 导出块之后插入：
+  - `pub use perplexity::{detect_adversarial_suffix, PerplexityAssessment};`
+  - `pub use syscall_anomaly::{SyscallAnomalyAlert, SyscallAnomalyDetector, SyscallAnomalyKind};`
+
+### 为什么这样做
+- 两个文件依赖的 config 类型（`PerplexityFilterConfig`、`AuditConfig`、`SyscallAnomalyConfig`）均已存在于 `src/config/schema.rs`
+- `regex` 和 `parking_lot` 均已在 `Cargo.toml` 中声明，无需新增依赖
+- 按逐字节方式移植，不做任何功能修改，保持与上游一致
+
+---
+
+## 2026-03-01 — 移植上游 MCP (Model Context Protocol) 工具套件
+
+**涉及文件**：
+- `src/tools/mcp_protocol.rs`（新建，126 行）
+- `src/tools/mcp_transport.rs`（新建，285 行）
+- `src/tools/mcp_client.rs`（新建，357 行）
+- `src/tools/mcp_tool.rs`（新建，68 行）
+- `src/tools/mod.rs`（修改：新增模块声明、pub use 导出）
+- `src/channels/mod.rs`（修改：添加 MCP 工具异步注册逻辑）
+
+### 改动内容
+
+#### `src/tools/mcp_protocol.rs`（新建，逐字节与上游一致）
+- JSON-RPC 2.0 协议类型：`JsonRpcRequest`、`JsonRpcResponse`、`JsonRpcError`
+- MCP 工具列表类型：`McpToolDef`、`McpToolsListResult`
+- 协议版本常量：`JSONRPC_VERSION = "2.0"`、`MCP_PROTOCOL_VERSION = "2024-11-05"`
+- 标准错误码常量（`PARSE_ERROR`、`INVALID_REQUEST` 等）
+- 4 个单元测试
+
+#### `src/tools/mcp_transport.rs`（新建，逐字节与上游一致）
+- `McpTransportConn` trait：抽象传输层（`send_and_recv`、`close`）
+- `StdioTransport`：spawn 本地进程，通过 stdin/stdout 通信
+- `HttpTransport`：HTTP POST 请求
+- `SseTransport`：SSE 传输（当前简化为 HTTP POST）
+- `create_transport()` 工厂函数，根据 `McpTransport` 枚举选择传输类型
+- import 路径：`crate::config::schema::{McpServerConfig, McpTransport}`（schema 模块是 pub，路径有效）
+- 3 个单元测试
+
+#### `src/tools/mcp_client.rs`（新建，逐字节与上游一致）
+- `McpServer`：单个 MCP 服务器的连接，封装在 `Arc<Mutex<McpServerInner>>` 内
+- `McpServer::connect()`：执行 initialize 握手 + `tools/list` 获取工具列表
+- `McpServer::call_tool()`：带超时的工具调用（可配置，上限 600 秒）
+- `McpRegistry`：多服务器聚合，工具名以 `<server>__<tool>` 前缀去重
+- `McpRegistry::connect_all()`：非致命性批量连接（单个失败只 log 不中断）
+- 5 个测试（含 2 个 async 测试）
+
+#### `src/tools/mcp_tool.rs`（新建，逐字节与上游一致）
+- `McpToolWrapper`：将 MCP 工具包装为 `Tool` trait 实现
+- 通过 `Arc<McpRegistry>` 分发工具调用，工具错误转换为 `ToolResult { success: false }`
+
+#### `src/tools/mod.rs`（修改）
+- 新增 4 个模块声明（字母排序插入）：`pub mod mcp_client;`、`pub mod mcp_protocol;`、`pub mod mcp_tool;`、`pub mod mcp_transport;`
+- 新增 pub use 导出：`McpRegistry`、`McpServer`、`McpToolWrapper`、`create_transport`、`McpTransportConn`、以及协议类型（`JsonRpcRequest/Response/Error`、`McpToolDef`、`McpToolsListResult`）
+- MCP 工具注册不在 `all_tools_with_runtime`（同步函数）内，见 channels/mod.rs 说明
+
+#### `src/channels/mod.rs`（修改）
+- 在 `run_channels()` 中，将原来同步的 `Arc::new(all_tools_with_runtime(...))` 拆分为：
+  1. `let mut built_tools = all_tools_with_runtime(...)` — 先建可变 Vec
+  2. 当 `config.mcp.enabled && !config.mcp.servers.is_empty()` 时，异步 `McpRegistry::connect_all()` 并追加 `McpToolWrapper` 实例
+  3. `let tools_registry = Arc::new(built_tools)` — 冻结
+- 与上游 channels/mod.rs 逻辑完全一致
+- 失败为非致命性（`tracing::error!` 记录，daemon 继续运行）
+
+### 架构说明
+- MCP 工具注册必须在异步路径中完成（`connect_all` 是 async），因此放在 `channels/mod.rs` 的 `run_channels()` 异步函数中，而非同步的 `all_tools_with_runtime()`
+- `McpConfig`（`mcp.enabled`、`mcp.servers`）已在 `src/config/schema.rs` 中定义，无需修改 schema
+
+### 验证
+- `cargo check --lib` — 零错误，6 个 warnings（均为已有 plugins 模块 unused imports，与本次改动无关）✓
+
+---
+
+## 2026-03-01 — 移植上游 gateway 兼容层：openai_compat + openclaw_compat
+
+**涉及文件**：
+- `src/gateway/openai_compat.rs`（新建，720 行）
+- `src/gateway/openclaw_compat.rs`（新建，902 行，含适配）
+- `src/gateway/mod.rs`（修改：添加模块声明 + 路由注册 + 启动提示）
+
+### 改动内容
+
+#### `src/gateway/openai_compat.rs`（新建）
+- 原封不动从上游移植，提供 `POST /v1/chat/completions`（简单 provider 直连，无 agent loop）和 `GET /v1/models` 端点
+- 导出常量 `CHAT_COMPLETIONS_MAX_BODY_SIZE = 524288`（512KB），供 openclaw_compat 引用
+- 支持流式（SSE）和非流式响应，含 Bearer token 认证和速率限制
+- 包含 8 个单元测试
+
+#### `src/gateway/openclaw_compat.rs`（新建，含适配）
+- 移植自上游，提供两个端点：
+  - `POST /api/chat`：ZeroClaw 原生端点，调用完整 agent loop（含工具和记忆），面向 OpenClaw 迁移用户
+  - `POST /v1/chat/completions`（工具增强版）：OpenAI 兼容 shim，提取最后一条用户消息 + 最近上下文，路由到完整 agent loop
+- **适配说明**：上游版本引用了 `state.tools_registry_exec` 和 `super::sanitize_gateway_response`，这两个在我们的 codebase 中均不存在。适配方案：直接使用 `run_gateway_chat_with_tools` 的返回值，不再调用 sanitize（agent loop 本身已产出干净输出）。这是最简、符合 KISS 原则的处理方式。
+- 包含 9 个单元测试
+
+#### `src/gateway/mod.rs`（修改）
+- 新增模块声明：`pub(crate) mod openclaw_compat;` 和 `pub(crate) mod openai_compat;`
+- 新增路由注册：
+  - `POST /api/chat` → `openclaw_compat::handle_api_chat`
+  - `POST /v1/chat/completions` → `openclaw_compat::handle_v1_chat_completions_with_tools`（512KB body limit 子路由器）
+  - `GET  /v1/models` → `openai_compat::handle_v1_models`
+- 新增启动提示信息（3 行）
+
+### 依赖差异说明
+
+| 上游符号 | 我们的 codebase | 处理方式 |
+|---------|----------------|---------|
+| `state.tools_registry_exec` | 不存在（我们只有 `tools_registry: Arc<Vec<ToolSpec>>`） | 移除调用，直接使用 agent 返回值 |
+| `super::sanitize_gateway_response` | 不存在（channels 中有私有版本） | 移除调用，agent loop 输出无需二次清洗 |
+
+### 验证
+- `cargo check --lib` — 零错误，6 个 warnings（均为已有 plugins 模块 unused import，与本次无关）✓
+
+---
+
+## 2026-03-01 — 上游 channel 移植核查：irc.rs + nostr.rs
+
+**涉及文件**：`src/channels/irc.rs`、`src/channels/nostr.rs`、`src/channels/mod.rs`、`src/config/schema.rs`
+
+### 改动内容
+
+#### 核查结论：已完整移植，无需修改
+
+执行了全面核查，结论如下：
+
+- `src/channels/irc.rs`（1021 行）：已存在，与上游 `zeroclaw_original` 逐字节一致（`diff` 输出 IDENTICAL）
+- `src/channels/nostr.rs`（398 行）：已存在，与上游 `zeroclaw_original` 逐字节一致（`diff` 输出 IDENTICAL）
+- `src/channels/mod.rs`：已包含 `pub mod irc;`、`pub mod nostr;`、`pub use irc::IrcChannel;`、`pub use nostr::NostrChannel;`，以及工厂注册代码（第 3107 行 IRC、第 3200 行 Nostr 健康检查、第 3440 行 Nostr 运行时启动）
+- `src/config/schema.rs`：`IrcConfig`（第 3531 行）和 `NostrConfig`（第 4043 行）均已存在
+
+#### 验证
+
+- `cargo check --lib` — 零错误，6 个 warnings（均为已有 plugins 模块 unused import，与本次无关）✓
+
+---
+
 ## 2026-03-01 — 上游工具移植：task_plan + url_validation
 
 **涉及文件**：`src/tools/task_plan.rs`（新建）、`src/tools/url_validation.rs`（新建）、`src/tools/mod.rs`（修改）

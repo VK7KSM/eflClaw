@@ -75,6 +75,7 @@ mod onboard;
 mod peripherals;
 mod providers;
 mod runtime;
+mod coordination;
 mod security;
 mod service;
 mod skillforge;
