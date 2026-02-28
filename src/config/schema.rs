@@ -2213,6 +2213,25 @@ impl Default for BuiltinHooksConfig {
 
 // ── Autonomy / Security ──────────────────────────────────────────
 
+/// How the agent requests approval from non-CLI channels (Telegram, Discord, etc.).
+///
+/// - `Disabled` — no approval prompt; tools are auto-approved (or auto-denied for
+///   high-risk tools that are still blocked by `block_high_risk_commands`).
+/// - `RequestConfirm` — send a structured confirmation request and wait for a
+///   Yes/No/Always response (default).
+/// - `Direct` — use a natural-language question in the channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum NonCliNaturalLanguageApprovalMode {
+    /// No approval prompt in non-CLI channels.
+    Disabled,
+    /// Send structured confirmation request and wait for a response (default).
+    #[default]
+    RequestConfirm,
+    /// Use natural-language question ("Do you want me to run X?").
+    Direct,
+}
+
 /// Autonomy and security policy configuration (`[autonomy]` section).
 ///
 /// Controls what the agent is allowed to do: shell commands, filesystem access,
@@ -2268,6 +2287,23 @@ pub struct AutonomyConfig {
     /// model in tool specs.
     #[serde(default)]
     pub non_cli_excluded_tools: Vec<String>,
+
+    /// User IDs who can approve non-CLI approval requests.
+    ///
+    /// If empty, any configured channel user can approve.
+    #[serde(default)]
+    pub non_cli_approval_approvers: Vec<String>,
+
+    /// Approval mode for non-CLI channels. Default: `request_confirm`.
+    #[serde(default)]
+    pub non_cli_natural_language_approval_mode: NonCliNaturalLanguageApprovalMode,
+
+    /// Per-channel approval mode overrides.
+    ///
+    /// Maps channel name (e.g. `"telegram"`) to approval mode.
+    #[serde(default)]
+    pub non_cli_natural_language_approval_mode_by_channel:
+        std::collections::HashMap<String, NonCliNaturalLanguageApprovalMode>,
 }
 
 fn default_auto_approve() -> Vec<String> {
@@ -2336,6 +2372,10 @@ impl Default for AutonomyConfig {
             always_ask: default_always_ask(),
             allowed_roots: Vec::new(),
             non_cli_excluded_tools: Vec::new(),
+            non_cli_approval_approvers: Vec::new(),
+            non_cli_natural_language_approval_mode:
+                NonCliNaturalLanguageApprovalMode::RequestConfirm,
+            non_cli_natural_language_approval_mode_by_channel: std::collections::HashMap::new(),
         }
     }
 }
@@ -5742,6 +5782,7 @@ default_temperature = 0.7
                 always_ask: vec![],
                 allowed_roots: vec![],
                 non_cli_excluded_tools: vec![],
+                ..AutonomyConfig::default()
             },
             security: SecurityConfig::default(),
             runtime: RuntimeConfig {

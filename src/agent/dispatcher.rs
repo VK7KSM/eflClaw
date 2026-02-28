@@ -33,7 +33,17 @@ impl XmlToolDispatcher {
     fn parse_xml_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
         let mut text_parts = Vec::new();
         let mut calls = Vec::new();
-        let mut remaining = response;
+        // Normalize alternative XML tag variants to the canonical <tool_call> form.
+        // Some models (especially fine-tuned or distilled variants) emit <toolcall>,
+        // <tool-call>, or <invoke> instead of the expected <tool_call>.
+        let normalized = response
+            .replace("<toolcall>", "<tool_call>")
+            .replace("</toolcall>", "</tool_call>")
+            .replace("<tool-call>", "<tool_call>")
+            .replace("</tool-call>", "</tool_call>")
+            .replace("<invoke>", "<tool_call>")
+            .replace("</invoke>", "</tool_call>");
+        let mut remaining = normalized.as_str();
 
         while let Some(start) = remaining.find("<tool_call>") {
             let before = &remaining[..start];
