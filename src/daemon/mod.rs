@@ -8,7 +8,26 @@ use tokio::time::Duration;
 
 const STATUS_FLUSH_SECONDS: u64 = 5;
 
+/// Check whether a TCP port on the given host is already in use.
+///
+/// Attempts a non-blocking bind; returns `true` if the port is available,
+/// `false` if it is already bound by another process.
+fn is_port_available(host: &str, port: u16) -> bool {
+    use std::net::TcpListener;
+    TcpListener::bind(format!("{host}:{port}")).is_ok()
+}
+
 pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
+    // Early port-conflict detection — gives a clear error before the gateway
+    // supervisor starts repeatedly failing and retrying with backoff.
+    if !is_port_available(&host, port) {
+        anyhow::bail!(
+            "Port {port} on {host} is already in use.\n\
+             Another ZeroClaw daemon may already be running.\n\
+             To check: run `zeroclaw status` or look for an existing daemon process.\n\
+             To stop it: run `zeroclaw stop` or kill the process holding port {port}."
+        );
+    }
     let initial_backoff = config.reliability.channel_initial_backoff_secs.max(1);
     let max_backoff = config
         .reliability
@@ -614,5 +633,25 @@ mod tests {
 
         let target = heartbeat_delivery_target(&config).unwrap();
         assert_eq!(target, Some(("telegram".to_string(), "123456".to_string())));
+    }
+
+    #[test]
+    fn port_available_returns_true_for_unused_port() {
+        // Pick an obscure high port unlikely to be in use.
+        // is_port_available opens and immediately drops a TcpListener, so
+        // repeated calls on the same port work fine.
+        assert!(is_port_available("127.0.0.1", 59998));
+    }
+
+    #[test]
+    fn port_available_returns_false_when_bound() {
+        use std::net::TcpListener;
+        // Bind a listener to hold the port.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let bound_port = listener.local_addr().unwrap().port();
+
+        // While _listener holds the port, is_port_available should return false.
+        assert!(!is_port_available("127.0.0.1", bound_port));
+        drop(listener);
     }
 }
