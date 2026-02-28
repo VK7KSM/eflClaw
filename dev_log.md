@@ -1511,3 +1511,32 @@ owner = "e1vix"
   - OpenRouter: "200+ models, 1 API key" → "Claude Sonnet 4.6, GPT-5.2, Gemini 3.1 Pro"
   - Anthropic: "Claude 3.5/4 Sonnet & Opus" → "Claude Sonnet 4.6, Claude Opus 4.6"
   - OpenAI: "GPT-4o, GPT-5, o1" → "GPT-5.2, GPT-5.2-Codex, o3"
+
+---
+
+## 2026-03-01 — 架构改进：统一渠道投递路径 (deliver_to_channel)
+
+**涉及文件**：
+- `src/channels/mod.rs`（添加：`deliver_to_channel()` 公开函数）
+- `src/cron/scheduler.rs`（重构：`deliver_announcement()` 委托给新函数）
+
+### 背景
+CLAUDE.md §15.3 指出 `deliver_announcement`（在 `scheduler.rs` 中）是架构债务：
+- 只硬编码支持 4 个渠道（telegram/discord/slack/mattermost）
+- 绕过了 `Channel` trait，每次重新实例化渠道对象
+- heartbeat 和 cron 使用独立的投递路径
+
+### 改动内容
+
+#### `src/channels/mod.rs`
+- 新增 `deliver_to_channel(config, channel, target, text)` 公开函数
+- 使用现有 `collect_configured_channels()` 获取所有已配置渠道
+- 按名称（不区分大小写）查找渠道，调用 `Channel.send()`
+- 支持**所有**已配置渠道（Telegram/Discord/Slack/Mattermost/Signal/WhatsApp/IRC/Email 等）
+- 未找到时，返回包含可用渠道列表的友好错误消息
+
+#### `src/cron/scheduler.rs`
+- `deliver_announcement()` 简化为单行委托：调用 `crate::channels::deliver_to_channel()`
+- 移除了 72 行硬编码 match 逻辑
+- 移除了不再需要的 `TelegramChannel/DiscordChannel/SlackChannel/MattermostChannel/SendMessage/Channel` 导入
+- 更新测试：错误消息匹配从 "unsupported delivery channel" 扩展为也接受 "no channel named"
