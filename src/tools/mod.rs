@@ -15,6 +15,7 @@
 //! To add a new tool, implement [`Tool`] in a new submodule and register it in
 //! [`all_tools_with_runtime`]. See `AGENTS.md` §7.3 for the full change playbook.
 
+pub mod agents_ipc;
 pub mod browser;
 pub mod apply_patch;
 pub mod browser_open;
@@ -28,6 +29,7 @@ pub mod cron_run;
 pub mod cron_runs;
 pub mod cron_update;
 pub mod delegate;
+pub mod delegate_coordination_status;
 pub mod file_edit;
 pub mod file_read;
 pub mod file_write;
@@ -64,6 +66,10 @@ pub mod subagent_registry;
 pub mod subagent_spawn;
 pub mod task_plan;
 pub mod docx_read;
+pub mod mcp_client;
+pub mod mcp_protocol;
+pub mod mcp_tool;
+pub mod mcp_transport;
 pub mod traits;
 pub mod url_validation;
 pub mod web_fetch;
@@ -81,6 +87,7 @@ pub use cron_run::CronRunTool;
 pub use cron_runs::CronRunsTool;
 pub use cron_update::CronUpdateTool;
 pub use delegate::DelegateTool;
+pub use delegate_coordination_status::DelegateCoordinationStatusTool;
 pub use file_edit::FileEditTool;
 pub use file_read::FileReadTool;
 pub use file_write::FileWriteTool;
@@ -101,6 +108,10 @@ pub use memory_store::MemoryStoreTool;
 pub use model_routing_config::ModelRoutingConfigTool;
 pub use pdf_read::PdfReadTool;
 pub use docx_read::DocxReadTool;
+pub use mcp_client::{McpRegistry, McpServer};
+pub use mcp_protocol::{JsonRpcError, JsonRpcRequest, JsonRpcResponse, McpToolDef, McpToolsListResult};
+pub use mcp_tool::McpToolWrapper;
+pub use mcp_transport::{create_transport, McpTransportConn};
 pub use process::ProcessTool;
 pub use proxy_config::ProxyConfigTool;
 pub use pushover::PushoverTool;
@@ -367,6 +378,29 @@ pub fn all_tools_with_runtime(
             workspace_dir.to_path_buf(),
             root_config.chat_log.owner.clone(),
         )));
+    }
+
+    // Inter-process agent communication (opt-in via [agents_ipc] config)
+    if root_config.agents_ipc.enabled {
+        match agents_ipc::IpcDb::open(workspace_dir, &root_config.agents_ipc) {
+            Ok(ipc_db) => {
+                let ipc_db = Arc::new(ipc_db);
+                tool_arcs.push(Arc::new(agents_ipc::AgentsListTool::new(ipc_db.clone())));
+                tool_arcs.push(Arc::new(agents_ipc::AgentsSendTool::new(
+                    ipc_db.clone(),
+                    security.clone(),
+                )));
+                tool_arcs.push(Arc::new(agents_ipc::AgentsInboxTool::new(ipc_db.clone())));
+                tool_arcs.push(Arc::new(agents_ipc::StateGetTool::new(ipc_db.clone())));
+                tool_arcs.push(Arc::new(agents_ipc::StateSetTool::new(
+                    ipc_db,
+                    security.clone(),
+                )));
+            }
+            Err(e) => {
+                tracing::warn!("agents_ipc: failed to open IPC database: {e}");
+            }
+        }
     }
 
     if let Some(key) = composio_key {

@@ -26,6 +26,8 @@ pub mod docker;
 
 // Prompt injection defense (contributed from RustyClaw, MIT licensed)
 pub mod domain_matcher;
+pub mod perplexity;
+pub mod syscall_anomaly;
 pub mod estop;
 #[cfg(target_os = "linux")]
 pub mod firejail;
@@ -63,6 +65,10 @@ pub use traits::{NoopSandbox, Sandbox};
 pub use leak_detector::{LeakDetector, LeakResult};
 #[allow(unused_imports)]
 pub use prompt_guard::{GuardAction, GuardResult, PromptGuard};
+#[allow(unused_imports)]
+pub use perplexity::{detect_adversarial_suffix, PerplexityAssessment};
+#[allow(unused_imports)]
+pub use syscall_anomaly::{SyscallAnomalyAlert, SyscallAnomalyDetector, SyscallAnomalyKind};
 
 /// Redact sensitive values for safe logging. Shows first 4 chars + "***" suffix.
 /// This function intentionally breaks the data-flow taint chain for static analysis.
