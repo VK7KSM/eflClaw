@@ -2,6 +2,85 @@
 
 ---
 
+## 2026-03-01 — Agent Loop 完整模块化 + Cargo 编译优化
+
+**涉及文件**：
+- `Cargo.toml` — 优化 release profile
+- `src/agent/loop_.rs` — 5810 行精简为 ~3976 行，提取 4 个子模块
+- `src/agent/loop_/context.rs`（新建）
+- `src/agent/loop_/history.rs`（新建）
+- `src/agent/loop_/execution.rs`（新建）
+- `src/agent/loop_/parsing.rs`（新建，含后续追加函数）
+
+### 改动内容
+
+#### `Cargo.toml`
+- `[profile.release]`：`lto = "fat"` → `lto = "thin"`（并行链接时间优化，体积几乎不变，编译速度大幅提升）
+- `codegen-units = 1` → `codegen-units = 0`（Cargo 自动选取 = CPU 核心数，充分利用顶配硬件并行编译）
+- 移除了树莓派相关注释（生产不考虑低配硬件）
+- 移除了冗余的 `[profile.release-fast]` 和 `[profile.dist]`，统一为单一 release profile
+
+#### `src/agent/loop_/context.rs`（与上游完全一致）
+- `build_context()`：从 SQLite 记忆搜索并构建上下文前缀
+- `build_hardware_context()`：从硬件 RAG 检索数据手册块
+
+#### `src/agent/loop_/history.rs`（与上游完全一致）
+- COMPACTION 常量（`COMPACTION_KEEP_RECENT_MESSAGES`、`COMPACTION_MAX_SOURCE_CHARS`、`COMPACTION_MAX_SUMMARY_CHARS`）
+- `trim_history()`、`build_compaction_transcript()`、`apply_compaction_summary()`、`auto_compact_history()`
+
+#### `src/agent/loop_/execution.rs`（与上游完全一致）
+- `execute_one_tool()`：单工具执行 + 超时取消
+- `ToolExecutionOutcome`：执行结果结构体
+- `should_execute_tools_in_parallel()`：并行执行判断（需审批的工具保持串行）
+- `execute_tools_parallel()`、`execute_tools_sequential()`
+
+#### `src/agent/loop_/parsing.rs`（包含 elfClaw 保留项）
+- 全部 tool call 解析函数（XML、JSON、GLM、minimax、perl 风格等）
+- `build_native_assistant_history()`、`build_native_assistant_history_from_parsed_calls()`、`build_assistant_history_with_tool_calls()`（追加）
+- **有意保留**：不包含 `normalize_shell_command_from_raw` 等函数（elfClaw URL 安全策略，URL 不转为 curl 命令）
+- 新增 `use crate::providers::ToolCall;` import
+
+#### `src/agent/loop_.rs` 主文件改动
+- 删除所有已迁移到子模块的函数（history/context/execution/parsing）
+- 添加 `mod context/execution/history/parsing;` 声明
+- 添加 `use` 导入块，含所有子模块函数
+- **保留在主文件**（elfClaw 特色功能）：
+  - Deferred action 检测（CJK + 英文，第 170-230 行附近）
+  - `DEFAULT_MAX_TOOL_ITERATIONS = 10`（上游为 20，elfClaw 降低至 10，加注释标记）
+  - `DEFAULT_MAX_HISTORY_MESSAGES = 50`（与上游一致，无需标记）
+- 测试模块新增 `use crate::providers::ToolCall;` import
+- clippy 修复：`for entry / if let Some(...)` → `.into_iter().flatten()` 展平迭代
+
+### 测试结果
+- `cargo test agent::` → 197 通过，1 失败（`run_tool_call_loop_returns_structured_error_for_non_vision_provider` 为**预存在**的失败，模块化前即已失败）
+- `cargo test` 全量 → ~3415 通过，26~27 失败（均为预存在失败，与模块化无关）
+- `cargo clippy` 对我们的文件零错误；全库存量 141 个 clippy 错误均为先前存在
+
+---
+
+## 2026-03-01 — Agent Loop 模块化：提取 parsing.rs
+
+**涉及文件**：
+- `src/agent/loop_/parsing.rs`（新建）— 从 `loop_.rs` 提取所有解析相关函数
+
+### 改动内容
+
+#### `src/agent/loop_/parsing.rs`（新建）
+- 从 `loop_.rs` 第 323-1803 行提取所有 tool call 解析函数，跳过第 473-528 行（deferred action 相关逻辑，保留在 `loop_.rs`）
+- 迁移内容包含：
+  - `ParsedToolCall` 结构体（新增 `#[derive(Debug, Clone)]` 和 `pub(super)` 可见性）
+  - 完整解析函数链：`parse_arguments_value`、`parse_tool_call_id`、`canonicalize_json_for_tool_signature`、`tool_call_signature`、`parse_tool_call_value`、`parse_tool_calls_from_json_value`
+  - XML 解析：`is_xml_meta_tag`、`extract_xml_pairs`、`parse_xml_tool_calls`、`parse_minimax_invoke_calls`
+  - 辅助函数：`find_first_tag`、`matching_tool_call_close_tag`、`extract_first_json_value_with_end`、`strip_leading_close_tags`、`extract_json_values`、`find_json_end`
+  - 格式特定解析：`parse_xml_attribute_tool_calls`、`parse_perl_style_tool_calls`、`parse_function_call_tool_calls`
+  - GLM 格式：`map_tool_name_alias`、`build_curl_command`、`parse_glm_style_tool_calls`、`default_param_for_tool`、`parse_glm_shortened_body`
+  - 主解析入口：`parse_tool_calls`、`detect_tool_call_parse_issue`、`parse_structured_tool_calls`
+- 所有函数均标记为 `pub(super)` 供 `loop_.rs` 主逻辑调用
+- 有意**未包含**：`normalize_shell_command_from_raw`、`normalize_shell_arguments`、`normalize_tool_arguments`（ZeroClaw 定制决策，URL 安全考虑）
+- 文件顶部使用 upstream 风格的 imports：`use regex::Regex; use std::collections::HashSet; use std::sync::LazyLock;`
+
+---
+
 ## 2026-03-01 — Phase 4 完成：Android 客户端 + Android FFI + Web 前端 + 插件示例
 
 **涉及文件**：
