@@ -13,6 +13,8 @@ use crate::tools::{self, Tool, ToolSpec};
 use anyhow::Result;
 use std::collections::HashMap;
 use std::io::Write as IoWrite;
+
+const AUTOSAVE_MIN_MESSAGE_CHARS: usize = 20;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -583,6 +585,17 @@ impl Agent {
                     .push(ConversationMessage::Chat(ChatMessage::assistant(
                         final_text.clone(),
                     )));
+                if self.auto_save && final_text.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
+                    let _ = self
+                        .memory
+                        .store(
+                            "assistant_resp",
+                            &final_text,
+                            MemoryCategory::Conversation,
+                            None,
+                        )
+                        .await;
+                }
                 self.trim_history();
 
                 return Ok(final_text);

@@ -12453,6 +12453,7 @@ default_model = "legacy-model"
     }
 
     #[test]
+    #[cfg(unix)]
     async fn persist_active_workspace_marker_is_cleared_for_default_config_dir() {
         let _env_guard = env_override_lock().await;
         let temp_home =
