@@ -215,6 +215,12 @@ pub struct Config {
     /// When unset, falls back to `default_model`.
     #[serde(default)]
     pub summary_model: Option<String>,
+    /// elfClaw: Model for all background tasks (cron jobs, heartbeat, email digest).
+    /// Machine-initiated tasks default to this model; interactive conversations use `default_model`.
+    /// Accepts a model ID (e.g. `"claude-haiku-4-5-20251001"`) or a `hint:<name>` route.
+    /// When unset, falls back to `default_model`.
+    #[serde(default)]
+    pub worker_model: Option<String>,
     /// Optional named provider profiles keyed by id (Codex app-server compatible layout).
     #[serde(default)]
     pub model_providers: HashMap<String, ModelProviderConfig>,
@@ -6324,6 +6330,7 @@ impl Default for Config {
             mcp: McpConfig::default(),
             model_support_vision: None,
             summary_model: None,
+            worker_model: None,
             wasm: WasmConfig::default(),
         }
     }

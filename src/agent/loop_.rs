@@ -1099,6 +1099,7 @@ pub async fn run(
     peripheral_overrides: Vec<String>,
     interactive: bool,
     max_tool_iterations_override: Option<usize>,
+    run_context: super::RunContext, // elfClaw: task origin for model routing
 ) -> Result<String> {
     // ── Wire up agnostic subsystems ──────────────────────────────
     let base_observer = observability::create_observer(&config.observability);
@@ -1165,10 +1166,22 @@ pub async fn run(
         .or(config.default_provider.as_deref())
         .unwrap_or("openrouter");
 
-    let model_name = model_override
-        .as_deref()
-        .or(config.default_model.as_deref())
-        .unwrap_or("anthropic/claude-sonnet-4");
+    let model_name = {
+        // elfClaw: Three-tier model resolution —
+        //   1. Per-call explicit override (highest priority, e.g. CLI --model flag)
+        //   2. Background tasks fall back to worker_model (cheaper inference)
+        //   3. Interactive sessions fall back to default_model (capable model)
+        let resolved = model_override.as_deref().or_else(|| {
+            if run_context == super::RunContext::Background {
+                config.worker_model.as_deref()
+            } else {
+                None
+            }
+        });
+        resolved
+            .or(config.default_model.as_deref())
+            .unwrap_or("anthropic/claude-sonnet-4")
+    };
 
     let provider_runtime_options = providers::ProviderRuntimeOptions {
         auth_profile_override: None,
