@@ -2,7 +2,66 @@
 
 ---
 
-## 2026-03-01 — 上游合并完成，main 分支替换并推送
+## 2026-03-01 — Telegram 图文消息诊断 + Web 仪表盘缺失路由记录
+
+### Telegram photo+caption 诊断修复
+
+**问题**：用户发送带文字说明（caption）的图片时，agent 只看到图，文字被忽略。
+
+**调查结论**：
+- Telegram Bot API **在单个 Message 对象中同时传递 photo + caption**，不分成两条消息
+- `telegram.rs` 正确提取 caption：`msg.content = "[IMAGE:/path]\n\nCaption"`
+- 静态代码分析：整个处理链路（telegram → channels/mod → loop_ → multimodal → anthropic）
+  理论上正确，caption 应被保留
+- **需要运行时诊断日志才能定位确切丢失位置**
+
+**本次修改（commit 待提交）**：
+
+1. `src/channels/mod.rs:~1576`：日志截断从 80 → 200 字符，便于看到完整内容
+
+2. `src/channels/mod.rs:~1673-1678`：chat_log 路径提取 Bug 修复
+   - `strip_suffix(']')` 对 `"[IMAGE:/path]\n\nCaption"` 返回 None（不影响 LLM，影响 chat_log 存储）
+   - 改为 `parse_image_markers` 正确提取路径
+
+3. `src/agent/loop_.rs`：加入诊断日志 + 错误降级
+   - 在 `strip_history_image_markers` 后 + `prepare_messages_for_provider` 后各加 `tracing::debug!`
+     记录 `caption_chars`（用户消息中非图片标记文字的字符数）
+   - `prepare_messages_for_provider` 失败时降级为纯文字模式（保留 caption），不报错退出
+
+**如何查看诊断日志**：
+```bash
+RUST_LOG=elfclaw=debug cargo run -- daemon
+# 发送 Telegram 图+文 → 观察：
+# before multimodal prepare: caption_chars > 0  ✓
+# after  multimodal prepare: caption_chars > 0  → chain 正常，问题在 Anthropic API 端
+# after  multimodal prepare: caption_chars = 0  → prepare_messages_for_provider 有 bug
+```
+
+---
+
+### Web 仪表盘缺失端点（已记录，等待上游完成）
+
+**问题**：
+- `/integrations` 页面报错 "Unexpected token '<', DOCTYPE"
+- `/devices` 页面同样报错
+
+**根本原因**（commit `03bf3f10` 引入的上游未完成功能）：
+
+| 端点 | 状态 |
+|------|------|
+| `GET /api/pairing/devices` | handler 在 `api.rs:533` 已实现，**未注册路由** |
+| `DELETE /api/pairing/devices/{id}` | handler 在 `api.rs:546` 已实现，**未注册路由** |
+| `GET /api/integrations/settings` | **handler 不存在**，上游也没有 |
+| `PUT /api/integrations/{id}/credentials` | **handler 不存在**，上游也没有 |
+
+**处理策略**：等待上游在一两周内完成这部分功能。下次合并上游时：
+- 检查上游是否实现了 `/api/integrations/settings` 和 `/api/integrations/{id}/credentials`
+- 若已完成 → merge 进来，同时注册 `/api/pairing/devices` 路由
+- 若未完成 → 继续等待
+
+---
+
+
 
 **操作**：
 - `git checkout main && git reset --hard merge/upstream-2026-03-01`
@@ -1765,3 +1824,38 @@ CLAUDE.md §15.3 指出 `deliver_announcement`（在 `scheduler.rs` 中）是架
 - 移除了 72 行硬编码 match 逻辑
 - 移除了不再需要的 `TelegramChannel/DiscordChannel/SlackChannel/MattermostChannel/SendMessage/Channel` 导入
 - 更新测试：错误消息匹配从 "unsupported delivery channel" 扩展为也接受 "no channel named"
+
+---
+
+## 2026-03-01 — CI 简化 + Token 烧耗分析
+
+### CI 工作流简化（build-elfclaw.yml）
+
+**变更**：移除 `build-cross` job（Linux/Android/FreeBSD 共 13 个目标），只保留：
+- `build-macos`：Intel x86_64（macos-13）+ Apple Silicon（macos-14）
+- `build-windows`：x86_64 MSVC
+
+`release` job 的 `needs` 从 `[build-cross, build-macos, build-windows]` 改为 `[build-macos, build-windows]`。
+
+顺带将产物命名从 `zeroclaw-*` 改为 `elfclaw-*`（品牌一致性）。
+
+**原因**：上游有 30 种平台的 cross 编译，但我们目前只需要 Windows + Mac 日常使用。
+cross 编译依赖 Docker + cross-rs 工具链，在上游大规模 merge 后可能有 Linux 特定编译问题。
+
+### Sonnet Token 烧耗过多 — 分析结论（不修改代码）
+
+**现象**：运行日志证实 cron 任务以 Sonnet 模型运行，单次任务触发 ~27,874 输入 token + 6.4K 缓存 token。
+
+**根本原因**：
+1. `config.default_model = "claude-sonnet-4-6"` — 主模型是 Sonnet
+2. `CronJob` struct 有 `pub model: Option<String>` 字段（`src/cron/types.rs:114`）
+3. 若某个 cron job 的 `model` 字段为 `None`，调度器调用 `agent::run(model_override=None)` → 解析链 → `config.default_model` → **Sonnet**
+4. Cron 任务跑完整 agent loop，每次迭代都携带完整历史（运行日志显示第一轮 `caption_chars=13218`，代表 ~4400+ tokens 的上下文）
+
+**为什么之前用 Haiku**：三种可能：
+- A: 之前 `config.toml` 的 `default_model` 设为 Haiku，现已改为 Sonnet
+- B: cron jobs 之前在 SQLite DB 中有 `model = "haiku"` 记录，upstream merge 后 schema 变动导致字段丢失/重置
+- C: 之前的 CronJob 代码路径不同（旧版本可能用轻量模型做 cron）
+
+**下一步**：检查 `D:\ZeroClaw_Workspace\config.toml` 中 `default_model` 字段，以及 cron jobs 的 SQLite 数据（`jobs.db` 或 `cron.db`）是否有 `model` 字段值。若要恢复 Haiku 处理 cron，可对每个 cron job 设置 `model = "claude-haiku-4-5-20251001"` 或修改调度器默认逻辑。
+

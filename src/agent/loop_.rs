@@ -369,8 +369,49 @@ pub(crate) async fn run_tool_call_loop(
         } else {
             crate::multimodal::strip_all_image_markers_with_note(history)
         };
+
+        // elfClaw: diagnostic — trace caption character count before/after multimodal preparation
+        let caption_chars_before = stripped
+            .last()
+            .filter(|m| m.role == "user")
+            .map(|m| {
+                let (clean, _) = crate::multimodal::parse_image_markers(&m.content);
+                clean.trim().len()
+            })
+            .unwrap_or(0);
+        tracing::debug!(caption_chars = caption_chars_before, "before multimodal prepare");
+
         let prepared_messages =
-            multimodal::prepare_messages_for_provider(&stripped, multimodal_config).await?;
+            match multimodal::prepare_messages_for_provider(&stripped, multimodal_config).await {
+                Ok(p) => {
+                    let caption_chars_after = p
+                        .messages
+                        .last()
+                        .filter(|m| m.role == "user")
+                        .map(|m| {
+                            let (clean, _) = crate::multimodal::parse_image_markers(&m.content);
+                            clean.trim().len()
+                        })
+                        .unwrap_or(0);
+                    tracing::debug!(
+                        caption_chars = caption_chars_after,
+                        "after multimodal prepare"
+                    );
+                    p
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "Multimodal image preparation failed; falling back to text-only"
+                    );
+                    let text_only =
+                        crate::multimodal::strip_all_image_markers_with_note(&stripped);
+                    multimodal::PreparedMessages {
+                        messages: text_only,
+                        contains_images: false,
+                    }
+                }
+            };
         let mut request_messages = prepared_messages.messages.clone();
 
         // Inject deferred-action correction prompt if the previous iteration
