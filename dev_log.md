@@ -64,7 +64,31 @@
 
 ---
 
+## 2026-03-01 — 合并后测试修复（10 项）
 
+**提交**：`5108cd03` 在分支 `merge/upstream-2026-03-01`
+
+**修复内容**：
+
+1. **`agent/agent.rs`** — 添加 `AUTOSAVE_MIN_MESSAGE_CHARS` 常量 + `assistant_resp` 自动保存（上游新增逻辑在合并时丢失）
+2. **`agent/loop_.rs`** — 恢复上游 vision 能力检查：非视觉 provider 收到图片时返回 `ProviderCapabilityError`（而非 strip-and-continue）；添加 `should_treat_provider_as_vision_capable()` 处理 anthropic false negative
+3. **`skills/mod.rs`** — `render_skill_location` 统一使用正斜杠（Windows 反斜杠兼容性）
+4. **`config/schema.rs`** — `persist_active_workspace_marker` 测试标记 `#[cfg(unix)]`（依赖 `HOME` 环境变量，Windows 用 `USERPROFILE`）
+5. **`cron/scheduler.rs`** — 退出状态断言改为平台感知（Unix: `exit status: 0`，Windows: `exit code: 0`）
+6. **`gateway/mod.rs`** — 更新 pairing tokens 测试以验证加密存储（配对 token 已加密保存，测试需解密后验证）
+7. **`channels/telegram.rs`** — 修复 `sanitize_attachment_filename`：只用 `/` 作为路径分隔符，保留 `\\` 被替换为 `__` 的行为
+8. **`tools/delegate.rs`** — `execute_agentic_respects_max_iterations` 测试接受 elfClaw 优雅降级（返回部分结果的 `Ok` 而非 `Err`）
+
+**剩余预存 Windows 平台失败（19 项，不影响功能）**：
+- 9 项 `content_search` 测试 — 需要系统安装 ripgrep
+- 4 项 symlink 测试 — Windows 需要 admin 才能创建符号链接
+- 2 项 security policy 测试 — Unix 绝对路径格式 (`/`)
+- 1 项 wasm 测试 — Unix 绝对路径
+- 1 项 hard link 测试 — Windows 权限
+- 1 项 process kill 测试 — Windows kill 语义
+- 1 项 screenshot 测试 — screenshot 工具不可用
+
+---
 
 **涉及文件**：
 - `Cargo.toml` — 优化 release profile
