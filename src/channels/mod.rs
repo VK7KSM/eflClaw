@@ -1573,7 +1573,7 @@ async fn process_channel_message(
         "  💬 [{}] from {}: {}",
         msg.channel,
         msg.sender,
-        truncate_with_ellipsis(&msg.content, 80)
+        truncate_with_ellipsis(&msg.content, 200)
     );
     runtime_trace::record_event(
         "channel_message_inbound",
@@ -1671,11 +1671,8 @@ async fn process_channel_message(
             let stt = msg.content.strip_prefix("[Voice] ").unwrap_or(&msg.content);
             chat_log::voice_turn_user(stt)
         } else if msg.content.starts_with("[IMAGE:") {
-            let path = msg
-                .content
-                .strip_prefix("[IMAGE:")
-                .and_then(|s| s.strip_suffix(']'))
-                .unwrap_or(&msg.content);
+            let (_, refs) = crate::multimodal::parse_image_markers(&msg.content);
+            let path = refs.first().map(String::as_str).unwrap_or(&msg.content);
             chat_log::image_turn(&msg.content, path)
         } else {
             chat_log::text_turn("user", &msg.content)
