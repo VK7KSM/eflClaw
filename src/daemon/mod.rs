@@ -403,6 +403,20 @@ fn validate_heartbeat_channel_config(config: &Config, channel: &str) -> Result<(
                 );
             }
         }
+        "whatsapp_web" => {
+            match config.channels_config.whatsapp.as_ref() {
+                None => anyhow::bail!(
+                    "heartbeat.target is set to whatsapp_web but channels_config.whatsapp is not configured"
+                ),
+                Some(wapp) => {
+                    if wapp.access_token.is_some() || wapp.phone_number_id.is_some() {
+                        anyhow::bail!(
+                            "heartbeat.target is set to whatsapp_web but channels_config.whatsapp is configured for cloud mode (access_token/phone_number_id). Use session_path for Web mode."
+                        );
+                    }
+                }
+            }
+        }
         other => anyhow::bail!("unsupported heartbeat.target channel: {other}"),
     }
 
@@ -536,7 +550,7 @@ mod tests {
             app_id: "app-id".into(),
             app_secret: "app-secret".into(),
             allowed_users: vec!["*".into()],
-            receive_mode: crate::config::schema::QQReceiveMode::Webhook,
+            receive_mode: crate::config::schema::QQReceiveMode::Websocket,
             environment: crate::config::schema::QQEnvironment::Production,
         });
         assert!(has_supervised_channels(&config));

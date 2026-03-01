@@ -206,7 +206,11 @@ fn is_http_url(target: &str) -> bool {
 }
 
 fn sanitize_attachment_filename(file_name: &str) -> Option<String> {
-    let basename = Path::new(file_name).file_name()?.to_str()?.trim();
+    // Only treat '/' as a directory separator to extract the basename.
+    // On Windows, Path::file_name() also strips '\\' components, which would
+    // incorrectly discard escaped-backslash sequences (e.g. "..\\secrets\\token.env"
+    // → "token.env") instead of sanitizing them to "..__..__secrets__token.env".
+    let basename = file_name.rsplit('/').next()?.trim();
     if basename.is_empty() || basename == "." || basename == ".." {
         return None;
     }

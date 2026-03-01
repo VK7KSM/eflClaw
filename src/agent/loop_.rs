@@ -36,6 +36,17 @@ const MAX_TOOL_RESULT_IN_HISTORY_CHARS: usize = 8_000;
 /// Matches the channel-side constant in `channels/mod.rs`.
 const AUTOSAVE_MIN_MESSAGE_CHARS: usize = 20;
 
+/// Returns true if the provider should be treated as vision-capable.
+/// Includes a guardrail for anthropic routes that may report false negatives
+/// on capability probing even though Claude models accept image inputs.
+fn should_treat_provider_as_vision_capable(provider_name: &str, provider: &dyn crate::providers::Provider) -> bool {
+    if provider.supports_vision() {
+        return true;
+    }
+    let normalized = provider_name.trim().to_ascii_lowercase();
+    normalized == "anthropic" || normalized.starts_with("anthropic-custom:")
+}
+
 static SENSITIVE_KEY_PATTERNS: LazyLock<RegexSet> = LazyLock::new(|| {
     RegexSet::new([
         r"(?i)token",
@@ -337,29 +348,26 @@ pub(crate) async fn run_tool_call_loop(
             return Err(ToolLoopCancelled.into());
         }
 
-        // Build effective history for this provider:
-        // • For vision-capable providers: keep current message images, strip only historical ones
-        //   (each image sent once, not re-transmitted in every subsequent request).
-        // • For non-vision providers: strip ALL images (incl. current); append a human-readable
-        //   note to the current message so the agent responds naturally. Raw capability errors
-        //   are never surfaced to the user.
-        let stripped: Vec<ChatMessage> = if provider.supports_vision() {
-            multimodal::strip_history_image_markers(history)
-        } else {
-            let cur_images = history
-                .iter()
-                .rev()
-                .find(|m| m.role == "user")
-                .map(|m| multimodal::parse_image_markers(&m.content).1.len())
-                .unwrap_or(0);
-            if cur_images > 0 {
-                tracing::warn!(
-                    provider = provider_name,
-                    image_count = cur_images,
-                    "Provider does not support vision; stripping images from current message; agent will respond with friendly message"
-                );
+        // Early capability check: if the current history contains image markers but the
+        // provider does not support vision input, return a structured capability error.
+        // The channel layer catches ProviderCapabilityError and sends a user-friendly reply.
+        let image_marker_count = crate::multimodal::count_image_markers(history);
+        let provider_supports_vision = should_treat_provider_as_vision_capable(provider_name, provider);
+        if image_marker_count > 0 && !provider_supports_vision {
+            return Err(crate::providers::ProviderCapabilityError {
+                provider: provider_name.to_string(),
+                capability: "vision".to_string(),
+                message: format!(
+                    "received {image_marker_count} image marker(s), but this provider does not support vision input"
+                ),
             }
-            multimodal::strip_all_image_markers_with_note(history)
+            .into());
+        }
+
+        let stripped: Vec<ChatMessage> = if provider_supports_vision {
+            crate::multimodal::strip_history_image_markers(history)
+        } else {
+            crate::multimodal::strip_all_image_markers_with_note(history)
         };
         let prepared_messages =
             multimodal::prepare_messages_for_provider(&stripped, multimodal_config).await?;

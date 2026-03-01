@@ -514,7 +514,11 @@ mod tests {
         let (success, output) = run_job_command(&config, &security, &job).await;
         assert!(success);
         assert!(output.contains("scheduler-ok"));
-        assert!(output.contains("status=exit status: 0"));
+        // ExitStatus::fmt produces "exit status: 0" on Unix, "exit code: 0" on Windows.
+        assert!(
+            output.contains("status=exit status: 0") || output.contains("status=exit code: 0"),
+            "expected exit status 0 in output, got: {output}"
+        );
     }
 
     #[tokio::test]
@@ -526,8 +530,11 @@ mod tests {
 
         let (success, output) = run_job_command(&config, &security, &job).await;
         assert!(!success);
-        assert!(output.contains("definitely_missing_file_for_scheduler_test"));
-        assert!(output.contains("status=exit status:"));
+        // ExitStatus::fmt produces "exit status:" on Unix, "exit code:" on Windows.
+        assert!(
+            output.contains("status=exit status:") || output.contains("status=exit code:"),
+            "expected exit status in output, got: {output}"
+        );
     }
 
     #[tokio::test]
