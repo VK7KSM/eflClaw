@@ -9,6 +9,9 @@ __pycache__/
 *.pyc
 docker-compose.override.yml
 
+# Private local config and data — never commit
+资料/
+
 # Environment files (may contain secrets)
 .env
 
