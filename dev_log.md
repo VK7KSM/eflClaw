@@ -2,7 +2,69 @@
 
 ---
 
-## 2026-03-01 — Agent Loop 完整模块化 + Cargo 编译优化
+## 2026-03-01 — upstream/main 合并冲突全量解决（78 个冲突文件）
+
+**涉及文件**（主要修改）：
+- `src/config/schema.rs` — 保留 elfClaw 字段 + 集成上游新类型
+- `src/channels/mod.rs` — 保留 deliver_to_channel + 集成上游新渠道
+- `src/channels/email_channel.rs` — 保留 monitor 模式 + 集成 IMAP ID
+- `src/agent/loop_.rs` — 保留 HEAD 模块化版本
+- `src/daemon/mod.rs` — 保留 elfClaw heartbeat 实现
+- `src/main.rs` — 修复 Commands::Agent 新字段解构
+- 多文件编译修复（8 个文件加 thought_signature，4 个文件加 quota_metadata）
+
+### 合并策略
+
+**AA 文件（43 个）**：上游新增文件全部接受 (`--theirs`)
+
+**UU 文件（35 个）**：
+- 无 elfClaw 标记 → 接受上游 (`--theirs`)
+- 有 elfClaw 标记 → 以 HEAD 为基础，人工补入上游新增内容
+
+### elfClaw 特性保留
+
+| 特性 | 文件 |
+|------|------|
+| TtsConfig, ChatLogConfig | schema.rs |
+| HeartbeatConfig active_hours + max_tool_iterations | schema.rs, daemon/mod.rs |
+| parse_hhmm / is_within_active_hours | schema.rs |
+| summary_model, SchedulerConfig.max_tool_iterations | schema.rs |
+| deliver_to_channel() 统一渠道路由 | channels/mod.rs |
+| Email monitor + notify_channel/notify_to | email_channel.rs |
+| loop_.rs 4 个子模块（context/execution/history/parsing） | agent/loop_/ |
+| DEFAULT_MAX_TOOL_ITERATIONS = 10 | agent/loop_.rs |
+
+### 上游功能集成
+
+| 功能 | 来源 |
+|------|------|
+| EmailImapIdConfig + send_imap_id() | email_channel.rs |
+| ToolCall.thought_signature | providers/traits.rs |
+| ChatResponse.quota_metadata | providers/traits.rs |
+| AckReactionConfig, EconomicConfig, GroupReplyConfig | schema.rs |
+| QQReceiveMode, QQEnvironment | schema.rs |
+| Skill.always, IdentityConfig.extra_files | schema.rs + channels/mod.rs |
+| MattermostConfig.group_reply, SlackChannel 5 参数 new() | schema.rs + channels/mod.rs |
+| TelegramChannel::new ack_enabled 参数 | channels/mod.rs |
+| BlueBubbles/GitHub/Napcat 新渠道 | channels/mod.rs |
+| Serial path 验证（is_serial_path_allowed） | util.rs |
+| Skills SkillToolHandler | skills/mod.rs |
+| PrometheusObserver::new() → Result<Self> | gateway/mod.rs |
+
+### 编译修复（cargo check --all-targets 0 错误）
+
+- 删除 6 个文件中的重复模块声明
+- 为 8 个文件中所有 ToolCall 构造添加 `thought_signature: None`
+- 为 4 个文件中所有 ChatResponse 构造添加 `quota_metadata: None`
+- 修复函数参数数量不匹配（consolidation.rs, channels/mod.rs, main.rs）
+- 替换 `windows_by_handle` 不稳定 API（file_link_guard.rs）
+- 恢复 HEAD 版本的 gateway/\*、agent/agent.rs、mod.rs（引用了上游-only API）
+
+**提交**：`64b4b26c` 在分支 `merge/upstream-2026-03-01`
+
+---
+
+
 
 **涉及文件**：
 - `Cargo.toml` — 优化 release profile
