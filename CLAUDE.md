@@ -732,3 +732,67 @@ Heartbeat/Cron 投递路径（`deliver_announcement`）与普通消息路径（`
 
 重构时应统一为单一投递路径，通过 `Channel` trait 发送，消除硬编码 match。
 
+## 16) CI 构建与发布流程（elfClaw）
+
+### 16.1 Workflow 文件
+
+唯一 CI 文件：`.github/workflows/build-elfclaw.yml`
+所有上游 workflow 文件已删除，不要从上游合并时重新引入。
+
+### 16.2 触发方式
+
+| 方式 | 条件 | 结果 |
+|------|------|------|
+| 推送 `v*` tag | `git push origin v0.2` | 自动 build + 创建 Release |
+| 手动 dispatch（无 tag）| GitHub Actions → Run workflow，不填 release_tag | 仅 build，**不发布** |
+| 手动 dispatch（填 tag）| 填写 release_tag 输入框 | build + 创建 Release |
+
+**推荐发布流程**：更新 `Cargo.toml` 版本号 → commit → `git tag vX.Y` → `git push origin main vX.Y`
+
+### 16.3 构建矩阵
+
+| 平台 | Runner | Target |
+|------|--------|--------|
+| Windows | `windows-latest` | `x86_64-pc-windows-msvc` |
+| macOS Apple Silicon | `macos-15` | `aarch64-apple-darwin` |
+
+> **注意**：`x86_64-apple-darwin`（Intel Mac）已移除。
+> macOS 15 仅支持 Apple Silicon；GitHub 已下线 `macos-13` Intel runner。
+> 若将来需要恢复 Intel Mac 支持，可考虑 `cargo-zigbuild` 跨编译方案。
+
+### 16.4 gh CLI 操作
+
+gh CLI 路径：`/c/Users/x/AppData/Local/gh-cli/bin/gh.exe`（不在 PATH，需用绝对路径）
+
+```bash
+GH=/c/Users/x/AppData/Local/gh-cli/bin/gh.exe
+
+# 查看最近 run
+"$GH" run list --repo VK7KSM/eflClaw --workflow build-elfclaw.yml --limit 5
+
+# 手动触发（仅编译，不发布）
+"$GH" workflow run build-elfclaw.yml --repo VK7KSM/eflClaw --ref main
+
+# 手动触发并发布（draft）
+"$GH" workflow run build-elfclaw.yml --repo VK7KSM/eflClaw --ref main \
+  -f release_tag=v0.2 -f draft=true
+
+# 取消某个 run
+"$GH" run cancel <run_id> --repo VK7KSM/eflClaw
+```
+
+### 16.5 常见错误与处理
+
+| 错误 | 原因 | 处理 |
+|------|------|------|
+| `macos-13-us-default is not supported` | GitHub 下线 Intel runner | 已改用 `macos-15`；勿改回 `macos-13` |
+| Release job skipped | 手动触发未填 `release_tag` | 推 tag 或填写 release_tag 重新触发 |
+| `tag already exists` | 本地/远程 tag 冲突 | 换新 tag 版本号，不要强制覆盖已发布 tag |
+| 重复 run | 操作前未确认是否已有 in_progress run | **触发前先执行 `run list` 确认无进行中的 run** |
+
+### 16.6 发布版本命名规范
+
+- 格式：`vMAJOR.MINOR`（如 `v0.2`）或 `vMAJOR.MINOR.PATCH`
+- Cargo.toml `version` 字段与 tag 同步更新
+- 不使用 `v0.1.7.1` 这类四段式（与 semver 不兼容）
+
