@@ -1,0 +1,144 @@
+name: Build elfClaw
+
+on:
+    workflow_dispatch:
+        inputs:
+            release_tag:
+                description: "Release tag (e.g. v0.2.0). Leave empty to only upload artifacts."
+                required: false
+                default: ""
+                type: string
+            draft:
+                description: "Create release as draft"
+                required: false
+                default: true
+                type: boolean
+    push:
+        tags:
+            - "v*"
+
+concurrency:
+    group: build-elfclaw-${{ github.ref || github.run_id }}
+    cancel-in-progress: false
+
+permissions:
+    contents: write
+
+env:
+    CARGO_TERM_COLOR: always
+
+jobs:
+    build:
+        name: Build ${{ matrix.target }}
+        runs-on: ${{ matrix.os }}
+        timeout-minutes: 60
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    - os: ubuntu-22.04
+                      target: x86_64-unknown-linux-gnu
+                      artifact: zeroclaw
+                      archive: zeroclaw-x86_64-linux.tar.gz
+                    - os: ubuntu-22.04
+                      target: aarch64-unknown-linux-gnu
+                      artifact: zeroclaw
+                      archive: zeroclaw-aarch64-linux.tar.gz
+                      cross_pkg: gcc-aarch64-linux-gnu
+                      cross_linker: CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+                    - os: macos-14
+                      target: aarch64-apple-darwin
+                      artifact: zeroclaw
+                      archive: zeroclaw-aarch64-macos.tar.gz
+                    - os: windows-latest
+                      target: x86_64-pc-windows-msvc
+                      artifact: zeroclaw.exe
+                      archive: zeroclaw-x86_64-windows.zip
+
+        steps:
+            - uses: actions/checkout@v4
+
+            - uses: dtolnay/rust-toolchain@stable
+              with:
+                  toolchain: stable
+                  targets: ${{ matrix.target }}
+
+            - uses: Swatinem/rust-cache@v2
+              with:
+                  key: ${{ matrix.target }}
+
+            - name: Install cross-compilation toolchain (aarch64 Linux)
+              if: matrix.cross_pkg != ''
+              run: |
+                  sudo apt-get update -qq
+                  sudo apt-get install -y ${{ matrix.cross_pkg }}
+
+            - name: Build (Linux cross)
+              if: matrix.cross_linker != ''
+              run: |
+                  env ${{ matrix.cross_linker }} \
+                    cargo build --release --locked --target ${{ matrix.target }}
+
+            - name: Build (native)
+              if: matrix.cross_linker == ''
+              run: cargo build --release --locked --target ${{ matrix.target }}
+
+            - name: Package (Unix)
+              if: runner.os != 'Windows'
+              run: |
+                  cd target/${{ matrix.target }}/release
+                  tar czf ../../../${{ matrix.archive }} ${{ matrix.artifact }}
+
+            - name: Package (Windows)
+              if: runner.os == 'Windows'
+              run: |
+                  cd target/${{ matrix.target }}/release
+                  7z a ../../../${{ matrix.archive }} ${{ matrix.artifact }}
+
+            - name: Upload artifact
+              uses: actions/upload-artifact@v4
+              with:
+                  name: ${{ matrix.archive }}
+                  path: ${{ matrix.archive }}
+                  retention-days: 14
+
+    release:
+        name: Create GitHub Release
+        needs: build
+        runs-on: ubuntu-latest
+        if: >
+            github.event_name == 'push' ||
+            (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
+        steps:
+            - uses: actions/checkout@v4
+
+            - name: Download all artifacts
+              uses: actions/download-artifact@v4
+              with:
+                  path: dist
+                  merge-multiple: true
+
+            - name: Generate SHA256 checksums
+              run: |
+                  cd dist
+                  sha256sum * > SHA256SUMS.txt
+                  cat SHA256SUMS.txt
+
+            - name: Determine release tag
+              id: tag
+              run: |
+                  if [[ "${{ github.event_name }}" == "push" ]]; then
+                    echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+                  else
+                    echo "tag=${{ inputs.release_tag }}" >> "$GITHUB_OUTPUT"
+                  fi
+
+            - name: Create release
+              uses: softprops/action-gh-release@v2
+              with:
+                  tag_name: ${{ steps.tag.outputs.tag }}
+                  draft: ${{ github.event_name == 'workflow_dispatch' && inputs.draft == 'true' }}
+                  generate_release_notes: true
+                  files: dist/*
+              env:
+                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
