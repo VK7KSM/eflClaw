@@ -84,10 +84,7 @@ impl Tool for SendTelegramTool {
             .ok_or_else(|| anyhow::anyhow!("Missing 'message' parameter"))?
             .to_string();
 
-        let url = format!(
-            "https://api.telegram.org/bot{}/sendMessage",
-            self.bot_token
-        );
+        let url = format!("https://api.telegram.org/bot{}/sendMessage", self.bot_token);
 
         let client = crate::config::build_runtime_proxy_client_with_timeouts(
             "tool.send_telegram",
@@ -164,19 +161,15 @@ mod tests {
 
     #[test]
     fn send_telegram_tool_name() {
-        let tool = SendTelegramTool::new(
-            test_security(AutonomyLevel::Full, 100),
-            "test-token".into(),
-        );
+        let tool =
+            SendTelegramTool::new(test_security(AutonomyLevel::Full, 100), "test-token".into());
         assert_eq!(tool.name(), "send_telegram");
     }
 
     #[test]
     fn send_telegram_tool_has_required_params() {
-        let tool = SendTelegramTool::new(
-            test_security(AutonomyLevel::Full, 100),
-            "test-token".into(),
-        );
+        let tool =
+            SendTelegramTool::new(test_security(AutonomyLevel::Full, 100), "test-token".into());
         let schema = tool.parameters_schema();
         assert_eq!(schema["type"], "object");
         let required = schema["required"].as_array().unwrap();
@@ -200,10 +193,8 @@ mod tests {
 
     #[tokio::test]
     async fn send_telegram_blocks_rate_limit() {
-        let tool = SendTelegramTool::new(
-            test_security(AutonomyLevel::Full, 0),
-            "test-token".into(),
-        );
+        let tool =
+            SendTelegramTool::new(test_security(AutonomyLevel::Full, 0), "test-token".into());
         let result = tool
             .execute(json!({"chat_id": "123", "message": "hi"}))
             .await

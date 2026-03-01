@@ -48,7 +48,11 @@ fn chat_log_dir(workspace_dir: &Path) -> PathBuf {
 
 /// Generate the file path for a specific user and date.
 pub fn log_file_path(workspace_dir: &Path, username: &str, date: &NaiveDate) -> PathBuf {
-    let filename = format!("{}_{}.json", sanitize_filename(username), date.format("%Y-%m-%d"));
+    let filename = format!(
+        "{}_{}.json",
+        sanitize_filename(username),
+        date.format("%Y-%m-%d")
+    );
     chat_log_dir(workspace_dir).join(filename)
 }
 
@@ -61,7 +65,13 @@ fn today_log_path(workspace_dir: &Path, username: &str) -> PathBuf {
 /// Sanitize username for use in filenames (remove unsafe chars).
 fn sanitize_filename(name: &str) -> String {
     name.chars()
-        .map(|c| if c.is_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -160,10 +170,7 @@ pub fn image_turn(content: &str, image_path: &str) -> ChatTurn {
 }
 
 /// Load messages from today's log file for a specific user.
-pub fn load_today_messages(
-    workspace_dir: &Path,
-    username: &str,
-) -> anyhow::Result<Vec<ChatTurn>> {
+pub fn load_today_messages(workspace_dir: &Path, username: &str) -> anyhow::Result<Vec<ChatTurn>> {
     let path = today_log_path(workspace_dir, username);
     if !path.exists() {
         return Ok(Vec::new());
@@ -322,13 +329,7 @@ mod tests {
         let ws = tmp.path();
 
         append_turn(ws, "123", "TestUser", text_turn("user", "Hello")).unwrap();
-        append_turn(
-            ws,
-            "123",
-            "TestUser",
-            text_turn("assistant", "Hi there!"),
-        )
-        .unwrap();
+        append_turn(ws, "123", "TestUser", text_turn("assistant", "Hi there!")).unwrap();
 
         let messages = load_today_messages(ws, "TestUser").unwrap();
         assert_eq!(messages.len(), 2);
@@ -345,13 +346,7 @@ mod tests {
         let ws = tmp.path();
 
         append_turn(ws, "123", "Alice", voice_turn_user("今天天气")).unwrap();
-        append_turn(
-            ws,
-            "123",
-            "Alice",
-            voice_turn_assistant("悉尼晴天"),
-        )
-        .unwrap();
+        append_turn(ws, "123", "Alice", voice_turn_assistant("悉尼晴天")).unwrap();
 
         let messages = load_today_messages(ws, "Alice").unwrap();
         assert_eq!(messages.len(), 2);

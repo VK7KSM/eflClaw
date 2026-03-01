@@ -72,14 +72,8 @@ impl Tool for SearchChatLogTool {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        let query = args
-            .get("query")
-            .and_then(|v| v.as_str())
-            .map(String::from);
-        let limit = args
-            .get("limit")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(10) as usize;
+        let query = args.get("query").and_then(|v| v.as_str()).map(String::from);
+        let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
 
         if chat_name.is_empty() {
             return Ok(ToolResult {
@@ -100,7 +94,9 @@ impl Tool for SearchChatLogTool {
             return Ok(ToolResult {
                 success: false,
                 output: "这是私密信息，我无法告诉你。".to_string(),
-                error: Some("Permission denied: cross-user chat log access restricted to owner".to_string()),
+                error: Some(
+                    "Permission denied: cross-user chat log access restricted to owner".to_string(),
+                ),
             });
         }
 
@@ -109,17 +105,18 @@ impl Tool for SearchChatLogTool {
         // ── 1. Fetch recent raw messages from JSON files ──
         match chat_log::load_recent_messages(&self.workspace_dir, &chat_name, limit) {
             Ok(messages) if !messages.is_empty() => {
-                output_parts.push(format!("## 最近 {} 条消息 ({})\n", messages.len(), chat_name));
+                output_parts.push(format!(
+                    "## 最近 {} 条消息 ({})\n",
+                    messages.len(),
+                    chat_name
+                ));
                 for msg in &messages {
                     let type_tag = if msg.msg_type != "text" {
                         format!(" [{}]", msg.msg_type)
                     } else {
                         String::new()
                     };
-                    output_parts.push(format!(
-                        "- **{}**{}: {}\n",
-                        msg.role, type_tag, msg.content
-                    ));
+                    output_parts.push(format!("- **{}**{}: {}\n", msg.role, type_tag, msg.content));
                 }
             }
             Ok(_) => {
@@ -136,7 +133,9 @@ impl Tool for SearchChatLogTool {
                 let summaries = if let Some(ref q) = query {
                     index.search_fts(q, limit).unwrap_or_default()
                 } else {
-                    index.get_user_summaries(&chat_name, limit).unwrap_or_default()
+                    index
+                        .get_user_summaries(&chat_name, limit)
+                        .unwrap_or_default()
                 };
 
                 if !summaries.is_empty() {

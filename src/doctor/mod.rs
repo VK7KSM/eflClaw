@@ -1165,7 +1165,9 @@ mod tests {
             hint: "fast".into(),
             provider: "groq".into(),
             model: String::new(),
+            max_tokens: None,
             api_key: None,
+            transport: None,
         }];
         let mut items = Vec::new();
         check_config_semantics(&config, &mut items);
@@ -1275,7 +1277,6 @@ mod tests {
                 provider: "totally-fake".into(),
                 model: "model-z".into(),
                 system_prompt: None,
-                system_prompt_file: None,
                 api_key: None,
                 temperature: None,
                 max_depth: 3,
@@ -1290,7 +1291,6 @@ mod tests {
                 provider: "totally-fake".into(),
                 model: "model-a".into(),
                 system_prompt: None,
-                system_prompt_file: None,
                 api_key: None,
                 temperature: None,
                 max_depth: 3,

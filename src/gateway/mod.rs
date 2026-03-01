@@ -8,8 +8,8 @@
 //! - Header sanitization (handled by axum/hyper)
 
 pub mod api;
-pub(crate) mod openclaw_compat;
 pub(crate) mod openai_compat;
+pub(crate) mod openclaw_compat;
 pub mod sse;
 pub mod static_files;
 pub mod ws;
@@ -1647,7 +1647,7 @@ mod tests {
 
     #[tokio::test]
     async fn metrics_endpoint_renders_prometheus_output() {
-        let prom = Arc::new(crate::observability::PrometheusObserver::new());
+        let prom = Arc::new(crate::observability::PrometheusObserver::new().unwrap());
         crate::observability::Observer::record_event(
             prom.as_ref(),
             &crate::observability::ObserverEvent::HeartbeatTick,

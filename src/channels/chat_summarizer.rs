@@ -46,10 +46,7 @@ pub async fn summarize_chat_logs(config: &Config) -> Result<SummarizeReport> {
     // Build provider using the SAME factory as channels/agent — supports all
     // provider formats (anthropic-custom:URL, openai, ollama, gemini etc.)
     // and handles encrypted API keys automatically.
-    let provider_name = config
-        .default_provider
-        .as_deref()
-        .unwrap_or("openrouter");
+    let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
 
     let options = ProviderRuntimeOptions {
         zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
@@ -129,10 +126,7 @@ async fn process_single_file(
          摘要：<一句话总结对话的主要内容>\n\
          话题：<用逗号分隔的2-5个关键话题>\n\n\
          聊天记录（{} 与 {} 在 {} 的对话）：\n{}",
-        log.chat_name,
-        "ZeroClaw",
-        entry.date,
-        messages_text
+        log.chat_name, "ZeroClaw", entry.date, messages_text
     );
 
     // Call the LLM

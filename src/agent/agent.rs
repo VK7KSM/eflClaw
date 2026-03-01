@@ -183,10 +183,7 @@ impl AgentBuilder {
         self
     }
 
-    pub fn research_config(
-        mut self,
-        research_config: crate::config::ResearchPhaseConfig,
-    ) -> Self {
+    pub fn research_config(mut self, research_config: crate::config::ResearchPhaseConfig) -> Self {
         self.research_config = Some(research_config);
         self
     }
@@ -502,7 +499,10 @@ impl Agent {
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
 
         // Research phase: proactively gather context before main response
-        let research_context = if super::research::should_trigger(&self.research_config, user_message) {
+        let research_context = if super::research::should_trigger(
+            &self.research_config,
+            user_message,
+        ) {
             match super::research::run_research_phase(
                 &self.research_config,
                 self.provider.as_ref(),
@@ -736,6 +736,7 @@ mod tests {
                     tool_calls: vec![],
                     usage: None,
                     reasoning_content: None,
+                    quota_metadata: None,
                 });
             }
             Ok(guard.remove(0))
@@ -773,6 +774,7 @@ mod tests {
                     tool_calls: vec![],
                     usage: None,
                     reasoning_content: None,
+                    quota_metadata: None,
                 });
             }
             Ok(guard.remove(0))
@@ -812,6 +814,7 @@ mod tests {
                 tool_calls: vec![],
                 usage: None,
                 reasoning_content: None,
+                quota_metadata: None,
             }]),
         });
 
@@ -853,12 +856,14 @@ mod tests {
                     }],
                     usage: None,
                     reasoning_content: None,
+                    quota_metadata: None,
                 },
                 crate::providers::ChatResponse {
                     text: Some("done".into()),
                     tool_calls: vec![],
                     usage: None,
                     reasoning_content: None,
+                    quota_metadata: None,
                 },
             ]),
         });
@@ -900,6 +905,7 @@ mod tests {
                 tool_calls: vec![],
                 usage: None,
                 reasoning_content: None,
+                quota_metadata: None,
             }]),
             seen_models: seen_models.clone(),
         });

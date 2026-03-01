@@ -188,19 +188,13 @@ mod tests {
 
     #[test]
     fn send_email_tool_name() {
-        let tool = SendEmailTool::new(
-            test_security(AutonomyLevel::Full, 100),
-            test_config(),
-        );
+        let tool = SendEmailTool::new(test_security(AutonomyLevel::Full, 100), test_config());
         assert_eq!(tool.name(), "send_email");
     }
 
     #[test]
     fn send_email_tool_has_required_params() {
-        let tool = SendEmailTool::new(
-            test_security(AutonomyLevel::Full, 100),
-            test_config(),
-        );
+        let tool = SendEmailTool::new(test_security(AutonomyLevel::Full, 100), test_config());
         let schema = tool.parameters_schema();
         assert_eq!(schema["type"], "object");
         let required = schema["required"].as_array().unwrap();
@@ -211,10 +205,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_email_blocks_readonly() {
-        let tool = SendEmailTool::new(
-            test_security(AutonomyLevel::ReadOnly, 100),
-            test_config(),
-        );
+        let tool = SendEmailTool::new(test_security(AutonomyLevel::ReadOnly, 100), test_config());
         let result = tool
             .execute(json!({"to": "a@b.com", "subject": "hi", "body": "hello"}))
             .await
@@ -225,10 +216,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_email_blocks_rate_limit() {
-        let tool = SendEmailTool::new(
-            test_security(AutonomyLevel::Full, 0),
-            test_config(),
-        );
+        let tool = SendEmailTool::new(test_security(AutonomyLevel::Full, 0), test_config());
         let result = tool
             .execute(json!({"to": "a@b.com", "subject": "hi", "body": "hello"}))
             .await

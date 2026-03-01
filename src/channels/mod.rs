@@ -14,14 +14,18 @@
 //! To add a new channel, implement [`Channel`] in a new submodule and wire it into
 //! [`start_channels`]. See `AGENTS.md` §7.2 for the full change playbook.
 
-pub mod chat_log;
+pub mod ack_reaction;
+pub mod acp;
+pub mod bluebubbles;
 pub mod chat_index;
+pub mod chat_log;
 pub mod chat_summarizer;
 pub mod clawdtalk;
 pub mod cli;
 pub mod dingtalk;
 pub mod discord;
 pub mod email_channel;
+pub mod github;
 pub mod imessage;
 pub mod irc;
 #[cfg(feature = "channel-lark")]
@@ -30,6 +34,7 @@ pub mod linq;
 #[cfg(feature = "channel-matrix")]
 pub mod matrix;
 pub mod mattermost;
+pub mod napcat;
 pub mod nextcloud_talk;
 pub mod nostr;
 pub mod qq;
@@ -46,11 +51,13 @@ pub mod whatsapp_storage;
 #[cfg(feature = "whatsapp-web")]
 pub mod whatsapp_web;
 
+pub use bluebubbles::BlueBubblesChannel;
 pub use clawdtalk::ClawdTalkChannel;
 pub use cli::CliChannel;
 pub use dingtalk::DingTalkChannel;
 pub use discord::DiscordChannel;
 pub use email_channel::EmailChannel;
+pub use github::GitHubChannel;
 pub use imessage::IMessageChannel;
 pub use irc::IrcChannel;
 #[cfg(feature = "channel-lark")]
@@ -59,6 +66,7 @@ pub use linq::LinqChannel;
 #[cfg(feature = "channel-matrix")]
 pub use matrix::MatrixChannel;
 pub use mattermost::MattermostChannel;
+pub use napcat::NapcatChannel;
 pub use nextcloud_talk::NextcloudTalkChannel;
 pub use nostr::NostrChannel;
 pub use qq::QQChannel;
@@ -1622,12 +1630,17 @@ async fn process_channel_message(
 
     // Persist user turn to local chat log
     if ctx.chat_log_config.enabled && msg.channel == "telegram" {
-        let chat_id = msg.reply_target.split(':').next().unwrap_or(&msg.reply_target);
+        let chat_id = msg
+            .reply_target
+            .split(':')
+            .next()
+            .unwrap_or(&msg.reply_target);
         let turn = if msg.content.starts_with("[Voice] ") {
             let stt = msg.content.strip_prefix("[Voice] ").unwrap_or(&msg.content);
             chat_log::voice_turn_user(stt)
         } else if msg.content.starts_with("[IMAGE:") {
-            let path = msg.content
+            let path = msg
+                .content
                 .strip_prefix("[IMAGE:")
                 .and_then(|s| s.strip_suffix(']'))
                 .unwrap_or(&msg.content);
@@ -1635,7 +1648,9 @@ async fn process_channel_message(
         } else {
             chat_log::text_turn("user", &msg.content)
         };
-        if let Err(e) = chat_log::append_turn(ctx.workspace_dir.as_path(), chat_id, &msg.sender, turn) {
+        if let Err(e) =
+            chat_log::append_turn(ctx.workspace_dir.as_path(), chat_id, &msg.sender, turn)
+        {
             tracing::warn!("chat_log: failed to persist user turn: {e}");
         }
     }
@@ -1704,9 +1719,7 @@ async fn process_channel_message(
                             s.date, s.msg_count, s.summary, topics
                         ));
                     }
-                    system_prompt.push_str(
-                        "如需回忆更多细节，可使用 search_chat_log 工具搜索。\n",
-                    );
+                    system_prompt.push_str("如需回忆更多细节，可使用 search_chat_log 工具搜索。\n");
                 }
             }
         }
@@ -2003,9 +2016,15 @@ async fn process_channel_message(
 
             // Persist assistant turn to local chat log
             if ctx.chat_log_config.enabled && msg.channel == "telegram" {
-                let chat_id = msg.reply_target.split(':').next().unwrap_or(&msg.reply_target);
+                let chat_id = msg
+                    .reply_target
+                    .split(':')
+                    .next()
+                    .unwrap_or(&msg.reply_target);
                 let turn = chat_log::text_turn("assistant", &delivered_response);
-                if let Err(e) = chat_log::append_turn(ctx.workspace_dir.as_path(), chat_id, &msg.sender, turn) {
+                if let Err(e) =
+                    chat_log::append_turn(ctx.workspace_dir.as_path(), chat_id, &msg.sender, turn)
+                {
                     tracing::warn!("chat_log: failed to persist assistant turn: {e}");
                 }
             }
@@ -2170,9 +2189,7 @@ async fn process_channel_message(
                         Ok(response) => {
                             let sanitized =
                                 sanitize_channel_response(&response, ctx.tools_registry.as_ref());
-                            let delivered = if sanitized.is_empty()
-                                && !response.trim().is_empty()
-                            {
+                            let delivered = if sanitized.is_empty() && !response.trim().is_empty() {
                                 "I encountered malformed tool-call output and could not produce a safe reply. Please try again.".to_string()
                             } else {
                                 sanitized
@@ -2210,7 +2227,8 @@ async fn process_channel_message(
                 }
 
                 if !recovered {
-                    let fallback = "⚠️ 上下文窗口溢出，自动压缩后仍无法恢复。对话历史已清空，请重新发送消息。";
+                    let fallback =
+                        "⚠️ 上下文窗口溢出，自动压缩后仍无法恢复。对话历史已清空，请重新发送消息。";
                     clear_sender_history(ctx.as_ref(), &history_key);
                     if let Some(channel) = target_channel.as_ref() {
                         let _ = channel
@@ -2914,6 +2932,7 @@ fn collect_configured_channels(
             tg.bot_token.clone(),
             tg.allowed_users.clone(),
             tg.mention_only,
+            tg.ack_enabled,
         )
         .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
         .with_transcription(config.transcription.clone())
@@ -2947,7 +2966,9 @@ fn collect_configured_channels(
             display_name: "Slack",
             channel: Arc::new(SlackChannel::new(
                 sl.bot_token.clone(),
+                sl.app_token.clone(),
                 sl.channel_id.clone(),
+                sl.channel_ids.clone(),
                 sl.allowed_users.clone(),
             )),
         });
@@ -3621,7 +3642,8 @@ pub async fn start_channels(config: Config) -> Result<()> {
             const STARTUP_RESTORE_RECENT_TURNS: usize = 8;
             let mut seed: HashMap<String, Vec<ChatMessage>> = HashMap::new();
             if config.chat_log.enabled {
-                for username in chat_log::list_chat_users(&config.workspace_dir).unwrap_or_default() {
+                for username in chat_log::list_chat_users(&config.workspace_dir).unwrap_or_default()
+                {
                     match chat_log::load_recent_messages(
                         &config.workspace_dir,
                         &username,
@@ -3636,10 +3658,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
                                     content: t.content,
                                 })
                                 .collect();
-                            println!(
-                                "  📂 Restored {} messages for {username}",
-                                messages.len()
-                            );
+                            println!("  📂 Restored {} messages for {username}", messages.len());
                             seed.insert(history_key, messages);
                         }
                         Err(e) => {
@@ -5822,6 +5841,7 @@ BTC is currently around $65,000 based on latest tool output."#
             }],
             prompts: vec!["Always run cargo test before final response.".into()],
             location: None,
+            always: false,
         }];
 
         let prompt = build_system_prompt(ws.path(), "model", &[], &skills, None, None);
@@ -5857,6 +5877,7 @@ BTC is currently around $65,000 based on latest tool output."#
             }],
             prompts: vec!["Always run cargo test before final response.".into()],
             location: None,
+            always: false,
         }];
 
         let prompt = build_system_prompt_with_mode(
@@ -5898,6 +5919,7 @@ BTC is currently around $65,000 based on latest tool output."#
             }],
             prompts: vec!["Use <tool_call> and & keep output \"safe\"".into()],
             location: None,
+            always: false,
         }];
 
         let prompt = build_system_prompt(ws.path(), "model", &[], &skills, None, None);
@@ -6468,6 +6490,7 @@ This is an example JSON object for profile settings."#;
         // Create identity config pointing to the file
         let config = IdentityConfig {
             format: "aieos".into(),
+            extra_files: vec![],
             aieos_path: Some("aieos_identity.json".into()),
             aieos_inline: None,
         };
@@ -6502,6 +6525,7 @@ This is an example JSON object for profile settings."#;
 
         let config = IdentityConfig {
             format: "aieos".into(),
+            extra_files: vec![],
             aieos_path: None,
             aieos_inline: Some(r#"{"identity":{"names":{"first":"Claw"}}}"#.into()),
         };
@@ -6525,6 +6549,7 @@ This is an example JSON object for profile settings."#;
 
         let config = IdentityConfig {
             format: "aieos".into(),
+            extra_files: vec![],
             aieos_path: Some("nonexistent.json".into()),
             aieos_inline: None,
         };
@@ -6544,6 +6569,7 @@ This is an example JSON object for profile settings."#;
         // Format is "aieos" but neither path nor inline is set
         let config = IdentityConfig {
             format: "aieos".into(),
+            extra_files: vec![],
             aieos_path: None,
             aieos_inline: None,
         };
@@ -6562,6 +6588,7 @@ This is an example JSON object for profile settings."#;
 
         let config = IdentityConfig {
             format: "openclaw".into(),
+            extra_files: vec![],
             aieos_path: Some("identity.json".into()),
             aieos_inline: None,
         };
@@ -6619,6 +6646,7 @@ This is an example JSON object for profile settings."#;
             allowed_users: vec![],
             thread_replies: Some(true),
             mention_only: Some(false),
+            group_reply: None,
         });
 
         let channels = collect_configured_channels(&config, "test");

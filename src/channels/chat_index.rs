@@ -193,11 +193,7 @@ impl ChatIndex {
     }
 
     /// Get summaries for a specific user, ordered by date descending.
-    pub fn get_user_summaries(
-        &self,
-        chat_name: &str,
-        limit: usize,
-    ) -> Result<Vec<ChatSummaryRow>> {
+    pub fn get_user_summaries(&self, chat_name: &str, limit: usize) -> Result<Vec<ChatSummaryRow>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, channel, chat_id, chat_name, date, summary, topics, msg_count
@@ -260,11 +256,8 @@ impl ChatIndex {
         let conn = self.conn.lock().unwrap();
 
         // Row count
-        let row_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM chat_summaries",
-            [],
-            |row| row.get(0),
-        )?;
+        let row_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM chat_summaries", [], |row| row.get(0))?;
 
         // DB file size
         let db_size_bytes: i64 = conn.query_row(
@@ -288,11 +281,8 @@ impl ChatIndex {
     /// Total number of summary rows (for monitoring).
     pub fn summary_count(&self) -> Result<i64> {
         let conn = self.conn.lock().unwrap();
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM chat_summaries",
-            [],
-            |row| row.get(0),
-        )?;
+        let count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM chat_summaries", [], |row| row.get(0))?;
         Ok(count)
     }
 }
@@ -324,10 +314,17 @@ mod tests {
         let idx = test_index(&tmp);
 
         idx.upsert_summary(
-            "telegram", "123", "Alice", "2026-02-26",
-            "讨论了天气和晚饭", Some("天气,晚饭"),
-            None, 15, "hash1",
-        ).unwrap();
+            "telegram",
+            "123",
+            "Alice",
+            "2026-02-26",
+            "讨论了天气和晚饭",
+            Some("天气,晚饭"),
+            None,
+            15,
+            "hash1",
+        )
+        .unwrap();
 
         let rows = idx.get_user_summaries("Alice", 10).unwrap();
         assert_eq!(rows.len(), 1);
@@ -342,14 +339,30 @@ mod tests {
         let idx = test_index(&tmp);
 
         idx.upsert_summary(
-            "telegram", "123", "Bob", "2026-02-26",
-            "上午的对话", None, None, 5, "hash1",
-        ).unwrap();
+            "telegram",
+            "123",
+            "Bob",
+            "2026-02-26",
+            "上午的对话",
+            None,
+            None,
+            5,
+            "hash1",
+        )
+        .unwrap();
 
         idx.upsert_summary(
-            "telegram", "123", "Bob", "2026-02-26",
-            "上午和下午的对话", Some("编程"), None, 20, "hash2",
-        ).unwrap();
+            "telegram",
+            "123",
+            "Bob",
+            "2026-02-26",
+            "上午和下午的对话",
+            Some("编程"),
+            None,
+            20,
+            "hash2",
+        )
+        .unwrap();
 
         let rows = idx.get_user_summaries("Bob", 10).unwrap();
         assert_eq!(rows.len(), 1);
@@ -362,14 +375,27 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let idx = test_index(&tmp);
 
-        assert!(idx.get_source_hash("telegram", "123", "2026-02-26").unwrap().is_none());
+        assert!(idx
+            .get_source_hash("telegram", "123", "2026-02-26")
+            .unwrap()
+            .is_none());
 
         idx.upsert_summary(
-            "telegram", "123", "Alice", "2026-02-26",
-            "test", None, None, 1, "abc123",
-        ).unwrap();
+            "telegram",
+            "123",
+            "Alice",
+            "2026-02-26",
+            "test",
+            None,
+            None,
+            1,
+            "abc123",
+        )
+        .unwrap();
 
-        let hash = idx.get_source_hash("telegram", "123", "2026-02-26").unwrap();
+        let hash = idx
+            .get_source_hash("telegram", "123", "2026-02-26")
+            .unwrap();
         assert_eq!(hash.as_deref(), Some("abc123"));
     }
 
@@ -379,16 +405,30 @@ mod tests {
         let idx = test_index(&tmp);
 
         idx.upsert_summary(
-            "telegram", "1", "Alice", "2026-02-26",
-            "discussed weather and dinner plans", Some("weather,dinner"),
-            None, 10, "h1",
-        ).unwrap();
+            "telegram",
+            "1",
+            "Alice",
+            "2026-02-26",
+            "discussed weather and dinner plans",
+            Some("weather,dinner"),
+            None,
+            10,
+            "h1",
+        )
+        .unwrap();
 
         idx.upsert_summary(
-            "telegram", "2", "Bob", "2026-02-26",
-            "talked about Python programming", Some("programming"),
-            None, 8, "h2",
-        ).unwrap();
+            "telegram",
+            "2",
+            "Bob",
+            "2026-02-26",
+            "talked about Python programming",
+            Some("programming"),
+            None,
+            8,
+            "h2",
+        )
+        .unwrap();
 
         let results = idx.search_fts("weather", 10).unwrap();
         assert_eq!(results.len(), 1);
@@ -404,8 +444,30 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let idx = test_index(&tmp);
 
-        idx.upsert_summary("telegram", "1", "Alice", "2026-02-26", "hello", None, None, 1, "h1").unwrap();
-        idx.upsert_summary("telegram", "2", "Bob", "2026-02-26", "world", None, None, 1, "h2").unwrap();
+        idx.upsert_summary(
+            "telegram",
+            "1",
+            "Alice",
+            "2026-02-26",
+            "hello",
+            None,
+            None,
+            1,
+            "h1",
+        )
+        .unwrap();
+        idx.upsert_summary(
+            "telegram",
+            "2",
+            "Bob",
+            "2026-02-26",
+            "world",
+            None,
+            None,
+            1,
+            "h2",
+        )
+        .unwrap();
 
         let results = idx.get_recent_cross_user_summaries("Alice", 10).unwrap();
         assert_eq!(results.len(), 1);
@@ -425,7 +487,8 @@ mod tests {
         let idx = test_index(&tmp);
         assert_eq!(idx.summary_count().unwrap(), 0);
 
-        idx.upsert_summary("telegram", "1", "A", "2026-01-01", "s", None, None, 1, "h").unwrap();
+        idx.upsert_summary("telegram", "1", "A", "2026-01-01", "s", None, None, 1, "h")
+            .unwrap();
         assert_eq!(idx.summary_count().unwrap(), 1);
     }
 

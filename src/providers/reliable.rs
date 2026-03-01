@@ -226,7 +226,6 @@ pub struct ReliableProvider {
     providers: Vec<(String, Box<dyn Provider>)>,
     max_retries: u32,
     base_backoff_ms: u64,
-    max_backoff_ms: u64,
     /// Extra API keys for rotation (index tracks round-robin position).
     api_keys: Vec<String>,
     key_index: AtomicUsize,
@@ -243,13 +242,11 @@ impl ReliableProvider {
         providers: Vec<(String, Box<dyn Provider>)>,
         max_retries: u32,
         base_backoff_ms: u64,
-        max_backoff_ms: u64,
     ) -> Self {
         Self {
             providers,
             max_retries,
             base_backoff_ms: base_backoff_ms.max(50),
-            max_backoff_ms: max_backoff_ms.max(base_backoff_ms),
             api_keys: Vec::new(),
             key_index: AtomicUsize::new(0),
             model_fallbacks: HashMap::new(),
@@ -465,7 +462,7 @@ impl Provider for ReliableProvider {
                                         "Provider call failed, retrying"
                                     );
                                     tokio::time::sleep(Duration::from_millis(wait)).await;
-                                    backoff_ms = (backoff_ms.saturating_mul(2)).min(self.max_backoff_ms);
+                                    backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
                                 }
                             }
                         }
@@ -588,7 +585,7 @@ impl Provider for ReliableProvider {
                                         "Provider call failed, retrying"
                                     );
                                     tokio::time::sleep(Duration::from_millis(wait)).await;
-                                    backoff_ms = (backoff_ms.saturating_mul(2)).min(self.max_backoff_ms);
+                                    backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
                                 }
                             }
                         }
@@ -719,7 +716,7 @@ impl Provider for ReliableProvider {
                                         "Provider call failed, retrying"
                                     );
                                     tokio::time::sleep(Duration::from_millis(wait)).await;
-                                    backoff_ms = (backoff_ms.saturating_mul(2)).min(self.max_backoff_ms);
+                                    backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
                                 }
                             }
                         }
@@ -835,7 +832,7 @@ impl Provider for ReliableProvider {
                                         "Provider call failed, retrying"
                                     );
                                     tokio::time::sleep(Duration::from_millis(wait)).await;
-                                    backoff_ms = (backoff_ms.saturating_mul(2)).min(self.max_backoff_ms);
+                                    backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
                                 }
                             }
                         }
@@ -1029,7 +1026,6 @@ mod tests {
             )],
             2,
             1,
-            60_000,
         );
 
         let result = provider.simple_chat("hello", "test", 0.0).await.unwrap();
@@ -1052,7 +1048,6 @@ mod tests {
             )],
             2,
             1,
-            60_000,
         );
 
         let result = provider.simple_chat("hello", "test", 0.0).await.unwrap();
@@ -1088,7 +1083,6 @@ mod tests {
             ],
             1,
             1,
-            60_000,
         );
 
         let result = provider.simple_chat("hello", "test", 0.0).await.unwrap();
@@ -1122,7 +1116,6 @@ mod tests {
             ],
             0,
             1,
-            60_000,
         );
 
         let err = provider
@@ -1191,7 +1184,6 @@ mod tests {
             )],
             4,
             1,
-            60_000,
         )
         .with_model_fallbacks(model_fallbacks);
 
@@ -1221,7 +1213,6 @@ mod tests {
             )],
             3,
             1,
-            60_000,
         );
 
         let err = provider
@@ -1264,7 +1255,6 @@ mod tests {
             ],
             3,
             1,
-            60_000,
         );
 
         let result = provider.simple_chat("hello", "test", 0.0).await.unwrap();
@@ -1289,7 +1279,6 @@ mod tests {
             )],
             2,
             1,
-            60_000,
         );
 
         let messages = vec![ChatMessage::system("system"), ChatMessage::user("hello")];
@@ -1329,7 +1318,6 @@ mod tests {
             ],
             1,
             1,
-            60_000,
         );
 
         let messages = vec![ChatMessage::user("hello")];
@@ -1364,7 +1352,6 @@ mod tests {
             )],
             0, // no retries — force immediate model failover
             1,
-            60_000,
         )
         .with_model_fallbacks(fallbacks);
 
@@ -1400,7 +1387,6 @@ mod tests {
             vec![("p1".into(), Box::new(mock.clone()) as Box<dyn Provider>)],
             0,
             1,
-            60_000,
         )
         .with_model_fallbacks(fallbacks);
 
@@ -1429,12 +1415,60 @@ mod tests {
             )],
             2,
             1,
-            60_000,
         );
         // No model_fallbacks set — should work exactly as before
         let result = provider.simple_chat("hello", "test", 0.0).await.unwrap();
         assert_eq!(result, "ok");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn provider_keyed_model_fallbacks_remap_fallback_provider_models() {
+        let primary = Arc::new(ModelAwareMock {
+            calls: Arc::new(AtomicUsize::new(0)),
+            models_seen: parking_lot::Mutex::new(Vec::new()),
+            fail_models: vec!["glm-5", "glm-4.7"],
+            response: "never",
+        });
+        let fallback = Arc::new(ModelAwareMock {
+            calls: Arc::new(AtomicUsize::new(0)),
+            models_seen: parking_lot::Mutex::new(Vec::new()),
+            fail_models: vec![],
+            response: "ok from remap",
+        });
+
+        let mut fallbacks = HashMap::new();
+        fallbacks.insert("zai".to_string(), vec!["glm-4.7".to_string()]);
+        fallbacks.insert(
+            "openrouter".to_string(),
+            vec!["anthropic/claude-sonnet-4".to_string()],
+        );
+
+        let provider = ReliableProvider::new(
+            vec![
+                ("zai".into(), Box::new(primary.clone()) as Box<dyn Provider>),
+                (
+                    "openrouter".into(),
+                    Box::new(fallback.clone()) as Box<dyn Provider>,
+                ),
+            ],
+            0,
+            1,
+        )
+        .with_model_fallbacks(fallbacks);
+
+        let result = provider.simple_chat("hello", "glm-5", 0.0).await.unwrap();
+        assert_eq!(result, "ok from remap");
+
+        let primary_seen = primary.models_seen.lock();
+        assert_eq!(primary_seen.len(), 2);
+        assert_eq!(primary_seen[0], "glm-5");
+        assert_eq!(primary_seen[1], "glm-4.7");
+
+        let fallback_seen = fallback.models_seen.lock();
+        assert_eq!(fallback_seen.len(), 1);
+        assert_eq!(fallback_seen[0], "anthropic/claude-sonnet-4");
+        assert!(!fallback_seen.iter().any(|m| m == "glm-5"));
     }
 
     // ── New tests: auth rotation ──
@@ -1453,7 +1487,6 @@ mod tests {
             )],
             0,
             1,
-            60_000,
         )
         .with_api_keys(vec!["key-a".into(), "key-b".into(), "key-c".into()]);
 
@@ -1464,7 +1497,7 @@ mod tests {
 
     #[tokio::test]
     async fn auth_rotation_returns_none_when_empty() {
-        let provider = ReliableProvider::new(vec![], 0, 1, 60_000);
+        let provider = ReliableProvider::new(vec![], 0, 1);
         assert!(provider.rotate_key().is_none());
     }
 
@@ -1535,21 +1568,21 @@ mod tests {
 
     #[test]
     fn compute_backoff_uses_retry_after() {
-        let provider = ReliableProvider::new(vec![], 0, 500, 60_000);
+        let provider = ReliableProvider::new(vec![], 0, 500);
         let err = anyhow::anyhow!("429 Retry-After: 3");
         assert_eq!(provider.compute_backoff(500, &err), 3_000);
     }
 
     #[test]
     fn compute_backoff_caps_at_30s() {
-        let provider = ReliableProvider::new(vec![], 0, 500, 60_000);
+        let provider = ReliableProvider::new(vec![], 0, 500);
         let err = anyhow::anyhow!("429 Retry-After: 120");
         assert_eq!(provider.compute_backoff(500, &err), 30_000);
     }
 
     #[test]
     fn compute_backoff_falls_back_to_base() {
-        let provider = ReliableProvider::new(vec![], 0, 500, 60_000);
+        let provider = ReliableProvider::new(vec![], 0, 500);
         let err = anyhow::anyhow!("500 Server Error");
         assert_eq!(provider.compute_backoff(500, &err), 500);
     }
@@ -1677,7 +1710,6 @@ mod tests {
             )],
             5,
             1,
-            60_000,
         );
 
         let result = provider.simple_chat("hello", "test", 0.0).await;
@@ -1704,7 +1736,6 @@ mod tests {
             )],
             5,
             1,
-            60_000,
         );
 
         let result = provider.simple_chat("hello", "test", 0.0).await;
@@ -1776,6 +1807,7 @@ mod tests {
                 tool_calls: self.tool_calls.clone(),
                 usage: None,
                 reasoning_content: None,
+                quota_metadata: None,
             })
         }
     }
@@ -1802,7 +1834,6 @@ mod tests {
             )],
             2,
             1,
-            60_000,
         );
 
         let messages = vec![ChatMessage::user("what time is it?")];
@@ -1840,7 +1871,6 @@ mod tests {
             )],
             3,
             1,
-            60_000,
         );
 
         let messages = vec![ChatMessage::user("test")];
@@ -1873,7 +1903,6 @@ mod tests {
             )],
             2,
             1,
-            60_000,
         );
 
         assert!(
@@ -1913,7 +1942,6 @@ mod tests {
             ],
             0,
             1,
-            60_000,
         );
 
         let messages = vec![ChatMessage::user("hello")];
@@ -1975,6 +2003,7 @@ mod tests {
                 tool_calls: vec![],
                 usage: None,
                 reasoning_content: None,
+                quota_metadata: None,
             })
         }
     }
@@ -2029,7 +2058,6 @@ mod tests {
             )],
             0, // no retries — force immediate model failover
             1,
-            60_000,
         )
         .with_model_fallbacks(fallbacks);
 
@@ -2079,7 +2107,6 @@ mod tests {
             ],
             3,
             1,
-            60_000,
         );
 
         let messages = vec![ChatMessage::user("hello")];
@@ -2092,5 +2119,69 @@ mod tests {
         // Primary should have been called only once (no retries)
         assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
         assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn vision_override_forces_true() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableProvider::new(
+            vec![(
+                "primary".into(),
+                Box::new(MockProvider {
+                    calls: Arc::clone(&calls),
+                    fail_until_attempt: 0,
+                    response: "ok",
+                    error: "",
+                }) as Box<dyn Provider>,
+            )],
+            1,
+            100,
+        )
+        .with_vision_override(Some(true));
+
+        // MockProvider default capabilities → vision: false
+        // Override should force true
+        assert!(provider.supports_vision());
+    }
+
+    #[test]
+    fn vision_override_forces_false() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableProvider::new(
+            vec![(
+                "primary".into(),
+                Box::new(MockProvider {
+                    calls: Arc::clone(&calls),
+                    fail_until_attempt: 0,
+                    response: "ok",
+                    error: "",
+                }) as Box<dyn Provider>,
+            )],
+            1,
+            100,
+        )
+        .with_vision_override(Some(false));
+
+        assert!(!provider.supports_vision());
+    }
+
+    #[test]
+    fn vision_override_none_defers_to_provider() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableProvider::new(
+            vec![(
+                "primary".into(),
+                Box::new(MockProvider {
+                    calls: Arc::clone(&calls),
+                    fail_until_attempt: 0,
+                    response: "ok",
+                    error: "",
+                }) as Box<dyn Provider>,
+            )],
+            1,
+            100,
+        );
+        // No override set → should defer to provider default (false)
+        assert!(!provider.supports_vision());
     }
 }

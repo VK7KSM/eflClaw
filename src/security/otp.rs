@@ -77,7 +77,6 @@ impl OtpValidator {
                 .get(normalized)
                 .is_some_and(|expiry| *expiry >= now_secs)
             {
-                // Code already used within the replay-protection window.
                 return Ok(false);
             }
         }
@@ -311,6 +310,18 @@ mod tests {
         let now = 1_700_000_000u64;
         let code = validator.code_for_timestamp(now);
         assert!(validator.validate_at(&code, now).unwrap());
+    }
+
+    #[test]
+    fn replayed_totp_code_is_rejected() {
+        let dir = tempdir().unwrap();
+        let store = SecretStore::new(dir.path(), true);
+        let (validator, _) = OtpValidator::from_config(&test_config(), dir.path(), &store).unwrap();
+
+        let now = 1_700_000_000u64;
+        let code = validator.code_for_timestamp(now);
+        assert!(validator.validate_at(&code, now).unwrap());
+        assert!(!validator.validate_at(&code, now).unwrap());
     }
 
     #[test]

@@ -1,163 +1,316 @@
-//! Provider health tracker — records failure counts and circuit-breaker state.
+//! Provider health tracking with circuit breaker pattern.
 //!
-//! Used by the quota CLI to show which providers are degraded or fully offline.
+//! Tracks provider failure counts and temporarily blocks providers that exceed
+//! failure thresholds (circuit breaker pattern). Uses separate storage for:
+//! - Persistent failure state (HashMap with failure counts)
+//! - Temporary circuit breaker blocks (BackoffStore with TTL)
 
+use super::backoff::BackoffStore;
+use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Duration;
 
-/// Snapshot of a single provider's health at query time.
-#[derive(Debug, Clone)]
-pub struct HealthState {
-    /// Number of consecutive failures (reset on success)
+/// Provider health state with failure tracking.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ProviderHealthState {
     pub failure_count: u32,
-    /// Last error message recorded
     pub last_error: Option<String>,
-    /// Whether the circuit breaker is currently open
-    pub circuit_open: bool,
 }
 
-/// Inner state for a tracked provider.
-#[derive(Debug)]
-struct ProviderEntry {
-    failure_count: u32,
-    last_error: Option<String>,
-    last_failure_at: Option<Instant>,
-}
-
-/// Thread-safe provider health tracker.
+/// Thread-safe provider health tracker with circuit breaker.
 ///
-/// Records consecutive failure counts and implements a simple circuit-breaker:
-/// once `failure_threshold` consecutive failures occur, the circuit opens until
-/// the `cooldown` duration elapses since the last failure.
+/// Architecture:
+/// - `states`: Persistent failure counts per provider (never expires)
+/// - `backoff`: Temporary circuit breaker blocks with TTL (auto-expires)
+///
+/// This separation ensures:
+/// - Circuit breaker blocks expire after cooldown (backoff.get() returns None)
+/// - Failure history persists for observability (states HashMap)
 pub struct ProviderHealthTracker {
+    /// Persistent failure state per provider
+    states: Arc<Mutex<HashMap<String, ProviderHealthState>>>,
+    /// Temporary circuit breaker blocks with TTL
+    backoff: Arc<BackoffStore<String, ()>>,
+    /// Failure threshold before circuit opens
     failure_threshold: u32,
+    /// Circuit breaker cooldown duration
     cooldown: Duration,
-    entries: Mutex<HashMap<String, ProviderEntry>>,
 }
 
 impl ProviderHealthTracker {
-    /// Create a new tracker.
+    /// Create new health tracker with circuit breaker settings.
     ///
-    /// - `failure_threshold`: failures before circuit opens
-    /// - `cooldown`: how long circuit stays open after last failure
-    /// - `_max_tracked`: maximum number of providers to track (unused, for API compat)
-    pub fn new(failure_threshold: u32, cooldown: Duration, _max_tracked: usize) -> Self {
+    /// # Arguments
+    /// * `failure_threshold` - Number of consecutive failures before circuit opens
+    /// * `cooldown` - Duration to block provider after circuit opens
+    /// * `max_tracked_providers` - Maximum number of providers to track (for BackoffStore capacity)
+    pub fn new(failure_threshold: u32, cooldown: Duration, max_tracked_providers: usize) -> Self {
+        assert!(
+            failure_threshold > 0,
+            "failure_threshold must be greater than 0"
+        );
+        assert!(!cooldown.is_zero(), "cooldown must be greater than 0");
+
         Self {
+            states: Arc::new(Mutex::new(HashMap::new())),
+            backoff: Arc::new(BackoffStore::new(max_tracked_providers)),
             failure_threshold,
             cooldown,
-            entries: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Record a successful call for a provider (resets failure count).
+    /// Check if provider should be tried (circuit closed).
+    ///
+    /// Returns:
+    /// - `Ok(())` if circuit is closed (provider can be tried)
+    /// - `Err((remaining, state))` if circuit is open (provider blocked)
+    pub fn should_try(&self, provider: &str) -> Result<(), (Duration, ProviderHealthState)> {
+        // Check circuit breaker
+        if let Some((remaining, ())) = self.backoff.get(&provider.to_string()) {
+            // Circuit is open - return remaining time and current state
+            let states = self.states.lock();
+            let state = states.get(provider).cloned().unwrap_or_default();
+            return Err((remaining, state));
+        }
+
+        Ok(())
+    }
+
+    /// Record successful provider call.
+    ///
+    /// Resets failure count and clears circuit breaker.
     pub fn record_success(&self, provider: &str) {
-        let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(entry) = entries.get_mut(provider) {
-            entry.failure_count = 0;
-            entry.last_error = None;
-            entry.last_failure_at = None;
+        let mut states = self.states.lock();
+        if let Some(state) = states.get_mut(provider) {
+            if state.failure_count > 0 {
+                tracing::info!(
+                    provider = provider,
+                    previous_failures = state.failure_count,
+                    "Provider recovered - resetting failure count"
+                );
+                state.failure_count = 0;
+                state.last_error = None;
+            }
         }
+        drop(states);
+
+        // Clear circuit breaker
+        self.backoff.clear(&provider.to_string());
     }
 
-    /// Record a failed call for a provider.
+    /// Record failed provider call.
+    ///
+    /// Increments failure count. If threshold exceeded, opens circuit breaker.
     pub fn record_failure(&self, provider: &str, error: &str) {
-        let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
-        let entry = entries.entry(provider.to_string()).or_insert(ProviderEntry {
-            failure_count: 0,
-            last_error: None,
-            last_failure_at: None,
-        });
-        entry.failure_count = entry.failure_count.saturating_add(1);
-        entry.last_error = Some(error.to_string());
-        entry.last_failure_at = Some(Instant::now());
-    }
+        let mut states = self.states.lock();
+        let state = states.entry(provider.to_string()).or_default();
 
-    /// Check whether the circuit for a provider is currently open.
-    pub fn is_circuit_open(&self, provider: &str) -> bool {
-        let entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
-        let Some(entry) = entries.get(provider) else {
-            return false;
-        };
-        if entry.failure_count < self.failure_threshold {
-            return false;
+        state.failure_count += 1;
+        state.last_error = Some(error.to_string());
+
+        let current_count = state.failure_count;
+        drop(states);
+
+        // Open circuit if threshold is exceeded and provider is not already
+        // in cooldown. This prevents repeated failures from extending cooldown.
+        let provider_key = provider.to_string();
+        if current_count >= self.failure_threshold && self.backoff.get(&provider_key).is_none() {
+            tracing::warn!(
+                provider = provider,
+                failure_count = current_count,
+                threshold = self.failure_threshold,
+                cooldown_secs = self.cooldown.as_secs(),
+                "Provider failure threshold exceeded - opening circuit breaker"
+            );
+            self.backoff.set(provider_key, self.cooldown, ());
         }
-        // Circuit stays open until cooldown elapses since last failure
-        entry
-            .last_failure_at
-            .map(|t| t.elapsed() < self.cooldown)
-            .unwrap_or(false)
     }
 
-    /// Retrieve health state snapshots for all tracked providers.
-    pub fn get_all_states(&self) -> HashMap<String, HealthState> {
-        let entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
-        entries
-            .iter()
-            .map(|(name, entry)| {
-                let circuit_open = entry.failure_count >= self.failure_threshold
-                    && entry
-                        .last_failure_at
-                        .map(|t| t.elapsed() < self.cooldown)
-                        .unwrap_or(false);
-                (
-                    name.clone(),
-                    HealthState {
-                        failure_count: entry.failure_count,
-                        last_error: entry.last_error.clone(),
-                        circuit_open,
-                    },
-                )
-            })
-            .collect()
+    /// Get current health state for a provider.
+    pub fn get_state(&self, provider: &str) -> ProviderHealthState {
+        self.states
+            .lock()
+            .get(provider)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Get all tracked provider states (for observability).
+    pub fn get_all_states(&self) -> HashMap<String, ProviderHealthState> {
+        self.states.lock().clone()
+    }
+
+    /// Clear all health tracking (for testing).
+    #[cfg(test)]
+    pub fn clear_all(&self) {
+        self.states.lock().clear();
+        self.backoff.clear_all();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::thread;
 
     #[test]
-    fn health_tracker_records_failures() {
+    fn allows_provider_initially() {
         let tracker = ProviderHealthTracker::new(3, Duration::from_secs(60), 100);
-        tracker.record_failure("openai", "timeout");
-        tracker.record_failure("openai", "timeout");
+        assert!(tracker.should_try("test-provider").is_ok());
+    }
 
-        let states = tracker.get_all_states();
-        let state = states.get("openai").unwrap();
+    #[test]
+    fn tracks_failures_below_threshold() {
+        let tracker = ProviderHealthTracker::new(3, Duration::from_secs(60), 100);
+
+        tracker.record_failure("test-provider", "error 1");
+        assert!(tracker.should_try("test-provider").is_ok());
+
+        tracker.record_failure("test-provider", "error 2");
+        assert!(tracker.should_try("test-provider").is_ok());
+
+        let state = tracker.get_state("test-provider");
         assert_eq!(state.failure_count, 2);
-        assert!(!state.circuit_open, "circuit should not open below threshold");
+        assert_eq!(state.last_error.as_deref(), Some("error 2"));
     }
 
     #[test]
-    fn health_tracker_circuit_opens_at_threshold() {
+    fn opens_circuit_at_threshold() {
         let tracker = ProviderHealthTracker::new(3, Duration::from_secs(60), 100);
-        tracker.record_failure("anthropic", "rate_limit");
-        tracker.record_failure("anthropic", "rate_limit");
-        tracker.record_failure("anthropic", "rate_limit");
 
-        let states = tracker.get_all_states();
-        let state = states.get("anthropic").unwrap();
-        assert_eq!(state.failure_count, 3);
-        assert!(state.circuit_open);
+        tracker.record_failure("test-provider", "error 1");
+        tracker.record_failure("test-provider", "error 2");
+        tracker.record_failure("test-provider", "error 3");
+
+        // Circuit should be open
+        let result = tracker.should_try("test-provider");
+        assert!(result.is_err());
+
+        if let Err((remaining, state)) = result {
+            assert!(remaining.as_secs() > 0 && remaining.as_secs() <= 60);
+            assert_eq!(state.failure_count, 3);
+        }
     }
 
     #[test]
-    fn health_tracker_success_resets_failure_count() {
-        let tracker = ProviderHealthTracker::new(3, Duration::from_secs(60), 100);
-        tracker.record_failure("gemini", "error");
-        tracker.record_failure("gemini", "error");
-        tracker.record_success("gemini");
+    fn circuit_closes_after_cooldown() {
+        let tracker = ProviderHealthTracker::new(3, Duration::from_millis(50), 100);
 
-        let states = tracker.get_all_states();
-        let state = states.get("gemini").unwrap();
+        // Trigger circuit breaker
+        tracker.record_failure("test-provider", "error 1");
+        tracker.record_failure("test-provider", "error 2");
+        tracker.record_failure("test-provider", "error 3");
+
+        assert!(tracker.should_try("test-provider").is_err());
+
+        // Wait for cooldown
+        thread::sleep(Duration::from_millis(200));
+
+        // Circuit should be closed (backoff expired)
+        assert!(tracker.should_try("test-provider").is_ok());
+    }
+
+    #[test]
+    fn repeated_failures_while_circuit_open_do_not_extend_cooldown() {
+        let tracker = ProviderHealthTracker::new(1, Duration::from_secs(2), 100);
+        tracker.record_failure("test-provider", "error 1");
+
+        let (remaining_before, _) = tracker
+            .should_try("test-provider")
+            .expect_err("circuit should be open after threshold is reached");
+        thread::sleep(Duration::from_millis(400));
+
+        // Simulate an extra failure reported while the circuit is still open.
+        tracker.record_failure("test-provider", "error while open");
+        let (remaining_after, _) = tracker
+            .should_try("test-provider")
+            .expect_err("circuit should still be open");
+
+        assert!(
+            remaining_after + Duration::from_millis(250) < remaining_before,
+            "cooldown should keep counting down instead of being reset"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "failure_threshold must be greater than 0")]
+    fn new_rejects_zero_failure_threshold() {
+        let _ = ProviderHealthTracker::new(0, Duration::from_secs(1), 100);
+    }
+
+    #[test]
+    #[should_panic(expected = "cooldown must be greater than 0")]
+    fn new_rejects_zero_cooldown() {
+        let _ = ProviderHealthTracker::new(1, Duration::ZERO, 100);
+    }
+
+    #[test]
+    fn success_resets_failure_count() {
+        let tracker = ProviderHealthTracker::new(3, Duration::from_secs(60), 100);
+
+        tracker.record_failure("test-provider", "error 1");
+        tracker.record_failure("test-provider", "error 2");
+
+        assert_eq!(tracker.get_state("test-provider").failure_count, 2);
+
+        tracker.record_success("test-provider");
+
+        let state = tracker.get_state("test-provider");
         assert_eq!(state.failure_count, 0);
-        assert!(!state.circuit_open);
+        assert_eq!(state.last_error, None);
     }
 
     #[test]
-    fn health_tracker_empty_provider_not_circuit_open() {
+    fn success_clears_circuit_breaker() {
         let tracker = ProviderHealthTracker::new(3, Duration::from_secs(60), 100);
-        assert!(!tracker.is_circuit_open("unknown"));
+
+        // Trigger circuit breaker
+        tracker.record_failure("test-provider", "error 1");
+        tracker.record_failure("test-provider", "error 2");
+        tracker.record_failure("test-provider", "error 3");
+
+        assert!(tracker.should_try("test-provider").is_err());
+
+        // Success should clear circuit immediately
+        tracker.record_success("test-provider");
+
+        assert!(tracker.should_try("test-provider").is_ok());
+        assert_eq!(tracker.get_state("test-provider").failure_count, 0);
+    }
+
+    #[test]
+    fn tracks_multiple_providers_independently() {
+        let tracker = ProviderHealthTracker::new(2, Duration::from_secs(60), 100);
+
+        tracker.record_failure("provider-a", "error a1");
+        tracker.record_failure("provider-a", "error a2");
+
+        tracker.record_failure("provider-b", "error b1");
+
+        // Provider A should have circuit open
+        assert!(tracker.should_try("provider-a").is_err());
+
+        // Provider B should still be allowed
+        assert!(tracker.should_try("provider-b").is_ok());
+
+        let state_a = tracker.get_state("provider-a");
+        let state_b = tracker.get_state("provider-b");
+        assert_eq!(state_a.failure_count, 2);
+        assert_eq!(state_b.failure_count, 1);
+    }
+
+    #[test]
+    fn get_all_states_returns_all_tracked_providers() {
+        let tracker = ProviderHealthTracker::new(3, Duration::from_secs(60), 100);
+
+        tracker.record_failure("provider-1", "error 1");
+        tracker.record_failure("provider-2", "error 2");
+        tracker.record_failure("provider-2", "error 2 again");
+
+        let states = tracker.get_all_states();
+        assert_eq!(states.len(), 2);
+        assert_eq!(states.get("provider-1").unwrap().failure_count, 1);
+        assert_eq!(states.get("provider-2").unwrap().failure_count, 2);
     }
 }

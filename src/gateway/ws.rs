@@ -146,9 +146,8 @@ fn build_ws_system_prompt(
         use std::fmt::Write;
         let mut tool_block = String::new();
         tool_block.push_str("\n## Tool Use Protocol\n\n");
-        tool_block.push_str(
-            "To use a tool, wrap a JSON object in <tool_call></tool_call> tags:\n\n",
-        );
+        tool_block
+            .push_str("To use a tool, wrap a JSON object in <tool_call></tool_call> tags:\n\n");
         tool_block.push_str("```\n<tool_call>\n{\"name\": \"tool_name\", \"arguments\": {\"param\": \"value\"}}\n</tool_call>\n```\n\n");
         tool_block.push_str(
             "CRITICAL: Output actual <tool_call> tags—never describe steps or give examples.\n\n",
