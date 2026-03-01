@@ -1,305 +1,326 @@
 <p align="center">
-  <img src="zeroclaw.png" alt="ZeroClaw" width="200" />
+  <img src="zeroclaw.png" alt="elfClaw" width="200" />
 </p>
 
-<h1 align="center">ZeroClaw 🦀（简体中文）</h1>
+<h1 align="center">elfClaw 🦀</h1>
 
 <p align="center">
-  <strong>零开销、零妥协；随处部署、万物可换。</strong>
-</p>
-
-<p align="center">
-  <a href="LICENSE-APACHE"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache%202.0-blue.svg" alt="License: MIT OR Apache-2.0" /></a>
-  <a href="NOTICE"><img src="https://img.shields.io/badge/contributors-27+-green.svg" alt="Contributors" /></a>
-  <a href="https://buymeacoffee.com/argenistherose"><img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Donate-yellow.svg?style=flat&logo=buy-me-a-coffee" alt="Buy Me a Coffee" /></a>
-  <a href="https://x.com/zeroclawlabs?s=21"><img src="https://img.shields.io/badge/X-%40zeroclawlabs-000000?style=flat&logo=x&logoColor=white" alt="X: @zeroclawlabs" /></a>
-  <a href="https://zeroclawlabs.cn/group.jpg"><img src="https://img.shields.io/badge/WeChat-Group-B7D7A8?logo=wechat&logoColor=white" alt="WeChat Group" /></a>
-  <a href="https://www.xiaohongshu.com/user/profile/67cbfc43000000000d008307?xsec_token=AB73VnYnGNx5y36EtnnZfGmAmS-6Wzv8WMuGpfwfkg6Yc%3D&xsec_source=pc_search"><img src="https://img.shields.io/badge/Xiaohongshu-Official-FF2442?style=flat" alt="Xiaohongshu: Official" /></a>
-  <a href="https://t.me/zeroclawlabs"><img src="https://img.shields.io/badge/Telegram-%40zeroclawlabs-26A5E4?style=flat&logo=telegram&logoColor=white" alt="Telegram: @zeroclawlabs" /></a>
-  <a href="https://www.facebook.com/groups/zeroclaw"><img src="https://img.shields.io/badge/Facebook-Group-1877F2?style=flat&logo=facebook&logoColor=white" alt="Facebook Group" /></a>
-  <a href="https://www.reddit.com/r/zeroclawlabs/"><img src="https://img.shields.io/badge/Reddit-r%2Fzeroclawlabs-FF4500?style=flat&logo=reddit&logoColor=white" alt="Reddit: r/zeroclawlabs" /></a>
+  <strong>ZeroClaw 的大胆分叉——为真实使用场景而重建。</strong><br>
+  持久对话记忆 · 主动语音通知 · 模块化架构 · 纯 Rust 生产级 AI Agent 运行时
 </p>
 
 <p align="center">
-  🌐 语言：<a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a> · <a href="README.ja.md">日本語</a> · <a href="README.ru.md">Русский</a> · <a href="README.fr.md">Français</a> · <a href="README.vi.md">Tiếng Việt</a>
+  <a href="README.md">English</a> ·
+  <a href="https://github.com/VK7KSM/eflClaw">GitHub</a> ·
+  <a href="#-新功能">新功能</a> ·
+  <a href="#-为什么要分叉架构问题">为什么要分叉</a> ·
+  <a href="#-路线图与上游同步">路线图</a>
 </p>
-
-<p align="center">
-  <a href="bootstrap.sh">一键部署</a> |
-  <a href="docs/getting-started/README.md">安装入门</a> |
-  <a href="docs/README.zh-CN.md">文档总览</a> |
-  <a href="docs/SUMMARY.md">文档目录</a>
-</p>
-
-<p align="center">
-  <strong>场景分流：</strong>
-  <a href="docs/reference/README.md">参考手册</a> ·
-  <a href="docs/operations/README.md">运维部署</a> ·
-  <a href="docs/troubleshooting.md">故障排查</a> ·
-  <a href="docs/security/README.md">安全专题</a> ·
-  <a href="docs/hardware/README.md">硬件外设</a> ·
-  <a href="docs/contributing/README.md">贡献与 CI</a>
-</p>
-
-> 本文是对 `README.md` 的人工对齐翻译（强调可读性与准确性，不做逐字直译）。
-> 
-> 技术标识（命令、配置键、API 路径、Trait 名称）保持英文，避免语义漂移。
-> 
-> 最后对齐时间：**2026-02-22**。
-
-## 📢 公告板
-
-用于发布重要通知（破坏性变更、安全通告、维护窗口、版本阻塞问题等）。
-
-| 日期（UTC） | 级别 | 通知 | 处理建议 |
-|---|---|---|---|
-| 2026-02-19 | _紧急_ | 我们与 `openagen/zeroclaw` 及 `zeroclaw.org` **没有任何关系**。`zeroclaw.org` 当前会指向 `openagen/zeroclaw` 这个 fork，并且该域名/仓库正在冒充我们的官网与官方项目。 | 请不要相信上述来源发布的任何信息、二进制、募资活动或官方声明。请仅以[本仓库](https://github.com/zeroclaw-labs/zeroclaw)和已验证官方社媒为准。 |
-| 2026-02-21 | _重要_ | 我们的官网现已上线：[zeroclawlabs.ai](https://zeroclawlabs.ai)。感谢大家一直以来的耐心等待。我们仍在持续发现冒充行为，请勿参与任何未经我们官方渠道发布、但打着 ZeroClaw 名义进行的投资、募资或类似活动。 | 一切信息请以[本仓库](https://github.com/zeroclaw-labs/zeroclaw)为准；也可关注 [X（@zeroclawlabs）](https://x.com/zeroclawlabs?s=21)、[Telegram（@zeroclawlabs）](https://t.me/zeroclawlabs)、[Facebook（群组）](https://www.facebook.com/groups/zeroclaw)、[Reddit（r/zeroclawlabs）](https://www.reddit.com/r/zeroclawlabs/) 与 [小红书账号](https://www.xiaohongshu.com/user/profile/67cbfc43000000000d008307?xsec_token=AB73VnYnGNx5y36EtnnZfGmAmS-6Wzv8WMuGpfwfkg6Yc%3D&xsec_source=pc_search) 获取官方最新动态。 |
-| 2026-02-19 | _重要_ | Anthropic 于 2026-02-19 更新了 Authentication and Credential Use 条款。条款明确：OAuth authentication（用于 Free、Pro、Max）仅适用于 Claude Code 与 Claude.ai；将 Claude Free/Pro/Max 账号获得的 OAuth token 用于其他任何产品、工具或服务（包括 Agent SDK）不被允许，并可能构成对 Consumer Terms of Service 的违规。 | 为避免损失，请暂时不要尝试 Claude Code OAuth 集成；原文见：[Authentication and Credential Use](https://code.claude.com/docs/en/legal-and-compliance#authentication-and-credential-use)。 |
-
-## 项目简介
-
-ZeroClaw 是一个高性能、低资源占用、可组合的自主智能体运行时。ZeroClaw 是面向智能代理工作流的**运行时操作系统** — 它抽象了模型、工具、记忆和执行层，使代理可以一次构建、随处运行。
-
-- Rust 原生实现，单二进制部署，跨 ARM / x86 / RISC-V。
-- Trait 驱动架构，`Provider` / `Channel` / `Tool` / `Memory` 可替换。
-- 安全默认值优先：配对鉴权、显式 allowlist、沙箱与作用域约束。
-
-## 为什么选择 ZeroClaw
-
-- **默认轻量运行时**：常见 CLI 与 `status` 工作流通常保持在几 MB 级内存范围。
-- **低成本部署友好**：面向低价板卡与小规格云主机设计，不依赖厚重运行时。
-- **冷启动速度快**：Rust 单二进制让常用命令与守护进程启动更接近“秒开”。
-- **跨架构可移植**：同一套二进制优先流程覆盖 ARM / x86 / RISC-V，并保持 provider/channel/tool 可替换。
-
-## 基准快照（ZeroClaw vs OpenClaw，可复现）
-
-以下是本地快速基准对比（macOS arm64，2026 年 2 月），按 0.8GHz 边缘 CPU 进行归一化展示：
-
-| | OpenClaw | NanoBot | PicoClaw | ZeroClaw 🦀 |
-|---|---|---|---|---|
-| **语言** | TypeScript | Python | Go | **Rust** |
-| **RAM** | > 1GB | > 100MB | < 10MB | **< 5MB** |
-| **启动时间（0.8GHz 核）** | > 500s | > 30s | < 1s | **< 10ms** |
-| **二进制体积** | ~28MB（dist） | N/A（脚本） | ~8MB | **~8.8 MB** |
-| **成本** | Mac Mini $599 | Linux SBC ~$50 | Linux 板卡 $10 | **任意 $10 硬件** |
-
-> 说明：ZeroClaw 的数据来自 release 构建，并通过 `/usr/bin/time -l` 测得。OpenClaw 需要 Node.js 运行时环境，仅该运行时通常就会带来约 390MB 的额外内存占用；NanoBot 需要 Python 运行时环境。PicoClaw 与 ZeroClaw 为静态二进制。
-
-<p align="center">
-  <img src="zero-claw.jpeg" alt="ZeroClaw vs OpenClaw 对比图" width="800" />
-</p>
-
-### 本地可复现测量
-
-基准数据会随代码与工具链变化，建议始终在你的目标环境自行复测：
-
-```bash
-cargo build --release
-ls -lh target/release/zeroclaw
-
-/usr/bin/time -l target/release/zeroclaw --help
-/usr/bin/time -l target/release/zeroclaw status
-```
-
-当前 README 的样例数据（macOS arm64，2026-02-18）：
-
-- Release 二进制：`8.8M`
-- `zeroclaw --help`：约 `0.02s`，峰值内存约 `3.9MB`
-- `zeroclaw status`：约 `0.01s`，峰值内存约 `4.1MB`
-
-## 一键部署
-
-```bash
-git clone https://github.com/zeroclaw-labs/zeroclaw.git
-cd zeroclaw
-./bootstrap.sh
-```
-
-可选环境初始化：`./bootstrap.sh --install-system-deps --install-rust`（可能需要 `sudo`）。
-
-详细说明见：[`docs/one-click-bootstrap.md`](docs/one-click-bootstrap.md)。
-
-## 快速开始
-
-### Homebrew（macOS/Linuxbrew）
-
-```bash
-brew install zeroclaw
-```
-
-```bash
-git clone https://github.com/zeroclaw-labs/zeroclaw.git
-cd zeroclaw
-cargo build --release --locked
-cargo install --path . --force --locked
-
-# 快速初始化（无交互）
-zeroclaw onboard --api-key sk-... --provider openrouter
-
-# 或使用交互式向导
-zeroclaw onboard --interactive
-
-# 单次对话
-zeroclaw agent -m "Hello, ZeroClaw!"
-
-# 启动网关（默认: 127.0.0.1:42617）
-zeroclaw gateway
-
-# 启动长期运行模式
-zeroclaw daemon
-```
-
-## Subscription Auth（OpenAI Codex / Claude Code）
-
-ZeroClaw 现已支持基于订阅的原生鉴权配置（多账号、静态加密存储）。
-
-- 配置文件：`~/.zeroclaw/auth-profiles.json`
-- 加密密钥：`~/.zeroclaw/.secret_key`
-- Profile ID 格式：`<provider>:<profile_name>`（例：`openai-codex:work`）
-
-OpenAI Codex OAuth（ChatGPT 订阅）：
-
-```bash
-# 推荐用于服务器/无显示器环境
-zeroclaw auth login --provider openai-codex --device-code
-
-# 浏览器/回调流程，支持粘贴回退
-zeroclaw auth login --provider openai-codex --profile default
-zeroclaw auth paste-redirect --provider openai-codex --profile default
-
-# 检查 / 刷新 / 切换 profile
-zeroclaw auth status
-zeroclaw auth refresh --provider openai-codex --profile default
-zeroclaw auth use --provider openai-codex --profile work
-```
-
-Claude Code / Anthropic setup-token：
-
-```bash
-# 粘贴订阅/setup token（Authorization header 模式）
-zeroclaw auth paste-token --provider anthropic --profile default --auth-kind authorization
-
-# 别名命令
-zeroclaw auth setup-token --provider anthropic --profile default
-```
-
-使用 subscription auth 运行 agent：
-
-```bash
-zeroclaw agent --provider openai-codex -m "hello"
-zeroclaw agent --provider openai-codex --auth-profile openai-codex:work -m "hello"
-
-# Anthropic 同时支持 API key 和 auth token 环境变量：
-# ANTHROPIC_AUTH_TOKEN, ANTHROPIC_OAUTH_TOKEN, ANTHROPIC_API_KEY
-zeroclaw agent --provider anthropic -m "hello"
-```
-
-## 架构
-
-每个子系统都是一个 **Trait** — 通过配置切换即可更换实现，无需修改代码。
-
-<p align="center">
-  <img src="docs/architecture.svg" alt="ZeroClaw 架构图" width="900" />
-</p>
-
-| 子系统 | Trait | 内置实现 | 扩展方式 |
-|--------|-------|----------|----------|
-| **AI 模型** | `Provider` | 通过 `zeroclaw providers` 查看（当前 28 个内置 + 别名，以及自定义端点） | `custom:https://your-api.com`（OpenAI 兼容）或 `anthropic-custom:https://your-api.com` |
-| **通道** | `Channel` | CLI, Telegram, Discord, Slack, Mattermost, iMessage, Matrix, Signal, WhatsApp, Linq, Email, IRC, Lark, DingTalk, QQ, Webhook | 任意消息 API |
-| **记忆** | `Memory` | SQLite 混合搜索, PostgreSQL 后端, Lucid 桥接, Markdown 文件, 显式 `none` 后端, 快照/恢复, 可选响应缓存 | 任意持久化后端 |
-| **工具** | `Tool` | shell/file/memory, cron/schedule, git, pushover, browser, http_request, screenshot/image_info, composio (opt-in), delegate, 硬件工具 | 任意能力 |
-| **可观测性** | `Observer` | Noop, Log, Multi | Prometheus, OTel |
-| **运行时** | `RuntimeAdapter` | Native, Docker（沙箱） | 通过 adapter 添加；不支持的类型会快速失败 |
-| **安全** | `SecurityPolicy` | Gateway 配对, 沙箱, allowlist, 速率限制, 文件系统作用域, 加密密钥 | — |
-| **身份** | `IdentityConfig` | OpenClaw (markdown), AIEOS v1.1 (JSON) | 任意身份格式 |
-| **隧道** | `Tunnel` | None, Cloudflare, Tailscale, ngrok, Custom | 任意隧道工具 |
-| **心跳** | Engine | HEARTBEAT.md 定期任务 | — |
-| **技能** | Loader | TOML 清单 + SKILL.md 指令 | 社区技能包 |
-| **集成** | Registry | 9 个分类下 70+ 集成 | 插件系统 |
-
-### 运行时支持（当前）
-
-- ✅ 当前支持：`runtime.kind = "native"` 或 `runtime.kind = "docker"`
-- 🚧 计划中，尚未实现：WASM / 边缘运行时
-
-配置了不支持的 `runtime.kind` 时，ZeroClaw 会以明确的错误退出，而非静默回退到 native。
-
-### 记忆系统（全栈搜索引擎）
-
-全部自研，零外部依赖 — 无需 Pinecone、Elasticsearch、LangChain：
-
-| 层级 | 实现 |
-|------|------|
-| **向量数据库** | Embeddings 以 BLOB 存储于 SQLite，余弦相似度搜索 |
-| **关键词搜索** | FTS5 虚拟表，BM25 评分 |
-| **混合合并** | 自定义加权合并函数（`vector.rs`） |
-| **Embeddings** | `EmbeddingProvider` trait — OpenAI、自定义 URL 或 noop |
-| **分块** | 基于行的 Markdown 分块器，保留标题结构 |
-| **缓存** | SQLite `embedding_cache` 表，LRU 淘汰策略 |
-| **安全重索引** | 原子化重建 FTS5 + 重新嵌入缺失向量 |
-
-Agent 通过工具自动进行记忆的回忆、保存和管理。
-
-```toml
-[memory]
-backend = "sqlite"             # "sqlite", "lucid", "postgres", "markdown", "none"
-auto_save = true
-embedding_provider = "none"    # "none", "openai", "custom:https://..."
-vector_weight = 0.7
-keyword_weight = 0.3
-```
-
-## 安全默认行为（关键）
-
-- Gateway 默认绑定：`127.0.0.1:42617`
-- Gateway 默认要求配对：`require_pairing = true`
-- 默认拒绝公网绑定：`allow_public_bind = false`
-- Channel allowlist 语义：
-  - 空列表 `[]` => deny-by-default
-  - `"*"` => allow all（仅在明确知道风险时使用）
-
-## 常用配置片段
-
-```toml
-api_key = "sk-..."
-default_provider = "openrouter"
-default_model = "anthropic/claude-sonnet-4-6"
-default_temperature = 0.7
-
-[memory]
-backend = "sqlite"             # sqlite | lucid | markdown | none
-auto_save = true
-embedding_provider = "none"    # none | openai | custom:https://...
-
-[gateway]
-host = "127.0.0.1"
-port = 42617
-require_pairing = true
-allow_public_bind = false
-```
-
-## 文档导航（推荐从这里开始）
-
-- 文档总览（英文）：[`docs/README.md`](docs/README.md)
-- 统一目录（TOC）：[`docs/SUMMARY.md`](docs/SUMMARY.md)
-- 文档总览（简体中文）：[`docs/README.zh-CN.md`](docs/README.zh-CN.md)
-- 命令参考：[`docs/commands-reference.md`](docs/commands-reference.md)
-- 配置参考：[`docs/config-reference.md`](docs/config-reference.md)
-- Provider 参考：[`docs/providers-reference.md`](docs/providers-reference.md)
-- Channel 参考：[`docs/channels-reference.md`](docs/channels-reference.md)
-- 运维手册：[`docs/operations-runbook.md`](docs/operations-runbook.md)
-- 故障排查：[`docs/troubleshooting.md`](docs/troubleshooting.md)
-- 文档清单与分类：[`docs/docs-inventory.md`](docs/docs-inventory.md)
-- 项目 triage 快照（2026-02-18）：[`docs/project-triage-snapshot-2026-02-18.md`](docs/project-triage-snapshot-2026-02-18.md)
-
-## 贡献与许可证
-
-- 贡献指南：[`CONTRIBUTING.md`](CONTRIBUTING.md)
-- PR 工作流：[`docs/pr-workflow.md`](docs/pr-workflow.md)
-- Reviewer 指南：[`docs/reviewer-playbook.md`](docs/reviewer-playbook.md)
-- 许可证：MIT 或 Apache 2.0（见 [`LICENSE-MIT`](LICENSE-MIT)、[`LICENSE-APACHE`](LICENSE-APACHE) 与 [`NOTICE`](NOTICE)）
 
 ---
 
-如果你需要完整实现细节（架构图、全部命令、完整 API、开发流程），请直接阅读英文主文档：[`README.md`](README.md)。
+## 目录
+
+- [elfClaw 是什么？](#-elfclaw-是什么)
+- [为什么要分叉——架构问题](#-为什么要分叉架构问题)
+- [新功能](#-新功能)
+  - [聊天记录持久化与记忆](#1-聊天记录持久化与记忆)
+  - [对话历史全文搜索](#2-对话历史全文搜索)
+  - [文字转语音与语音消息](#3-文字转语音与语音消息)
+  - [主动通知——Telegram 与 Email](#4-主动通知telegram-与-email)
+  - [Email 监控 → Telegram 摘要](#5-email-监控--telegram-摘要)
+  - [可配置活跃时间段](#6-可配置活跃时间段)
+  - [统一渠道投递](#7-统一渠道投递)
+  - [Agent Loop 模块化](#8-agent-loop-模块化)
+- [已集成的上游功能](#-已集成的上游功能)
+- [路线图与上游同步](#-路线图与上游同步)
+- [致谢](#-致谢)
+- [快速开始](#-快速开始)
+
+---
+
+## 🦅 elfClaw 是什么？
+
+**elfClaw** 是 [ZeroClaw](https://github.com/zeroclaw-labs/zeroclaw) 的一个分叉项目。ZeroClaw 是 ZeroClaw Labs 社区开发的 Rust 原生自主 AI Agent 运行时。我们分叉它，是因为我们需要上游项目尚未优先实现的功能——最关键的是**持久对话历史**、**主动通知**以及一个**可持续演进的代码架构**，而不是一个随时可能倒塌的屎山。
+
+elfClaw 包含 ZeroClaw 的所有功能——多 Provider LLM 支持、多渠道消息（Telegram、Discord、Slack、Matrix、Email、IRC、WhatsApp 等）、工具执行、定时心跳、硬件外设、MCP 客户端、子 Agent 协调——并在此之上增加了让它真正可以作为日常工具使用的一层完善。
+
+我们持续跟踪 ZeroClaw 上游并合并有价值的更新。当我们的二次开发功能成熟后，计划将其作为 PR 提交回上游。
+
+---
+
+## 🏗 为什么要分叉——架构问题
+
+ZeroClaw 在技术上令人印象深刻：编译后二进制文件不到 5MB，启动时间不足 10ms，覆盖了极其广泛的集成。我们深深尊重这个团队的工作。
+
+但诚实的工程需要诚实的评估。截至 2026 年初，ZeroClaw 的代码库存在**结构性债务**，使得贡献和维护越来越痛苦：
+
+### 上帝模块（God Module）问题
+
+| 文件 | 行数（上游） | 问题 |
+|------|------------|------|
+| `src/config/schema.rs` | **11,061 行** | 单体配置巨无霸。数百个结构体，没有 derive 宏简化。每个 `Default` 实现全部手写。添加一个配置键需要在 3 处以上修改。 |
+| `src/channels/mod.rs` | **10,645 行** | 典型的上帝模块。消息处理、历史管理、System Prompt 构建、Channel 初始化、Tool dispatch 全部塞在一个文件里。 |
+| `src/onboard/wizard.rs` | **8,061 行** | 交互式 setup、快速 setup、Provider 模型列表、Scaffold 全混在一起，毫无关注点分离。 |
+| `src/agent/loop_.rs` | **5,153 行** | 整个 Agent 执行循环——上下文构建、历史压缩、工具解析、并行派发——全在一个文件里。 |
+
+> **合计：** 四个文件贡献约 **34,920 行**，占整个代码库近 20%。
+
+### 重复代码与维护黑洞
+
+上游内部代码审查记录了这些问题：
+
+- **24 个测试**需要手写完整的 `ChannelRuntimeContext { ... }` 初始化，每新增一个字段就要改 24 处
+- `Config` 构造出现在 3 个地方（`Config::default()`、Wizard 交互式、Wizard 快速 setup），字段增减需要同步 3 处
+- 大量 `match channel_name { "telegram" => ..., "discord" => ..., "slack" => ... }` 硬编码重复判断
+
+### 结果：功能"存在"但残废
+
+ZeroClaw 的功能广度具有欺骗性。很多功能只是**骨架级实现**——能编译、有文档，但无法真实使用：
+
+- **没有持久聊天记录。** 每次对话从零开始。Agent 对昨天说过什么一无所知。
+- **没有自动对话总结。** 随着历史窗口填满，长会话会默默丢失上下文。
+- **没有主动通知能力。** Agent 能收消息，但无法主动联系你。
+- **Email 监控是摆设。** 可以拉取邮件，但没有机制将其通知给你（比如发到 Telegram）。
+- **活跃时间段硬编码。** 心跳调度器在固定的编译时间唤醒，无法配置。
+- **渠道投递硬编码。** Cron 和心跳通知只支持 4 个渠道（telegram/discord/slack/mattermost），通过硬编码 `match` 块绕过 `Channel` trait。
+
+上游项目的内部代码质量评估总结：
+
+> *"功能齐全但架构需要重构，不算屎山但是已经在屎山的路上了——再不拆文件就变成了。"*
+
+### elfClaw 的做法
+
+elfClaw 采取**外科手术式重构**——我们不为重写而重写，只修复那些实际阻碍功能开发的部分：
+
+- `src/agent/loop_.rs` 拆分为 `loop_/context.rs`、`loop_/history.rs`、`loop_/execution.rs`、`loop_/parsing.rs`
+- 渠道投递统一通过 `deliver_to_channel()` 走 `Channel` trait，消除硬编码 match 块
+- 新功能以**专注、可测试的模块**形式添加（每个 200~450 行），每个模块包含覆盖正常路径、错误路径和边界条件的单元测试
+
+---
+
+## ✨ 新功能
+
+### 1. 聊天记录持久化与记忆
+
+**ZeroClaw 最大的缺失功能。**
+
+elfClaw 自动将每次对话持久化到磁盘，并在 SQLite FTS5 中建立索引以供全文搜索。Agent 在会话之间不会丢失上下文。
+
+**文件：** `src/channels/chat_log.rs`（449 行）、`src/channels/chat_index.rs`（439 行）
+
+```toml
+# config.toml — 无需任何配置，开箱即用
+# 日志存储路径：~/.zeroclaw/chat_log/<渠道>/<用户>/<YYYY-MM-DD>.json
+# 索引存储路径：~/.zeroclaw/chat_index.db
+```
+
+**功能详情：**
+- 将所有消息（用户 + Agent）以带时间戳和元数据的结构化 JSON 持久化
+- 维护 SQLite FTS5 索引，支持即时全文搜索
+- 会话恢复时自动加载最近的对话历史
+- Owner 账户可获得跨用户摘要注入（可了解所有用户的对话模式）
+- 16 个单元测试，覆盖持久化、索引、恢复和访问控制
+
+**对比 ZeroClaw 上游：** 完全不存在。每次会话都是无状态的。
+
+---
+
+### 2. 对话历史全文搜索
+
+Agent 可以将自己的对话历史作为工具进行搜索。
+
+**文件：** `src/tools/search_chat_log.rs`（245 行）
+
+**使用方式——直接向 Agent 提问：**
+```
+"在我的对话历史中搜索关于树莓派项目的内容"
+"上周我们讨论了哪些关于 API 密钥的内容？"
+"找出所有我询问过部署流程的对话"
+```
+
+**工具参数：**
+```json
+{
+  "query": "树莓派 GPIO 配置",
+  "channel": "telegram",
+  "user_id": "495916105",
+  "limit": 20
+}
+```
+
+**访问控制：** 只有 `owner` 角色用户可以跨用户搜索，普通用户只能搜索自己的历史。
+
+**对比 ZeroClaw 上游：** 完全不存在。
+
+---
+
+### 3. 文字转语音与语音消息
+
+elfClaw 能够合成语音并发送语音消息——**无需任何 API Key**。
+
+**文件：** `src/channels/tts.rs`（195 行）、`src/tools/send_voice.rs`（223 行）
+
+使用 **Microsoft Edge Read Aloud API**（完全免费，无需认证）。Agent 根据上下文自主决定何时发送语音。
+
+**使用方式：**
+```
+"把今天的摘要以语音消息的形式发给我"
+"用语音告诉我这段代码的分析结果"
+```
+
+**配置（可选）：**
+```toml
+[tts]
+voice = "zh-CN-XiaoxiaoNeural"
+rate = "+0%"
+pitch = "+0Hz"
+```
+
+**对比 ZeroClaw 上游：** 完全不存在。
+
+---
+
+### 4. 主动通知——Telegram 与 Email
+
+**文件：** `src/tools/send_telegram.rs`（214 行）、`src/tools/send_email.rs`（239 行）
+
+```json
+// send_telegram
+{ "chat_id": "495916105", "message": "定时任务已完成，共处理 3 个项目。" }
+
+// send_email
+{ "to": "user@example.com", "subject": "elfClaw 每日摘要", "body": "..." }
+```
+
+**对比 ZeroClaw 上游：** 完全不存在。
+
+---
+
+### 5. Email 监控 → Telegram 摘要
+
+```toml
+[channels.email]
+mode = "monitor"
+imap_host = "imap.gmail.com"
+imap_port = 993
+username = "你的邮箱@gmail.com"
+password = "应用专用密码"
+from_address = "你的邮箱@gmail.com"
+notify_channel = "telegram"
+notify_to = "你的 TELEGRAM CHAT ID"
+```
+
+工作流：IMAP IDLE 监听 → Agent 分类分析 → 推送到 Telegram → 由用户决定后续操作 → Agent 绝不主动发邮件。
+
+**对比 ZeroClaw 上游：** Email 监控功能存在，但没有跨渠道通知能力。
+
+---
+
+### 6. 可配置活跃时间段
+
+```toml
+[heartbeat]
+active_hours_start = "08:00"
+active_hours_end = "23:00"
+timezone = "Asia/Shanghai"
+```
+
+支持跨午夜时间段。**对比 ZeroClaw 上游：** 硬编码，无法配置。
+
+---
+
+### 7. 统一渠道投递
+
+所有通告路径通过 `deliver_to_channel()` 走 `Channel` trait，适用于全部已配置渠道。
+
+**对比 ZeroClaw 上游：** 仅支持 4 个硬编码渠道，完全绕过 `Channel` trait。
+
+---
+
+### 8. Agent Loop 模块化
+
+| 模块 | 行数 | 职责 |
+|------|------|------|
+| `loop_/context.rs` | 81 | 上下文构建 |
+| `loop_/history.rs` | 106 | 历史压缩与管理 |
+| `loop_/execution.rs` | 166 | 工具执行与派发 |
+| `loop_/parsing.rs` | ~1,540 | 所有工具调用解析 |
+| `loop_.rs`（核心） | ~3,970 | 主循环逻辑 |
+
+---
+
+## 📦 已集成的上游功能
+
+| 功能 | 状态 |
+|------|------|
+| 审批系统 | ✅ 已集成 |
+| 研究阶段 | ✅ 已集成 |
+| OTP + RBAC | ✅ 已集成 |
+| 紧急停止 | ✅ 已集成 |
+| 查询分类器 | ✅ 已集成 |
+| apply_patch 工具 | ✅ 已集成 |
+| 子 Agent 协调 | ✅ 已集成 |
+| 目标引擎 | ✅ 已集成 |
+| MCP 客户端套件 | ✅ 已集成 |
+| Agent IPC 工具 | ✅ 已集成 |
+| OpenAI/OpenClaw 兼容网关 | ✅ 已集成 |
+| WebSocket 网关 | ✅ 已集成 |
+| 插件系统 | ✅ 已集成 |
+| 技能系统 + SkillForge | ✅ 已集成 |
+| IRC 渠道 | ✅ 已集成 |
+| Android 客户端 + FFI | ✅ 已集成 |
+| Web 前端 | ✅ 已集成 |
+| process / url_validation / task_plan / subagent 工具 | ✅ 已集成 |
+
+---
+
+## 🗺 路线图与上游同步
+
+### 计划向上游提交的功能
+
+- 聊天历史 + 索引模块
+- 对话自动总结
+- TTS + 语音发送工具
+- Email 监控 → 跨渠道通知
+- 活跃时间段配置
+- 统一渠道投递路径
+- Agent Loop 模块化
+
+### 未来工作
+
+- [ ] `channels/mod.rs` 拆分（10,645 行 → 4 个模块）
+- [ ] `config/schema.rs` derive 宏改造
+- [ ] 混合内存（SQLite + Qdrant）
+- [ ] 内存卫生与自动归档
+- [ ] Perplexity 事实核验
+
+---
+
+## 🙏 致谢
+
+**没有 ZeroClaw，就没有 elfClaw。**
+
+深深感谢 [ZeroClaw Labs](https://github.com/zeroclaw-labs/zeroclaw) 团队——[theonlyhennygod](https://github.com/theonlyhennygod) 及全体贡献者——从零开始构建了这个极其强大的 Rust Agent 运行时。本文档中的架构批评是以诚实工程的精神提出的，而非贬低。ZeroClaw 提供的基础——trait 架构、Provider 抽象、工具系统、安全模型——是出色的，elfClaw 直接建立在其上。
+
+同样感谢 **[OpenClaw](https://github.com/openclaw) 团队**，感谢他们对本地优先个人 AI 助手的愿景，以及对我们设计理念的启发。
+
+---
+
+## 🚀 快速开始
+
+```bash
+git clone https://github.com/VK7KSM/eflClaw.git
+cd eflClaw
+cargo build --release
+./target/release/zeroclaw setup
+./target/release/zeroclaw daemon
+```
+
+> 可执行文件名为 `zeroclaw`——内部模块和命令名称与上游保持一致，保证完全兼容性。
+
+---
+
+## 许可证
+
+MIT OR Apache-2.0 · elfClaw 是 ZeroClaw 的分叉项目，原始版权归属 ZeroClaw Labs 贡献者。
