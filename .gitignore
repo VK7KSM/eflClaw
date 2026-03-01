@@ -12,6 +12,10 @@ docker-compose.override.yml
 # Private local config and data — never commit
 资料/
 
+# Release artifacts (built locally)
+elfClaw-*.zip
+zeroclaw-*.zip
+
 # Environment files (may contain secrets)
 .env
 

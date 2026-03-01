@@ -217,7 +217,7 @@ whatsapp-web = ["dep:wa-rs", "dep:wa-rs-core", "dep:wa-rs-binary", "dep:wa-rs-pr
 [profile.release]
 opt-level = "z"       # Optimize for minimum binary size
 lto = "thin"          # Thin LTO: parallel link-time optimization, near-identical size to fat
-codegen-units = 0     # 0 = Cargo auto-selects (= CPU core count), maximizes parallel codegen
+codegen-units = 1     # 1 = maximum optimization (allows cross-crate inlining)
 strip = true
 panic = "abort"
 
