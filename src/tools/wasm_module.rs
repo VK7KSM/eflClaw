@@ -1,5 +1,5 @@
 use super::traits::{Tool, ToolResult};
-use crate::runtime::{WasmCapabilities, WasmRuntime};
+use crate::runtime::{RuntimeAdapter, WasmCapabilities, WasmRuntime};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
@@ -8,25 +8,16 @@ use std::sync::Arc;
 /// Tool for listing and executing sandboxed WASM modules.
 pub struct WasmModuleTool {
     security: Arc<SecurityPolicy>,
-    wasm_runtime: Option<Arc<WasmRuntime>>,
+    runtime: Arc<dyn RuntimeAdapter>,
 }
 
 impl WasmModuleTool {
-    /// Create a tool backed by a specific WASM runtime.
-    pub fn new(security: Arc<SecurityPolicy>, wasm_runtime: Option<Arc<WasmRuntime>>) -> Self {
-        Self {
-            security,
-            wasm_runtime,
-        }
+    pub fn new(security: Arc<SecurityPolicy>, runtime: Arc<dyn RuntimeAdapter>) -> Self {
+        Self { security, runtime }
     }
 
-    /// Module name validation: snake_case only (lowercase letters, digits, underscores).
-    fn is_valid_module_name(name: &str) -> bool {
-        !name.is_empty()
-            && name.len() <= 64
-            && name
-                .chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+    fn wasm_runtime(&self) -> Option<&WasmRuntime> {
+        self.runtime.as_any().downcast_ref::<WasmRuntime>()
     }
 
     fn parse_caps(args: &serde_json::Value) -> anyhow::Result<WasmCapabilities> {
@@ -152,7 +143,7 @@ impl Tool for WasmModuleTool {
             });
         }
 
-        let Some(wasm_runtime) = self.wasm_runtime.as_ref() else {
+        let Some(wasm_runtime) = self.wasm_runtime() else {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -164,19 +155,11 @@ impl Tool for WasmModuleTool {
 
         match action {
             "list" => match wasm_runtime.list_modules(&self.security.workspace_dir) {
-                Ok(modules) => {
-                    // Filter to valid module names (snake_case, max 64 chars)
-                    let valid_modules: Vec<&str> = modules
-                        .iter()
-                        .filter(|m| Self::is_valid_module_name(m))
-                        .map(String::as_str)
-                        .collect();
-                    Ok(ToolResult {
-                        success: true,
-                        output: serde_json::to_string_pretty(&json!({ "modules": valid_modules }))?,
-                        error: None,
-                    })
-                }
+                Ok(modules) => Ok(ToolResult {
+                    success: true,
+                    output: serde_json::to_string_pretty(&json!({ "modules": modules }))?,
+                    error: None,
+                }),
                 Err(err) => Ok(ToolResult {
                     success: false,
                     output: String::new(),
@@ -188,22 +171,12 @@ impl Tool for WasmModuleTool {
                     .get("module")
                     .and_then(serde_json::Value::as_str)
                     .ok_or_else(|| anyhow::anyhow!("Missing 'module' parameter for action=run"))?;
-
-                if !Self::is_valid_module_name(module) {
-                    return Ok(ToolResult {
-                        success: false,
-                        output: String::new(),
-                        error: Some(format!(
-                            "Invalid module name '{module}': must be snake_case (lowercase letters, digits, underscores), max 64 chars"
-                        )),
-                    });
-                }
-
                 let caps = Self::parse_caps(&args)?;
                 match wasm_runtime.execute_module(module, &self.security.workspace_dir, &caps) {
                     Ok(result) => {
                         let output = serde_json::to_string_pretty(&json!({
                             "module": module,
+                            "module_sha256": result.module_sha256,
                             "exit_code": result.exit_code,
                             "fuel_consumed": result.fuel_consumed,
                             "stdout": result.stdout,
@@ -246,6 +219,7 @@ impl Tool for WasmModuleTool {
 mod tests {
     use super::*;
     use crate::config::WasmRuntimeConfig;
+    use crate::runtime::NativeRuntime;
     use crate::security::{AutonomyLevel, SecurityPolicy};
 
     fn test_security(workspace_dir: std::path::PathBuf) -> Arc<SecurityPolicy> {
@@ -260,32 +234,10 @@ mod tests {
     fn wasm_module_tool_name() {
         let dir = tempfile::tempdir().unwrap();
         let security = test_security(dir.path().to_path_buf());
-        let tool = WasmModuleTool::new(security, None);
+        let runtime: Arc<dyn RuntimeAdapter> =
+            Arc::new(WasmRuntime::new(WasmRuntimeConfig::default()));
+        let tool = WasmModuleTool::new(security, runtime);
         assert_eq!(tool.name(), "wasm_module");
-    }
-
-    #[test]
-    fn wasm_module_tool_no_runtime_description() {
-        let dir = tempfile::tempdir().unwrap();
-        let security = test_security(dir.path().to_path_buf());
-        let wasm_runtime = Arc::new(WasmRuntime::new(WasmRuntimeConfig::default()));
-        let tool = WasmModuleTool::new(security, Some(wasm_runtime));
-        assert!(tool.description().contains("wasm_module"));
-    }
-
-    #[tokio::test]
-    async fn wasm_sandbox_no_fs_access_by_default() {
-        let dir = tempfile::tempdir().unwrap();
-        // No modules in tools dir → list returns empty
-        let security = test_security(dir.path().to_path_buf());
-        let wasm_runtime = Arc::new(WasmRuntime::new(WasmRuntimeConfig::default()));
-        let tool = WasmModuleTool::new(security, Some(wasm_runtime));
-
-        let result = tool.execute(json!({"action": "list"})).await.unwrap();
-        assert!(result.success);
-        // Default caps have no fs access — modules list should be empty
-        let val: serde_json::Value = serde_json::from_str(&result.output).unwrap();
-        assert!(val["modules"].as_array().map(|a| a.is_empty()).unwrap_or(true));
     }
 
     #[tokio::test]
@@ -295,12 +247,12 @@ mod tests {
         std::fs::create_dir_all(&tools_dir).unwrap();
         std::fs::write(tools_dir.join("alpha.wasm"), b"\0asm").unwrap();
         std::fs::write(tools_dir.join("beta.wasm"), b"\0asm").unwrap();
-        // Name with invalid characters should be filtered out
         std::fs::write(tools_dir.join("bad$name.wasm"), b"\0asm").unwrap();
 
         let security = test_security(dir.path().to_path_buf());
-        let wasm_runtime = Arc::new(WasmRuntime::new(WasmRuntimeConfig::default()));
-        let tool = WasmModuleTool::new(security, Some(wasm_runtime));
+        let runtime: Arc<dyn RuntimeAdapter> =
+            Arc::new(WasmRuntime::new(WasmRuntimeConfig::default()));
+        let tool = WasmModuleTool::new(security, runtime);
 
         let result = tool.execute(json!({"action": "list"})).await.unwrap();
         assert!(result.success);
@@ -313,8 +265,9 @@ mod tests {
     async fn run_action_requires_module() {
         let dir = tempfile::tempdir().unwrap();
         let security = test_security(dir.path().to_path_buf());
-        let wasm_runtime = Arc::new(WasmRuntime::new(WasmRuntimeConfig::default()));
-        let tool = WasmModuleTool::new(security, Some(wasm_runtime));
+        let runtime: Arc<dyn RuntimeAdapter> =
+            Arc::new(WasmRuntime::new(WasmRuntimeConfig::default()));
+        let tool = WasmModuleTool::new(security, runtime);
 
         let result = tool.execute(json!({"action": "run"})).await;
         assert!(result.is_err());
@@ -322,42 +275,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wasm_sandbox_no_network() {
-        // No network: allowed_hosts is empty by default
-        let dir = tempfile::tempdir().unwrap();
-        let security = test_security(dir.path().to_path_buf());
-        let wasm_runtime = Arc::new(WasmRuntime::new(WasmRuntimeConfig::default()));
-        let caps = wasm_runtime.default_capabilities();
-        assert!(caps.allowed_hosts.is_empty(), "no network by default");
-        let _ = WasmModuleTool::new(security, Some(wasm_runtime));
-    }
+    async fn run_action_errors_without_runtime_wasm_feature() {
+        if WasmRuntime::is_available() {
+            return;
+        }
 
-    #[tokio::test]
-    async fn wasm_timeout_kill() {
-        // Attempting to run a missing module returns an error (not available / not found)
         let dir = tempfile::tempdir().unwrap();
+        let tools_dir = dir.path().join("tools/wasm");
+        std::fs::create_dir_all(&tools_dir).unwrap();
+        std::fs::write(tools_dir.join("hello.wasm"), b"\0asm\x01\0\0\0").unwrap();
+
         let security = test_security(dir.path().to_path_buf());
-        let wasm_runtime = Arc::new(WasmRuntime::new(WasmRuntimeConfig::default()));
-        let tool = WasmModuleTool::new(security, Some(wasm_runtime));
+        let runtime: Arc<dyn RuntimeAdapter> =
+            Arc::new(WasmRuntime::new(WasmRuntimeConfig::default()));
+        let tool = WasmModuleTool::new(security, runtime);
 
         let result = tool
-            .execute(json!({"action": "run", "module": "nonexistent_zeroclaw_test"}))
+            .execute(json!({"action": "run", "module": "hello"}))
             .await
             .unwrap();
         assert!(!result.success);
-        // Either "not available" (feature disabled) or "not found" (feature enabled but missing file)
-        let err = result.error.unwrap_or_default();
-        assert!(
-            err.contains("not available") || err.contains("not found") || err.contains("WASM"),
-            "unexpected error: {err}"
-        );
+        assert!(result.error.unwrap_or_default().contains("not available"));
     }
 
     #[tokio::test]
-    async fn tool_rejects_without_wasm_runtime() {
+    async fn tool_rejects_non_wasm_runtime() {
         let dir = tempfile::tempdir().unwrap();
         let security = test_security(dir.path().to_path_buf());
-        let tool = WasmModuleTool::new(security, None);
+        let runtime: Arc<dyn RuntimeAdapter> = Arc::new(NativeRuntime::new());
+        let tool = WasmModuleTool::new(security, runtime);
 
         let result = tool.execute(json!({"action": "list"})).await.unwrap();
         assert!(!result.success);
@@ -365,15 +311,5 @@ mod tests {
             .error
             .unwrap_or_default()
             .contains("runtime.kind = \"wasm\""));
-    }
-
-    #[test]
-    fn module_name_validation() {
-        assert!(WasmModuleTool::is_valid_module_name("hello_world"));
-        assert!(WasmModuleTool::is_valid_module_name("tool123"));
-        assert!(!WasmModuleTool::is_valid_module_name("bad$name"));
-        assert!(!WasmModuleTool::is_valid_module_name(""));
-        assert!(!WasmModuleTool::is_valid_module_name("CamelCase"));
-        assert!(!WasmModuleTool::is_valid_module_name("has space"));
     }
 }

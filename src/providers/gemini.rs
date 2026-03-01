@@ -288,9 +288,7 @@ impl CandidateContent {
     /// - `{"functionCall": {"name": "...", "args": {...}}}` — tool invocation
     ///
     /// Returns non-thinking text (falling back to thinking text), plus any tool calls.
-    fn extract_tool_calls(
-        self,
-    ) -> (Option<String>, Vec<crate::providers::traits::ToolCall>) {
+    fn extract_tool_calls(self) -> (Option<String>, Vec<crate::providers::traits::ToolCall>) {
         let mut answer_parts: Vec<String> = Vec::new();
         let mut first_thinking: Option<String> = None;
         let mut tool_calls: Vec<crate::providers::traits::ToolCall> = Vec::new();
@@ -434,7 +432,8 @@ fn refresh_gemini_cli_token(
         .unwrap_or_else(|_| "<failed to read response body>".to_string());
 
     if !status.is_success() {
-        anyhow::bail!("Gemini CLI OAuth refresh failed (HTTP {status}): {body}");
+        let sanitized = super::sanitize_api_error(&body);
+        anyhow::bail!("Gemini CLI OAuth refresh failed (HTTP {status}): {sanitized}");
     }
 
     #[derive(Deserialize)]
@@ -942,7 +941,8 @@ impl GeminiProvider {
                 );
                 return Ok(seed);
             }
-            anyhow::bail!("loadCodeAssist failed (HTTP {status}): {body}");
+            let sanitized = super::sanitize_api_error(&body);
+            anyhow::bail!("loadCodeAssist failed (HTTP {status}): {sanitized}");
         }
 
         #[derive(Deserialize)]
@@ -1054,7 +1054,11 @@ impl GeminiProvider {
         model: &str,
         temperature: f64,
         tools: Option<Vec<GeminiTool>>,
-    ) -> anyhow::Result<(Option<String>, Vec<crate::providers::traits::ToolCall>, Option<TokenUsage>)> {
+    ) -> anyhow::Result<(
+        Option<String>,
+        Vec<crate::providers::traits::ToolCall>,
+        Option<TokenUsage>,
+    )> {
         let auth = self.auth.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
                 "Gemini API key not found. Options:\n\
@@ -1284,7 +1288,10 @@ impl Provider for GeminiProvider {
         }
     }
 
-    fn convert_tools(&self, tools: &[crate::tools::ToolSpec]) -> crate::providers::traits::ToolsPayload {
+    fn convert_tools(
+        &self,
+        tools: &[crate::tools::ToolSpec],
+    ) -> crate::providers::traits::ToolsPayload {
         let function_declarations: Vec<serde_json::Value> = tools
             .iter()
             .map(|t| {
@@ -1295,7 +1302,9 @@ impl Provider for GeminiProvider {
                 })
             })
             .collect();
-        crate::providers::traits::ToolsPayload::Gemini { function_declarations }
+        crate::providers::traits::ToolsPayload::Gemini {
+            function_declarations,
+        }
     }
 
     async fn chat_with_system(
@@ -1413,10 +1422,10 @@ impl Provider for GeminiProvider {
                 "assistant" => {
                     // Try to parse as native tool-call history JSON produced by the agent loop:
                     // {"tool_calls": [...], "content": "..."}
-                    if let Ok(parsed) =
-                        serde_json::from_str::<serde_json::Value>(&msg.content)
-                    {
-                        if let Some(tool_calls) = parsed.get("tool_calls").and_then(|v| v.as_array()) {
+                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&msg.content) {
+                        if let Some(tool_calls) =
+                            parsed.get("tool_calls").and_then(|v| v.as_array())
+                        {
                             // Check if ALL tool calls have thought_signature (new history).
                             // Old history (saved before the thought_signature fix) won't have it,
                             // and Gemini thinking models reject functionCall without thought_signature.
@@ -1441,7 +1450,11 @@ impl Provider for GeminiProvider {
                                 });
                                 // Mark these tool call IDs as degraded so tool results are also skipped
                                 for tc in tool_calls {
-                                    let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                    let id = tc
+                                        .get("id")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
                                     tool_id_to_name.insert(id, "__degraded__".to_string());
                                 }
                                 continue;
@@ -1475,9 +1488,8 @@ impl Provider for GeminiProvider {
                                 // If a thought_signature was stored with this tool call,
                                 // insert a thought Part before the functionCall Part.
                                 // Gemini thinking models require this for multi-turn history.
-                                if let Some(sig) = tc
-                                    .get("thought_signature")
-                                    .and_then(|v| v.as_str())
+                                if let Some(sig) =
+                                    tc.get("thought_signature").and_then(|v| v.as_str())
                                 {
                                     parts.push(Part {
                                         text: Some(String::new()),
@@ -1491,10 +1503,7 @@ impl Provider for GeminiProvider {
                                 parts.push(Part {
                                     text: None,
                                     inline_data: None,
-                                    function_call: Some(RequestFunctionCall {
-                                        name,
-                                        args,
-                                    }),
+                                    function_call: Some(RequestFunctionCall { name, args }),
                                     function_response: None,
                                     thought: None,
                                     thought_signature: None,
@@ -1515,9 +1524,7 @@ impl Provider for GeminiProvider {
                 }
                 "tool" => {
                     // Parse tool result: {"tool_call_id": "...", "content": "..."}
-                    if let Ok(parsed) =
-                        serde_json::from_str::<serde_json::Value>(&msg.content)
-                    {
+                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&msg.content) {
                         let tool_call_id = parsed
                             .get("tool_call_id")
                             .and_then(|v| v.as_str())
@@ -1579,9 +1586,7 @@ impl Provider for GeminiProvider {
                 .map(|t| FunctionDeclaration {
                     name: t.name.clone(),
                     description: t.description.clone(),
-                    parameters: crate::tools::SchemaCleanr::clean_for_gemini(
-                        t.parameters.clone(),
-                    ),
+                    parameters: crate::tools::SchemaCleanr::clean_for_gemini(t.parameters.clone()),
                 })
                 .collect();
             Some(vec![GeminiTool {
@@ -1604,6 +1609,7 @@ impl Provider for GeminiProvider {
             tool_calls,
             usage,
             reasoning_content: None,
+            quota_metadata: None,
         })
     }
 

@@ -207,15 +207,16 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
         // ── activeHours: skip outside configured window ──
         let now = chrono::Local::now();
         let current_minutes = now.hour() * 60 + now.minute();
-        let start = crate::config::parse_hhmm(&config.heartbeat.active_hours_start)
-            .unwrap_or(6 * 60 + 30); // fallback 06:30
-        let end = crate::config::parse_hhmm(&config.heartbeat.active_hours_end)
-            .unwrap_or(23 * 60); // fallback 23:00
+        let start =
+            crate::config::parse_hhmm(&config.heartbeat.active_hours_start).unwrap_or(6 * 60 + 30); // fallback 06:30
+        let end = crate::config::parse_hhmm(&config.heartbeat.active_hours_end).unwrap_or(23 * 60); // fallback 23:00
         if !crate::config::is_within_active_hours(current_minutes, start, end) {
             tracing::debug!(
                 "Heartbeat skipped: outside active hours ({:02}:{:02}, window {}–{})",
-                now.hour(), now.minute(),
-                config.heartbeat.active_hours_start, config.heartbeat.active_hours_end
+                now.hour(),
+                now.minute(),
+                config.heartbeat.active_hours_start,
+                config.heartbeat.active_hours_end
             );
             crate::health::mark_component_ok("heartbeat");
             continue;
@@ -277,10 +278,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                 if !output.trim().is_empty() {
                     if let Some((channel, target)) = &delivery {
                         if let Err(e) = crate::cron::scheduler::deliver_announcement(
-                            &config,
-                            channel,
-                            target,
-                            &output,
+                            &config, channel, target, &output,
                         )
                         .await
                         {
@@ -305,7 +303,9 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                 Ok(report) if report.processed > 0 => {
                     tracing::info!(
                         "Chat summarization: {} processed, {} skipped, {} errors",
-                        report.processed, report.skipped, report.errors.len()
+                        report.processed,
+                        report.skipped,
+                        report.errors.len()
                     );
                 }
                 Ok(_) => {} // all skipped — nothing to log
@@ -495,6 +495,9 @@ mod tests {
             draft_update_interval_ms: 1000,
             interrupt_on_new_message: false,
             mention_only: false,
+            progress_mode: crate::config::ProgressMode::default(),
+            ack_enabled: true,
+            group_reply: None,
             base_url: None,
         });
         assert!(has_supervised_channels(&config));
@@ -521,6 +524,7 @@ mod tests {
             allowed_users: vec!["*".into()],
             thread_replies: Some(true),
             mention_only: Some(false),
+            group_reply: None,
         });
         assert!(has_supervised_channels(&config));
     }
@@ -532,6 +536,8 @@ mod tests {
             app_id: "app-id".into(),
             app_secret: "app-secret".into(),
             allowed_users: vec!["*".into()],
+            receive_mode: crate::config::schema::QQReceiveMode::Webhook,
+            environment: crate::config::schema::QQEnvironment::Production,
         });
         assert!(has_supervised_channels(&config));
     }
@@ -628,11 +634,57 @@ mod tests {
             draft_update_interval_ms: 1000,
             interrupt_on_new_message: false,
             mention_only: false,
+            progress_mode: crate::config::ProgressMode::default(),
+            ack_enabled: true,
+            group_reply: None,
             base_url: None,
         });
 
         let target = heartbeat_delivery_target(&config).unwrap();
         assert_eq!(target, Some(("telegram".to_string(), "123456".to_string())));
+    }
+
+    #[test]
+    fn heartbeat_delivery_target_accepts_whatsapp_web_target_in_web_mode() {
+        let mut config = Config::default();
+        config.heartbeat.target = Some("whatsapp_web".into());
+        config.heartbeat.to = Some("+15551234567".into());
+        config.channels_config.whatsapp = Some(crate::config::schema::WhatsAppConfig {
+            access_token: None,
+            phone_number_id: None,
+            verify_token: None,
+            app_secret: None,
+            session_path: Some("~/.zeroclaw/state/whatsapp-web/session.db".into()),
+            pair_phone: None,
+            pair_code: None,
+            allowed_numbers: vec!["*".into()],
+        });
+
+        let target = heartbeat_delivery_target(&config).unwrap();
+        assert_eq!(
+            target,
+            Some(("whatsapp_web".to_string(), "+15551234567".to_string()))
+        );
+    }
+
+    #[test]
+    fn heartbeat_delivery_target_rejects_whatsapp_web_target_in_cloud_mode() {
+        let mut config = Config::default();
+        config.heartbeat.target = Some("whatsapp_web".into());
+        config.heartbeat.to = Some("+15551234567".into());
+        config.channels_config.whatsapp = Some(crate::config::schema::WhatsAppConfig {
+            access_token: Some("token".into()),
+            phone_number_id: Some("123456".into()),
+            verify_token: Some("verify".into()),
+            app_secret: None,
+            session_path: None,
+            pair_phone: None,
+            pair_code: None,
+            allowed_numbers: vec!["*".into()],
+        });
+
+        let err = heartbeat_delivery_target(&config).unwrap_err();
+        assert!(err.to_string().contains("configured for cloud mode"));
     }
 
     #[test]

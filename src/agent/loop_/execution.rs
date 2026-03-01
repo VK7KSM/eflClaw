@@ -10,7 +10,6 @@ use tokio_util::sync::CancellationToken;
 fn find_tool<'a>(tools: &'a [Box<dyn Tool>], name: &str) -> Option<&'a dyn Tool> {
     tools.iter().find(|t| t.name() == name).map(|t| t.as_ref())
 }
-
 async fn execute_one_tool(
     call_name: &str,
     call_arguments: serde_json::Value,

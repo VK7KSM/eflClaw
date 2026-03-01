@@ -85,9 +85,9 @@ When you have enough information, summarize what you found in this format:
 
 /// Run the research phase.
 ///
-/// Executes a focused LLM + tools loop to gather information before the main
-/// response. The collected context is returned for injection into the main
-/// conversation.
+/// This executes a focused LLM + tools loop to gather information before
+/// the main response. The collected context is returned for injection
+/// into the main conversation.
 pub async fn run_research_phase(
     config: &ResearchPhaseConfig,
     provider: &dyn Provider,
@@ -104,7 +104,7 @@ pub async fn run_research_phase(
 
     let uses_native_tools = provider.supports_native_tools();
 
-    // Build tool specs
+    // Build tool specs for native OR prompt-guided tool calling
     let tool_specs: Vec<ToolSpec> = tools
         .iter()
         .map(|t| ToolSpec {
@@ -114,7 +114,8 @@ pub async fn run_research_phase(
         })
         .collect();
 
-    // Build system prompt — for prompt-guided providers, include tool instructions
+    // Build system prompt
+    // For prompt-guided providers, include tool instructions in system prompt
     let base_prompt = if config.system_prompt_prefix.is_empty() {
         RESEARCH_SYSTEM_PROMPT.to_string()
     } else {
@@ -127,6 +128,7 @@ pub async fn run_research_phase(
     let system_prompt = if uses_native_tools {
         base_prompt
     } else {
+        // Prompt-guided: append tool instructions
         format!(
             "{}\n\n{}",
             base_prompt,
@@ -144,19 +146,22 @@ pub async fn run_research_phase(
     while iteration < config.max_iterations {
         iteration += 1;
 
+        // Log research iteration if showing progress
         if config.show_progress {
             tracing::info!(iteration, "Research phase iteration");
         }
 
+        // Build messages with system prompt as first message
         let mut full_messages = vec![ChatMessage::system(&system_prompt)];
         full_messages.extend(messages.iter().cloned());
 
+        // Call LLM
         let request = ChatRequest {
             messages: &full_messages,
             tools: if uses_native_tools {
                 Some(&tool_specs)
             } else {
-                None
+                None // Prompt-guided: tools are in system prompt
             },
         };
 
@@ -165,6 +170,7 @@ pub async fn run_research_phase(
         // Check if research is complete
         if let Some(ref text) = response.text {
             if text.contains("[RESEARCH COMPLETE]") {
+                // Extract the summary
                 if let Some(idx) = text.find("[RESEARCH COMPLETE]") {
                     collected_context = text[idx..].to_string();
                 }
@@ -176,6 +182,7 @@ pub async fn run_research_phase(
         let tool_calls: Vec<ToolCall> = if uses_native_tools {
             response.tool_calls.clone()
         } else {
+            // Parse XML <tool_call> tags from response text using XmlToolDispatcher
             let dispatcher = XmlToolDispatcher;
             let (_, parsed) = dispatcher.parse_response(&response);
             parsed
@@ -192,6 +199,7 @@ pub async fn run_research_phase(
                 .collect()
         };
 
+        // If no tool calls, we're done
         if tool_calls.is_empty() {
             if let Some(text) = response.text {
                 collected_context = text;
@@ -220,6 +228,7 @@ pub async fn run_research_phase(
 
             tool_summaries.push(summary);
 
+            // Add tool result to conversation
             messages.push(ChatMessage::assistant(format!(
                 "Called tool `{}` with arguments: {}",
                 tool_call.name, tool_call.arguments
@@ -243,13 +252,16 @@ pub async fn run_research_phase(
 
 /// Execute a single tool call.
 async fn execute_tool_call(tools: &[Box<dyn Tool>], tool_call: &ToolCall) -> ToolResult {
+    // Find the tool
     let tool = tools.iter().find(|t| t.name() == tool_call.name);
 
     match tool {
         Some(t) => {
+            // Parse arguments
             let args: serde_json::Value = serde_json::from_str(&tool_call.arguments)
                 .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
 
+            // Execute
             match t.execute(args).await {
                 Ok(result) => result,
                 Err(e) => ToolResult {

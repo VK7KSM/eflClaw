@@ -81,6 +81,37 @@ pub struct EmailConfig {
     /// Prevents processing hundreds of old unread emails.
     #[serde(default = "default_startup_lookback")]
     pub startup_lookback_minutes: u64,
+    /// Optional IMAP ID extension (RFC 2971) client identification.
+    #[serde(default)]
+    pub imap_id: EmailImapIdConfig,
+}
+
+/// IMAP ID extension metadata (RFC 2971)
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct EmailImapIdConfig {
+    /// Send IMAP `ID` command after login (recommended for some providers such as NetEase).
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Client application name
+    #[serde(default = "default_imap_id_name")]
+    pub name: String,
+    /// Client application version
+    #[serde(default = "default_imap_id_version")]
+    pub version: String,
+    /// Client vendor name
+    #[serde(default = "default_imap_id_vendor")]
+    pub vendor: String,
+}
+
+impl Default for EmailImapIdConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            name: default_imap_id_name(),
+            version: default_imap_id_version(),
+            vendor: default_imap_id_vendor(),
+        }
+    }
 }
 
 impl crate::config::traits::ChannelConfig for EmailConfig {
@@ -113,6 +144,15 @@ fn default_email_mode() -> String {
 fn default_startup_lookback() -> u64 {
     5
 }
+fn default_imap_id_name() -> String {
+    "zeroclaw".into()
+}
+fn default_imap_id_version() -> String {
+    env!("CARGO_PKG_VERSION").into()
+}
+fn default_imap_id_vendor() -> String {
+    "zeroclaw-labs".into()
+}
 
 impl Default for EmailConfig {
     fn default() -> Self {
@@ -132,6 +172,7 @@ impl Default for EmailConfig {
             notify_channel: None,
             notify_to: None,
             startup_lookback_minutes: default_startup_lookback(),
+            imap_id: EmailImapIdConfig::default(),
         }
     }
 }
@@ -270,7 +311,47 @@ impl EmailChannel {
             .map_err(|(e, _)| anyhow!("IMAP login failed: {}", e))?;
 
         debug!("IMAP login successful");
+        let mut session = session;
+        self.send_imap_id(&mut session).await;
         Ok(session)
+    }
+
+    /// Send RFC 2971 IMAP ID extension metadata.
+    /// Any ID errors are non-fatal to keep compatibility with providers
+    /// that do not support the extension.
+    async fn send_imap_id(&self, session: &mut ImapSession) {
+        if !self.config.imap_id.enabled {
+            debug!("IMAP ID extension disabled by configuration");
+            return;
+        }
+
+        let name = self.config.imap_id.name.trim();
+        let version = self.config.imap_id.version.trim();
+        let vendor = self.config.imap_id.vendor.trim();
+
+        let mut identification: Vec<(&str, Option<&str>)> = Vec::new();
+        if !name.is_empty() {
+            identification.push(("name", Some(name)));
+        }
+        if !version.is_empty() {
+            identification.push(("version", Some(version)));
+        }
+        if !vendor.is_empty() {
+            identification.push(("vendor", Some(vendor)));
+        }
+
+        if identification.is_empty() {
+            debug!("IMAP ID extension enabled but no identification fields configured");
+            return;
+        }
+
+        match session.id(identification).await {
+            Ok(_) => debug!("IMAP ID extension sent successfully"),
+            Err(err) => warn!(
+                "IMAP ID extension failed (continuing without ID metadata): {}",
+                err
+            ),
+        }
     }
 
     /// Fetch and process unseen messages from the selected mailbox

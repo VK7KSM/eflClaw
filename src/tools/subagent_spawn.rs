@@ -519,7 +519,6 @@ mod tests {
                 provider: "ollama".to_string(),
                 model: "llama3".to_string(),
                 system_prompt: Some("You are a research assistant.".to_string()),
-                system_prompt_file: None,
                 api_key: None,
                 temperature: Some(0.3),
                 max_depth: 3,

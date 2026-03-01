@@ -396,6 +396,8 @@ struct ApiChatRequest {
     messages: Vec<Message>,
     temperature: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<serde_json::Value>>,
@@ -587,6 +589,8 @@ struct NativeChatRequest {
     model: String,
     messages: Vec<NativeMessage>,
     temperature: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -933,6 +937,7 @@ fn parse_responses_chat_response(response: ResponsesResponse) -> ProviderChatRes
         tool_calls,
         usage: None,
         reasoning_content: None,
+        quota_metadata: None,
     }
 }
 
@@ -1356,6 +1361,23 @@ impl OpenAiCompatibleProvider {
             .ok_or_else(|| anyhow::anyhow!("No response from {} Responses API", self.name))
     }
 
+    async fn chat_via_responses_chat(
+        &self,
+        credential: &str,
+        messages: &[ChatMessage],
+        model: &str,
+        tools: Option<Vec<Value>>,
+    ) -> anyhow::Result<ProviderChatResponse> {
+        let responses = self
+            .send_responses_request(credential, messages, model, tools)
+            .await?;
+        let parsed = parse_responses_chat_response(responses);
+        if parsed.text.is_none() && parsed.tool_calls.is_empty() {
+            anyhow::bail!("No response from {} Responses API", self.name);
+        }
+        Ok(parsed)
+    }
+
     fn convert_tool_specs(
         tools: Option<&[crate::tools::ToolSpec]>,
     ) -> Option<Vec<serde_json::Value>> {
@@ -1559,6 +1581,7 @@ impl OpenAiCompatibleProvider {
             tool_calls,
             usage: None,
             reasoning_content,
+            quota_metadata: None,
         }
     }
 
@@ -1588,6 +1611,9 @@ impl OpenAiCompatibleProvider {
 impl Provider for OpenAiCompatibleProvider {
     fn capabilities(&self) -> crate::providers::traits::ProviderCapabilities {
         crate::providers::traits::ProviderCapabilities {
+            // Providers that require system-prompt merging (e.g. MiniMax) also
+            // reject OpenAI-style `tools` in the request body. Fall back to
+            // prompt-guided tool calling for those providers.
             native_tool_calling: self.native_tool_calling,
             vision: self.supports_vision,
         }
@@ -1635,6 +1661,7 @@ impl Provider for OpenAiCompatibleProvider {
             model: model.to_string(),
             messages,
             temperature,
+            max_tokens: self.effective_max_tokens(),
             stream: Some(false),
             tools: None,
             tool_choice: None,
@@ -1652,6 +1679,12 @@ impl Provider for OpenAiCompatibleProvider {
         } else {
             fallback_messages
         };
+
+        if self.should_use_responses_mode() {
+            return self
+                .chat_via_responses(credential, &fallback_messages, model)
+                .await;
+        }
 
         let response = match self
             .apply_auth_header(self.http_client().post(&url).json(&request), credential)
@@ -1757,10 +1790,17 @@ impl Provider for OpenAiCompatibleProvider {
             model: model.to_string(),
             messages: api_messages,
             temperature,
+            max_tokens: self.effective_max_tokens(),
             stream: Some(false),
             tools: None,
             tool_choice: None,
         };
+
+        if self.should_use_responses_mode() {
+            return self
+                .chat_via_responses(credential, &effective_messages, model)
+                .await;
+        }
 
         let url = self.chat_completions_url();
         let response = match self
@@ -1867,6 +1907,7 @@ impl Provider for OpenAiCompatibleProvider {
             model: model.to_string(),
             messages: api_messages,
             temperature,
+            max_tokens: self.effective_max_tokens(),
             stream: Some(false),
             tools: if tools.is_empty() {
                 None
@@ -1879,6 +1920,17 @@ impl Provider for OpenAiCompatibleProvider {
                 Some("auto".to_string())
             },
         };
+
+        if self.should_use_responses_mode() {
+            return self
+                .chat_via_responses_chat(
+                    credential,
+                    &effective_messages,
+                    model,
+                    (!tools.is_empty()).then(|| tools.to_vec()),
+                )
+                .await;
+        }
 
         let url = self.chat_completions_url();
         let response = match self
@@ -1898,11 +1950,23 @@ impl Provider for OpenAiCompatibleProvider {
                     tool_calls: vec![],
                     usage: None,
                     reasoning_content: None,
+                    quota_metadata: None,
                 });
             }
         };
 
         if !response.status().is_success() {
+            let status = response.status();
+            if status == reqwest::StatusCode::NOT_FOUND && self.supports_responses_fallback {
+                return self
+                    .chat_via_responses_chat(
+                        credential,
+                        &effective_messages,
+                        model,
+                        (!tools.is_empty()).then(|| tools.to_vec()),
+                    )
+                    .await;
+            }
             return Err(super::api_error(&self.name, response).await);
         }
 
@@ -1943,6 +2007,7 @@ impl Provider for OpenAiCompatibleProvider {
             tool_calls,
             usage,
             reasoning_content,
+            quota_metadata: None,
         })
     }
 
@@ -1960,6 +2025,7 @@ impl Provider for OpenAiCompatibleProvider {
         })?;
 
         let tools = Self::convert_tool_specs(request.tools);
+        let response_tools = tools.clone();
         let effective_messages = if self.merge_system_into_user {
             Self::flatten_system_messages(request.messages)
         } else {
@@ -1972,10 +2038,22 @@ impl Provider for OpenAiCompatibleProvider {
                 !self.merge_system_into_user,
             ),
             temperature,
+            max_tokens: self.effective_max_tokens(),
             stream: Some(false),
             tool_choice: tools.as_ref().map(|_| "auto".to_string()),
             tools,
         };
+
+        if self.should_use_responses_mode() {
+            return self
+                .chat_via_responses_chat(
+                    credential,
+                    &effective_messages,
+                    model,
+                    response_tools.clone(),
+                )
+                .await;
+        }
 
         let url = self.chat_completions_url();
         let response = match self
@@ -1991,14 +2069,13 @@ impl Provider for OpenAiCompatibleProvider {
                 if self.supports_responses_fallback {
                     let sanitized = super::sanitize_api_error(&chat_error.to_string());
                     return self
-                        .chat_via_responses(credential, &effective_messages, model)
+                        .chat_via_responses_chat(
+                            credential,
+                            &effective_messages,
+                            model,
+                            response_tools.clone(),
+                        )
                         .await
-                        .map(|text| ProviderChatResponse {
-                            text: Some(text),
-                            tool_calls: vec![],
-                            usage: None,
-                            reasoning_content: None,
-                        })
                         .map_err(|responses_err| {
                             anyhow::anyhow!(
                                 "{} native chat transport error: {sanitized} (responses fallback failed: {responses_err})",
@@ -2027,19 +2104,19 @@ impl Provider for OpenAiCompatibleProvider {
                     tool_calls: vec![],
                     usage: None,
                     reasoning_content: None,
+                    quota_metadata: None,
                 });
             }
 
             if status == reqwest::StatusCode::NOT_FOUND && self.supports_responses_fallback {
                 return self
-                    .chat_via_responses(credential, &effective_messages, model)
+                    .chat_via_responses_chat(
+                        credential,
+                        &effective_messages,
+                        model,
+                        response_tools.clone(),
+                    )
                     .await
-                    .map(|text| ProviderChatResponse {
-                        text: Some(text),
-                        tool_calls: vec![],
-                        usage: None,
-                        reasoning_content: None,
-                    })
                     .map_err(|responses_err| {
                         anyhow::anyhow!(
                             "{} API error ({status}): {sanitized} (chat completions unavailable; responses fallback failed: {responses_err})",
@@ -2114,6 +2191,7 @@ impl Provider for OpenAiCompatibleProvider {
             model: model.to_string(),
             messages,
             temperature,
+            max_tokens: self.effective_max_tokens(),
             stream: Some(options.enabled),
             tools: None,
             tool_choice: None,
@@ -2255,6 +2333,7 @@ mod tests {
                 },
             ],
             temperature: 0.4,
+            max_tokens: None,
             stream: Some(false),
             tools: None,
             tool_choice: None,
@@ -2331,6 +2410,22 @@ mod tests {
         assert!(matches!(p.auth_header, AuthStyle::Custom(_)));
     }
 
+    #[test]
+    fn custom_constructor_applies_responses_mode_and_max_tokens_override() {
+        let provider = OpenAiCompatibleProvider::new_custom_with_mode(
+            "custom",
+            "https://api.example.com",
+            Some("key"),
+            AuthStyle::Bearer,
+            true,
+            CompatibleApiMode::OpenAiResponses,
+            Some(2048),
+        );
+
+        assert!(provider.should_use_responses_mode());
+        assert_eq!(provider.effective_max_tokens(), Some(2048));
+    }
+
     #[tokio::test]
     async fn all_compatible_providers_fail_without_key() {
         let providers = vec![
@@ -2338,7 +2433,7 @@ mod tests {
             make_provider("Moonshot", "https://api.moonshot.cn", None),
             make_provider("GLM", "https://open.bigmodel.cn", None),
             make_provider("MiniMax", "https://api.minimaxi.com/v1", None),
-            make_provider("Groq", "https://api.groq.com/openai", None),
+            make_provider("Groq", "https://api.groq.com/openai/v1", None),
             make_provider("Mistral", "https://api.mistral.ai", None),
             make_provider("xAI", "https://api.x.ai", None),
             make_provider("Astrai", "https://as-trai.com/v1", None),
@@ -2384,6 +2479,124 @@ mod tests {
             extract_responses_text(&response).as_deref(),
             Some("Fallback text")
         );
+    }
+
+    #[test]
+    fn responses_extracts_function_call_as_tool_call() {
+        let json = r#"{
+            "output":[
+                {
+                    "type":"function_call",
+                    "call_id":"call_abc",
+                    "name":"shell",
+                    "arguments":"{\"command\":\"date\"}"
+                }
+            ]
+        }"#;
+        let response: ResponsesResponse = serde_json::from_str(json).unwrap();
+        let parsed = parse_responses_chat_response(response);
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.tool_calls[0].id, "call_abc");
+        assert_eq!(parsed.tool_calls[0].name, "shell");
+        assert_eq!(parsed.tool_calls[0].arguments, "{\"command\":\"date\"}");
+    }
+
+    #[test]
+    fn websocket_url_converts_scheme_and_adds_model_query() {
+        let provider = make_provider("custom", "https://api.openai.com/v1", Some("key"));
+        let ws_url = provider
+            .responses_websocket_url("gpt-5.2")
+            .expect("websocket URL should be derived");
+        assert_eq!(ws_url, "wss://api.openai.com/v1/responses?model=gpt-5.2");
+    }
+
+    #[test]
+    fn websocket_url_preserves_existing_model_query() {
+        let provider = make_provider(
+            "custom",
+            "https://api.openai.com/v1/responses?model=gpt-4.1-mini",
+            Some("key"),
+        );
+        let ws_url = provider
+            .responses_websocket_url("gpt-5.2")
+            .expect("existing query should be preserved");
+        assert_eq!(
+            ws_url,
+            "wss://api.openai.com/v1/responses?model=gpt-4.1-mini"
+        );
+    }
+
+    #[test]
+    fn websocket_accumulator_parses_delta_and_completed_event() {
+        let mut acc = ResponsesWebSocketAccumulator::default();
+
+        assert!(acc
+            .apply_event(&serde_json::json!({
+                "type":"response.created",
+                "response":{"id":"resp_123"}
+            }))
+            .unwrap()
+            .is_none());
+
+        assert!(acc
+            .apply_event(&serde_json::json!({
+                "type":"response.output_text.delta",
+                "delta":"Hello"
+            }))
+            .unwrap()
+            .is_none());
+
+        let response = acc
+            .apply_event(&serde_json::json!({
+                "type":"response.completed",
+                "response":{"id":"resp_123","output_text":"Hello world","output":[]}
+            }))
+            .unwrap()
+            .expect("completed event should finalize response");
+
+        assert_eq!(response.id.as_deref(), Some("resp_123"));
+        assert_eq!(
+            extract_responses_text(&response).as_deref(),
+            Some("Hello world")
+        );
+    }
+
+    #[test]
+    fn websocket_accumulator_falls_back_to_output_items() {
+        let mut acc = ResponsesWebSocketAccumulator::default();
+        assert!(acc
+            .apply_event(&serde_json::json!({
+                "type":"response.output_item.done",
+                "item":{
+                    "type":"function_call",
+                    "name":"shell",
+                    "call_id":"call_xyz",
+                    "arguments":"{\"command\":\"pwd\"}"
+                }
+            }))
+            .unwrap()
+            .is_none());
+
+        let fallback = acc
+            .fallback_response()
+            .expect("function-call output item should be retained");
+        let parsed = parse_responses_chat_response(fallback);
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.tool_calls[0].id, "call_xyz");
+        assert_eq!(parsed.tool_calls[0].name, "shell");
+    }
+
+    #[test]
+    fn websocket_accumulator_reports_stream_error() {
+        let mut acc = ResponsesWebSocketAccumulator::default();
+        let err = acc
+            .apply_event(&serde_json::json!({
+                "type":"error",
+                "error":{"code":"previous_response_not_found","message":"missing response id"}
+            }))
+            .expect_err("error event should fail");
+
+        assert!(err.to_string().contains("missing response id"));
     }
 
     #[test]
@@ -2968,6 +3181,7 @@ mod tests {
                 content: MessageContent::Text("What is the weather?".to_string()),
             }],
             temperature: 0.7,
+            max_tokens: None,
             stream: Some(false),
             tools: Some(tools),
             tool_choice: Some("auto".to_string()),

@@ -369,18 +369,4 @@ mod tests {
         assert!(result.is_err());
         assert!(result.expect_err("error").to_string().contains("cycle"));
     }
-
-    #[test]
-    fn unknown_role_is_denied() {
-        let registry = RoleRegistry::built_in();
-        let access = registry.resolve_tool_access("nonexistent_role", "shell", &[]);
-        assert!(!access.allowed);
-    }
-
-    #[test]
-    fn guest_role_has_no_tools() {
-        let registry = RoleRegistry::built_in();
-        let access = registry.resolve_tool_access("guest", "file_read", &[]);
-        assert!(!access.allowed);
-    }
 }

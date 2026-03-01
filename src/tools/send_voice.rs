@@ -123,10 +123,7 @@ impl Tool for SendVoiceTool {
         crate::channels::tts::cleanup(&audio_path).await;
 
         // Step 4: Send the text version as a follow-up message
-        let text_url = format!(
-            "https://api.telegram.org/bot{}/sendMessage",
-            self.bot_token
-        );
+        let text_url = format!("https://api.telegram.org/bot{}/sendMessage", self.bot_token);
 
         let client = crate::config::build_runtime_proxy_client_with_timeouts(
             "tool.send_voice",

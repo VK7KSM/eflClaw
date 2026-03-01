@@ -43,19 +43,72 @@ pub fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
     }
 }
 
-/// Find the largest byte index ≤ `max_bytes` that is a valid UTF-8 character boundary.
+/// Return the greatest valid UTF-8 char boundary at or below `index`.
 ///
-/// Returns 0 if `max_bytes` is 0 or if the string is empty.
-/// Returns `s.len()` if `max_bytes >= s.len()`.
-pub fn floor_utf8_char_boundary(s: &str, max_bytes: usize) -> usize {
-    if max_bytes >= s.len() {
+/// This mirrors `str::floor_char_boundary` behavior while remaining compatible
+/// with stable toolchains where that API is not available.
+pub fn floor_utf8_char_boundary(s: &str, index: usize) -> usize {
+    if index >= s.len() {
         return s.len();
     }
-    let mut idx = max_bytes;
-    while idx > 0 && !s.is_char_boundary(idx) {
-        idx -= 1;
+
+    let mut i = index;
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
     }
-    idx
+    i
+}
+
+/// Allowed serial device path prefixes shared across hardware transports.
+pub const ALLOWED_SERIAL_PATH_PREFIXES: &[&str] = &[
+    "/dev/ttyACM",
+    "/dev/ttyUSB",
+    "/dev/tty.usbmodem",
+    "/dev/cu.usbmodem",
+    "/dev/tty.usbserial",
+    "/dev/cu.usbserial",
+    "COM",
+];
+
+/// Validate serial device path against per-platform rules.
+pub fn is_serial_path_allowed(path: &str) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        use std::sync::OnceLock;
+        if !std::path::Path::new(path).is_absolute() {
+            return false;
+        }
+        static PAT: OnceLock<regex::Regex> = OnceLock::new();
+        let re = PAT.get_or_init(|| {
+            regex::Regex::new(r"^/dev/tty(ACM|USB|S|AMA|MFD)\d+$").expect("valid regex")
+        });
+        return re.is_match(path);
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        use std::sync::OnceLock;
+        if !std::path::Path::new(path).is_absolute() {
+            return false;
+        }
+        static PAT: OnceLock<regex::Regex> = OnceLock::new();
+        let re = PAT.get_or_init(|| {
+            regex::Regex::new(r"^/dev/(tty|cu)\.(usbmodem|usbserial)[^\x00/]*$")
+                .expect("valid regex")
+        });
+        return re.is_match(path);
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::sync::OnceLock;
+        static PAT: OnceLock<regex::Regex> = OnceLock::new();
+        let re = PAT.get_or_init(|| regex::Regex::new(r"^COM\d{1,3}$").expect("valid regex"));
+        return re.is_match(path);
+    }
+
+    #[allow(unreachable_code)]
+    false
 }
 
 /// Utility enum for handling optional values.
@@ -156,5 +209,22 @@ mod tests {
     fn test_truncate_zero_max_chars() {
         // Edge case: max_chars = 0
         assert_eq!(truncate_with_ellipsis("hello", 0), "...");
+    }
+
+    #[test]
+    fn test_floor_utf8_char_boundary_ascii() {
+        assert_eq!(floor_utf8_char_boundary("hello", 0), 0);
+        assert_eq!(floor_utf8_char_boundary("hello", 3), 3);
+        assert_eq!(floor_utf8_char_boundary("hello", 99), 5);
+    }
+
+    #[test]
+    fn test_floor_utf8_char_boundary_multibyte() {
+        let s = "aé你🦀";
+        assert_eq!(floor_utf8_char_boundary(s, 1), 1);
+        // Index 2 is inside "é" (2-byte char), floor should move back to 1.
+        assert_eq!(floor_utf8_char_boundary(s, 2), 1);
+        // Index 5 is inside "你" (3-byte char), floor should move back to 3.
+        assert_eq!(floor_utf8_char_boundary(s, 5), 3);
     }
 }

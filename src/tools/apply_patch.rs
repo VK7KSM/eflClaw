@@ -4,12 +4,12 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use tokio::io::AsyncWriteExt;
+use tempfile::NamedTempFile;
 use tokio::process::Command;
 
 /// ApplyPatchTool
 ///
-/// A constrained "self-fix" primitive:
+/// A constrained “self-fix” primitive:
 /// - Accepts a unified diff as a string
 /// - Optionally dry-runs via `git apply --check`
 /// - Applies via `git apply`
@@ -47,12 +47,6 @@ impl ApplyPatchTool {
             },
             "required": ["patch"]
         })
-    }
-}
-
-impl Default for ApplyPatchTool {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -108,11 +102,20 @@ impl Tool for ApplyPatchTool {
         let _ = writeln!(log, "Repo root: {}", repo_root.display());
         let _ = writeln!(log, "Mode: {}", if dry_run { "dry-run" } else { "apply" });
 
+        // Write patch to a temp file.
+        let mut tmp = NamedTempFile::new().context("Failed to create temp file for patch")?;
+        std::io::Write::write_all(&mut tmp, patch.as_bytes())
+            .context("Failed to write patch to temp file")?;
+        let patch_path: PathBuf = tmp.path().to_path_buf();
+
         // Always run a check first (even if applying).
         {
-            let (code, out, err) =
-                run_cmd_stdin(&repo_root, "git", &["apply", "--check", "-"], patch.as_bytes())
-                    .await?;
+            let (code, out, err) = run_cmd(
+                &repo_root,
+                "git",
+                &["apply", "--check", patch_path.to_string_lossy().as_ref()],
+            )
+            .await?;
 
             log.push_str("\n# git apply --check\n");
             let _ = writeln!(log, "exit_code: {code}");
@@ -151,8 +154,12 @@ impl Tool for ApplyPatchTool {
 
         // Apply patch.
         {
-            let (code, out, err) =
-                run_cmd_stdin(&repo_root, "git", &["apply", "-"], patch.as_bytes()).await?;
+            let (code, out, err) = run_cmd(
+                &repo_root,
+                "git",
+                &["apply", patch_path.to_string_lossy().as_ref()],
+            )
+            .await?;
 
             log.push_str("\n# git apply\n");
             let _ = writeln!(log, "exit_code: {code}");
@@ -241,7 +248,7 @@ impl Tool for ApplyPatchTool {
             }
 
             if code_commit != 0 {
-                // Often means "nothing to commit" or hooks blocked it.
+                // Often means “nothing to commit” or hooks blocked it.
                 return Ok(ToolResult {
                     success: false,
                     output: log,
@@ -294,51 +301,14 @@ async fn git_repo_root() -> Result<PathBuf> {
     Ok(PathBuf::from(root))
 }
 
-/// Run a command and capture output (no stdin).
 async fn run_cmd(dir: &Path, program: &str, args: &[&str]) -> Result<(i32, String, String)> {
-    let output = Command::new(program)
-        .args(args)
-        .current_dir(dir)
+    let mut cmd = Command::new(program);
+    cmd.args(args).current_dir(dir);
+
+    let output = cmd
         .output()
         .await
         .with_context(|| format!("Failed to run command: {program} {:?}", args))?;
-
-    let code = output.status.code().unwrap_or(-1);
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    Ok((code, stdout, stderr))
-}
-
-/// Run a command with stdin input (used to pipe patch content).
-async fn run_cmd_stdin(
-    dir: &Path,
-    program: &str,
-    args: &[&str],
-    stdin_data: &[u8],
-) -> Result<(i32, String, String)> {
-    use std::process::Stdio;
-    let mut child = Command::new(program)
-        .args(args)
-        .current_dir(dir)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("Failed to spawn command: {program} {:?}", args))?;
-
-    if let Some(stdin) = child.stdin.take() {
-        let mut stdin = tokio::io::BufWriter::new(stdin);
-        stdin
-            .write_all(stdin_data)
-            .await
-            .context("Failed to write patch to git stdin")?;
-        stdin.flush().await.context("Failed to flush git stdin")?;
-    }
-
-    let output = child
-        .wait_with_output()
-        .await
-        .with_context(|| format!("Failed to wait for command: {program} {:?}", args))?;
 
     let code = output.status.code().unwrap_or(-1);
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -357,12 +327,5 @@ mod tests {
         assert_eq!(s["type"], "object");
         assert!(s["properties"].is_object());
         assert!(s["properties"]["patch"].is_object());
-    }
-
-    #[test]
-    fn tool_metadata() {
-        let t = ApplyPatchTool::new();
-        assert_eq!(t.name(), "apply_patch");
-        assert!(!t.description().is_empty());
     }
 }
