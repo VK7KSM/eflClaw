@@ -243,7 +243,7 @@ web-fetch-html2md = []
 
 [profile.release]
 opt-level = "z"       # Optimize for minimum binary size
-lto = "thin"          # Thin LTO: parallel link-time optimization, near-identical size to fat
+lto = "fat"           # Fat LTO: full link-time optimization (slower build, smaller+faster binary)
 codegen-units = 1     # 1 = maximum optimization (allows cross-crate inlining)
 strip = true
 panic = "abort"

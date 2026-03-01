@@ -262,6 +262,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
             vec![],
             false,
             Some(config.heartbeat.max_tool_iterations),
+            crate::agent::RunContext::Background, // elfClaw: heartbeat uses worker_model
         )
         .await
         {

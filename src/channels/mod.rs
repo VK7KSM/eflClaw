@@ -185,6 +185,7 @@ struct ChannelRuntimeDefaults {
     api_key: Option<String>,
     api_url: Option<String>,
     reliability: crate::config::ReliabilityConfig,
+    worker_model: Option<String>, // elfClaw: model for background tasks (email digest, etc.)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -269,6 +270,7 @@ struct ChannelRuntimeContext {
     non_cli_excluded_tools: Arc<Vec<String>>,
     tts_config: crate::config::TtsConfig,
     chat_log_config: crate::config::ChatLogConfig,
+    worker_model: Option<String>, // elfClaw: model for background tasks (email digest, etc.)
 }
 
 #[derive(Clone)]
@@ -619,6 +621,7 @@ fn runtime_defaults_from_config(config: &Config) -> ChannelRuntimeDefaults {
         api_key: config.api_key.clone(),
         api_url: config.api_url.clone(),
         reliability: config.reliability.clone(),
+        worker_model: config.worker_model.clone(), // elfClaw
     }
 }
 
@@ -646,6 +649,7 @@ fn runtime_defaults_snapshot(ctx: &ChannelRuntimeContext) -> ChannelRuntimeDefau
         api_key: ctx.api_key.clone(),
         api_url: ctx.api_url.clone(),
         reliability: (*ctx.reliability).clone(),
+        worker_model: ctx.worker_model.clone(), // elfClaw
     }
 }
 
@@ -1613,8 +1617,14 @@ async fn process_channel_message(
     }
 
     let history_key = conversation_history_key(&msg);
-    let route = get_route_selection(ctx.as_ref(), &history_key);
+    let mut route = get_route_selection(ctx.as_ref(), &history_key);
     let runtime_defaults = runtime_defaults_snapshot(ctx.as_ref());
+    // elfClaw: background email digests use worker_model to keep inference costs low
+    if msg.id.starts_with("email-digest-") {
+        if let Some(ref wm) = runtime_defaults.worker_model {
+            route.model = wm.clone();
+        }
+    }
     let active_provider = match get_or_create_provider(ctx.as_ref(), &route.provider).await {
         Ok(provider) => provider,
         Err(err) => {
@@ -3752,6 +3762,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         non_cli_excluded_tools: Arc::new(config.autonomy.non_cli_excluded_tools.clone()),
         tts_config: config.tts.clone(),
         chat_log_config: config.chat_log.clone(),
+        worker_model: config.worker_model.clone(), // elfClaw
     });
 
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
@@ -5031,6 +5042,7 @@ BTC is currently around $65,000 based on latest tool output."#
                         api_key: None,
                         api_url: None,
                         reliability: crate::config::ReliabilityConfig::default(),
+                        worker_model: None,
                     },
                     last_applied_stamp: None,
                 },

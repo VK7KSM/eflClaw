@@ -189,6 +189,7 @@ async fn run_agent_job(
                 vec![],
                 false,
                 Some(config.scheduler.max_tool_iterations),
+                crate::agent::RunContext::Background, // elfClaw: cron uses worker_model
             ))
             .await
         }

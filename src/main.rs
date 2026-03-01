@@ -979,6 +979,7 @@ async fn main() -> Result<()> {
                 peripheral,
                 interactive,
                 max_tool_iterations,
+                agent::RunContext::Interactive, // elfClaw: CLI is user-initiated
             ))
             .await
             .map(|_| ())
