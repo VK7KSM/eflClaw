@@ -2,6 +2,20 @@
 
 ---
 
+## 2026-03-01 — 上游合并完成，main 分支替换并推送
+
+**操作**：
+- `git checkout main && git reset --hard merge/upstream-2026-03-01`
+- `git push origin main --force-with-lease`（origin 上 main 是新分支，推送成功）
+- `git branch -d merge/upstream-2026-03-01`（清理临时分支）
+
+**结果**：
+- `main` 分支现在包含完整的上游 merge（750+ commits）+ elfClaw 所有改动
+- 测试结果：4131 passed，19 failed（全部是预存在的 Windows 平台限制，非回归）
+- GitHub 仓库：https://github.com/VK7KSM/eflClaw（main 分支已更新）
+
+---
+
 ## 2026-03-01 — upstream/main 合并冲突全量解决（78 个冲突文件）
 
 **涉及文件**（主要修改）：
