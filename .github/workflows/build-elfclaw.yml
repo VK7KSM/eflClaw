@@ -32,7 +32,8 @@ env:
 
 jobs:
     # ─────────────────────────────────────────────────────────────────────────
-    # macOS — native runners (x86_64 Intel + Apple Silicon)
+    # macOS — Apple Silicon (aarch64); Intel Mac dropped: macOS 15 requires
+    # Apple Silicon, and GitHub retired the macos-13 Intel runner.
     # ─────────────────────────────────────────────────────────────────────────
     build-macos:
         name: Build ${{ matrix.target }}
@@ -43,9 +44,6 @@ jobs:
             matrix:
                 include:
                     - os: macos-15
-                      target: x86_64-apple-darwin
-                      archive: elfclaw-x86_64-macos.tar.gz
-                    - os: macos-14
                       target: aarch64-apple-darwin
                       archive: elfclaw-aarch64-macos.tar.gz
 
