@@ -1,10 +1,13 @@
 name: Build elfClaw
 
+# Triggers:
+#   - Push a tag "v*"  → build + publish GitHub Release
+#   - Manual dispatch  → build artifacts (optionally publish if release_tag is given)
 on:
     workflow_dispatch:
         inputs:
             release_tag:
-                description: "Release tag (e.g. v0.2.0). Leave empty to only upload artifacts."
+                description: "Release tag to publish (e.g. v0.2.0). Leave empty for artifact-only build."
                 required: false
                 default: ""
                 type: string
@@ -28,7 +31,85 @@ env:
     CARGO_TERM_COLOR: always
 
 jobs:
-    build:
+    # ─────────────────────────────────────────────────────────────────────────
+    # Linux + Android + FreeBSD — all via `cross` (Docker-based, zero env setup)
+    # ─────────────────────────────────────────────────────────────────────────
+    build-cross:
+        name: Build ${{ matrix.target }}
+        runs-on: ubuntu-22.04
+        timeout-minutes: 60
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    # ── Linux GNU ──────────────────────────────────────────
+                    - target: x86_64-unknown-linux-gnu
+                      archive: zeroclaw-x86_64-linux-gnu.tar.gz
+                    - target: aarch64-unknown-linux-gnu
+                      archive: zeroclaw-aarch64-linux-gnu.tar.gz
+                    - target: armv7-unknown-linux-gnueabihf
+                      archive: zeroclaw-armv7-linux-gnu.tar.gz
+                    - target: arm-unknown-linux-gnueabihf
+                      archive: zeroclaw-armv6-linux-gnu.tar.gz
+                    - target: i686-unknown-linux-gnu
+                      archive: zeroclaw-i686-linux-gnu.tar.gz
+                    # ── Linux MUSL (static, runs without glibc) ───────────
+                    - target: x86_64-unknown-linux-musl
+                      archive: zeroclaw-x86_64-linux-musl.tar.gz
+                    - target: aarch64-unknown-linux-musl
+                      archive: zeroclaw-aarch64-linux-musl.tar.gz
+                    - target: armv7-unknown-linux-musleabihf
+                      archive: zeroclaw-armv7-linux-musl.tar.gz
+                    - target: arm-unknown-linux-musleabihf
+                      archive: zeroclaw-armv6-linux-musl.tar.gz
+                    # ── Android ───────────────────────────────────────────
+                    - target: aarch64-linux-android
+                      archive: zeroclaw-aarch64-android.tar.gz
+                    - target: armv7-linux-androideabi
+                      archive: zeroclaw-armv7-android.tar.gz
+                    - target: x86_64-linux-android
+                      archive: zeroclaw-x86_64-android.tar.gz
+                    # ── FreeBSD ───────────────────────────────────────────
+                    - target: x86_64-unknown-freebsd
+                      archive: zeroclaw-x86_64-freebsd.tar.gz
+
+        steps:
+            - uses: actions/checkout@v4
+
+            - uses: dtolnay/rust-toolchain@stable
+              with:
+                  toolchain: stable
+                  targets: ${{ matrix.target }}
+
+            - uses: Swatinem/rust-cache@v2
+              with:
+                  key: cross-${{ matrix.target }}
+
+            - name: Install cross
+              run: |
+                  cargo install cross --git https://github.com/cross-rs/cross \
+                    --rev 085092c || true
+                  cross --version
+
+            - name: Build with cross
+              run: cross build --release --locked --target ${{ matrix.target }}
+
+            - name: Package
+              run: |
+                  cd target/${{ matrix.target }}/release
+                  tar czf ../../../${{ matrix.archive }} zeroclaw
+
+            - name: Upload artifact
+              uses: actions/upload-artifact@v4
+              with:
+                  name: ${{ matrix.archive }}
+                  path: ${{ matrix.archive }}
+                  retention-days: 14
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # macOS — native runners (x86_64 Intel + Apple Silicon)
+    # ─────────────────────────────────────────────────────────────────────────
+    build-macos:
         name: Build ${{ matrix.target }}
         runs-on: ${{ matrix.os }}
         timeout-minutes: 60
@@ -36,24 +117,12 @@ jobs:
             fail-fast: false
             matrix:
                 include:
-                    - os: ubuntu-22.04
-                      target: x86_64-unknown-linux-gnu
-                      artifact: zeroclaw
-                      archive: zeroclaw-x86_64-linux.tar.gz
-                    - os: ubuntu-22.04
-                      target: aarch64-unknown-linux-gnu
-                      artifact: zeroclaw
-                      archive: zeroclaw-aarch64-linux.tar.gz
-                      cross_pkg: gcc-aarch64-linux-gnu
-                      cross_linker: CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+                    - os: macos-13
+                      target: x86_64-apple-darwin
+                      archive: zeroclaw-x86_64-macos.tar.gz
                     - os: macos-14
                       target: aarch64-apple-darwin
-                      artifact: zeroclaw
                       archive: zeroclaw-aarch64-macos.tar.gz
-                    - os: windows-latest
-                      target: x86_64-pc-windows-msvc
-                      artifact: zeroclaw.exe
-                      archive: zeroclaw-x86_64-windows.zip
 
         steps:
             - uses: actions/checkout@v4
@@ -67,33 +136,13 @@ jobs:
               with:
                   key: ${{ matrix.target }}
 
-            - name: Install cross-compilation toolchain (aarch64 Linux)
-              if: matrix.cross_pkg != ''
-              run: |
-                  sudo apt-get update -qq
-                  sudo apt-get install -y ${{ matrix.cross_pkg }}
-
-            - name: Build (Linux cross)
-              if: matrix.cross_linker != ''
-              run: |
-                  env ${{ matrix.cross_linker }} \
-                    cargo build --release --locked --target ${{ matrix.target }}
-
-            - name: Build (native)
-              if: matrix.cross_linker == ''
+            - name: Build
               run: cargo build --release --locked --target ${{ matrix.target }}
 
-            - name: Package (Unix)
-              if: runner.os != 'Windows'
+            - name: Package
               run: |
                   cd target/${{ matrix.target }}/release
-                  tar czf ../../../${{ matrix.archive }} ${{ matrix.artifact }}
-
-            - name: Package (Windows)
-              if: runner.os == 'Windows'
-              run: |
-                  cd target/${{ matrix.target }}/release
-                  7z a ../../../${{ matrix.archive }} ${{ matrix.artifact }}
+                  tar czf ../../../${{ matrix.archive }} zeroclaw
 
             - name: Upload artifact
               uses: actions/upload-artifact@v4
@@ -102,13 +151,52 @@ jobs:
                   path: ${{ matrix.archive }}
                   retention-days: 14
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # Windows — native runner (MSVC)
+    # ─────────────────────────────────────────────────────────────────────────
+    build-windows:
+        name: Build x86_64-pc-windows-msvc
+        runs-on: windows-latest
+        timeout-minutes: 60
+
+        steps:
+            - uses: actions/checkout@v4
+
+            - uses: dtolnay/rust-toolchain@stable
+              with:
+                  toolchain: stable
+                  targets: x86_64-pc-windows-msvc
+
+            - uses: Swatinem/rust-cache@v2
+              with:
+                  key: x86_64-pc-windows-msvc
+
+            - name: Build
+              run: cargo build --release --locked --target x86_64-pc-windows-msvc
+
+            - name: Package
+              run: |
+                  cd target/x86_64-pc-windows-msvc/release
+                  7z a ../../../zeroclaw-x86_64-windows.zip zeroclaw.exe
+
+            - name: Upload artifact
+              uses: actions/upload-artifact@v4
+              with:
+                  name: zeroclaw-x86_64-windows.zip
+                  path: zeroclaw-x86_64-windows.zip
+                  retention-days: 14
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Create GitHub Release (runs after all builds)
+    # ─────────────────────────────────────────────────────────────────────────
     release:
         name: Create GitHub Release
-        needs: build
+        needs: [build-cross, build-macos, build-windows]
         runs-on: ubuntu-latest
         if: >
             github.event_name == 'push' ||
             (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
+
         steps:
             - uses: actions/checkout@v4
 
@@ -121,7 +209,10 @@ jobs:
             - name: Generate SHA256 checksums
               run: |
                   cd dist
-                  sha256sum * > SHA256SUMS.txt
+                  sha256sum * | sort > SHA256SUMS.txt
+                  echo "=== Artifacts ==="
+                  ls -lh
+                  echo "=== Checksums ==="
                   cat SHA256SUMS.txt
 
             - name: Determine release tag
