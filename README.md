@@ -86,10 +86,10 @@ The project's own analysis (pre-fork) summarized it well:
 
 ### What elfClaw Does Differently
 
-elfClaw applies **surgical refactoring** — we don't rewrite for the sake of rewriting. We fix the parts that actively block feature development:
+elfClaw applies **surgical fixes** — we don't rewrite for the sake of rewriting. We fix the parts that actively block feature development:
 
-- `src/agent/loop_.rs` split into `loop_/context.rs`, `loop_/history.rs`, `loop_/execution.rs`, `loop_/parsing.rs`
-- Channel delivery unified via `deliver_to_channel()` — all channels route through the `Channel` trait, no hardcoded match blocks
+- Channel delivery unified via `deliver_to_channel()` — our own fix to an architectural debt we inherited from the fork base: hardcoded 4-channel `match` blocks in `daemon/mod.rs` and `cron/scheduler.rs` that bypassed the `Channel` trait entirely
+- Agent loop submodule structure integrated from upstream's newer commits, with elfClaw-specific customizations layered on top
 - New features added as **focused, testable modules** (200–450 lines each), each with unit tests covering happy path, error path, and edge cases
 
 ---
@@ -264,17 +264,19 @@ Supports **cross-midnight ranges** (e.g., `22:00`–`06:00` for night-shift work
 
 All announcement paths (heartbeat, cron jobs, scheduled tasks) now route through the `Channel` trait via a single `deliver_to_channel()` function.
 
-**What this means for users:** Heartbeat announcements and cron job notifications work on **all configured channels** — not just the 4 that were hardcoded in upstream (Telegram, Discord, Slack, Mattermost).
+**What this means for users:** Heartbeat announcements and cron job notifications work on **all configured channels** — not just Telegram, Discord, Slack, and Mattermost.
 
-**What this means for developers:** Adding a new channel automatically makes it available for all delivery paths. No more editing 3 different hardcoded match blocks.
+**What this means for developers:** Adding a new channel automatically makes it available for all delivery paths. No more editing multiple hardcoded match blocks.
 
-**vs ZeroClaw upstream:** Hardcoded `match channel_name { "telegram" => ..., "discord" => ..., "slack" => ..., "mattermost" => ... }` in both `daemon/mod.rs` and `cron/scheduler.rs`, bypassing the `Channel` trait entirely.
+**Background:** The fork base we started from had `daemon/mod.rs` and `cron/scheduler.rs` each containing their own hardcoded `match channel_name { "telegram" => ..., "discord" => ..., "slack" => ..., "mattermost" => ... }` blocks that bypassed the `Channel` trait entirely. This was our own architectural debt to fix, not something to blame on upstream.
 
 ---
 
-### 8. Agent Loop Modularization
+### 8. Agent Loop Submodule Structure
 
-The 5,810-line `src/agent/loop_.rs` has been split into focused submodules:
+elfClaw integrates the submodule architecture that ZeroClaw upstream introduced in their newer commits, adapted to our codebase and extended with elfClaw-specific logic.
+
+The 5,810-line monolithic `src/agent/loop_.rs` is now organized as:
 
 | Module | Lines | Responsibility |
 |--------|-------|---------------|
@@ -284,10 +286,10 @@ The 5,810-line `src/agent/loop_.rs` has been split into focused submodules:
 | `loop_/parsing.rs` | ~1,540 | All tool call parsing (XML, JSON, GLM, MiniMax, Perl-style) |
 | `loop_.rs` (core) | ~3,970 | Main loop logic, deferred action detection |
 
-**elfClaw-specific customizations preserved:**
-- `DEFAULT_MAX_TOOL_ITERATIONS = 10` (upstream: 20) — tighter loop control
-- CJK deferred action detection — recognizes deferred intent in Chinese/Japanese/Korean
-- URL-safe policy: plain URLs are **never** silently converted to `curl` shell commands
+**elfClaw-specific additions on top of the upstream structure:**
+- `DEFAULT_MAX_TOOL_ITERATIONS = 10` (upstream: 20) — tighter loop control to reduce runaway tool chains
+- CJK deferred action detection — recognizes deferred intent in Chinese/Japanese/Korean text
+- URL-safe policy: plain URLs are **never** silently converted to `curl` shell commands (upstream had an auto-convert behavior that we removed as a security fix)
 
 ---
 
@@ -340,7 +342,6 @@ We track ZeroClaw upstream on branch `dev/upstream-fixes` and merge valuable cha
 - Email monitor → cross-channel notification bridge
 - Active hours configuration
 - Unified channel delivery path (`deliver_to_channel()`)
-- Agent loop modularization
 
 We will submit these as PRs once the implementation is stable and well-tested.
 
