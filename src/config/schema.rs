@@ -9727,6 +9727,7 @@ ws_url = "ws://127.0.0.1:3002"
             mcp: McpConfig::default(),
             model_support_vision: None,
             summary_model: None,
+            worker_model: None,
             wasm: WasmConfig::default(),
         };
 
@@ -10105,6 +10106,7 @@ tool_dispatcher = "xml"
             mcp: McpConfig::default(),
             model_support_vision: None,
             summary_model: None,
+            worker_model: None,
             wasm: WasmConfig::default(),
         };
 

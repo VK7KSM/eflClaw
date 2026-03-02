@@ -1083,6 +1083,32 @@ pub(crate) fn build_tool_instructions(tools_registry: &[Box<dyn Tool>]) -> Strin
     instructions
 }
 
+// ── elfClaw: Three-tier model resolution ─────────────────────────────────
+// Extracted as a standalone function for unit-testability.
+//
+// Resolution order:
+//   1. `model_override` — per-call explicit override (CLI --model flag, cron job model field)
+//   2. `worker_model` — only for `RunContext::Background` (cron, heartbeat, email digest)
+//   3. `default_model` — interactive conversations
+//   4. built-in fallback constant
+pub(crate) fn resolve_model_for_context<'a>(
+    model_override: Option<&'a str>,
+    worker_model: Option<&'a str>,
+    default_model: Option<&'a str>,
+    run_context: super::RunContext,
+) -> &'a str {
+    let resolved = model_override.or_else(|| {
+        if run_context == super::RunContext::Background {
+            worker_model
+        } else {
+            None
+        }
+    });
+    resolved
+        .or(default_model)
+        .unwrap_or("anthropic/claude-sonnet-4")
+}
+
 // ── CLI Entrypoint ───────────────────────────────────────────────────────
 // Wires up all subsystems (observer, runtime, security, memory, tools,
 // provider, hardware RAG, peripherals) and enters either single-shot or
@@ -1166,22 +1192,22 @@ pub async fn run(
         .or(config.default_provider.as_deref())
         .unwrap_or("openrouter");
 
-    let model_name = {
-        // elfClaw: Three-tier model resolution —
-        //   1. Per-call explicit override (highest priority, e.g. CLI --model flag)
-        //   2. Background tasks fall back to worker_model (cheaper inference)
-        //   3. Interactive sessions fall back to default_model (capable model)
-        let resolved = model_override.as_deref().or_else(|| {
-            if run_context == super::RunContext::Background {
-                config.worker_model.as_deref()
-            } else {
-                None
-            }
-        });
-        resolved
-            .or(config.default_model.as_deref())
-            .unwrap_or("anthropic/claude-sonnet-4")
-    };
+    let model_name = resolve_model_for_context(
+        model_override.as_deref(),
+        config.worker_model.as_deref(),
+        config.default_model.as_deref(),
+        run_context,
+    );
+
+    // elfClaw: diagnostic log — confirms which model heartbeat/cron/email tasks resolve to.
+    // Check daemon logs for "elfClaw: resolved model" to verify worker_model routing.
+    tracing::info!(
+        model = model_name,
+        context = ?run_context,
+        worker_model_configured = config.worker_model.is_some(),
+        default_model = ?config.default_model,
+        "elfClaw: resolved model for task"
+    );
 
     let provider_runtime_options = providers::ProviderRuntimeOptions {
         auth_profile_override: None,
@@ -4030,5 +4056,64 @@ Let me check the result."#;
         let parsed: serde_json::Value = serde_json::from_str(result.as_deref().unwrap()).unwrap();
         assert_eq!(parsed["content"].as_str(), Some("answer"));
         assert!(parsed.get("reasoning_content").is_none());
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // elfClaw: worker_model routing tests
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn resolve_model_background_prefers_worker_model() {
+        let result = resolve_model_for_context(
+            None,
+            Some("claude-haiku-4-5-20251001"),
+            Some("claude-sonnet-4-6"),
+            crate::agent::RunContext::Background,
+        );
+        assert_eq!(result, "claude-haiku-4-5-20251001");
+    }
+
+    #[test]
+    fn resolve_model_background_falls_back_to_default_when_no_worker() {
+        let result = resolve_model_for_context(
+            None,
+            None,
+            Some("claude-sonnet-4-6"),
+            crate::agent::RunContext::Background,
+        );
+        assert_eq!(result, "claude-sonnet-4-6");
+    }
+
+    #[test]
+    fn resolve_model_interactive_ignores_worker_model() {
+        let result = resolve_model_for_context(
+            None,
+            Some("claude-haiku-4-5-20251001"),
+            Some("claude-sonnet-4-6"),
+            crate::agent::RunContext::Interactive,
+        );
+        assert_eq!(result, "claude-sonnet-4-6");
+    }
+
+    #[test]
+    fn resolve_model_explicit_override_trumps_all() {
+        let result = resolve_model_for_context(
+            Some("gpt-5.2"),
+            Some("claude-haiku-4-5-20251001"),
+            Some("claude-sonnet-4-6"),
+            crate::agent::RunContext::Background,
+        );
+        assert_eq!(result, "gpt-5.2");
+    }
+
+    #[test]
+    fn resolve_model_no_config_uses_builtin_fallback() {
+        let result = resolve_model_for_context(
+            None,
+            None,
+            None,
+            crate::agent::RunContext::Interactive,
+        );
+        assert_eq!(result, "anthropic/claude-sonnet-4");
     }
 }
