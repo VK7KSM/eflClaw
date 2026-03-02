@@ -370,7 +370,10 @@ fn parse_path_only_attachment(message: &str) -> Option<TelegramAttachment> {
     let candidate = candidate.strip_prefix("file://").unwrap_or(candidate);
     let kind = infer_attachment_kind_from_target(candidate)?;
 
-    if !is_http_url(candidate) && !Path::new(candidate).exists() {
+    // elfClaw: eliminate TOCTOU — canonicalize at detection time so a file deleted
+    // between exists() and the subsequent canonicalize() call no longer causes a
+    // spurious "attachment path not found" error that silences the text reply.
+    if !is_http_url(candidate) && Path::new(candidate).canonicalize().is_err() {
         return None;
     }
 

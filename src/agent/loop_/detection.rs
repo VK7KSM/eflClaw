@@ -8,8 +8,11 @@
 //! On first detection an `InjectWarning` verdict gives the LLM a chance to
 //! self-correct.  If the pattern persists the next check returns `HardStop`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
+
+// elfClaw: action tools that fire real-world effects; monitored for per-turn spam
+const ACTION_SPAM_TOOLS: &[&str] = &["send_voice", "send_email", "send_telegram"];
 
 /// Maximum bytes of tool output considered when hashing results.
 /// Keeps hashing fast and bounded for large outputs.
@@ -29,6 +32,10 @@ pub(crate) struct LoopDetectionConfig {
     /// Consecutive failures of the *same* tool before triggering.
     /// `0` = disabled.  Default: `3`.
     pub failure_streak_threshold: usize,
+    /// elfClaw: max successful invocations of an action tool before triggering spam watchdog.
+    /// At this count the detector injects a warning; above it issues a HardStop.
+    /// `0` = disabled.  Default: `1` (warn after 1st, stop after 2nd).
+    pub action_success_limit: usize,
 }
 
 impl Default for LoopDetectionConfig {
@@ -37,6 +44,7 @@ impl Default for LoopDetectionConfig {
             no_progress_threshold: 3,
             ping_pong_cycles: 2,
             failure_streak_threshold: 3,
+            action_success_limit: 1,
         }
     }
 }
@@ -70,6 +78,10 @@ pub(crate) struct LoopDetector {
     history: Vec<CallRecord>,
     consecutive_failures: HashMap<String, usize>,
     warning_injected: bool,
+    /// elfClaw: per-tool success counts for action spam detection (only ACTION_SPAM_TOOLS tracked)
+    success_counts: HashMap<String, usize>,
+    /// elfClaw: tracks which action tools have already received a spam warning this turn
+    success_spam_warned: HashSet<String>,
 }
 
 impl LoopDetector {
@@ -79,6 +91,8 @@ impl LoopDetector {
             history: Vec::new(),
             consecutive_failures: HashMap::new(),
             warning_injected: false,
+            success_counts: HashMap::new(),
+            success_spam_warned: HashSet::new(),
         }
     }
 
@@ -99,6 +113,10 @@ impl LoopDetector {
 
         if success {
             self.consecutive_failures.remove(tool_name);
+            // elfClaw: Fix 1 — track action tool successes for spam watchdog
+            if ACTION_SPAM_TOOLS.contains(&tool_name) {
+                *self.success_counts.entry(tool_name.to_owned()).or_insert(0) += 1;
+            }
         } else {
             *self
                 .consecutive_failures
@@ -114,7 +132,7 @@ impl LoopDetector {
             .or_else(|| self.check_ping_pong())
             .or_else(|| self.check_failure_streak());
 
-        match reason {
+        let existing_verdict = match reason {
             None => DetectionVerdict::Continue,
             Some(msg) => {
                 if self.warning_injected {
@@ -124,7 +142,19 @@ impl LoopDetector {
                     DetectionVerdict::InjectWarning(format_warning(&msg))
                 }
             }
+        };
+
+        if existing_verdict != DetectionVerdict::Continue {
+            return existing_verdict;
         }
+
+        // elfClaw: Fix 1 — strategy 4: action spam watchdog
+        // Fires independently of the existing warning_injected flag.
+        if let Some(verdict) = self.check_action_success_spam() {
+            return verdict;
+        }
+
+        DetectionVerdict::Continue
     }
 
     // ── Strategy 1: no-progress repeat ───────────────────────────────────
@@ -214,6 +244,40 @@ impl LoopDetector {
         }
         None
     }
+
+    // ── elfClaw: Strategy 4: action spam watchdog ─────────────────────────
+
+    /// Check whether any action tool has been called successfully more times
+    /// than `action_success_limit` allows.  Returns an `InjectWarning` on first
+    /// breach and a `HardStop` thereafter, using per-tool warned state so this
+    /// strategy does not interfere with the shared `warning_injected` flag.
+    fn check_action_success_spam(&mut self) -> Option<DetectionVerdict> {
+        let limit = self.config.action_success_limit;
+        if limit == 0 {
+            return None;
+        }
+        // Snapshot to avoid borrow conflict when inserting into success_spam_warned.
+        let candidates: Vec<(String, usize)> = self
+            .success_counts
+            .iter()
+            .map(|(k, &v)| (k.clone(), v))
+            .collect();
+        for (tool, count) in candidates {
+            if count > limit {
+                return Some(DetectionVerdict::HardStop(format!(
+                    "Watchdog: tool `{tool}` succeeded {count} times in this turn. \
+                     This action is complete — stop and give a final text response."
+                )));
+            } else if count == limit && !self.success_spam_warned.contains(&tool) {
+                self.success_spam_warned.insert(tool.clone());
+                return Some(DetectionVerdict::InjectWarning(format!(
+                    "Watchdog: tool `{tool}` has already been called successfully. \
+                     Do NOT call it again. Provide your final text response now."
+                )));
+            }
+        }
+        None
+    }
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -257,6 +321,7 @@ mod tests {
             no_progress_threshold: 0,
             ping_pong_cycles: 0,
             failure_streak_threshold: 0,
+            action_success_limit: 0,
         }
     }
 
@@ -409,5 +474,62 @@ mod tests {
         let mixed = "a".repeat(4094) + "文文"; // 4094 + 6 = 4100 bytes, boundary at 4096
         let hash3 = super::hash_output(&mixed);
         assert!(hash3 != 0); // Just verify it runs
+    }
+
+    // 12. elfClaw: Action spam — warn after first success, hard-stop after second
+    #[test]
+    fn action_spam_warns_after_first_success_and_stops_after_second() {
+        let mut det = LoopDetector::new(default_config());
+        // 1st success → count reaches limit (1) → InjectWarning
+        det.record_call("send_voice", r#"{"text":"sorry"}"#, "sent", true);
+        match det.check() {
+            DetectionVerdict::InjectWarning(msg) => {
+                assert!(msg.contains("send_voice"), "msg: {msg}");
+                assert!(msg.contains("already been called"), "msg: {msg}");
+            }
+            other => panic!("expected InjectWarning, got {other:?}"),
+        }
+        // 2nd success → count > limit → HardStop
+        det.record_call("send_voice", r#"{"text":"sorry again"}"#, "sent", true);
+        match det.check() {
+            DetectionVerdict::HardStop(msg) => {
+                assert!(msg.contains("send_voice"), "msg: {msg}");
+                assert!(msg.contains("2 times"), "msg: {msg}");
+            }
+            other => panic!("expected HardStop, got {other:?}"),
+        }
+    }
+
+    // 13. elfClaw: Action spam does not fire for non-action tools
+    #[test]
+    fn action_spam_does_not_fire_for_non_action_tools() {
+        let mut det = LoopDetector::new(LoopDetectionConfig {
+            // raise other thresholds to isolate spam detection
+            no_progress_threshold: 10,
+            failure_streak_threshold: 10,
+            ping_pong_cycles: 10,
+            action_success_limit: 1,
+        });
+        // shell succeeds many times — should NOT trigger spam watchdog
+        for i in 0..5 {
+            let args = format!(r#"{{"cmd":"task{i}"}}"#);
+            det.record_call("shell", &args, &format!("ok {i}"), true);
+        }
+        assert_eq!(det.check(), DetectionVerdict::Continue);
+    }
+
+    // 14. elfClaw: Action spam disabled when action_success_limit = 0
+    #[test]
+    fn action_spam_disabled_when_limit_zero() {
+        let mut det = LoopDetector::new(LoopDetectionConfig {
+            no_progress_threshold: 10,
+            ping_pong_cycles: 10,
+            failure_streak_threshold: 10,
+            action_success_limit: 0,
+        });
+        for _ in 0..5 {
+            det.record_call("send_voice", r#"{"text":"x"}"#, "sent", true);
+        }
+        assert_eq!(det.check(), DetectionVerdict::Continue);
     }
 }

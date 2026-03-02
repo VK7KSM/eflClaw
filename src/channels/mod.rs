@@ -1184,6 +1184,14 @@ async fn build_memory_context(
     context
 }
 
+/// elfClaw: Fix 3 — detect action tool references in a history message.
+/// Used to check prior-turn assistant messages for send_voice/send_email/send_telegram
+/// summaries so inter-turn boundaries can be injected to prevent Gemini from replaying them.
+fn contains_action_tool_summary(content: &str) -> bool {
+    const ACTION_TOOLS: &[&str] = &["send_voice", "send_email", "send_telegram"];
+    ACTION_TOOLS.iter().any(|&tool| content.contains(tool))
+}
+
 /// Extract a compact summary of tool interactions from history messages added
 /// during `run_tool_call_loop`. Scans assistant messages for `<tool_call>` tags
 /// or native tool-call JSON to collect tool names used.
@@ -1768,6 +1776,30 @@ async fn process_channel_message(
     let system_prompt_for_retry = system_prompt.clone();
     let mut history = vec![ChatMessage::system(system_prompt)];
     history.extend(prior_turns);
+
+    // elfClaw: Fix 3 — inject turn boundary to prevent Gemini from replaying prior action tools.
+    // Gemini 2.5 Pro's thinking layer tends to "continue" tasks it sees in history even after they
+    // are done, spontaneously re-sending voice/email/telegram messages on unrelated user turns.
+    // If prior assistant turns reference action tools, insert an explicit completion marker
+    // immediately before the current user message so the model has a clear task boundary.
+    //
+    // Structure: history = [system(0), ...prior_turns..., current_user_msg(last)]
+    // We inject between prior_turns and current_user_msg when prior_turns contain action refs.
+    if history.len() >= 3 {
+        // history[1..len-1] = prior assistant/user turns (excludes system and current user msg)
+        let prior_end = history.len() - 1;
+        if history[1..prior_end]
+            .iter()
+            .any(|m| contains_action_tool_summary(&m.content))
+        {
+            let boundary = ChatMessage::user(
+                "[SYSTEM] The previous tasks listed above are COMPLETE and must NOT be repeated. \
+                 Now respond ONLY to the following new user message."
+                    .to_string(),
+            );
+            history.insert(prior_end, boundary);
+        }
+    }
     let use_streaming = target_channel
         .as_ref()
         .is_some_and(|ch| ch.supports_draft_updates());
@@ -3397,6 +3429,8 @@ pub async fn start_channels(config: Config) -> Result<()> {
         zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
         secrets_encrypt: config.secrets.encrypt,
         reasoning_enabled: config.runtime.reasoning_enabled,
+        // elfClaw: pass reasoning_level for Gemini thinkingConfig; other providers ignore it
+        reasoning_level: config.provider.reasoning_level.clone(),
         ..providers::ProviderRuntimeOptions::default()
     };
     let provider: Arc<dyn Provider> = Arc::from(
@@ -3978,6 +4012,7 @@ mod tests {
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tts_config: Default::default(),
             chat_log_config: Default::default(),
+            worker_model: None,
         };
 
         assert!(compact_sender_history(&ctx, &sender));
@@ -4029,6 +4064,7 @@ mod tests {
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tts_config: Default::default(),
             chat_log_config: Default::default(),
+            worker_model: None,
         };
 
         append_sender_turn(&ctx, &sender, ChatMessage::user("hello"));
@@ -4083,6 +4119,7 @@ mod tests {
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tts_config: Default::default(),
             chat_log_config: Default::default(),
+            worker_model: None,
         };
 
         assert!(rollback_orphan_user_turn(&ctx, &sender, "pending"));
@@ -4560,6 +4597,7 @@ BTC is currently around $65,000 based on latest tool output."#
             chat_log_config: Default::default(),
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
+            worker_model: None,
         });
 
         process_channel_message(
@@ -4621,6 +4659,7 @@ BTC is currently around $65,000 based on latest tool output."#
             chat_log_config: Default::default(),
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
+            worker_model: None,
         });
 
         process_channel_message(
@@ -4696,6 +4735,7 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tts_config: Default::default(),
             chat_log_config: Default::default(),
+            worker_model: None,
         });
 
         process_channel_message(
@@ -4757,6 +4797,7 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tts_config: Default::default(),
             chat_log_config: Default::default(),
+            worker_model: None,
         });
 
         process_channel_message(
@@ -4827,6 +4868,7 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tts_config: Default::default(),
             chat_log_config: Default::default(),
+            worker_model: None,
         });
 
         process_channel_message(
@@ -4918,6 +4960,7 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tts_config: Default::default(),
             chat_log_config: Default::default(),
+            worker_model: None,
         });
 
         process_channel_message(
@@ -4991,6 +5034,7 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tts_config: Default::default(),
             chat_log_config: Default::default(),
+            worker_model: None,
         });
 
         process_channel_message(
@@ -5080,6 +5124,7 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tts_config: Default::default(),
             chat_log_config: Default::default(),
+            worker_model: None,
         });
 
         process_channel_message(
@@ -5153,6 +5198,7 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tts_config: Default::default(),
             chat_log_config: Default::default(),
+            worker_model: None,
         });
 
         process_channel_message(
@@ -5215,6 +5261,7 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tts_config: Default::default(),
             chat_log_config: Default::default(),
+            worker_model: None,
         });
 
         process_channel_message(
@@ -5396,6 +5443,7 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tts_config: Default::default(),
             chat_log_config: Default::default(),
+            worker_model: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
@@ -5478,6 +5526,7 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tts_config: Default::default(),
             chat_log_config: Default::default(),
+            worker_model: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -5572,6 +5621,7 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tts_config: Default::default(),
             chat_log_config: Default::default(),
+            worker_model: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -5648,6 +5698,7 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tts_config: Default::default(),
             chat_log_config: Default::default(),
+            worker_model: None,
         });
 
         process_channel_message(
@@ -5709,6 +5760,7 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tts_config: Default::default(),
             chat_log_config: Default::default(),
+            worker_model: None,
         });
 
         process_channel_message(
@@ -6230,6 +6282,7 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tts_config: Default::default(),
             chat_log_config: Default::default(),
+            worker_model: None,
         });
 
         process_channel_message(
@@ -6317,6 +6370,7 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tts_config: Default::default(),
             chat_log_config: Default::default(),
+            worker_model: None,
         });
 
         process_channel_message(
@@ -6404,6 +6458,7 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tts_config: Default::default(),
             chat_log_config: Default::default(),
+            worker_model: None,
         });
 
         process_channel_message(
@@ -6961,6 +7016,7 @@ This is an example JSON object for profile settings."#;
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tts_config: Default::default(),
             chat_log_config: Default::default(),
+            worker_model: None,
         });
 
         // Simulate a photo attachment message with [IMAGE:] marker.
@@ -7029,6 +7085,7 @@ This is an example JSON object for profile settings."#;
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tts_config: Default::default(),
             chat_log_config: Default::default(),
+            worker_model: None,
         });
 
         process_channel_message(
