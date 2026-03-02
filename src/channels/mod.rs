@@ -2070,7 +2070,7 @@ async fn process_channel_message(
             println!(
                 "  🤖 Reply ({}ms): {}",
                 started_at.elapsed().as_millis(),
-                truncate_with_ellipsis(&delivered_response, 80)
+                truncate_with_ellipsis(&delivered_response, 200) // elfClaw: 80→200 for caption visibility
             );
             if let Some(channel) = target_channel.as_ref() {
                 if delivered_response.trim().is_empty() {

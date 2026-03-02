@@ -194,7 +194,11 @@ pub async fn handle_ws_chat(
         }
     }
 
-    ws.on_upgrade(move |socket| handle_socket(socket, state))
+    // elfClaw: echo Sec-WebSocket-Protocol: zeroclaw.v1 in 101 response;
+    // Chrome 145+ drops the handshake if the client sends a protocol list but the server
+    // returns no Sec-WebSocket-Protocol header.
+    ws.protocols(["zeroclaw.v1"])
+        .on_upgrade(move |socket| handle_socket(socket, state))
         .into_response()
 }
 

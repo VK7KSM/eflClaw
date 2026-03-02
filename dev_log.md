@@ -2,6 +2,121 @@
 
 ---
 
+## 2026-03-02 — WebSocket 握手修复 + Telegram caption 诊断
+
+### 问题 1：Agent 页面 WebSocket 握手失败（Chrome 145+）
+
+**现象**：`WebSocket connection to 'ws://127.0.0.1:42617/ws/chat' failed: Error during WebSocket handshake: Sent non-empty 'Sec-WebSocket-Protocol' header but no response was received`
+
+**根因**：前端发送 `Sec-WebSocket-Protocol: zeroclaw.v1, bearer.<token>`，后端升级响应未回传协议头。Chrome 145+ 强制要求服务端在 101 响应中选择一个协议，否则拒绝握手。
+
+**修改**：`src/gateway/ws.rs` — `handle_ws_chat` 函数中将
+
+```rust
+ws.on_upgrade(...)
+```
+
+改为：
+
+```rust
+// elfClaw: echo Sec-WebSocket-Protocol: zeroclaw.v1 in 101 response
+ws.protocols(["zeroclaw.v1"]).on_upgrade(...)
+```
+
+### 问题 2：回复日志截断过短（调试辅助）
+
+**修改**：`src/channels/mod.rs:2073` — 回复日志截断从 80 字符改为 200 字符，便于诊断含 caption 的图片消息。
+
+```rust
+truncate_with_ellipsis(&delivered_response, 200) // elfClaw: 80→200
+```
+
+### 确认已实现（无需重复修改）
+
+- `src/agent/loop_.rs`：`prepare_messages_for_provider` 前后 caption 字符计数诊断日志（已实现，有 `// elfClaw:` 注释）
+- `src/agent/loop_.rs`：multimodal 错误降级为纯文本（已实现）
+- `src/channels/mod.rs`：chat_log IMAGE 路径提取（已用 `parse_image_markers`，bug 已修复）
+- `src/gateway/mod.rs`：`/api/pairing/devices` 路由已注册（上次修复）
+
+### 验证
+
+`cargo build` 成功，exit code 0，无新增 warning。
+
+---
+
+## 2026-03-02 — 修复 Web 仪表盘 Devices 页面路由缺失
+
+### 问题
+
+`/devices` 页面访问报错：`Unexpected token '<', "<!DOCTYPE "... is not valid JSON`
+
+### 根因
+
+`handle_api_pairing_devices`（GET）和 `handle_api_pairing_device_revoke`（DELETE）两个
+handler 已在 `src/gateway/api.rs:532-572` 实现，但从未注册到路由表。
+请求命中 SPA fallback → 返回 `index.html`（HTML）→ 前端解析为 JSON → 报错。
+
+### 修改
+
+**文件**：`src/gateway/mod.rs`，在 `.route("/api/health", ...)` 之后追加：
+
+```rust
+.route("/api/pairing/devices", get(api::handle_api_pairing_devices))
+.route("/api/pairing/devices/{id}", delete(api::handle_api_pairing_device_revoke))
+```
+
+### 未修改
+
+- Web 仪表盘 Integrations 页面（`GET /api/integrations/settings`、`PUT /api/integrations/{id}/credentials`）
+  —— 等待上游代码实现对应后端 handler，暂不修复
+
+---
+
+## 2026-03-01 — RunContext + worker_model 任务路由系统（elfClaw 原创）
+
+### 背景
+
+合并上游代码后，新闻推送等后台 cron 任务默认使用 `default_model`（Sonnet），
+而原本应走次级模型（Haiku / Gemini Flash），导致 token 消耗大幅上升。
+
+### 设计方案（elfClaw 原创）
+
+**三层模型解析**：`model_override` → `worker_model`（背景任务）→ `default_model` → 硬编码默认
+
+**新增内容**：
+- `src/agent/mod.rs`：`RunContext` 枚举（`Interactive` / `Background`）
+- `src/config/schema.rs`：`worker_model: Option<String>` 字段（紧随 `summary_model`）
+- `src/agent/loop_.rs`：`run()` 新增 `run_context` 参数，三层模型解析逻辑
+- `src/daemon/mod.rs`：heartbeat 传入 `RunContext::Background`
+- `src/cron/scheduler.rs`：cron 传入 `RunContext::Background`
+- `src/main.rs`：CLI 传入 `RunContext::Interactive`
+- `src/channels/mod.rs`：
+  - `ChannelRuntimeDefaults` / `ChannelRuntimeContext` 新增 `worker_model` 字段
+  - `runtime_defaults_from_config()` 读取 `config.worker_model`
+  - `runtime_defaults_snapshot()` 热加载时回退到 ctx 字段
+  - email-digest 消息将 `route.model` 覆盖为 `worker_model`
+
+**配置示例**（config.toml）：
+```toml
+worker_model = "claude-haiku-4-5-20251001"
+# 或兼容上游 hint 系统：
+# worker_model = "hint:worker"
+```
+
+**兼容性**：CronJob.model 字段仍有效（最高优先级 model_override）。
+
+### 编译结果
+
+- 编译用时：8分38秒（fat LTO + opt-level=z）
+- 可执行文件大小：18 MB（zeroclaw.exe）
+- Cargo.toml：`lto = "thin"` → `lto = "fat"`
+
+### 提交
+
+`a4dfa67b` — 已推送至 `origin main`
+
+---
+
 ## 2026-03-01 — Telegram 图文消息诊断 + Web 仪表盘缺失路由记录
 
 ### Telegram photo+caption 诊断修复
