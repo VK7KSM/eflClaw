@@ -437,10 +437,11 @@ pub struct ModelProviderConfig {
 /// Provider behavior overrides (`[provider]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
 pub struct ProviderConfig {
-    /// Optional reasoning level override for providers that support explicit levels
-    /// (e.g. OpenAI Codex `/responses` reasoning effort).
+    /// Thinking intensity for providers that support it (0=off/min, 4=max).
+    /// Gemini: 0-4 maps to model-specific thinkingLevel/thinkingBudget.
+    /// Unsupported models ignore this setting.
     #[serde(default)]
-    pub reasoning_level: Option<String>,
+    pub reasoning_level: Option<u8>,
     /// Optional transport override for providers that support multiple transports.
     /// Supported values: "auto", "websocket", "sse".
     ///
@@ -3473,7 +3474,7 @@ pub struct RuntimeConfig {
     /// - Legacy key accepted for compatibility: `runtime.reasoning_level`
     /// - When both are set, provider-level value wins.
     #[serde(default)]
-    pub reasoning_level: Option<String>,
+    pub reasoning_level: Option<u8>,
 }
 
 /// Docker runtime configuration (`[runtime.docker]` section).
@@ -7362,14 +7363,31 @@ impl Config {
         }
     }
 
-    fn normalize_reasoning_level_override(raw: Option<&str>, source: &str) -> Option<String> {
+    fn normalize_reasoning_level_override(raw: Option<&str>, source: &str) -> Option<u8> {
         let value = raw?.trim();
         if value.is_empty() {
             return None;
         }
+        // Try numeric 0-4 first (new canonical format)
+        if let Ok(n) = value.parse::<u8>() {
+            if n <= 4 {
+                return Some(n);
+            }
+            tracing::warn!(
+                reasoning_level = %value,
+                source,
+                "Ignoring out-of-range reasoning level (valid: 0-4)"
+            );
+            return None;
+        }
+        // Legacy string support for backwards compatibility with env overrides
         let normalized = value.to_ascii_lowercase().replace(['-', '_'], "");
         match normalized.as_str() {
-            "minimal" | "low" | "medium" | "high" | "xhigh" => Some(normalized),
+            "minimal" => Some(0),
+            "low"     => Some(1),
+            "medium"  => Some(2),
+            "high"    => Some(3),
+            "xhigh"   => Some(4),
             _ => {
                 tracing::warn!(
                     reasoning_level = %value,
@@ -7408,15 +7426,9 @@ impl Config {
     /// Priority:
     /// 1) `provider.reasoning_level` (canonical)
     /// 2) `runtime.reasoning_level` (deprecated compatibility alias)
-    pub fn effective_provider_reasoning_level(&self) -> Option<String> {
-        let provider_level = Self::normalize_reasoning_level_override(
-            self.provider.reasoning_level.as_deref(),
-            "provider.reasoning_level",
-        );
-        let runtime_level = Self::normalize_reasoning_level_override(
-            self.runtime.reasoning_level.as_deref(),
-            "runtime.reasoning_level",
-        );
+    pub fn effective_provider_reasoning_level(&self) -> Option<u8> {
+        let provider_level = self.provider.reasoning_level;
+        let runtime_level = self.runtime.reasoning_level;
 
         match (provider_level, runtime_level) {
             (Some(provider_level), Some(runtime_level)) => {
@@ -9952,14 +9964,14 @@ default_temperature = 0.7
 default_temperature = 0.7
 
 [provider]
-reasoning_level = "high"
+reasoning_level = 3
 "#;
 
         let parsed: Config = toml::from_str(raw).unwrap();
-        assert_eq!(parsed.provider.reasoning_level.as_deref(), Some("high"));
+        assert_eq!(parsed.provider.reasoning_level, Some(3u8));
         assert_eq!(
-            parsed.effective_provider_reasoning_level().as_deref(),
-            Some("high")
+            parsed.effective_provider_reasoning_level(),
+            Some(3u8)
         );
     }
 
@@ -9969,14 +9981,14 @@ reasoning_level = "high"
 default_temperature = 0.7
 
 [runtime]
-reasoning_level = "xhigh"
+reasoning_level = 4
 "#;
 
         let parsed: Config = toml::from_str(raw).unwrap();
-        assert_eq!(parsed.runtime.reasoning_level.as_deref(), Some("xhigh"));
+        assert_eq!(parsed.runtime.reasoning_level, Some(4u8));
         assert_eq!(
-            parsed.effective_provider_reasoning_level().as_deref(),
-            Some("xhigh")
+            parsed.effective_provider_reasoning_level(),
+            Some(4u8)
         );
     }
 
@@ -9986,16 +9998,16 @@ reasoning_level = "xhigh"
 default_temperature = 0.7
 
 [provider]
-reasoning_level = "medium"
+reasoning_level = 2
 
 [runtime]
-reasoning_level = "high"
+reasoning_level = 3
 "#;
 
         let parsed: Config = toml::from_str(raw).unwrap();
         assert_eq!(
-            parsed.effective_provider_reasoning_level().as_deref(),
-            Some("medium")
+            parsed.effective_provider_reasoning_level(),
+            Some(2u8)
         );
     }
 
@@ -12627,10 +12639,10 @@ default_model = "legacy-model"
 
         std::env::set_var("ZEROCLAW_REASONING_LEVEL", "xhigh");
         config.apply_env_overrides();
-        assert_eq!(config.runtime.reasoning_level.as_deref(), Some("xhigh"));
+        assert_eq!(config.runtime.reasoning_level, Some(4u8));
         assert_eq!(
-            config.effective_provider_reasoning_level().as_deref(),
-            Some("xhigh")
+            config.effective_provider_reasoning_level(),
+            Some(4u8)
         );
 
         std::env::remove_var("ZEROCLAW_REASONING_LEVEL");
@@ -12640,11 +12652,11 @@ default_model = "legacy-model"
     async fn env_override_reasoning_level_alias_invalid_ignored() {
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
-        config.runtime.reasoning_level = Some("medium".to_string());
+        config.runtime.reasoning_level = Some(2u8);
 
         std::env::set_var("ZEROCLAW_REASONING_LEVEL", "invalid");
         config.apply_env_overrides();
-        assert_eq!(config.runtime.reasoning_level.as_deref(), Some("medium"));
+        assert_eq!(config.runtime.reasoning_level, Some(2u8));
 
         std::env::remove_var("ZEROCLAW_REASONING_LEVEL");
     }

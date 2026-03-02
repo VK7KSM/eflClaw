@@ -702,7 +702,7 @@ pub struct ProviderRuntimeOptions {
     pub zeroclaw_dir: Option<PathBuf>,
     pub secrets_encrypt: bool,
     pub reasoning_enabled: Option<bool>,
-    pub reasoning_level: Option<String>,
+    pub reasoning_level: Option<u8>,
     pub custom_provider_api_mode: Option<CompatibleApiMode>,
     pub max_tokens_override: Option<u32>,
     pub model_support_vision: Option<bool>,
@@ -1088,6 +1088,7 @@ fn create_provider_with_url_and_options(
             key,
             options.reasoning_enabled,
         ))),
+        // elfClaw: pass reasoning_level to Gemini provider for thinkingConfig support
         "gemini" | "google" | "google-gemini" => {
             let state_dir = options.zeroclaw_dir.clone().unwrap_or_else(|| {
                 directories::UserDirs::new().map_or_else(
@@ -1100,6 +1101,7 @@ fn create_provider_with_url_and_options(
                 key,
                 auth_service,
                 options.auth_profile_override.clone(),
+                options.reasoning_level.clone(),
             )))
         }
         "telnyx" => Ok(Box::new(telnyx::TelnyxProvider::new(key))),

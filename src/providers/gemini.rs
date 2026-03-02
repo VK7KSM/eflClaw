@@ -24,6 +24,8 @@ pub struct GeminiProvider {
     auth_service: Option<AuthService>,
     /// Override profile name for managed auth.
     auth_profile_override: Option<String>,
+    // elfClaw: 0-4 thinking intensity → model-specific thinkingConfig injection
+    thinking_level: Option<u8>,
 }
 
 /// Mutable OAuth token state — supports runtime refresh for long-lived processes.
@@ -214,11 +216,24 @@ struct InlineData {
     data: String,
 }
 
+// elfClaw: Gemini 3 thinking level control (replaces thinkingBudget for Gemini 3)
+// elfClaw: Gemini 3 → thinkingLevel(字符串)，Gemini 2.5 → thinkingBudget(整数)，互斥注入
+#[derive(Debug, Serialize, Clone)]
+struct ThinkingConfig {
+    #[serde(rename = "thinkingLevel", skip_serializing_if = "Option::is_none")]
+    thinking_level: Option<String>,
+    #[serde(rename = "thinkingBudget", skip_serializing_if = "Option::is_none")]
+    thinking_budget: Option<i32>,
+}
+
 #[derive(Debug, Serialize, Clone)]
 struct GenerationConfig {
     temperature: f64,
     #[serde(rename = "maxOutputTokens")]
     max_output_tokens: u32,
+    // elfClaw: thinkingConfig for Gemini 3 Flash/Pro — controls reasoning depth
+    #[serde(rename = "thinkingConfig", skip_serializing_if = "Option::is_none")]
+    thinking_config: Option<ThinkingConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -555,6 +570,7 @@ impl GeminiProvider {
             oauth_index: Arc::new(tokio::sync::Mutex::new(0)),
             auth_service: None,
             auth_profile_override: None,
+            thinking_level: None,
         }
     }
 
@@ -570,6 +586,8 @@ impl GeminiProvider {
         api_key: Option<&str>,
         auth_service: AuthService,
         profile_override: Option<String>,
+        // elfClaw: reasoning_level from ProviderRuntimeOptions → 0-4 thinking intensity
+        reasoning_level: Option<u8>,
     ) -> Self {
         let oauth_cred_paths = Self::discover_oauth_cred_paths();
 
@@ -628,6 +646,7 @@ impl GeminiProvider {
                 None
             },
             auth_profile_override: profile_override,
+            thinking_level: reasoning_level,
         }
     }
 
@@ -1047,6 +1066,72 @@ impl GeminiProvider {
         Some((mime.to_string(), data.to_string()))
     }
 
+    // elfClaw: map 0-4 thinking intensity to model-specific thinkingConfig.
+    // Gemini 3 uses thinkingLevel string; Gemini 2.5 uses thinkingBudget integer.
+    // Pro models cannot disable thinking; level 0 maps to minimum instead.
+    // Gemini 2.0 and older: return None (no thinking support).
+    // NOTE: check order matters — more specific prefixes must come before shorter ones
+    // (e.g. gemini-2.5-flash-lite before gemini-2.5-flash).
+    fn build_thinking_config(level: u8, model: &str) -> Option<ThinkingConfig> {
+        if model.contains("gemini-3.1-pro") || model.contains("gemini-3-pro") {
+            // Gemini 3 Pro: thinkingLevel, cannot disable (0 → "low")
+            // "minimal" not available on Pro; levels 3 and 4 both map to max "high"
+            let lvl = match level {
+                0 | 1 => "low",
+                2     => "medium",
+                _     => "high",
+            };
+            Some(ThinkingConfig { thinking_level: Some(lvl.to_string()), thinking_budget: None })
+
+        } else if model.contains("gemini-3") {
+            // Gemini 3 Flash: thinkingLevel, "minimal" ≈ near-off; levels 3+ map to "high"
+            let lvl = match level {
+                0 => "minimal",
+                1 => "low",
+                2 => "medium",
+                _ => "high",
+            };
+            Some(ThinkingConfig { thinking_level: Some(lvl.to_string()), thinking_budget: None })
+
+        } else if model.contains("gemini-2.5-flash-lite") {
+            // Gemini 2.5 Flash Lite: thinkingBudget 0 (disabled) or 512-24576
+            let budget: i32 = match level {
+                0 => 0,
+                1 => 512,
+                2 => 4096,
+                3 => 12288,
+                _ => 24576,
+            };
+            Some(ThinkingConfig { thinking_level: None, thinking_budget: Some(budget) })
+
+        } else if model.contains("gemini-2.5-flash") {
+            // Gemini 2.5 Flash: thinkingBudget 0-24576
+            let budget: i32 = match level {
+                0 => 0,
+                1 => 1024,
+                2 => 8192,
+                3 => 16384,
+                _ => 24576,
+            };
+            Some(ThinkingConfig { thinking_level: None, thinking_budget: Some(budget) })
+
+        } else if model.contains("gemini-2.5-pro") {
+            // Gemini 2.5 Pro: thinkingBudget 128-32768, cannot disable (0 → 128)
+            let budget: i32 = match level {
+                0 => 128,
+                1 => 2048,
+                2 => 8192,
+                3 => 16384,
+                _ => 32768,
+            };
+            Some(ThinkingConfig { thinking_level: None, thinking_budget: Some(budget) })
+
+        } else {
+            // Gemini 2.0, 1.5, or unknown: no thinking support
+            None
+        }
+    }
+
     async fn send_generate_content(
         &self,
         contents: Vec<Content>,
@@ -1117,6 +1202,9 @@ impl GeminiProvider {
             generation_config: GenerationConfig {
                 temperature,
                 max_output_tokens: 8192,
+                // elfClaw: 0-4 thinking intensity → model-specific thinkingConfig (or None if unsupported)
+                thinking_config: self.thinking_level
+                    .and_then(|lvl| Self::build_thinking_config(lvl, model)),
             },
             tools,
             tool_config,
@@ -1680,6 +1768,7 @@ mod tests {
             oauth_index: Arc::new(tokio::sync::Mutex::new(0)),
             auth_service: None,
             auth_profile_override: None,
+            thinking_level: None,
         }
     }
 
@@ -1882,6 +1971,7 @@ mod tests {
             generation_config: GenerationConfig {
                 temperature: 0.7,
                 max_output_tokens: 8192,
+                thinking_config: None,
             },
             tools: None,
             tool_config: None,
@@ -1923,6 +2013,7 @@ mod tests {
             generation_config: GenerationConfig {
                 temperature: 0.7,
                 max_output_tokens: 8192,
+                thinking_config: None,
             },
             tools: None,
             tool_config: None,
@@ -1967,6 +2058,7 @@ mod tests {
             generation_config: GenerationConfig {
                 temperature: 0.7,
                 max_output_tokens: 8192,
+                thinking_config: None,
             },
             tools: None,
             tool_config: None,
@@ -2002,6 +2094,7 @@ mod tests {
             generation_config: GenerationConfig {
                 temperature: 0.7,
                 max_output_tokens: 8192,
+                thinking_config: None,
             },
             tools: None,
             tool_config: None,
@@ -2031,6 +2124,7 @@ mod tests {
                 generation_config: Some(GenerationConfig {
                     temperature: 0.7,
                     max_output_tokens: 8192,
+                    thinking_config: None,
                 }),
                 tools: None,
             },
@@ -2450,6 +2544,7 @@ mod tests {
             oauth_index: Arc::new(tokio::sync::Mutex::new(0)),
             auth_service: None, // Missing auth_service
             auth_profile_override: None,
+            thinking_level: None,
         };
 
         let result = provider.warmup().await;
