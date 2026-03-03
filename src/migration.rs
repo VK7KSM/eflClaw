@@ -599,14 +599,18 @@ fn merge_delegate_agent(
 ) -> bool {
     let mut changed = false;
 
-    if target.provider.trim().is_empty() && !source.provider.trim().is_empty() {
+    if target.provider.as_deref().unwrap_or("").trim().is_empty()
+        && !source.provider.as_deref().unwrap_or("").trim().is_empty()
+    {
         target.provider = source.provider.clone();
         changed = true;
     } else if target.provider != source.provider {
         stats.merge_conflicts_preserved += 1;
     }
 
-    if target.model.trim().is_empty() && !source.model.trim().is_empty() {
+    if target.model.as_deref().unwrap_or("").trim().is_empty()
+        && !source.model.as_deref().unwrap_or("").trim().is_empty()
+    {
         target.model = source.model.clone();
         changed = true;
     } else if target.model != source.model {
@@ -847,8 +851,8 @@ fn parse_source_agent(raw_agent: &Value) -> Option<DelegateAgentConfig> {
         .unwrap_or_default();
 
     Some(DelegateAgentConfig {
-        provider: provider.unwrap_or_else(|| "openrouter".to_string()),
-        model,
+        provider: Some(provider.unwrap_or_else(|| "openrouter".to_string())),
+        model: Some(model),
         system_prompt: find_string(obj, &["system_prompt", "systemPrompt"]),
         api_key: find_string(obj, &["api_key", "apiKey"]),
         temperature: find_f64(obj, &["temperature"]),

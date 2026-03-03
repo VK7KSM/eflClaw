@@ -364,7 +364,8 @@ impl Tool for SkillToolHandler {
             .render_command(&args)
             .context("Failed to render skill tool command")?;
 
-        if let Err(e) = self.security.validate_command_execution(&command, false) {
+        // elfClaw: skill commands are user-defined trusted configs — pre-approved
+        if let Err(e) = self.security.validate_command_execution(&command, true) {
             return Ok(ToolResult {
                 output: format!("Blocked by security policy: {e}"),
                 success: false,

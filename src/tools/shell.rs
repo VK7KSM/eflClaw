@@ -18,6 +18,27 @@ const SAFE_ENV_VARS: &[&str] = &[
     "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
 ];
 
+/// Windows-specific environment variables needed for uv, pip, and Python tooling.
+/// uv stores its package cache under APPDATA/LOCALAPPDATA on Windows; without these
+/// the package resolver fails to locate installed packages after env_clear().
+/// Never includes API keys, tokens, or secrets.
+#[cfg(windows)]
+const SAFE_ENV_VARS_WINDOWS: &[&str] = &[
+    // elfClaw: Windows vars required by uv and Python package tooling
+    "APPDATA",
+    "LOCALAPPDATA",
+    "USERPROFILE",
+    "TEMP",
+    "TMP",
+    "SYSTEMROOT",
+    "SYSTEMDRIVE",
+    "WINDIR",
+    // elfClaw: PATHEXT required for Windows to resolve bare command names (uv → uv.exe)
+    "PATHEXT",
+    // elfClaw: COMSPEC is cmd.exe path, needed by tools that spawn cmd internally
+    "COMSPEC",
+];
+
 fn truncate_utf8_to_max_bytes(text: &mut String, max_bytes: usize) {
     if text.len() <= max_bytes {
         return;
@@ -75,6 +96,14 @@ pub(super) fn collect_allowed_shell_env_vars(security: &SecurityPolicy) -> Vec<S
         if candidate.is_empty() || !is_valid_env_var_name(candidate) {
             continue;
         }
+        if seen.insert(candidate.to_string()) {
+            out.push(candidate.to_string());
+        }
+    }
+    // elfClaw: append Windows-specific vars required by uv and Python package tooling
+    #[cfg(windows)]
+    for key in SAFE_ENV_VARS_WINDOWS {
+        let candidate = key.trim();
         if seen.insert(candidate.to_string()) {
             out.push(candidate.to_string());
         }
@@ -165,6 +194,8 @@ impl Tool for ShellTool {
         match self.security.validate_command_execution(&command, approved) {
             Ok(_) => {}
             Err(reason) => {
+                // elfClaw: log shell rejection so it's visible in terminal
+                tracing::warn!(command = %command, reason = %reason, "Shell command rejected by security policy");
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
@@ -174,6 +205,8 @@ impl Tool for ShellTool {
         }
 
         if let Some(path) = self.security.forbidden_path_argument(&command) {
+            // elfClaw: log forbidden path rejection for terminal visibility
+            tracing::warn!(command = %command, path = %path, "Shell command blocked: forbidden path");
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -182,6 +215,8 @@ impl Tool for ShellTool {
         }
 
         if !self.security.record_action() {
+            // elfClaw: log budget exhaustion for terminal visibility
+            tracing::warn!(command = %command, "Shell command blocked: action budget exhausted");
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -240,6 +275,33 @@ impl Tool for ShellTool {
                     );
                 }
 
+                // elfClaw: log shell failures so operators can see the actual error
+                // (stderr is returned to the LLM but not visible in application logs otherwise)
+                if !output.status.success() {
+                    tracing::warn!(
+                        command = %command,
+                        exit_code = ?output.status.code(),
+                        stderr = %stderr,
+                        "shell command failed"
+                    );
+
+                    // elfClaw: PATH diagnostic when command not found (helps debug env_clear issues)
+                    if stderr.contains("CommandNotFoundException") || stderr.contains("not found") {
+                        let path_val = std::env::var("PATH").unwrap_or_else(|_| "(not set)".to_string());
+                        let preview_end = path_val.len().min(500);
+                        let mut end = preview_end;
+                        while end > 0 && !path_val.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        tracing::warn!(
+                            command = %command,
+                            path_len = path_val.len(),
+                            path_preview = %&path_val[..end],
+                            "PATH diagnostic: command not found in child process PATH"
+                        );
+                    }
+                }
+
                 Ok(ToolResult {
                     success: output.status.success(),
                     output: stdout,
@@ -250,18 +312,30 @@ impl Tool for ShellTool {
                     },
                 })
             }
-            Ok(Err(e)) => Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!("Failed to execute command: {e}")),
-            }),
-            Err(_) => Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!(
-                    "Command timed out after {SHELL_TIMEOUT_SECS}s and was killed"
-                )),
-            }),
+            Ok(Err(e)) => {
+                // elfClaw: log spawn failures (e.g., powershell/sh not found in PATH)
+                tracing::warn!(command = %command, error = %e, "shell command failed to start");
+                Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("Failed to execute command: {e}")),
+                })
+            }
+            Err(_) => {
+                // elfClaw: log timeouts so operators can see which commands are hanging
+                tracing::warn!(
+                    command = %command,
+                    timeout_secs = SHELL_TIMEOUT_SECS,
+                    "shell command timed out"
+                );
+                Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!(
+                        "Command timed out after {SHELL_TIMEOUT_SECS}s and was killed"
+                    )),
+                })
+            }
         }
     }
 }

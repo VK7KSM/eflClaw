@@ -603,14 +603,15 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
     agent_names.sort();
     for name in agent_names {
         let agent = config.agents.get(name).unwrap();
-        if let Some(reason) = provider_validation_error(&agent.provider) {
-            items.push(DiagItem::warn(
-                cat,
-                format!(
-                    "agent \"{name}\" uses invalid provider \"{}\": {}",
-                    agent.provider, reason
-                ),
-            ));
+        if let Some(provider_name) = agent.provider.as_deref() {
+            if let Some(reason) = provider_validation_error(provider_name) {
+                items.push(DiagItem::warn(
+                    cat,
+                    format!(
+                        "agent \"{name}\" uses invalid provider \"{provider_name}\": {reason}",
+                    ),
+                ));
+            }
         }
     }
 }

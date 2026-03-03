@@ -509,6 +509,30 @@ fn looks_like_path(candidate: &str) -> bool {
         || candidate == "."
         || candidate == ".."
         || candidate.contains('/')
+        // elfClaw: Windows absolute paths (C:\..., D:\...)
+        || (candidate.len() >= 3
+            && candidate.as_bytes()[0].is_ascii_alphabetic()
+            && candidate.as_bytes()[1] == b':'
+            && (candidate.as_bytes()[2] == b'\\' || candidate.as_bytes()[2] == b'/'))
+        // elfClaw: Windows UNC paths (\\server\share)
+        || candidate.starts_with("\\\\")
+}
+
+/// elfClaw: extract base command name from a potentially path-qualified executable.
+/// Handles both Unix (/) and Windows (\) path separators, and strips
+/// Windows executable extensions (.exe, .cmd, .bat, .com) for allowlist matching.
+fn extract_base_command_name(executable: &str) -> &str {
+    let base = executable
+        .rsplit(|c: char| c == '/' || c == '\\')
+        .next()
+        .unwrap_or(executable);
+    // Strip common Windows executable extensions for allowlist matching
+    for ext in &[".exe", ".EXE", ".cmd", ".CMD", ".bat", ".BAT", ".com", ".COM"] {
+        if let Some(stripped) = base.strip_suffix(ext) {
+            return stripped;
+        }
+    }
+    base
 }
 
 fn attached_short_option_value(token: &str) -> Option<&str> {
@@ -582,11 +606,8 @@ impl SecurityPolicy {
                 continue;
             };
 
-            let base = base_raw
-                .rsplit('/')
-                .next()
-                .unwrap_or("")
-                .to_ascii_lowercase();
+            // elfClaw: handle both Unix (/) and Windows (\) path separators + strip .exe
+            let base = extract_base_command_name(base_raw).to_ascii_lowercase();
 
             let args: Vec<String> = words.map(|w| w.to_ascii_lowercase()).collect();
             let joined_segment = cmd_part.to_ascii_lowercase();
@@ -797,7 +818,8 @@ impl SecurityPolicy {
 
             let mut words = cmd_part.split_whitespace();
             let executable = strip_wrapping_quotes(words.next().unwrap_or("")).trim();
-            let base_cmd = executable.rsplit('/').next().unwrap_or("");
+            // elfClaw: handle both Unix (/) and Windows (\) path separators + strip .exe
+            let base_cmd = extract_base_command_name(executable);
 
             if base_cmd.is_empty() {
                 continue;

@@ -606,6 +606,18 @@ pub fn all_tools_with_runtime(
             security.clone(),
             provider_runtime_options.clone(),
         )
+        // elfClaw: workers without explicit provider/model inherit worker_model from config
+        .with_worker_model_fallback(
+            root_config
+                .default_provider
+                .as_deref()
+                .unwrap_or("gemini"),
+            root_config
+                .worker_model
+                .as_deref()
+                .or(root_config.default_model.as_deref())
+                .unwrap_or(""),
+        )
         .with_parent_tools(parent_tools.clone())
         .with_multimodal_config(root_config.multimodal.clone());
 

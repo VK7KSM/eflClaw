@@ -78,7 +78,7 @@ impl Tool for CronAddTool {
                 "command": { "type": "string" },
                 "prompt": { "type": "string" },
                 "session_target": { "type": "string", "enum": ["isolated", "main"] },
-                "model": { "type": "string" },
+                // elfClaw: removed model field — cron jobs must always use worker_model from config at runtime
                 "recurring_confirmed": {
                     "type": "boolean",
                     "description": "Required for agent recurring schedules (schedule.kind='cron' or 'every'). Set true only when recurring behavior is intentional.",
@@ -225,10 +225,8 @@ impl Tool for CronAddTool {
                     None => SessionTarget::Isolated,
                 };
 
-                let model = args
-                    .get("model")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_string);
+                // elfClaw: always None — model is resolved at runtime from config (worker_model)
+                let model: Option<String> = None;
                 let recurring_confirmed = args
                     .get("recurring_confirmed")
                     .and_then(serde_json::Value::as_bool)
