@@ -313,17 +313,22 @@ impl CandidateContent {
         for part in self.parts {
             // Capture thought_signature from thought parts before functionCall parts.
             if part.thought {
-                if let Some(sig) = part.thought_signature {
-                    pending_thought_sig = Some(sig);
+                if let Some(ref sig) = part.thought_signature {
+                    pending_thought_sig = Some(sig.clone());
                 }
             }
 
             if let Some(fc) = part.function_call {
+                // elfClaw: Gemini 2.5 puts thought_signature on a preceding thought Part;
+                // Gemini 3 puts it directly on the functionCall Part itself. Capture from either
+                // so the signature is never lost, preventing 400 "missing thought_signature" errors.
+                let sig = pending_thought_sig.take()
+                    .or_else(|| part.thought_signature.clone());
                 tool_calls.push(crate::providers::traits::ToolCall {
                     id: uuid::Uuid::new_v4().to_string(),
                     name: fc.name,
                     arguments: fc.args.to_string(),
-                    thought_signature: pending_thought_sig.take(),
+                    thought_signature: sig,
                 });
             } else if let Some(text) = part.text {
                 if !text.is_empty() {
@@ -1514,41 +1519,13 @@ impl Provider for GeminiProvider {
                         if let Some(tool_calls) =
                             parsed.get("tool_calls").and_then(|v| v.as_array())
                         {
-                            // Check if ALL tool calls have thought_signature (new history).
-                            // Old history (saved before the thought_signature fix) won't have it,
-                            // and Gemini thinking models reject functionCall without thought_signature.
-                            let all_have_signature = tool_calls.iter().all(|tc| {
-                                tc.get("thought_signature")
-                                    .and_then(|v| v.as_str())
-                                    .map(|s| !s.is_empty())
-                                    .unwrap_or(false)
-                            });
-
-                            if !all_have_signature && !tool_calls.is_empty() {
-                                // Degrade: convert old tool call history to a compact single-line
-                                // summary to avoid Gemini "thought_signature missing" error
-                                // and prevent [Used tool: xxx] spam in context.
-                                let summary = match parsed.get("content").and_then(|v| v.as_str()) {
-                                    Some(text) if !text.trim().is_empty() => text.to_string(),
-                                    _ => "(Continued from previous tool interaction)".to_string(),
-                                };
-                                contents.push(Content {
-                                    role: Some("model".to_string()),
-                                    parts: vec![Part::text(&summary)],
-                                });
-                                // Mark these tool call IDs as degraded so tool results are also skipped
-                                for tc in tool_calls {
-                                    let id = tc
-                                        .get("id")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("")
-                                        .to_string();
-                                    tool_id_to_name.insert(id, "__degraded__".to_string());
-                                }
-                                continue;
-                            }
-
-                            // Normal path: all tool calls have thought_signature (new history)
+                            // elfClaw: include tool calls regardless of thought_signature presence.
+                            // Gemini may skip the thought part for low-level / simple calls even
+                            // when thinking is enabled — that is expected and valid. The normal path
+                            // below inserts a thought Part only when thought_signature is available,
+                            // and omits it otherwise. Replacing the entire tool call history with
+                            // "(Continued from previous tool interaction)" text caused Gemini to
+                            // lose all tool context and loop indefinitely until the iteration cap.
                             let mut parts: Vec<Part> = Vec::new();
                             // Optional text alongside tool calls
                             if let Some(text) = parsed.get("content").and_then(|v| v.as_str()) {
@@ -1574,11 +1551,12 @@ impl Provider for GeminiProvider {
                                     .unwrap_or(serde_json::Value::Object(Default::default()));
                                 tool_id_to_name.insert(id.clone(), name.clone());
                                 // If a thought_signature was stored with this tool call,
-                                // insert a thought Part before the functionCall Part.
-                                // Gemini thinking models require this for multi-turn history.
-                                if let Some(sig) =
-                                    tc.get("thought_signature").and_then(|v| v.as_str())
-                                {
+                                // insert a thought Part before the functionCall Part (Gemini 2.5).
+                                // elfClaw: also set thought_signature on the functionCall Part itself
+                                // (Gemini 3 requires it there to avoid 400 "missing thought_signature").
+                                let sig_opt =
+                                    tc.get("thought_signature").and_then(|v| v.as_str());
+                                if let Some(sig) = sig_opt {
                                     parts.push(Part {
                                         text: Some(String::new()),
                                         inline_data: None,
@@ -1594,7 +1572,8 @@ impl Provider for GeminiProvider {
                                     function_call: Some(RequestFunctionCall { name, args }),
                                     function_response: None,
                                     thought: None,
-                                    thought_signature: None,
+                                    // elfClaw: include sig on functionCall Part — Gemini 3 requires this
+                                    thought_signature: sig_opt.map(|s| s.to_string()),
                                 });
                             }
                             contents.push(Content {
@@ -1628,12 +1607,6 @@ impl Provider for GeminiProvider {
                             .get(&tool_call_id)
                             .cloned()
                             .unwrap_or_else(|| "unknown_tool".to_string());
-                        // Skip tool results for degraded (old history without thought_signature)
-                        // tool calls — Gemini supports consecutive same-role Contents, so this
-                        // won't break role alternation.
-                        if tool_name == "__degraded__" {
-                            continue;
-                        }
                         // Gemini requires functionResponse role = "user"
                         contents.push(Content {
                             role: Some("user".to_string()),

@@ -14,10 +14,10 @@ use std::time::Duration;
 use tokio::fs;
 
 /// Telegram's maximum message length for text messages
-const TELEGRAM_MAX_MESSAGE_LENGTH: usize = 4096;
+pub(crate) const TELEGRAM_MAX_MESSAGE_LENGTH: usize = 4096;
 /// Reserve space for continuation markers added by send_text_chunks:
 /// worst case is "(continued)\n\n" + chunk + "\n\n(continues...)" = 30 extra chars
-const TELEGRAM_CONTINUATION_OVERHEAD: usize = 30;
+pub(crate) const TELEGRAM_CONTINUATION_OVERHEAD: usize = 30;
 const TELEGRAM_ACK_REACTIONS: &[&str] = &["⚡️", "👌", "👀", "🔥", "👍"];
 
 /// Metadata for an incoming document or photo attachment.
@@ -52,7 +52,7 @@ const TELEGRAM_APPROVAL_CALLBACK_DENY_PREFIX: &str = "zcapr:no:";
 /// Split a message into chunks that respect Telegram's 4096 character limit.
 /// Tries to split at word boundaries when possible, and handles continuation.
 /// The effective per-chunk limit is reduced to leave room for continuation markers.
-fn split_message_for_telegram(message: &str) -> Vec<String> {
+pub(crate) fn split_message_for_telegram(message: &str) -> Vec<String> {
     if message.chars().count() <= TELEGRAM_MAX_MESSAGE_LENGTH {
         return vec![message.to_string()];
     }
@@ -2191,6 +2191,31 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 .await?;
 
             if markdown_resp.status().is_success() {
+                // elfClaw: confirm delivery with message_id for traceability
+                let resp_body: serde_json::Value = markdown_resp.json().await.unwrap_or_default();
+                if resp_body.get("ok").and_then(|v| v.as_bool()) == Some(true) {
+                    let msg_id = resp_body
+                        .pointer("/result/message_id")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(-1);
+                    tracing::info!(
+                        chat_id = %chat_id,
+                        message_id = msg_id,
+                        chunk = index + 1,
+                        total = chunks.len(),
+                        "Telegram message delivered"
+                    );
+                } else {
+                    let desc = resp_body
+                        .get("description")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+                    tracing::warn!(
+                        chat_id = %chat_id,
+                        description = %desc,
+                        "Telegram API returned ok=false despite HTTP 200"
+                    );
+                }
                 if index < chunks.len() - 1 {
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
@@ -2233,6 +2258,14 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                     sanitized_plain_err
                 );
             }
+
+            // elfClaw: confirm plain-text fallback delivery
+            tracing::info!(
+                chat_id = %chat_id,
+                chunk = index + 1,
+                total = chunks.len(),
+                "Telegram message delivered (plain-text fallback)"
+            );
 
             if index < chunks.len() - 1 {
                 tokio::time::sleep(Duration::from_millis(100)).await;
@@ -2945,8 +2978,31 @@ impl Channel for TelegramChannel {
 
             // Send attachments
             for attachment in &attachments {
-                self.send_attachment(&chat_id, thread_id.as_deref(), attachment)
-                    .await?;
+                // elfClaw: notify user explicitly when local file wasn't generated instead of
+                // propagating an opaque error that silences the text reply.
+                if let Err(e) = self
+                    .send_attachment(&chat_id, thread_id.as_deref(), attachment)
+                    .await
+                {
+                    let err_str = e.to_string();
+                    if !is_http_url(&attachment.target)
+                        && (err_str.contains("Telegram attachment path not found")
+                            || err_str.contains("Telegram attachment path is not a file"))
+                    {
+                        tracing::warn!(
+                            path = %attachment.target,
+                            "attachment file not found (was the script executed successfully?)"
+                        );
+                        let notice = format!(
+                            "\n⚠️ 文件未找到：`{}`\n（图片未能生成，请检查脚本是否成功执行以及输出目录是否存在）",
+                            attachment.target
+                        );
+                        self.send_text_chunks(&notice, &chat_id, thread_id.as_deref())
+                            .await?;
+                    } else {
+                        return Err(e);
+                    }
+                }
             }
 
             return Ok(());
@@ -3127,7 +3183,27 @@ impl Channel for TelegramChannel {
             }
 
             for attachment in &attachments {
-                self.send_attachment(chat_id, thread_id, attachment).await?;
+                // elfClaw: notify user explicitly when local file wasn't generated instead of
+                // propagating an opaque error that silences the text reply.
+                if let Err(e) = self.send_attachment(chat_id, thread_id, attachment).await {
+                    let err_str = e.to_string();
+                    if !is_http_url(&attachment.target)
+                        && (err_str.contains("Telegram attachment path not found")
+                            || err_str.contains("Telegram attachment path is not a file"))
+                    {
+                        tracing::warn!(
+                            path = %attachment.target,
+                            "attachment file not found (was the script executed successfully?)"
+                        );
+                        let notice = format!(
+                            "\n⚠️ 文件未找到：`{}`\n（图片未能生成，请检查脚本是否成功执行以及输出目录是否存在）",
+                            attachment.target
+                        );
+                        self.send_text_chunks(&notice, chat_id, thread_id).await?;
+                    } else {
+                        return Err(e);
+                    }
+                }
             }
 
             return Ok(());

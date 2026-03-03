@@ -300,7 +300,7 @@ impl ModelRoutingConfigTool {
                     "model": agent.model,
                     "system_prompt": agent.system_prompt,
                     "api_key_configured": has_provider_credential(
-                        &agent.provider,
+                        agent.provider.as_deref().unwrap_or(""),
                         agent.api_key.as_deref()
                     ),
                     "temperature": agent.temperature,
@@ -673,8 +673,8 @@ impl ModelRoutingConfigTool {
             .get(&name)
             .cloned()
             .unwrap_or(DelegateAgentConfig {
-                provider: provider.clone(),
-                model: model.clone(),
+                provider: Some(provider.clone()),
+                model: Some(model.clone()),
                 system_prompt: None,
                 api_key: None,
                 temperature: None,
@@ -684,8 +684,8 @@ impl ModelRoutingConfigTool {
                 max_iterations: DEFAULT_AGENT_MAX_ITERATIONS,
             });
 
-        next_agent.provider = provider;
-        next_agent.model = model;
+        next_agent.provider = Some(provider);
+        next_agent.model = Some(model);
 
         match system_prompt_update {
             MaybeSet::Set(value) => next_agent.system_prompt = Some(value),

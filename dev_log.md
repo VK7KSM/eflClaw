@@ -2,6 +2,328 @@
 
 ---
 
+## 2026-03-04 — Fix 12: send_telegram 消息分片 + 失败日志 + Cron Prompt 强化
+
+### 背景
+Fix 11 已部署后，Gemini cron agent 确实执行了新闻抓取任务，但用户只收到空洞通知（"任务已执行完毕"），无实际内容。根因：
+1. send_telegram 不支持分片（>4096 字符的消息静默失败，且失败无 warn 日志）
+2. Cron prompt 引导不够强，agent 只回复"任务完成"而不输出实际内容
+3. Agent 可能冗余调用 send_telegram（cron 系统已自动投递文本响应）
+
+### 改动要点
+
+**Fix 12a: `src/channels/telegram.rs` — 常量和函数改 pub(crate)**
+- `TELEGRAM_MAX_MESSAGE_LENGTH`、`TELEGRAM_CONTINUATION_OVERHEAD` 改为 `pub(crate)`
+- `split_message_for_telegram()` 改为 `pub(crate)`，供 send_telegram 工具跨模块使用
+
+**Fix 12a: `src/channels/mod.rs` — 重新导出**
+- 添加 `pub(crate) use telegram::split_message_for_telegram;`
+
+**Fix 12a: `src/tools/send_telegram.rs` — 消息分片 + message_id 日志 + 失败 WARN**
+- `execute()` 方法重写：用 `split_message_for_telegram()` 自动分片长消息
+- 多片消息加 continuation 标记（`_(continues... 1/N)_`、`_(continued 2/N)_`）
+- 新增 `send_one_chunk()` 方法：
+  - 成功时 `info!()` 记录 chat_id、message_id、chunk/total
+  - 失败时 `warn!()` 记录 chat_id、status、chunk/total（解决原来静默失败问题）
+  - Markdown 降级逻辑保持不变（`can't parse entities` → plain text retry）
+- 新增 `extract_message_id()` 从 Telegram API 响应 JSON 提取 message_id
+- 片间 100ms 间隔防止速率限制
+
+**Fix 12b: `src/cron/scheduler.rs` — 增强 Cron Prompt 引导**
+- 替换 Fix 11 的引导文本，5 条明确规则：
+  1. 直接用工具执行任务
+  2. 最终文本响应就是用户看到的消息 — 必须包含所有结果和摘要
+  3. 禁止空洞回复（"task completed"、"please check above"）
+  4. 禁止调用 send_telegram（系统自动投递）
+  5. 不要等其他 agent
+- 标记 `// elfClaw:` 注释
+
+### 编译验证
+- `cargo build --release --features wasm-tools` ✅ 通过（无新增 warning）
+
+---
+
+## 2026-03-03 — Fix 11: Cron Agent Prompt 行为引导（防 haiku 自言自语）
+
+### 背景
+Cron 推送机制正常（message 到达 Telegram），但 haiku 执行 cron 任务时只会自言自语（"我来等 news_fetcher 完成任务..."），不执行实际工作。根因：非委派路径（`delegate_to=None`）的 cron prompt 没有行为引导，haiku 不知道自己应该直接执行任务。
+
+### 改动要点
+
+**Fix 11: `src/cron/scheduler.rs` — line 197-210（非委派 cron prompt 行为引导）**
+- 原代码：`format!("[cron:{} {name}] {prompt}", job.id)` — 零行为指令
+- 新代码：添加 IMPORTANT 行为引导指令，告知 agent：
+  - 你是后台定时任务，直接用工具执行
+  - 不要描述计划，而是实际执行
+  - 不要等其他 agent，你就是负责人
+  - 你的文本输出会送达用户
+- 对比委派路径已有 "Use the delegate tool now" 指令，非委派路径现获得同等级别引导
+- 已有具体 prompt 的任务（如 22:00 新闻源搜索）不受影响，因为引导指令与具体步骤不冲突
+- 标记 `// elfClaw:` 注释
+
+---
+
+## 2026-03-03 — Fix: Windows 安全策略路径兼容 + Shell PATHEXT + Telegram 确认日志
+
+### 背景
+部署后 agent 尝试用绝对路径 `X:\...\uv.exe` 运行 uv 被安全策略拦截。根因：`is_command_allowed()` 用 `rsplit('/')` 提取 base command，Windows `\` 路径无法正确分割。同时 shell 子进程缺少 `PATHEXT` 环境变量导致裸命令 `uv` 无法解析为 `uv.exe`。Cron 推送到 Telegram 后无成功确认日志。
+
+### 改动要点
+
+**Fix 8a: `src/security/policy.rs` — 新增 `extract_base_command_name()`**
+- 同时按 `/` 和 `\` 分割路径，提取 base command
+- 剥离 Windows 可执行文件扩展名（.exe/.cmd/.bat/.com）用于白名单匹配
+- 例：`C:\Users\xxx\.local\bin\uv.exe` → `uv`
+
+**Fix 8b: `src/security/policy.rs` — `is_command_allowed()` line 800**
+- `rsplit('/')` 替换为 `extract_base_command_name()`
+- 修复 Windows 绝对路径命令被误拦截的问题
+
+**Fix 8c: `src/security/policy.rs` — `command_risk_level()` line 586**
+- 同样替换 `rsplit('/')` 为 `extract_base_command_name()`
+
+**Fix 8d: `src/security/policy.rs` — `looks_like_path()`**
+- 新增 Windows 绝对路径检测（`C:\...`）
+- 新增 UNC 路径检测（`\\server\share`）
+
+**Fix 9a: `src/tools/shell.rs` — `SAFE_ENV_VARS_WINDOWS`**
+- 添加 `PATHEXT`（Windows 命令解析必需）和 `COMSPEC`（cmd.exe 路径）
+
+**Fix 9b: `src/tools/shell.rs` — PATH 诊断日志**
+- shell 命令失败且 stderr 含 `CommandNotFoundException` 时记录 PATH 值
+- 帮助诊断 `env_clear()` 后子进程环境变量问题
+
+**Fix 10: `src/channels/telegram.rs` — 发送成功确认**
+- `send_text_chunks()` HTML 格式成功：解析响应体，记录 chat_id + message_id
+- 检测 Telegram API 返回 `ok=false` 的异常情况
+- plain text fallback 成功也记录确认日志
+
+### 验证
+- `cargo build --release --features wasm-tools` 成功
+- 部署后让 agent 运行 `uv run python -c "print('ok')"` 验证安全策略
+- Cron 推送后终端应出现 `"Telegram message delivered"` + message_id
+
+---
+
+## 2026-03-03 — Fix: Cron 全局推送 + Python/uv 白名单
+
+### 背景
+部署测试发现 cron job 执行成功（haiku 模型）但消息没有推送到 Telegram。同时 skill python 脚本被安全策略拦截。
+
+### 改动要点
+
+**Fix 6a: `src/channels/mod.rs` — 注册 live channel 实例**
+- `start_channels()` 在 `channels_by_name` 构建后调用 `register_live_channels()`
+- 将所有启动的 channel（telegram/discord/slack/等）注册到全局 registry
+- **根因**：`register_live_channels()` 已定义但**从未被调用**，导致全局 registry 永远为空
+
+**Fix 6b: `src/channels/mod.rs` — `deliver_to_channel()` 优先 live 实例**
+- 在 `collect_configured_channels()` 之前，先查全局 live channel registry
+- 找到就用活跃实例发送（与 channels runtime 共享连接）
+- 找不到才降级创建 ad-hoc 实例
+- 这是全局方案：任何启动的 channel 都自动支持 cron/daemon 投递
+
+**Fix 6c: `src/cron/scheduler.rs` — 推送日志可见**
+- `deliver_if_configured()` 在调用 `deliver_announcement` 前添加 `tracing::info!`
+- 含 job_id, channel, target, output_len，让 cron → channel 推送流程在终端可追踪
+
+**Fix 7: `资料/config.toml` — 添加 `uv` 到白名单**
+- `allowed_commands` 新增 `"uv"`
+- skill 用 `uv run python script.py` 时，安全策略检查第一个词 `uv`，之前不在白名单被拒绝
+
+### 验证
+- `cargo build --release --features wasm-tools` 成功
+- 部署注意：编译后需将 `资料/config.toml` 一起复制到 `D:\ZeroClaw_Workspace\`
+
+---
+
+## 2026-03-03 — Fix: 运行时 5 个关联问题（基于运行日志实证）
+
+### 背景
+上一轮修改部署后，运行日志暴露了 5 个互相关联的问题：UTF-8 panic、shell 拒绝静默、python3/Windows 兼容、agent 环境无感知、delegate 失败无原因。
+
+### 改动要点
+
+**Fix 1 (Critical): `src/cron/scheduler.rs`**
+- 新增 `truncate_str_safe()` 函数：UTF-8 安全截断，避免中文字符边界 panic
+- 替换 `&response[..response.len().min(120)]` 为 `truncate_str_safe(&response, 200)`
+- 修复 `panicked at byte index 120 is not a char boundary` 问题
+
+**Fix 2: `src/tools/shell.rs`**
+- `validate_command_execution` 拒绝点添加 `tracing::warn!`（含 command + reason）
+- `forbidden_path_argument` 拒绝点添加 `tracing::warn!`（含 command + path）
+- `record_action` 耗尽点添加 `tracing::warn!`（含 command）
+- 让安全策略拒绝在终端可见，之前只有 LLM 能看到 ToolResult.error
+
+**Fix 3a: `src/channels/mod.rs`**
+- `build_system_prompt_with_mode()` 的 Runtime 段注入平台详情
+- Windows: "Shell: PowerShell. Use `python` (not `python3`)."
+- macOS/Linux: 对应的 shell 和 python 命令提示
+- 使 LLM 知道当前运行环境，避免生成不兼容命令
+
+**Fix 3b: `src/runtime/native.rs`**
+- Windows `build_shell_command()` 中自动将 `python3` 规范化为 `python`
+- 双层防御：系统提示告诉 LLM 用 python，运行时兜底自动转换
+
+**Fix 4a: `src/channels/mod.rs` — ChannelRuntimeContext**
+- 新增 `config: Arc<Config>` 字段用于运行时状态注入
+- 生产构造处和所有测试构造处均添加了字段
+
+**Fix 4b: `src/channels/mod.rs` — 运行时状态注入**
+- 新增 `build_runtime_status_section()` 函数，生成动态 Runtime Status 段
+- 内容包括：autonomy 级别、allowed_commands、worker_model、已配置 agents、活跃 cron jobs（从 store 动态读取）
+- 在 `process_channel_message()` 中紧跟 `build_channel_system_prompt()` 之后注入
+- Agent 现在能看到所有 cron job 的 ID、名称、状态、调度表达式
+
+**Fix 5a: `src/tools/delegate.rs`**
+- `execute_agentic()` 的 `Ok(Err(e))` 路径添加 `tracing::warn!`（含 agent + error）
+
+**Fix 5b: `src/tools/delegate.rs`**
+- Agent 有显式 provider 且与默认 provider 不同时发出 `tracing::warn!`
+- 帮助检测过期配置
+
+**Fix 5c: `src/tools/delegate.rs`**
+- 将 agentic completion log 拆分为成功/失败两条路径
+- 成功用 `info!`，失败用 `warn!`（含 error 详情）
+
+### 验证
+- `cargo build` 成功，无新增 error（预存在 warnings 不变）
+
+---
+
+## 2026-03-03 — Fix: Cron/Worker 日志缺失 + Skill Python 执行被锁
+
+### 改动要点
+
+**Fix 1: `src/cron/scheduler.rs`**
+- `run_agent_job()` 新增 `tracing::info!` 日志：job 启动（含 job_id/name/delegate_to）、完成（含输出预览）、失败
+- `persist_job_result()` 中 `record_run()` 错误从 `let _ =` 吞掉改为 `if let Err(e)` 并输出 `warn!`
+- 所有新增日志均带 `// elfClaw:` 注释
+
+**Fix 2: `src/tools/delegate.rs`**
+- `execute()` 中 provider/model 解析成功后新增 `tracing::info!` "Delegate: starting sub-agent"（含 agent/provider/model/agentic 字段）
+- 非 agentic 成功路径新增 `tracing::info!` "Delegate: sub-agent completed"（含 output_len）
+- agentic 路径 `return Ok(result)` 前新增 `tracing::info!` "Delegate: sub-agent (agentic) completed"
+- 所有新增日志均带 `// elfClaw:` 注释
+
+**Fix 3a: `资料/config.toml`**
+- `allowed_commands` 列表追加 `"python"` 和 `"python3"`（带 elfClaw 注释）
+- 目的：允许 SKILL.toml 定义的 Python 脚本通过 shell 工具执行
+
+**Fix 3b: `src/skills/tool_handler.rs:367`**
+- `validate_command_execution(&command, false)` → `validate_command_execution(&command, true)`
+- Skill 命令模板由用户在 SKILL.toml 中明确定义，属于预信任命令（approved=true）
+- 高风险命令仍由 `block_high_risk_commands=true` 独立拦截，安全性不降低
+
+### 验证
+- `cargo build` 成功，无新增 error（预存在 warnings 不变）
+
+---
+
+## 2026-03-03 — delegate worker agent 继承 worker_model，provider/model 改为 Optional
+
+### 背景
+`news_fetcher` 等 worker agent 在 `[agents.xxx]` 中必须硬编码 `provider`/`model`，
+切换主 provider 时需逐一更新。旧配置使用已失效的 Anthropic 自定义 endpoint，导致 `API key not valid`。
+
+### 根因
+`DelegateAgentConfig.provider` / `.model` 为强制 `String`，无法省略。
+
+### 改动（6 个文件）
+
+**`src/config/schema.rs`**
+- `DelegateAgentConfig.provider` / `.model` 改为 `#[serde(default)] Option<String>`
+
+**`src/tools/delegate.rs`**
+- `DelegateTool` struct 新增 `fallback_provider: Option<String>` / `fallback_model: Option<String>`
+- `new_with_options` / `with_depth_and_options` 初始化时赋 `None`
+- 新增 builder 方法 `with_worker_model_fallback(provider, model)`
+- `execute()` 中插入 `effective_provider` / `effective_model` 解析（优先 agent 自身配置，再 fallback）
+- `execute_agentic()` 签名增加 `effective_provider`/`effective_model` 参数，内部 run_tool_call_loop 使用这两个值
+- 测试辅助函数 `sample_agents()` / `agentic_config()` 中 `provider`/`model` 改为 `Some(...)`
+
+**`src/tools/mod.rs`**
+- 构造 `DelegateTool` 时链式调用 `.with_worker_model_fallback(default_provider, worker_model|default_model)`
+
+**`src/tools/model_routing_config.rs`**
+- `has_provider_credential()` 调用改为 `.as_deref().unwrap_or("")`
+- `handle_upsert_agent()` 中赋值和 struct 初始化改为 `Some(...)`
+
+**`src/tools/subagent_spawn.rs`**
+- `create_provider_with_options` / `chat_with_system` / `run_tool_call_loop` 调用中 provider/model 改为 `.as_deref().unwrap_or("")`
+- 格式化字符串改为 `.as_deref().unwrap_or("(none)")`
+
+**`src/doctor/mod.rs`**
+- `provider_validation_error` 调用改为 `if let Some(provider_name) = agent.provider.as_deref()`
+
+**`src/migration.rs`**
+- `.trim()` 调用改为 `.as_deref().unwrap_or("").trim()`
+- `DelegateAgentConfig` 初始化改为 `Some(...)`
+
+**`资料/config.toml`**
+- `[agents.news_fetcher]` 删除 `provider` / `model`，改为继承 `worker_model`
+
+### 验证
+- `cargo build` → 成功（仅有预存 warnings，无新 error）
+
+---
+
+## 2026-03-03 — 修复 Gemini 400 "Function call is missing a thought_signature"
+
+### 背景
+上一个修复（删除降级块）后，cron job 触发时报：
+```
+Gemini API error (400 Bad Request): Function call is missing a thought_signature
+in functionCall parts. This is required for tools to work correctly.
+```
+
+### 根因
+Gemini 3 Flash 将 `thought_signature` 直接放在 **functionCall Part 本身**（不是独立的 thought Part），而原有代码只从 `thought=true` 的 Part 读取签名。结果：
+1. 捕获阶段：`thought_signature` 丢失 → 历史工具调用 `thought_signature = None`
+2. 重放阶段：function_call Part 的 `thought_signature: None` → Gemini 400
+
+### 改动文件
+
+**`src/providers/gemini.rs`**（两处，均标 `// elfClaw:`）
+
+**Fix A**（行 ~314-332，`extract_tool_calls()`）：
+- 改 `if let Some(sig) = part.thought_signature` 为 `if let Some(ref sig) = ...`（避免所有权移动）
+- 在处理 function_call Part 时，用 `.or_else(|| part.thought_signature.clone())` 从 function_call Part 本身捕获签名
+- Gemini 2.5（签名在 thought Part）和 Gemini 3（签名在 function_call Part）均正确处理
+
+**Fix B**（行 ~1557-1577，history rebuild）：
+- 提取 `sig_opt` 变量（共用）
+- function_call Part 新增 `thought_signature: sig_opt.map(|s| s.to_string())`
+- thought Part（Gemini 2.5）保持不变；functionCall Part 同时携带签名（Gemini 3 要求）
+
+### 验证
+- `cargo build --release` → 成功（无新 error）
+
+---
+
+## 2026-03-03 — 修复 Gemini 工具调用停不下来（降级块根因修复）
+
+### 背景
+Gemini 模型调用任何工具（send_voice、read_file、cron job 等）后陷入无限循环，每次迭代向 Telegram 发送 "(Continued from previous tool interaction)" 消息，最终命中 25/50 次上限失败。
+
+### 根因
+`src/providers/gemini.rs` 行 1517–1550 存在"降级块"：当历史工具调用缺少 `thought_signature` 时，将整个工具调用历史替换为文本 "(Continued from previous tool interaction)"，并跳过工具结果。
+
+根本原因：Gemini 3 Flash 在 "low" thinking 级别（`reasoning_level = 1`）下**有时直接输出 function_call 而不包含 thought 部分**，导致 `thought_signature = None`。降级块将此视为异常历史，把整轮工具调用上下文抹掉，Gemini 下一轮失去上下文 → 重复调用 → 无限循环。
+
+### 修改文件
+
+**`src/providers/gemini.rs`**
+- 删除 `all_have_signature` 检查 + 整个降级 `if` 块（-34 行）
+- 删除 `if tool_name == "__degraded__"` 死代码检查及注释（-6 行）
+- 更新降级块位置的注释，说明正常路径已正确处理有/无 `thought_signature` 两种情况
+- 净变化：-40 行（纯删除，零新增）
+
+### 验证
+- `cargo build --release` → 成功（无新 error，仅已有 warning）
+
+---
+
 ## 2026-03-03 — 修复 Telegram TOCTOU 竞态 + Gemini 503 重试间隔过短
 
 ### Bug A：Telegram 附件路径 TOCTOU 竞态
@@ -28,6 +350,83 @@
 ### 验证
 
 - `cargo build --release` → 成功（无新 error，仅已有 warning）
+
+---
+
+## 2026-03-03 — 修复波形图失败：附件未找到通知用户 + plotly 脚本规范
+
+### 背景
+
+elfClaw 使用 plotly skill 生成波形图时，Python 脚本 shell 执行连续失败（loop detection HardStop）。图片文件从未生成，但 LLM 在回复中仍引用了脚本里硬编码的输出路径，导致两个问题：
+
+1. Telegram 附件发送失败但用户收不到任何提示（内部错误被 `?` 静默传播）
+2. LLM 生成的脚本缺少 `os.makedirs` + 错误处理，也未明确说明 kaleido/Chrome 依赖
+
+### 修改文件
+
+**`src/channels/telegram.rs`**（两处，已标 `// elfClaw:`）
+
+- 修改 `send_reply_with_attachments()` 和 `send()` 中的 `for attachment in &attachments` 循环
+- 原来：`self.send_attachment(...).await?`（文件不存在 → 内部错误传播，用户看不到提示）
+- 现在：`if let Err(e) = ...` 捕获错误；若错误包含 "Telegram attachment path not found" 或 "is not a file"（且不是 HTTP URL），则向用户发送 ⚠️ 文字通知，而非传播内部错误；其他错误仍正常传播
+
+**`资料/skills/scientific-tools/scientific-skills/plotly/SKILL.md`**
+
+- Quick Start 之后新增 "Script Execution Rules" 章节：`os.makedirs` 要求、`uv run` 语法、成功确认输出 + 错误处理模板
+- Export Options 章节更新：加入 kaleido/Chrome 依赖警告（⚠️ 红色提示）、HTML 首选回退方案
+
+**`资料/skills/scientific-tools/scientific-skills/plotly/references/export-interactivity.md`**
+
+- Static Image Export 章节新增：kaleido/Chrome 不可用时的故障排查说明 + 安全导出模板（含 `os.makedirs` + 成功确认 + HTML 回退）
+
+### 设计决策
+
+- telegram.rs 修改**拦截错误**而非**预先检查路径**：避免在循环中重复 `resolve_workspace_attachment_path` 的路径解析逻辑（符合 DRY）
+- 错误消息字符串 "Telegram attachment path not found" 和 "is not a file" 是本仓库内部定义（`telegram.rs:268,274`），不会误匹配外部错误
+- `// elfClaw:` 标记已加在两处循环修改的起始注释行
+
+---
+
+## 2026-03-03 — 修复 Windows 上 shell 工具无法执行 Python 脚本
+
+### 背景
+
+用户要求生成 220V 正弦波图片，shell 工具连续失败 4 次触发 HardStop。日志只显示 "Tool 'shell' failed 4 consecutive times"，没有具体原因。通过代码分析发现两处 Windows 兼容性问题。
+
+### 根因 A：NativeRuntime 硬编码 `sh`
+
+`src/runtime/native.rs:46` 无条件使用 `Command::new("sh")`。Windows 上 `sh` 只有安装 Git Bash 且加入 PATH 才存在，直接导致命令无法启动。
+
+### 根因 B：`env_clear()` 后 Windows uv 无法工作
+
+`src/tools/shell.rs:17-19` 的 `SAFE_ENV_VARS` 只包含 Unix 变量，不包含 `APPDATA`/`LOCALAPPDATA`/`TEMP` 等 Windows 系统变量。`uv` 在 Windows 上把包缓存放在 `%LOCALAPPDATA%\uv\`，没有这些变量时包解析失败。
+
+### 根因 C（诊断障碍）：shell 错误不写日志
+
+shell 失败的 stderr 只返回给 LLM，不写到应用日志，操作员无法从日志看到具体错误原因。
+
+### 修改文件
+
+**`src/runtime/native.rs`**（已标 `// elfClaw:`）
+
+- `build_shell_command()` 改为平台分支：
+  - `#[cfg(windows)]`：使用 `powershell -NoProfile -NonInteractive -Command`
+  - `#[cfg(not(windows))]`：保持原有 `sh -c`（Linux/macOS 不变）
+
+**`src/tools/shell.rs`**（已标 `// elfClaw:`，3 处）
+
+- 在 `SAFE_ENV_VARS` 之后新增 `#[cfg(windows)]` 常量 `SAFE_ENV_VARS_WINDOWS`，包含 `APPDATA`、`LOCALAPPDATA`、`USERPROFILE`、`TEMP`、`TMP`、`SYSTEMROOT`、`SYSTEMDRIVE`、`WINDIR`
+- `collect_allowed_shell_env_vars()` 末尾新增 `#[cfg(windows)]` 块，将 Windows 变量追加到返回列表
+- `execute()` 结果处理新增两处 `tracing::warn!`：
+  - shell 返回 exit code 非零时记录命令 + exit_code + stderr
+  - 进程启动失败（`Ok(Err(e))`）时记录命令 + error
+
+### 验证
+
+- `cargo check` → 通过，无新 error/warning
+
+
+
 
 ---
 

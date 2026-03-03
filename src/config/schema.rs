@@ -463,10 +463,14 @@ pub struct ProviderConfig {
 /// Configuration for a delegate sub-agent used by the `delegate` tool.
 #[derive(Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DelegateAgentConfig {
-    /// Provider name (e.g. "ollama", "openrouter", "anthropic")
-    pub provider: String,
-    /// Model name
-    pub model: String,
+    /// Provider name (e.g. "ollama", "openrouter", "anthropic").
+    /// elfClaw: optional — agents without explicit provider inherit worker_model fallback.
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// Model name.
+    /// elfClaw: optional — agents without explicit model inherit worker_model fallback.
+    #[serde(default)]
+    pub model: Option<String>,
     /// Optional system prompt for the sub-agent
     #[serde(default)]
     pub system_prompt: Option<String>,

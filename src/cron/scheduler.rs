@@ -16,6 +16,18 @@ const MIN_POLL_SECONDS: u64 = 5;
 const SHELL_JOB_TIMEOUT_SECS: u64 = 120;
 const SCHEDULER_COMPONENT: &str = "scheduler";
 
+// elfClaw: truncate to nearest UTF-8 char boundary (safe for CJK multi-byte)
+fn truncate_str_safe(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 pub(crate) fn is_no_reply_sentinel(output: &str) -> bool {
     output.trim().eq_ignore_ascii_case("NO_REPLY")
 }
@@ -166,6 +178,15 @@ async fn run_agent_job(
     }
     let name = job.name.clone().unwrap_or_else(|| "cron-job".to_string());
     let prompt = job.prompt.clone().unwrap_or_default();
+
+    // elfClaw: log cron job start so execution is visible in terminal
+    tracing::info!(
+        job_id = %job.id,
+        job_name = %name,
+        delegate_to = ?job.delegate_to,
+        "Cron job starting (worker_model via RunContext::Background)"
+    );
+
     let prefixed_prompt = if let Some(ref agent_name) = job.delegate_to {
         // Escape inner prompt for safe embedding in the instruction string
         let escaped = prompt.replace('\\', "\\\\").replace('"', "\\\"");
@@ -174,9 +195,28 @@ async fn run_agent_job(
             job.id
         )
     } else {
-        format!("[cron:{} {name}] {prompt}", job.id)
+        // elfClaw: strong behavioral guidance for cron agents.
+        // Fix 12b: explicitly instruct that final text IS the user-facing delivery,
+        // prohibit empty "task completed" responses and redundant send_telegram calls.
+        format!(
+            "[cron:{id} {name}] IMPORTANT: You are a scheduled background task.\n\
+             \n\
+             RULES:\n\
+             1. Execute the task directly using your tools.\n\
+             2. Your final text response IS the message delivered to the user — \
+                include ALL results, summaries, and findings in it.\n\
+             3. Do NOT just say \"task completed\" or \"please check above\" — \
+                the user can ONLY see your final text response.\n\
+             4. Do NOT call send_telegram — the system delivers your response automatically.\n\
+             5. Do NOT wait for other agents — you ARE the agent responsible.\n\
+             \n\
+             Task: {prompt}",
+            id = job.id
+        )
     };
-    let model_override = job.model.clone();
+    // elfClaw: cron jobs always use worker_model from current config, not the
+    // model snapshot stored at creation time — see RunContext::Background resolution
+    let model_override: Option<String> = None;
 
     let run_result = match job.session_target {
         SessionTarget::Main | SessionTarget::Isolated => {
@@ -196,15 +236,26 @@ async fn run_agent_job(
     };
 
     match run_result {
-        Ok(response) => (
-            true,
+        Ok(response) => {
+            // elfClaw: log cron job completion outcome
             if response.trim().is_empty() {
-                "agent job executed".to_string()
+                tracing::info!(job_id = %job.id, "Cron job completed (empty output)");
+                (true, "agent job executed".to_string())
             } else {
-                response
-            },
-        ),
-        Err(e) => (false, format!("agent job failed: {e}")),
+                // elfClaw: use UTF-8-safe truncation to avoid panic on CJK multi-byte chars
+                tracing::info!(
+                    job_id = %job.id,
+                    output_preview = %truncate_str_safe(&response, 200),
+                    "Cron job completed"
+                );
+                (true, response)
+            }
+        }
+        Err(e) => {
+            // elfClaw: log cron job failure
+            tracing::warn!(job_id = %job.id, error = %e, "Cron job failed");
+            (false, format!("agent job failed: {e}"))
+        }
     }
 }
 
@@ -227,7 +278,8 @@ async fn persist_job_result(
         }
     }
 
-    let _ = record_run(
+    // elfClaw: surface record_run errors instead of silently discarding them
+    if let Err(e) = record_run(
         config,
         &job.id,
         started_at,
@@ -235,7 +287,9 @@ async fn persist_job_result(
         if success { "ok" } else { "error" },
         Some(output),
         duration_ms,
-    );
+    ) {
+        tracing::warn!(job_id = %job.id, error = %e, "Failed to persist cron run result");
+    }
 
     if is_one_shot_auto_delete(job) {
         if success {
@@ -317,6 +371,15 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
         .to
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("delivery.to is required for announce mode"))?;
+
+    // elfClaw: log delivery attempt so terminal user can trace cron → channel flow
+    tracing::info!(
+        job_id = %job.id,
+        channel = %channel,
+        target = %target,
+        output_len = output.len(),
+        "Cron delivery: attempting announce to channel"
+    );
 
     deliver_announcement(config, channel, target, output).await
 }
