@@ -143,10 +143,22 @@ async fn execute_and_persist_job(
     crate::health::mark_component_ok(component);
     warn_if_high_frequency_agent_job(job);
 
+    let job_name = job.name.clone().unwrap_or_else(|| job.id.clone());
+    // elfClaw: log cron job start
+    crate::elfclaw_log::log_cron_event(&job.id, &job_name, "started", serde_json::json!({"model": &job.model}));
+
     let started_at = Utc::now();
     let (success, output) = Box::pin(execute_job_with_retry(config, security, job)).await;
     let finished_at = Utc::now();
+    let duration_ms = (finished_at - started_at).num_milliseconds().max(0) as u64;
     let success = persist_job_result(config, job, success, &output, started_at, finished_at).await;
+
+    // elfClaw: log cron job completion/failure
+    if success {
+        crate::elfclaw_log::log_cron_event(&job.id, &job_name, "completed", serde_json::json!({"duration_ms": duration_ms, "output_len": output.len()}));
+    } else {
+        crate::elfclaw_log::log_cron_event(&job.id, &job_name, "failed", serde_json::json!({"duration_ms": duration_ms, "error": truncate_str_safe(&output, 200)}));
+    }
 
     (job.id.clone(), success, output)
 }

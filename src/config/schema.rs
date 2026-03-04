@@ -3077,7 +3077,7 @@ pub struct ObservabilityConfig {
 impl Default for ObservabilityConfig {
     fn default() -> Self {
         Self {
-            backend: "none".into(),
+            backend: "log".into(), // elfClaw: default to "log" so tracing output is visible
             otel_endpoint: None,
             otel_service_name: None,
             runtime_trace_mode: default_runtime_trace_mode(),
@@ -3088,6 +3088,8 @@ impl Default for ObservabilityConfig {
 }
 
 fn default_runtime_trace_mode() -> String {
+    // elfClaw: elfclaw-logs.db (SQLite WAL) replaces runtime_trace; default back to "none"
+    // to eliminate Windows file-lock races (os error 5) on high-concurrency write paths.
     "none".to_string()
 }
 
@@ -9382,8 +9384,8 @@ mod tests {
     #[test]
     async fn observability_config_default() {
         let o = ObservabilityConfig::default();
-        assert_eq!(o.backend, "none");
-        assert_eq!(o.runtime_trace_mode, "none");
+        assert_eq!(o.backend, "log"); // elfClaw: changed default from "none" to "log"
+        assert_eq!(o.runtime_trace_mode, "none"); // elfClaw: reverted to "none" (Fix 15a) — elfclaw-logs.db supersedes runtime_trace
         assert_eq!(o.runtime_trace_path, "state/runtime-trace.jsonl");
         assert_eq!(o.runtime_trace_max_entries, 200);
     }

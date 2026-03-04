@@ -412,8 +412,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         None
     };
 
-    // SSE broadcast channel for real-time events
-    let (event_tx, _event_rx) = tokio::sync::broadcast::channel::<serde_json::Value>(256);
+    // elfClaw: use global event bus instead of creating an internal broadcast channel
+    let event_tx = crate::elfclaw_log::global_event_tx();
     // Extract webhook secret for authentication
     let webhook_secret_hash: Option<Arc<str>> =
         config.channels_config.webhook.as_ref().and_then(|webhook| {
@@ -621,11 +621,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         hooks.fire_gateway_start(host, actual_port).await;
     }
 
-    // Wrap observer with broadcast capability for SSE
+    // elfClaw: wrap observer with ElfClawObserver for SQLite logging + SSE broadcast
     let broadcast_observer: Arc<dyn crate::observability::Observer> =
-        Arc::new(sse::BroadcastObserver::new(
+        Arc::new(crate::elfclaw_log::wrap_observer(
             crate::observability::create_observer(&config.observability),
-            event_tx.clone(),
         ));
 
     let state = AppState {
@@ -718,6 +717,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         )
         // ── SSE event stream ──
         .route("/api/events", get(sse::handle_sse_events))
+        // elfClaw: historical logs REST endpoint for Logs web page
+        .route("/api/logs/recent", get(api::handle_api_logs_recent))
         // ── WebSocket agent chat ──
         .route("/ws/chat", get(ws::handle_ws_chat))
         // ── Static assets (web dashboard) ──

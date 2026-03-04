@@ -1094,6 +1094,13 @@ pub(crate) async fn run_tool_call_loop(
         }),
     );
 
+    // elfClaw: log loop exhaustion with tool statistics
+    crate::elfclaw_log::log_error(
+        "agent_loop",
+        &format!("Tool loop exhausted after {max_iterations} iterations"),
+        serde_json::json!({"max_iterations": max_iterations, "channel": channel_name}),
+    );
+
     // Graceful degradation: return partial results instead of bailing.
     // Side-effects from already-executed tools (file writes, message sends, etc.)
     // have already taken effect — treating this as an error loses that work.
@@ -1183,8 +1190,9 @@ pub async fn run(
     run_context: super::RunContext, // elfClaw: task origin for model routing
 ) -> Result<String> {
     // ── Wire up agnostic subsystems ──────────────────────────────
+    // elfClaw: wrap observer with ElfClawObserver for SQLite logging + SSE broadcast
     let base_observer = observability::create_observer(&config.observability);
-    let observer: Arc<dyn Observer> = Arc::from(base_observer);
+    let observer: Arc<dyn Observer> = Arc::new(crate::elfclaw_log::wrap_observer(base_observer));
     let runtime: Arc<dyn runtime::RuntimeAdapter> =
         Arc::from(runtime::create_runtime(&config.runtime)?);
     let security = Arc::new(SecurityPolicy::from_config(
@@ -1680,8 +1688,9 @@ pub async fn run(
 /// Process a single message through the full agent (with tools, peripherals, memory).
 /// Used by channels (Telegram, Discord, etc.) to enable hardware and tool use.
 pub async fn process_message(config: Config, message: &str) -> Result<String> {
+    // elfClaw: wrap observer with ElfClawObserver for SQLite logging + SSE broadcast
     let observer: Arc<dyn Observer> =
-        Arc::from(observability::create_observer(&config.observability));
+        Arc::new(crate::elfclaw_log::wrap_observer(observability::create_observer(&config.observability)));
     let runtime: Arc<dyn runtime::RuntimeAdapter> =
         Arc::from(runtime::create_runtime(&config.runtime)?);
     let security = Arc::new(SecurityPolicy::from_config(
