@@ -616,7 +616,8 @@ impl Tool for ChannelAckConfigTool {
                         {"type": "null"}
                     ]
                 },
-                "rules": {"type": ["array", "null"]},
+                // elfClaw: Gemini requires items when type contains "array"
+                "rules": {"type": ["array", "null"], "items": {"type": "object"}},
                 "rule": {"type": "object"},
                 "index": {"type": "integer", "minimum": 0},
                 "text": {"type": "string"},

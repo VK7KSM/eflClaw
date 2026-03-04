@@ -60,7 +60,7 @@ jobs:
                   key: ${{ matrix.target }}
 
             - name: Build
-              run: cargo build --release --locked --target ${{ matrix.target }}
+              run: cargo build --release --locked --features wasm-tools --target ${{ matrix.target }}
 
             - name: Package
               run: |
@@ -95,7 +95,7 @@ jobs:
                   key: x86_64-pc-windows-msvc
 
             - name: Build
-              run: cargo build --release --locked --target x86_64-pc-windows-msvc
+              run: cargo build --release --locked --features wasm-tools --target x86_64-pc-windows-msvc
 
             - name: Package
               run: |

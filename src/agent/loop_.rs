@@ -26,6 +26,10 @@ const STREAM_CHUNK_MIN_CHARS: usize = 80;
 // elfClaw: reduced from upstream's 20 to 10 for tighter loop control
 const DEFAULT_MAX_TOOL_ITERATIONS: usize = 10;
 
+/// elfClaw: action tools that fire real-world effects and must not be called more than once
+/// per user message. Excluded from tool_specs after the first successful invocation.
+const SINGLE_USE_TOOLS: &[&str] = &["send_voice", "send_email", "send_telegram"];
+
 /// Maximum characters per tool result stored in history. Prevents context
 /// overflow from large tool outputs (e.g. RSS feeds, web scrapes). The LLM
 /// already sees the full result in the current iteration; this cap only
@@ -107,11 +111,13 @@ pub(crate) fn scrub_credentials(input: &str) -> String {
 const DEFAULT_MAX_HISTORY_MESSAGES: usize = 50;
 
 mod context;
+mod detection;
 mod execution;
 mod history;
 mod parsing;
 
 use context::{build_context, build_hardware_context};
+use detection::{DetectionVerdict, LoopDetectionConfig, LoopDetector};
 use execution::{
     execute_tools_parallel, execute_tools_sequential, should_execute_tools_in_parallel,
     ToolExecutionOutcome,
@@ -339,6 +345,12 @@ pub(crate) async fn run_tool_call_loop(
     let mut last_response_text = String::new();
     let mut missing_tool_call_retry_used = false;
     let mut missing_tool_call_retry_prompt: Option<String> = None;
+    // elfClaw: activate loop detection — detection.rs was dead code, now wired in
+    let mut loop_detector = LoopDetector::new(LoopDetectionConfig::default());
+    // When Some, signals a HardStop verdict; checked after inner tool-result loop
+    let mut loop_hard_stop: Option<String> = None;
+    // elfClaw: Fix 2 — action tools successfully invoked this turn; excluded from next LLM call
+    let mut used_action_tools: HashSet<String> = HashSet::new();
 
     for iteration in 0..max_iterations {
         if cancellation_token
@@ -458,8 +470,21 @@ pub(crate) async fn run_tool_call_loop(
 
         // Unified path via Provider::chat so provider-specific native tool logic
         // (OpenAI/Anthropic/OpenRouter/compatible adapters) is honored.
-        let request_tools = if use_native_tools {
-            Some(tool_specs.as_slice())
+        // elfClaw: Fix 2 — compute per-iteration tool list; exclude action tools already used this turn.
+        // Gemini cannot call an action tool it cannot see in the tool_specs.
+        let turn_tool_specs: Vec<crate::tools::ToolSpec> = if !use_native_tools
+            || used_action_tools.is_empty()
+        {
+            tool_specs.clone()
+        } else {
+            tool_specs
+                .iter()
+                .filter(|s| !used_action_tools.contains(&s.name))
+                .cloned()
+                .collect()
+        };
+        let request_tools = if use_native_tools && !turn_tool_specs.is_empty() {
+            Some(turn_tool_specs.as_slice())
         } else {
             None
         };
@@ -972,7 +997,37 @@ pub(crate) async fn run_tool_call_loop(
                 let _ = tx.send(format!("{icon} {} ({secs}s)\n", call.name)).await;
             }
 
+            // ── elfClaw: loop detection — record this call and evaluate ──
+            loop_detector.record_call(
+                &call.name.to_ascii_lowercase(),
+                &call.arguments.to_string(),
+                &outcome.output,
+                outcome.success,
+            );
+            // elfClaw: Fix 2 — mark action tool as used so it is excluded from the next LLM call
+            if outcome.success && SINGLE_USE_TOOLS.contains(&call.name.as_str()) {
+                used_action_tools.insert(call.name.clone());
+            }
+            match loop_detector.check() {
+                DetectionVerdict::Continue => {}
+                DetectionVerdict::InjectWarning(warning) => {
+                    tracing::warn!(tool = %call.name, "Loop detection: injecting self-correction warning");
+                    history.push(ChatMessage::user(warning));
+                }
+                DetectionVerdict::HardStop(reason) => {
+                    tracing::warn!(reason = %reason, "Loop detection: hard stop triggered");
+                    loop_hard_stop = Some(reason);
+                    break;
+                }
+            }
+
             ordered_results[*idx] = Some((call.name.clone(), call.tool_call_id.clone(), outcome));
+        }
+
+        // elfClaw: if loop detection triggered a hard stop, exit the outer iteration loop
+        if let Some(reason) = loop_hard_stop.take() {
+            last_response_text = format!("⚠️ [循环检测：已停止。原因：{}]", reason);
+            break;
         }
 
         for (tool_name, tool_call_id, outcome) in ordered_results.into_iter().flatten() {
@@ -1037,6 +1092,13 @@ pub(crate) async fn run_tool_call_loop(
         serde_json::json!({
             "max_iterations": max_iterations,
         }),
+    );
+
+    // elfClaw: log loop exhaustion with tool statistics
+    crate::elfclaw_log::log_error(
+        "agent_loop",
+        &format!("Tool loop exhausted after {max_iterations} iterations"),
+        serde_json::json!({"max_iterations": max_iterations, "channel": channel_name}),
     );
 
     // Graceful degradation: return partial results instead of bailing.
@@ -1128,8 +1190,9 @@ pub async fn run(
     run_context: super::RunContext, // elfClaw: task origin for model routing
 ) -> Result<String> {
     // ── Wire up agnostic subsystems ──────────────────────────────
+    // elfClaw: wrap observer with ElfClawObserver for SQLite logging + SSE broadcast
     let base_observer = observability::create_observer(&config.observability);
-    let observer: Arc<dyn Observer> = Arc::from(base_observer);
+    let observer: Arc<dyn Observer> = Arc::new(crate::elfclaw_log::wrap_observer(base_observer));
     let runtime: Arc<dyn runtime::RuntimeAdapter> =
         Arc::from(runtime::create_runtime(&config.runtime)?);
     let security = Arc::new(SecurityPolicy::from_config(
@@ -1215,6 +1278,8 @@ pub async fn run(
         zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
         secrets_encrypt: config.secrets.encrypt,
         reasoning_enabled: config.runtime.reasoning_enabled,
+        // elfClaw: pass reasoning_level for Gemini thinkingConfig; other providers ignore it
+        reasoning_level: config.provider.reasoning_level.clone(),
         ..providers::ProviderRuntimeOptions::default()
     };
 
@@ -1623,8 +1688,9 @@ pub async fn run(
 /// Process a single message through the full agent (with tools, peripherals, memory).
 /// Used by channels (Telegram, Discord, etc.) to enable hardware and tool use.
 pub async fn process_message(config: Config, message: &str) -> Result<String> {
+    // elfClaw: wrap observer with ElfClawObserver for SQLite logging + SSE broadcast
     let observer: Arc<dyn Observer> =
-        Arc::from(observability::create_observer(&config.observability));
+        Arc::new(crate::elfclaw_log::wrap_observer(observability::create_observer(&config.observability)));
     let runtime: Arc<dyn runtime::RuntimeAdapter> =
         Arc::from(runtime::create_runtime(&config.runtime)?);
     let security = Arc::new(SecurityPolicy::from_config(
@@ -1676,6 +1742,8 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
         secrets_encrypt: config.secrets.encrypt,
         reasoning_enabled: config.runtime.reasoning_enabled,
+        // elfClaw: pass reasoning_level for Gemini thinkingConfig; other providers ignore it
+        reasoning_level: config.provider.reasoning_level.clone(),
         ..providers::ProviderRuntimeOptions::default()
     };
     let provider: Box<dyn Provider> = providers::create_routed_provider_with_options(

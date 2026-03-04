@@ -67,6 +67,7 @@ mod cost;
 mod cron;
 mod daemon;
 mod doctor;
+mod elfclaw_log; // elfClaw: structured logging + SSE event bus
 mod gateway;
 mod goals;
 mod hardware;
@@ -917,7 +918,20 @@ async fn main() -> Result<()> {
     // All other commands need config loaded first
     let mut config = Config::load_or_init().await?;
     config.apply_env_overrides();
+    // elfClaw: decrypt api_key at startup so all downstream paths receive plaintext.
+    // Config::load_or_init() does not decrypt enc2: secrets; only the channel hot-reload
+    // path (load_runtime_defaults_from_config_file) decrypts. Without this, background
+    // tasks (daemon heartbeat, cron, chat_summarizer) send the raw enc2: string as the
+    // API key and Gemini returns "API key not valid".
+    // SecretStore::decrypt() is a no-op for plaintext (no-prefix) values.
+    if let (Some(raw), Some(config_dir)) = (config.api_key.clone(), config.config_path.parent()) {
+        let store = security::SecretStore::new(config_dir, config.secrets.encrypt);
+        if let Ok(decrypted) = store.decrypt(&raw) {
+            config.api_key = Some(decrypted);
+        }
+    }
     observability::runtime_trace::init_from_config(&config.observability, &config.workspace_dir);
+    crate::elfclaw_log::init(&config.workspace_dir); // elfClaw: init SQLite log database
     if config.security.otp.enabled {
         let config_dir = config
             .config_path

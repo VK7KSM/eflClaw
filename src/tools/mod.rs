@@ -22,6 +22,7 @@ pub mod bg_run;
 pub mod browser;
 pub mod browser_open;
 pub mod channel_ack_config;
+pub mod check_logs;
 pub mod cli_discovery;
 pub mod composio;
 pub mod content_search;
@@ -138,6 +139,7 @@ pub use proxy_config::ProxyConfigTool;
 pub use pushover::PushoverTool;
 pub use schedule::ScheduleTool;
 #[allow(unused_imports)]
+pub use check_logs::CheckLogsTool;
 pub use schema::{CleaningStrategy, SchemaCleanr};
 pub use screenshot::ScreenshotTool;
 pub use search_chat_log::SearchChatLogTool;
@@ -572,6 +574,9 @@ pub fn all_tools_with_runtime(
         }
     }
 
+    // elfClaw: check_logs tool — always available so agent can query runtime logs
+    tool_arcs.push(Arc::new(CheckLogsTool::new()));
+
     // Add delegation and sub-agent orchestration tools when agents are configured
     if !agents.is_empty() {
         let delegate_agents: HashMap<String, DelegateAgentConfig> = agents
@@ -605,6 +610,18 @@ pub fn all_tools_with_runtime(
             delegate_fallback_credential.clone(),
             security.clone(),
             provider_runtime_options.clone(),
+        )
+        // elfClaw: workers without explicit provider/model inherit worker_model from config
+        .with_worker_model_fallback(
+            root_config
+                .default_provider
+                .as_deref()
+                .unwrap_or("gemini"),
+            root_config
+                .worker_model
+                .as_deref()
+                .or(root_config.default_model.as_deref())
+                .unwrap_or(""),
         )
         .with_parent_tools(parent_tools.clone())
         .with_multimodal_config(root_config.multimodal.clone());

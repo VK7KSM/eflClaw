@@ -99,6 +99,24 @@ fn is_rate_limited(err: &anyhow::Error) -> bool {
         && (msg.contains("Too Many") || msg.contains("rate") || msg.contains("limit"))
 }
 
+// elfClaw: detect 503 server-overload errors (Gemini "model overloaded / high demand")
+fn is_server_overload(err: &anyhow::Error) -> bool {
+    if let Some(reqwest_err) = err.downcast_ref::<reqwest::Error>() {
+        if let Some(status) = reqwest_err.status() {
+            return status.as_u16() == 503;
+        }
+    }
+    let msg = err.to_string().to_lowercase();
+    msg.contains("503")
+        && (msg.contains("overload")
+            || msg.contains("high demand")
+            || msg.contains("service unavailable")
+            || msg.contains("unavailable"))
+}
+
+// elfClaw: minimum backoff for server overload (503) — Gemini needs ~5-30s to recover
+const OVERLOAD_BACKOFF_FLOOR_MS: u64 = 5_000;
+
 /// Check if a 429 is a business/quota-plan error that retries cannot fix.
 ///
 /// Examples:
@@ -343,6 +361,9 @@ impl ReliableProvider {
         if let Some(retry_after) = parse_retry_after_ms(err) {
             // Use Retry-After but cap at 30s to avoid indefinite waits
             retry_after.min(30_000).max(base)
+        } else if is_server_overload(err) {
+            // elfClaw: apply overload floor — 500ms base is useless for Gemini 503
+            base.max(OVERLOAD_BACKOFF_FLOOR_MS)
         } else {
             base
         }

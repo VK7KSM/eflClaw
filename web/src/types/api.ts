@@ -130,6 +130,17 @@ export interface SSEEvent {
   [key: string]: any;
 }
 
+// elfClaw: structured log entry from elfclaw-logs.db (mirrors src/elfclaw_log/types.rs)
+export interface ElfClawLogEntry {
+  id: string;
+  timestamp: string;
+  level: 'debug' | 'info' | 'warn' | 'error';
+  category: string;
+  component: string;
+  message: string;
+  details: Record<string, unknown>;
+}
+
 export interface WsMessage {
   type: 'message' | 'chunk' | 'tool_call' | 'tool_result' | 'done' | 'error' | 'history';
   content?: string;
