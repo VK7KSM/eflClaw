@@ -73,6 +73,7 @@ pub use qq::QQChannel;
 pub use signal::SignalChannel;
 pub use slack::SlackChannel;
 pub use telegram::TelegramChannel;
+pub(crate) use telegram::split_message_for_telegram;
 pub use traits::{Channel, SendMessage};
 pub use wati::WatiChannel;
 pub use whatsapp::WhatsAppChannel;
@@ -271,6 +272,7 @@ struct ChannelRuntimeContext {
     tts_config: crate::config::TtsConfig,
     chat_log_config: crate::config::ChatLogConfig,
     worker_model: Option<String>, // elfClaw: model for background tasks (email digest, etc.)
+    config: Arc<crate::config::Config>, // elfClaw: full config for runtime status injection
 }
 
 #[derive(Clone)]
@@ -498,6 +500,72 @@ fn build_channel_system_prompt(
     ));
 
     prompt
+}
+
+// elfClaw: build dynamic runtime status section so agent knows its current environment
+// (cron jobs, autonomy config, configured agents, worker model)
+fn build_runtime_status_section(config: &crate::config::Config) -> String {
+    use std::fmt::Write;
+    let mut section = String::new();
+    section.push_str("\n\n## Runtime Status\n\n");
+
+    // Autonomy
+    let _ = writeln!(
+        section,
+        "**Autonomy**: {:?} | allowed_commands: [{}]",
+        config.autonomy.level,
+        config.autonomy.allowed_commands.join(", ")
+    );
+
+    // Worker model + agents
+    if let Some(ref wm) = config.worker_model {
+        let _ = writeln!(section, "**Worker Model**: {wm}");
+    }
+    if !config.agents.is_empty() {
+        let agent_names: Vec<_> = config.agents.keys().map(|s| s.as_str()).collect();
+        let _ = writeln!(section, "**Configured Agents**: {}", agent_names.join(", "));
+    }
+
+    // Cron jobs (dynamic — read from store each time)
+    if config.cron.enabled {
+        match crate::cron::list_jobs(config) {
+            Ok(jobs) if !jobs.is_empty() => {
+                let _ = writeln!(section, "\n**Active Cron Jobs** ({} total):", jobs.len());
+                for job in &jobs {
+                    let name = job.name.as_deref().unwrap_or("unnamed");
+                    let enabled = if job.enabled { "on" } else { "off" };
+                    let delegate = job.delegate_to.as_deref().unwrap_or("-");
+                    let job_type: &str = job.job_type.clone().into();
+                    let _ = writeln!(
+                        section,
+                        "- id=`{}` name=\"{}\" enabled={} type={} delegate={} schedule={}",
+                        job.id,
+                        name,
+                        enabled,
+                        job_type,
+                        delegate,
+                        &job.expression
+                    );
+                }
+            }
+            Ok(_) => {
+                let _ = writeln!(section, "**Cron Jobs**: none configured");
+            }
+            Err(_) => {} // elfClaw: silently skip if store unavailable
+        }
+    }
+
+    // elfClaw: explicit log inspection rule — prevents agent from defaulting to shell commands
+    section.push_str(
+        "\n**⚠️ 日志查询规则（必须遵守）**：\
+         当用户要求查看、检查、查询运行日志、错误记录或系统状态时，\
+         **必须首先使用 `check_logs` 工具**。\
+         禁止使用 shell 命令（tail/cat/grep/Get-Content 在 Windows 环境不可用且可能被安全策略拦截）。\
+         `check_logs` 支持过滤：level=error/warn/info/debug，\
+         category=tool_call/cron_job/llm_call/channel_message/system，since_minutes=N。\n"
+    );
+
+    section
 }
 
 fn normalize_cached_channel_turns(turns: Vec<ChatMessage>) -> Vec<ChatMessage> {
@@ -1184,6 +1252,14 @@ async fn build_memory_context(
     context
 }
 
+/// elfClaw: Fix 3 — detect action tool references in a history message.
+/// Used to check prior-turn assistant messages for send_voice/send_email/send_telegram
+/// summaries so inter-turn boundaries can be injected to prevent Gemini from replaying them.
+fn contains_action_tool_summary(content: &str) -> bool {
+    const ACTION_TOOLS: &[&str] = &["send_voice", "send_email", "send_telegram"];
+    ACTION_TOOLS.iter().any(|&tool| content.contains(tool))
+}
+
 /// Extract a compact summary of tool interactions from history messages added
 /// during `run_tool_call_loop`. Scans assistant messages for `<tool_call>` tags
 /// or native tool-call JSON to collect tool names used.
@@ -1579,6 +1655,8 @@ async fn process_channel_message(
         msg.sender,
         truncate_with_ellipsis(&msg.content, 200)
     );
+    // elfClaw: log incoming channel message
+    crate::elfclaw_log::log_channel_message(&msg.channel, "incoming", &msg.sender, &msg.reply_target);
     runtime_trace::record_event(
         "channel_message_inbound",
         Some(msg.channel.as_str()),
@@ -1668,7 +1746,14 @@ async fn process_channel_message(
         .is_some_and(|turns| !turns.is_empty());
 
     // Preserve user turn before the LLM call so interrupted requests keep context.
-    append_sender_turn(ctx.as_ref(), &history_key, ChatMessage::user(&msg.content));
+    // elfClaw: prefix user messages with timestamp for temporal context
+    let ts_prefix = crate::elfclaw_log::format_unix_timestamp(msg.timestamp);
+    let timestamped_content = if ts_prefix.is_empty() {
+        msg.content.clone()
+    } else {
+        format!("{ts_prefix} {}", msg.content)
+    };
+    append_sender_turn(ctx.as_ref(), &history_key, ChatMessage::user(&timestamped_content));
 
     // Persist user turn to local chat log
     if ctx.chat_log_config.enabled && msg.channel == "telegram" {
@@ -1719,6 +1804,10 @@ async fn process_channel_message(
     let mut system_prompt =
         build_channel_system_prompt(ctx.system_prompt.as_str(), &msg.channel, &msg.reply_target);
 
+    // elfClaw: inject dynamic runtime status (cron jobs, autonomy, agents) so agent
+    // knows its current environment and can self-diagnose tool/config issues
+    system_prompt.push_str(&build_runtime_status_section(&ctx.config));
+
     // Inject cross-user chat summaries for the owner only
     if ctx.chat_log_config.enabled && msg.channel == "telegram" {
         let is_owner = ctx
@@ -1768,6 +1857,30 @@ async fn process_channel_message(
     let system_prompt_for_retry = system_prompt.clone();
     let mut history = vec![ChatMessage::system(system_prompt)];
     history.extend(prior_turns);
+
+    // elfClaw: Fix 3 — inject turn boundary to prevent Gemini from replaying prior action tools.
+    // Gemini 2.5 Pro's thinking layer tends to "continue" tasks it sees in history even after they
+    // are done, spontaneously re-sending voice/email/telegram messages on unrelated user turns.
+    // If prior assistant turns reference action tools, insert an explicit completion marker
+    // immediately before the current user message so the model has a clear task boundary.
+    //
+    // Structure: history = [system(0), ...prior_turns..., current_user_msg(last)]
+    // We inject between prior_turns and current_user_msg when prior_turns contain action refs.
+    if history.len() >= 3 {
+        // history[1..len-1] = prior assistant/user turns (excludes system and current user msg)
+        let prior_end = history.len() - 1;
+        if history[1..prior_end]
+            .iter()
+            .any(|m| contains_action_tool_summary(&m.content))
+        {
+            let boundary = ChatMessage::user(
+                "[SYSTEM] The previous tasks listed above are COMPLETE and must NOT be repeated. \
+                 Now respond ONLY to the following new user message."
+                    .to_string(),
+            );
+            history.insert(prior_end, boundary);
+        }
+    }
     let use_streaming = target_channel
         .as_ref()
         .is_some_and(|ch| ch.supports_draft_updates());
@@ -2047,10 +2160,23 @@ async fn process_channel_message(
                 format!("{tool_summary}\n{delivered_response}")
             };
 
+            // elfClaw: prefix assistant response with timestamp
+            let asst_ts = crate::elfclaw_log::format_unix_timestamp(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            );
+            let timestamped_response = if asst_ts.is_empty() {
+                history_response.clone()
+            } else {
+                format!("{asst_ts} {history_response}")
+            };
+
             append_sender_turn(
                 ctx.as_ref(),
                 &history_key,
-                ChatMessage::assistant(&history_response),
+                ChatMessage::assistant(&timestamped_response),
             );
 
             // Persist assistant turn to local chat log
@@ -2671,9 +2797,20 @@ pub fn build_system_prompt_with_mode(
     // ── 7. Runtime ──────────────────────────────────────────────
     let host =
         hostname::get().map_or_else(|_| "unknown".into(), |h| h.to_string_lossy().to_string());
+
+    // elfClaw: inject platform details so LLM adapts shell commands to current OS
+    #[cfg(windows)]
+    let platform_hint = "Shell: PowerShell. Use `python` (not `python3`). Use PowerShell syntax.";
+    #[cfg(target_os = "macos")]
+    let platform_hint = "Shell: sh (macOS). Use `python3` for Python.";
+    #[cfg(target_os = "linux")]
+    let platform_hint = "Shell: sh (Linux). Use `python3` for Python.";
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+    let platform_hint = "Shell: sh.";
+
     let _ = writeln!(
         prompt,
-        "## Runtime\n\nHost: {host} | OS: {} | Model: {model_name}\n",
+        "## Runtime\n\nHost: {host} | OS: {} | Model: {model_name}\n{platform_hint}\n",
         std::env::consts::OS,
     );
 
@@ -3363,6 +3500,20 @@ pub async fn deliver_to_channel(
         }
     }
 
+    // elfClaw: try live channel instance first (shared with running channels runtime).
+    // This is the primary delivery path when channels runtime is active (daemon mode).
+    // Works for ALL channel types — whichever channels are started get registered globally.
+    let needle = channel.to_ascii_lowercase();
+    if let Some(live) = get_live_channel(&needle) {
+        tracing::info!(channel = %channel, target = %target, "Cron delivery: sending via live channel instance");
+        return live
+            .send(&crate::channels::traits::SendMessage::new(text, target))
+            .await;
+    }
+
+    // elfClaw: fallback — create ad-hoc channel instance when runtime is not active
+    // (e.g. CLI-only mode, standalone scheduler without channels runtime)
+    tracing::debug!(channel = %channel, "No live channel instance available; creating ad-hoc instance for delivery");
     let channels = collect_configured_channels(config, "deliver_to_channel");
     let needle = channel.to_ascii_lowercase();
     let found = channels
@@ -3397,6 +3548,8 @@ pub async fn start_channels(config: Config) -> Result<()> {
         zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
         secrets_encrypt: config.secrets.encrypt,
         reasoning_enabled: config.runtime.reasoning_enabled,
+        // elfClaw: pass reasoning_level for Gemini thinkingConfig; other providers ignore it
+        reasoning_level: config.provider.reasoning_level.clone(),
         ..providers::ProviderRuntimeOptions::default()
     };
     let provider: Arc<dyn Provider> = Arc::from(
@@ -3430,8 +3583,9 @@ pub async fn start_channels(config: Config) -> Result<()> {
         );
     }
 
+    // elfClaw: wrap observer with ElfClawObserver for SQLite logging + SSE broadcast
     let observer: Arc<dyn Observer> =
-        Arc::from(observability::create_observer(&config.observability));
+        Arc::new(crate::elfclaw_log::wrap_observer(observability::create_observer(&config.observability)));
     let runtime: Arc<dyn runtime::RuntimeAdapter> =
         Arc::from(runtime::create_runtime(&config.runtime)?);
     let security = Arc::new(SecurityPolicy::from_config(
@@ -3676,6 +3830,12 @@ pub async fn start_channels(config: Config) -> Result<()> {
             .map(|ch| (ch.name().to_string(), Arc::clone(ch)))
             .collect::<HashMap<_, _>>(),
     );
+
+    // elfClaw: register all live channel instances to global registry so that
+    // cross-subsystem delivery (cron, daemon, heartbeat) can use active instances
+    // instead of creating ad-hoc ones. Any configured channel is available for delivery.
+    register_live_channels(&channels_by_name);
+
     let max_in_flight_messages = compute_max_in_flight_messages(channels.len());
 
     println!("  🚦 In-flight message limit: {max_in_flight_messages}");
@@ -3763,6 +3923,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         tts_config: config.tts.clone(),
         chat_log_config: config.chat_log.clone(),
         worker_model: config.worker_model.clone(), // elfClaw
+        config: Arc::new(config.clone()), // elfClaw: full config for runtime status injection
     });
 
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
@@ -3978,6 +4139,8 @@ mod tests {
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tts_config: Default::default(),
             chat_log_config: Default::default(),
+            worker_model: None,
+            config: Arc::new(crate::config::Config::default()), // elfClaw: test default
         };
 
         assert!(compact_sender_history(&ctx, &sender));
@@ -4029,6 +4192,8 @@ mod tests {
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tts_config: Default::default(),
             chat_log_config: Default::default(),
+            worker_model: None,
+            config: Arc::new(crate::config::Config::default()), // elfClaw: test default
         };
 
         append_sender_turn(&ctx, &sender, ChatMessage::user("hello"));
@@ -4083,6 +4248,8 @@ mod tests {
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tts_config: Default::default(),
             chat_log_config: Default::default(),
+            worker_model: None,
+            config: Arc::new(crate::config::Config::default()), // elfClaw: test default
         };
 
         assert!(rollback_orphan_user_turn(&ctx, &sender, "pending"));
@@ -4560,6 +4727,8 @@ BTC is currently around $65,000 based on latest tool output."#
             chat_log_config: Default::default(),
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
+            worker_model: None,
+            config: Arc::new(crate::config::Config::default()), // elfClaw: test default
         });
 
         process_channel_message(
@@ -4621,6 +4790,8 @@ BTC is currently around $65,000 based on latest tool output."#
             chat_log_config: Default::default(),
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
+            worker_model: None,
+            config: Arc::new(crate::config::Config::default()), // elfClaw: test default
         });
 
         process_channel_message(
@@ -4696,6 +4867,8 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tts_config: Default::default(),
             chat_log_config: Default::default(),
+            worker_model: None,
+            config: Arc::new(crate::config::Config::default()), // elfClaw: test default
         });
 
         process_channel_message(
@@ -4757,6 +4930,8 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tts_config: Default::default(),
             chat_log_config: Default::default(),
+            worker_model: None,
+            config: Arc::new(crate::config::Config::default()), // elfClaw: test default
         });
 
         process_channel_message(
@@ -4827,6 +5002,8 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tts_config: Default::default(),
             chat_log_config: Default::default(),
+            worker_model: None,
+            config: Arc::new(crate::config::Config::default()), // elfClaw: test default
         });
 
         process_channel_message(
@@ -4918,6 +5095,8 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tts_config: Default::default(),
             chat_log_config: Default::default(),
+            worker_model: None,
+            config: Arc::new(crate::config::Config::default()), // elfClaw: test default
         });
 
         process_channel_message(
@@ -4991,6 +5170,8 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tts_config: Default::default(),
             chat_log_config: Default::default(),
+            worker_model: None,
+            config: Arc::new(crate::config::Config::default()), // elfClaw: test default
         });
 
         process_channel_message(
@@ -5080,6 +5261,8 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tts_config: Default::default(),
             chat_log_config: Default::default(),
+            worker_model: None,
+            config: Arc::new(crate::config::Config::default()), // elfClaw: test default
         });
 
         process_channel_message(
@@ -5153,6 +5336,8 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tts_config: Default::default(),
             chat_log_config: Default::default(),
+            worker_model: None,
+            config: Arc::new(crate::config::Config::default()), // elfClaw: test default
         });
 
         process_channel_message(
@@ -5215,6 +5400,8 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tts_config: Default::default(),
             chat_log_config: Default::default(),
+            worker_model: None,
+            config: Arc::new(crate::config::Config::default()), // elfClaw: test default
         });
 
         process_channel_message(
@@ -5396,6 +5583,8 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tts_config: Default::default(),
             chat_log_config: Default::default(),
+            worker_model: None,
+            config: Arc::new(crate::config::Config::default()), // elfClaw: test default
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
@@ -5478,6 +5667,8 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tts_config: Default::default(),
             chat_log_config: Default::default(),
+            worker_model: None,
+            config: Arc::new(crate::config::Config::default()), // elfClaw: test default
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -5572,6 +5763,8 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tts_config: Default::default(),
             chat_log_config: Default::default(),
+            worker_model: None,
+            config: Arc::new(crate::config::Config::default()), // elfClaw: test default
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -5648,6 +5841,8 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tts_config: Default::default(),
             chat_log_config: Default::default(),
+            worker_model: None,
+            config: Arc::new(crate::config::Config::default()), // elfClaw: test default
         });
 
         process_channel_message(
@@ -5709,6 +5904,8 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tts_config: Default::default(),
             chat_log_config: Default::default(),
+            worker_model: None,
+            config: Arc::new(crate::config::Config::default()), // elfClaw: test default
         });
 
         process_channel_message(
@@ -6230,6 +6427,8 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tts_config: Default::default(),
             chat_log_config: Default::default(),
+            worker_model: None,
+            config: Arc::new(crate::config::Config::default()), // elfClaw: test default
         });
 
         process_channel_message(
@@ -6317,6 +6516,8 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tts_config: Default::default(),
             chat_log_config: Default::default(),
+            worker_model: None,
+            config: Arc::new(crate::config::Config::default()), // elfClaw: test default
         });
 
         process_channel_message(
@@ -6404,6 +6605,8 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tts_config: Default::default(),
             chat_log_config: Default::default(),
+            worker_model: None,
+            config: Arc::new(crate::config::Config::default()), // elfClaw: test default
         });
 
         process_channel_message(
@@ -6961,6 +7164,8 @@ This is an example JSON object for profile settings."#;
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tts_config: Default::default(),
             chat_log_config: Default::default(),
+            worker_model: None,
+            config: Arc::new(crate::config::Config::default()), // elfClaw: test default
         });
 
         // Simulate a photo attachment message with [IMAGE:] marker.
@@ -7029,6 +7234,8 @@ This is an example JSON object for profile settings."#;
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tts_config: Default::default(),
             chat_log_config: Default::default(),
+            worker_model: None,
+            config: Arc::new(crate::config::Config::default()), // elfClaw: test default
         });
 
         process_channel_message(

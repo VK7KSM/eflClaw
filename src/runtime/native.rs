@@ -43,9 +43,29 @@ impl RuntimeAdapter for NativeRuntime {
         command: &str,
         workspace_dir: &Path,
     ) -> anyhow::Result<tokio::process::Command> {
-        let mut process = tokio::process::Command::new("sh");
-        process.arg("-c").arg(command).current_dir(workspace_dir);
-        Ok(process)
+        // elfClaw: On Windows, sh (Git Bash) may not be in PATH.
+        // PowerShell is available on all Windows 10+ systems and supports uv run,
+        // python, pipes (|), and compound commands (;) used by LLM-generated scripts.
+        #[cfg(windows)]
+        {
+            // elfClaw: normalize python3 → python on Windows (python3 doesn't exist on Windows)
+            let command = if command.starts_with("python3 ") || command == "python3" {
+                command.replacen("python3", "python", 1)
+            } else {
+                command.to_string()
+            };
+            let mut process = tokio::process::Command::new("powershell");
+            process
+                .args(["-NoProfile", "-NonInteractive", "-Command", &command])
+                .current_dir(workspace_dir);
+            return Ok(process);
+        }
+        #[cfg(not(windows))]
+        {
+            let mut process = tokio::process::Command::new("sh");
+            process.arg("-c").arg(command).current_dir(workspace_dir);
+            Ok(process)
+        }
     }
 }
 

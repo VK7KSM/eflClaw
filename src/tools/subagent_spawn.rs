@@ -179,7 +179,7 @@ impl Tool for SubAgentSpawnTool {
         let provider_credential = provider_credential_owned.as_ref().map(String::as_str);
 
         let provider: Box<dyn Provider> = match providers::create_provider_with_options(
-            &agent_config.provider,
+            agent_config.provider.as_deref().unwrap_or(""),
             provider_credential,
             &self.provider_runtime_options,
         ) {
@@ -190,7 +190,7 @@ impl Tool for SubAgentSpawnTool {
                     output: String::new(),
                     error: Some(format!(
                         "Failed to create provider '{}' for agent '{agent_name}': {e}",
-                        agent_config.provider
+                        agent_config.provider.as_deref().unwrap_or("(none)")
                     )),
                 });
             }
@@ -303,7 +303,7 @@ async fn run_simple_background(
         provider.chat_with_system(
             agent_config.system_prompt.as_deref(),
             full_prompt,
-            &agent_config.model,
+            agent_config.model.as_deref().unwrap_or(""),
             temperature,
         ),
     )
@@ -334,8 +334,8 @@ async fn run_simple_background(
                 success: true,
                 output: format!(
                     "[Agent '{agent_name}' ({provider}/{model})]\n{rendered}",
-                    provider = agent_config.provider,
-                    model = agent_config.model
+                    provider = agent_config.provider.as_deref().unwrap_or("(none)"),
+                    model = agent_config.model.as_deref().unwrap_or("(none)")
                 ),
                 error: None,
             })
@@ -453,8 +453,8 @@ async fn run_agentic_background(
             &mut history,
             &sub_tools,
             &noop_observer,
-            &agent_config.provider,
-            &agent_config.model,
+            &agent_config.provider.as_deref().unwrap_or(""),
+            &agent_config.model.as_deref().unwrap_or(""),
             temperature,
             true,
             None,
@@ -481,8 +481,8 @@ async fn run_agentic_background(
                 success: true,
                 output: format!(
                     "[Agent '{agent_name}' ({provider}/{model}, agentic)]\n{rendered}",
-                    provider = agent_config.provider,
-                    model = agent_config.model
+                    provider = agent_config.provider.as_deref().unwrap_or("(none)"),
+                    model = agent_config.model.as_deref().unwrap_or("(none)")
                 ),
                 error: None,
             })

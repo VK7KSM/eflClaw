@@ -1,9 +1,10 @@
 use super::traits::{Tool, ToolResult};
+use crate::channels::split_message_for_telegram;
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 
 const TELEGRAM_API_TIMEOUT_SECS: u64 = 15;
 
@@ -92,13 +93,73 @@ impl Tool for SendTelegramTool {
             10,
         );
 
+        // elfClaw: split long messages into chunks that fit Telegram's 4096 char limit
+        let chunks = split_message_for_telegram(&message);
+        let total = chunks.len();
+
+        for (i, chunk) in chunks.iter().enumerate() {
+            // Add continuation markers for multi-chunk messages
+            let text = if total == 1 {
+                chunk.clone()
+            } else if i == 0 {
+                format!("{chunk}\n\n_(continues... {}/{total})_", i + 1)
+            } else if i < total - 1 {
+                format!("_(continued {}/{total})_\n\n{chunk}\n\n_(continues...)_", i + 1)
+            } else {
+                format!("_(continued {}/{total})_\n\n{chunk}", i + 1)
+            };
+
+            if let Err(e) = self.send_one_chunk(&client, &url, &chat_id, &text, i, total).await {
+                warn!(
+                    chat_id = %chat_id,
+                    chunk = i + 1,
+                    total = total,
+                    error = %e,
+                    "send_telegram chunk failed"
+                );
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!(
+                        "Failed to send chunk {}/{total} to {chat_id}: {e}",
+                        i + 1
+                    )),
+                });
+            }
+
+            // Brief pause between chunks to respect rate limits
+            if total > 1 && i < total - 1 {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+
+        Ok(ToolResult {
+            success: true,
+            output: format!("Message sent to chat_id {chat_id} ({total} chunk(s))"),
+            error: None,
+        })
+    }
+}
+
+impl SendTelegramTool {
+    /// Send a single chunk with Markdown parse_mode, falling back to plain text
+    /// if Telegram can't parse the entities. Logs message_id on success, warns on failure.
+    async fn send_one_chunk(
+        &self,
+        client: &reqwest::Client,
+        url: &str,
+        chat_id: &str,
+        text: &str,
+        chunk_index: usize,
+        total_chunks: usize,
+    ) -> anyhow::Result<()> {
         let payload = json!({
             "chat_id": chat_id,
-            "text": message,
+            "text": text,
             "parse_mode": "Markdown"
         });
 
-        let response = client.post(&url).json(&payload).send().await?;
+        let response = client.post(url).json(&payload).send().await?;
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
 
@@ -107,41 +168,65 @@ impl Tool for SendTelegramTool {
             if body.contains("can't parse entities") {
                 let payload_plain = json!({
                     "chat_id": chat_id,
-                    "text": message
+                    "text": text
                 });
-                let retry = client.post(&url).json(&payload_plain).send().await?;
+                let retry = client.post(url).json(&payload_plain).send().await?;
                 let retry_status = retry.status();
                 let retry_body = retry.text().await.unwrap_or_default();
 
                 if !retry_status.is_success() {
-                    return Ok(ToolResult {
-                        success: false,
-                        output: retry_body,
-                        error: Some(format!("Telegram API returned status {retry_status}")),
-                    });
+                    // elfClaw: log failure instead of silent return
+                    warn!(
+                        chat_id = %chat_id,
+                        status = %retry_status,
+                        chunk = chunk_index + 1,
+                        total = total_chunks,
+                        "send_telegram failed (plain text fallback)"
+                    );
+                    anyhow::bail!(
+                        "Telegram API returned {retry_status} (plain text fallback)"
+                    );
                 }
 
-                info!("Telegram message sent to {} (plain text fallback)", chat_id);
-                return Ok(ToolResult {
-                    success: true,
-                    output: format!("Message sent to chat_id {chat_id} (plain text)"),
-                    error: None,
-                });
+                let message_id = Self::extract_message_id(&retry_body);
+                info!(
+                    chat_id = %chat_id,
+                    message_id = message_id,
+                    chunk = chunk_index + 1,
+                    total = total_chunks,
+                    "Telegram message sent (plain text fallback)"
+                );
+                return Ok(());
             }
 
-            return Ok(ToolResult {
-                success: false,
-                output: body,
-                error: Some(format!("Telegram API returned status {status}")),
-            });
+            // elfClaw: log non-Markdown failures with warn! (was silent before)
+            warn!(
+                chat_id = %chat_id,
+                status = %status,
+                chunk = chunk_index + 1,
+                total = total_chunks,
+                "send_telegram failed"
+            );
+            anyhow::bail!("Telegram API returned {status}");
         }
 
-        info!("Telegram message sent to {}", chat_id);
-        Ok(ToolResult {
-            success: true,
-            output: format!("Message sent successfully to chat_id {chat_id}"),
-            error: None,
-        })
+        let message_id = Self::extract_message_id(&body);
+        info!(
+            chat_id = %chat_id,
+            message_id = message_id,
+            chunk = chunk_index + 1,
+            total = total_chunks,
+            "Telegram message sent"
+        );
+        Ok(())
+    }
+
+    /// Extract message_id from Telegram API response JSON for tracing.
+    fn extract_message_id(body: &str) -> i64 {
+        serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|v| v["result"]["message_id"].as_i64())
+            .unwrap_or(-1)
     }
 }
 

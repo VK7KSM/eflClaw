@@ -43,6 +43,10 @@ pub struct DelegateTool {
     coordination_bus: Option<InMemoryMessageBus>,
     /// Logical lead agent identity used in coordination trace events.
     coordination_lead_agent: String,
+    /// elfClaw: fallback provider for workers without explicit config (inherits worker_model).
+    fallback_provider: Option<String>,
+    /// elfClaw: fallback model for workers without explicit config (inherits worker_model).
+    fallback_model: Option<String>,
 }
 
 impl DelegateTool {
@@ -76,6 +80,8 @@ impl DelegateTool {
             multimodal_config: crate::config::MultimodalConfig::default(),
             coordination_bus,
             coordination_lead_agent: DEFAULT_COORDINATION_LEAD_AGENT.to_string(),
+            fallback_provider: None,
+            fallback_model: None,
         }
     }
 
@@ -115,6 +121,8 @@ impl DelegateTool {
             multimodal_config: crate::config::MultimodalConfig::default(),
             coordination_bus,
             coordination_lead_agent: DEFAULT_COORDINATION_LEAD_AGENT.to_string(),
+            fallback_provider: None,
+            fallback_model: None,
         }
     }
 
@@ -127,6 +135,18 @@ impl DelegateTool {
     /// Attach multimodal configuration for sub-agent tool loops.
     pub fn with_multimodal_config(mut self, config: crate::config::MultimodalConfig) -> Self {
         self.multimodal_config = config;
+        self
+    }
+
+    /// elfClaw: set fallback provider/model for worker agents that have no explicit config.
+    /// Called with config.default_provider and config.worker_model at construction time.
+    pub fn with_worker_model_fallback(
+        mut self,
+        provider: impl Into<String>,
+        model: impl Into<String>,
+    ) -> Self {
+        self.fallback_provider = Some(provider.into());
+        self.fallback_model = Some(model.into());
         self
     }
 
@@ -296,6 +316,51 @@ impl Tool for DelegateTool {
         let coordination_trace =
             self.start_coordination_trace(agent_name, prompt, context, agent_config);
 
+        // elfClaw: resolve provider/model — prefer agent-specific config, fall back to worker_model
+        let effective_provider = agent_config
+            .provider
+            .as_deref()
+            .or(self.fallback_provider.as_deref())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Agent '{agent_name}' has no provider configured and no worker_model fallback set"
+                )
+            })?
+            .to_string();
+        let effective_model = agent_config
+            .model
+            .as_deref()
+            .or(self.fallback_model.as_deref())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Agent '{agent_name}' has no model configured and no worker_model fallback set"
+                )
+            })?
+            .to_string();
+
+        // elfClaw: log delegate start for worker visibility
+        tracing::info!(
+            agent = %agent_name,
+            provider = %effective_provider,
+            model = %effective_model,
+            agentic = %agent_config.agentic,
+            "Delegate: starting sub-agent"
+        );
+
+        // elfClaw: warn when agent uses different provider than default (helps detect stale configs)
+        if agent_config.provider.is_some() {
+            if let Some(ref fallback) = self.fallback_provider {
+                if effective_provider != *fallback {
+                    tracing::warn!(
+                        agent = %agent_name,
+                        agent_provider = %effective_provider,
+                        default_provider = %fallback,
+                        "Delegate: agent uses explicit provider different from default — check agent config"
+                    );
+                }
+            }
+        }
+
         // Create provider for this agent
         let provider_credential_owned = agent_config
             .api_key
@@ -305,15 +370,14 @@ impl Tool for DelegateTool {
         let provider_credential = provider_credential_owned.as_ref().map(String::as_str);
 
         let provider: Box<dyn Provider> = match providers::create_provider_with_options(
-            &agent_config.provider,
+            &effective_provider,
             provider_credential,
             &self.provider_runtime_options,
         ) {
             Ok(p) => p,
             Err(e) => {
                 let error_message = format!(
-                    "Failed to create provider '{}' for agent '{agent_name}': {e}",
-                    agent_config.provider
+                    "Failed to create provider '{effective_provider}' for agent '{agent_name}': {e}"
                 );
                 self.finish_coordination_trace(
                     agent_name,
@@ -347,6 +411,8 @@ impl Tool for DelegateTool {
                     &*provider,
                     &full_prompt,
                     temperature,
+                    &effective_provider,
+                    &effective_model,
                 )
                 .await?;
 
@@ -365,6 +431,17 @@ impl Tool for DelegateTool {
                 summary,
             );
 
+            // elfClaw: log agentic delegate completion with success/failure detail
+            if result.success {
+                tracing::info!(agent = %agent_name, "Delegate: sub-agent (agentic) completed successfully");
+            } else {
+                tracing::warn!(
+                    agent = %agent_name,
+                    error = ?result.error,
+                    "Delegate: sub-agent (agentic) completed with failure"
+                );
+            }
+
             return Ok(result);
         }
 
@@ -374,7 +451,7 @@ impl Tool for DelegateTool {
             provider.chat_with_system(
                 agent_config.system_prompt.as_deref(),
                 &full_prompt,
-                &agent_config.model,
+                &effective_model,
                 temperature,
             ),
         )
@@ -406,11 +483,16 @@ impl Tool for DelegateTool {
                     rendered = "[Empty response]".to_string();
                 }
                 let output = format!(
-                    "[Agent '{agent_name}' ({provider}/{model})]\n{rendered}",
-                    provider = agent_config.provider,
-                    model = agent_config.model
+                    "[Agent '{agent_name}' ({effective_provider}/{effective_model})]\n{rendered}",
                 );
                 self.finish_coordination_trace(agent_name, &coordination_trace, true, &output);
+
+                // elfClaw: log delegate completion
+                tracing::info!(
+                    agent = %agent_name,
+                    output_len = %output.len(),
+                    "Delegate: sub-agent completed"
+                );
 
                 Ok(ToolResult {
                     success: true,
@@ -444,6 +526,8 @@ impl DelegateTool {
         provider: &dyn Provider,
         full_prompt: &str,
         temperature: f64,
+        effective_provider: &str, // elfClaw: resolved provider name
+        effective_model: &str,    // elfClaw: resolved model name
     ) -> anyhow::Result<ToolResult> {
         if agent_config.allowed_tools.is_empty() {
             return Ok(ToolResult {
@@ -496,8 +580,8 @@ impl DelegateTool {
                 &mut history,
                 &sub_tools,
                 &noop_observer,
-                &agent_config.provider,
-                &agent_config.model,
+                effective_provider,
+                effective_model,
                 temperature,
                 true,
                 None,
@@ -523,18 +607,20 @@ impl DelegateTool {
                 Ok(ToolResult {
                     success: true,
                     output: format!(
-                        "[Agent '{agent_name}' ({provider}/{model}, agentic)]\n{rendered}",
-                        provider = agent_config.provider,
-                        model = agent_config.model
+                        "[Agent '{agent_name}' ({effective_provider}/{effective_model}, agentic)]\n{rendered}",
                     ),
                     error: None,
                 })
             }
-            Ok(Err(e)) => Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!("Agent '{agent_name}' failed: {e}")),
-            }),
+            Ok(Err(e)) => {
+                // elfClaw: log the actual error so terminal user can diagnose
+                tracing::warn!(agent = %agent_name, error = %e, "Delegate: sub-agent (agentic) failed");
+                Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("Agent '{agent_name}' failed: {e}")),
+                })
+            }
             Err(_) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -573,8 +659,8 @@ impl DelegateTool {
                 task_id: correlation_id.clone(),
                 summary: text_preview(prompt, COORDINATION_PREVIEW_MAX_CHARS),
                 metadata: json!({
-                    "provider": agent_config.provider,
-                    "model": agent_config.model,
+                    "provider": agent_config.provider.as_deref().unwrap_or("(inherit)"),
+                    "model": agent_config.model.as_deref().unwrap_or("(inherit)"),
                     "agentic": agent_config.agentic,
                     "max_depth": agent_config.max_depth,
                     "max_iterations": agent_config.max_iterations,
@@ -788,8 +874,8 @@ mod tests {
         agents.insert(
             "researcher".to_string(),
             DelegateAgentConfig {
-                provider: "ollama".to_string(),
-                model: "llama3".to_string(),
+                provider: Some("ollama".to_string()),
+                model: Some("llama3".to_string()),
                 system_prompt: Some("You are a research assistant.".to_string()),
                 api_key: None,
                 temperature: Some(0.3),
@@ -802,8 +888,8 @@ mod tests {
         agents.insert(
             "coder".to_string(),
             DelegateAgentConfig {
-                provider: "openrouter".to_string(),
-                model: crate::config::DEFAULT_MODEL_FALLBACK.to_string(),
+                provider: Some("openrouter".to_string()),
+                model: Some(crate::config::DEFAULT_MODEL_FALLBACK.to_string()),
                 system_prompt: None,
                 api_key: Some("delegate-test-credential".to_string()),
                 temperature: None,
@@ -960,8 +1046,8 @@ mod tests {
 
     fn agentic_config(allowed_tools: Vec<String>, max_iterations: usize) -> DelegateAgentConfig {
         DelegateAgentConfig {
-            provider: "openrouter".to_string(),
-            model: "model-test".to_string(),
+            provider: Some("openrouter".to_string()),
+            model: Some("model-test".to_string()),
             system_prompt: Some("You are agentic.".to_string()),
             api_key: Some("delegate-test-credential".to_string()),
             temperature: Some(0.2),

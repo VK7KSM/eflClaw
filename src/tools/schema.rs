@@ -284,6 +284,23 @@ impl SchemaCleanr {
             }
         }
 
+        // elfClaw: Gemini safety — inject missing items for array type.
+        // Gemini rejects function_declarations where a property has type=array but no items.
+        // Individual tool schemas should define items explicitly; this is the last resort.
+        if strategy == CleaningStrategy::Gemini {
+            let type_is_array = cleaned
+                .get("type")
+                .and_then(Value::as_str)
+                .map_or(false, |t| t == "array");
+            if type_is_array && !cleaned.contains_key("items") {
+                tracing::warn!(
+                    "Gemini schema: array property has no 'items' — injecting \
+                     {{\"type\":\"string\"}}; fix the tool schema to be explicit"
+                );
+                cleaned.insert("items".to_string(), serde_json::json!({"type": "string"}));
+            }
+        }
+
         Value::Object(cleaned)
     }
 

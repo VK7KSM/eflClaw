@@ -437,10 +437,11 @@ pub struct ModelProviderConfig {
 /// Provider behavior overrides (`[provider]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
 pub struct ProviderConfig {
-    /// Optional reasoning level override for providers that support explicit levels
-    /// (e.g. OpenAI Codex `/responses` reasoning effort).
+    /// Thinking intensity for providers that support it (0=off/min, 4=max).
+    /// Gemini: 0-4 maps to model-specific thinkingLevel/thinkingBudget.
+    /// Unsupported models ignore this setting.
     #[serde(default)]
-    pub reasoning_level: Option<String>,
+    pub reasoning_level: Option<u8>,
     /// Optional transport override for providers that support multiple transports.
     /// Supported values: "auto", "websocket", "sse".
     ///
@@ -462,10 +463,14 @@ pub struct ProviderConfig {
 /// Configuration for a delegate sub-agent used by the `delegate` tool.
 #[derive(Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DelegateAgentConfig {
-    /// Provider name (e.g. "ollama", "openrouter", "anthropic")
-    pub provider: String,
-    /// Model name
-    pub model: String,
+    /// Provider name (e.g. "ollama", "openrouter", "anthropic").
+    /// elfClaw: optional — agents without explicit provider inherit worker_model fallback.
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// Model name.
+    /// elfClaw: optional — agents without explicit model inherit worker_model fallback.
+    #[serde(default)]
+    pub model: Option<String>,
     /// Optional system prompt for the sub-agent
     #[serde(default)]
     pub system_prompt: Option<String>,
@@ -3072,7 +3077,7 @@ pub struct ObservabilityConfig {
 impl Default for ObservabilityConfig {
     fn default() -> Self {
         Self {
-            backend: "none".into(),
+            backend: "log".into(), // elfClaw: default to "log" so tracing output is visible
             otel_endpoint: None,
             otel_service_name: None,
             runtime_trace_mode: default_runtime_trace_mode(),
@@ -3083,6 +3088,8 @@ impl Default for ObservabilityConfig {
 }
 
 fn default_runtime_trace_mode() -> String {
+    // elfClaw: elfclaw-logs.db (SQLite WAL) replaces runtime_trace; default back to "none"
+    // to eliminate Windows file-lock races (os error 5) on high-concurrency write paths.
     "none".to_string()
 }
 
@@ -3473,7 +3480,7 @@ pub struct RuntimeConfig {
     /// - Legacy key accepted for compatibility: `runtime.reasoning_level`
     /// - When both are set, provider-level value wins.
     #[serde(default)]
-    pub reasoning_level: Option<String>,
+    pub reasoning_level: Option<u8>,
 }
 
 /// Docker runtime configuration (`[runtime.docker]` section).
@@ -7362,14 +7369,31 @@ impl Config {
         }
     }
 
-    fn normalize_reasoning_level_override(raw: Option<&str>, source: &str) -> Option<String> {
+    fn normalize_reasoning_level_override(raw: Option<&str>, source: &str) -> Option<u8> {
         let value = raw?.trim();
         if value.is_empty() {
             return None;
         }
+        // Try numeric 0-4 first (new canonical format)
+        if let Ok(n) = value.parse::<u8>() {
+            if n <= 4 {
+                return Some(n);
+            }
+            tracing::warn!(
+                reasoning_level = %value,
+                source,
+                "Ignoring out-of-range reasoning level (valid: 0-4)"
+            );
+            return None;
+        }
+        // Legacy string support for backwards compatibility with env overrides
         let normalized = value.to_ascii_lowercase().replace(['-', '_'], "");
         match normalized.as_str() {
-            "minimal" | "low" | "medium" | "high" | "xhigh" => Some(normalized),
+            "minimal" => Some(0),
+            "low"     => Some(1),
+            "medium"  => Some(2),
+            "high"    => Some(3),
+            "xhigh"   => Some(4),
             _ => {
                 tracing::warn!(
                     reasoning_level = %value,
@@ -7408,15 +7432,9 @@ impl Config {
     /// Priority:
     /// 1) `provider.reasoning_level` (canonical)
     /// 2) `runtime.reasoning_level` (deprecated compatibility alias)
-    pub fn effective_provider_reasoning_level(&self) -> Option<String> {
-        let provider_level = Self::normalize_reasoning_level_override(
-            self.provider.reasoning_level.as_deref(),
-            "provider.reasoning_level",
-        );
-        let runtime_level = Self::normalize_reasoning_level_override(
-            self.runtime.reasoning_level.as_deref(),
-            "runtime.reasoning_level",
-        );
+    pub fn effective_provider_reasoning_level(&self) -> Option<u8> {
+        let provider_level = self.provider.reasoning_level;
+        let runtime_level = self.runtime.reasoning_level;
 
         match (provider_level, runtime_level) {
             (Some(provider_level), Some(runtime_level)) => {
@@ -9366,8 +9384,8 @@ mod tests {
     #[test]
     async fn observability_config_default() {
         let o = ObservabilityConfig::default();
-        assert_eq!(o.backend, "none");
-        assert_eq!(o.runtime_trace_mode, "none");
+        assert_eq!(o.backend, "log"); // elfClaw: changed default from "none" to "log"
+        assert_eq!(o.runtime_trace_mode, "none"); // elfClaw: reverted to "none" (Fix 15a) — elfclaw-logs.db supersedes runtime_trace
         assert_eq!(o.runtime_trace_path, "state/runtime-trace.jsonl");
         assert_eq!(o.runtime_trace_max_entries, 200);
     }
@@ -9952,14 +9970,14 @@ default_temperature = 0.7
 default_temperature = 0.7
 
 [provider]
-reasoning_level = "high"
+reasoning_level = 3
 "#;
 
         let parsed: Config = toml::from_str(raw).unwrap();
-        assert_eq!(parsed.provider.reasoning_level.as_deref(), Some("high"));
+        assert_eq!(parsed.provider.reasoning_level, Some(3u8));
         assert_eq!(
-            parsed.effective_provider_reasoning_level().as_deref(),
-            Some("high")
+            parsed.effective_provider_reasoning_level(),
+            Some(3u8)
         );
     }
 
@@ -9969,14 +9987,14 @@ reasoning_level = "high"
 default_temperature = 0.7
 
 [runtime]
-reasoning_level = "xhigh"
+reasoning_level = 4
 "#;
 
         let parsed: Config = toml::from_str(raw).unwrap();
-        assert_eq!(parsed.runtime.reasoning_level.as_deref(), Some("xhigh"));
+        assert_eq!(parsed.runtime.reasoning_level, Some(4u8));
         assert_eq!(
-            parsed.effective_provider_reasoning_level().as_deref(),
-            Some("xhigh")
+            parsed.effective_provider_reasoning_level(),
+            Some(4u8)
         );
     }
 
@@ -9986,16 +10004,16 @@ reasoning_level = "xhigh"
 default_temperature = 0.7
 
 [provider]
-reasoning_level = "medium"
+reasoning_level = 2
 
 [runtime]
-reasoning_level = "high"
+reasoning_level = 3
 "#;
 
         let parsed: Config = toml::from_str(raw).unwrap();
         assert_eq!(
-            parsed.effective_provider_reasoning_level().as_deref(),
-            Some("medium")
+            parsed.effective_provider_reasoning_level(),
+            Some(2u8)
         );
     }
 
@@ -12627,10 +12645,10 @@ default_model = "legacy-model"
 
         std::env::set_var("ZEROCLAW_REASONING_LEVEL", "xhigh");
         config.apply_env_overrides();
-        assert_eq!(config.runtime.reasoning_level.as_deref(), Some("xhigh"));
+        assert_eq!(config.runtime.reasoning_level, Some(4u8));
         assert_eq!(
-            config.effective_provider_reasoning_level().as_deref(),
-            Some("xhigh")
+            config.effective_provider_reasoning_level(),
+            Some(4u8)
         );
 
         std::env::remove_var("ZEROCLAW_REASONING_LEVEL");
@@ -12640,11 +12658,11 @@ default_model = "legacy-model"
     async fn env_override_reasoning_level_alias_invalid_ignored() {
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
-        config.runtime.reasoning_level = Some("medium".to_string());
+        config.runtime.reasoning_level = Some(2u8);
 
         std::env::set_var("ZEROCLAW_REASONING_LEVEL", "invalid");
         config.apply_env_overrides();
-        assert_eq!(config.runtime.reasoning_level.as_deref(), Some("medium"));
+        assert_eq!(config.runtime.reasoning_level, Some(2u8));
 
         std::env::remove_var("ZEROCLAW_REASONING_LEVEL");
     }
