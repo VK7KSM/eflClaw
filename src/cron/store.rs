@@ -27,12 +27,51 @@ pub fn add_job(config: &Config, expression: &str, command: &str) -> Result<CronJ
     add_shell_job(config, None, schedule, command)
 }
 
+// elfClaw: find an existing job by name for idempotent deduplication
+pub fn find_job_by_name(config: &Config, name: &str) -> Result<Option<CronJob>> {
+    with_connection(config, |conn| {
+        let mut stmt = conn.prepare(
+            "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
+                    enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
+                    delegate_to
+             FROM cron_jobs WHERE name = ?1 LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![name])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(map_cron_job_row(row)?))
+        } else {
+            Ok(None)
+        }
+    })
+}
+
 pub fn add_shell_job(
     config: &Config,
     name: Option<String>,
     schedule: Schedule,
     command: &str,
 ) -> Result<CronJob> {
+    // elfClaw: idempotent dedup — if a job with the same name already exists, update it
+    if let Some(ref job_name) = name {
+        if let Ok(Some(existing)) = find_job_by_name(config, job_name) {
+            tracing::info!(
+                job_id = %existing.id,
+                name = %job_name,
+                "Cron dedup: updating existing shell job instead of creating duplicate"
+            );
+            crate::elfclaw_log::log_cron_event(
+                &existing.id, job_name, "dedup_update",
+                serde_json::json!({"action": "updated existing shell job"}),
+            );
+            let patch = CronJobPatch {
+                schedule: Some(schedule),
+                command: Some(command.to_string()),
+                ..CronJobPatch::default()
+            };
+            return update_job(config, &existing.id, patch);
+        }
+    }
+
     let now = Utc::now();
     validate_schedule(&schedule, now)?;
     let next_run = next_run_for_schedule(&schedule, now)?;
@@ -64,6 +103,11 @@ pub fn add_shell_job(
         Ok(())
     })?;
 
+    // elfClaw: log new job creation
+    if let Some(ref job_name) = name {
+        crate::elfclaw_log::log_cron_event(&id, job_name, "created", serde_json::json!({"type": "shell"}));
+    }
+
     get_job(config, &id)
 }
 
@@ -79,6 +123,32 @@ pub fn add_agent_job(
     delete_after_run: bool,
     delegate_to: Option<String>,
 ) -> Result<CronJob> {
+    // elfClaw: idempotent dedup — if a job with the same name already exists, update it
+    if let Some(ref job_name) = name {
+        if let Ok(Some(existing)) = find_job_by_name(config, job_name) {
+            tracing::info!(
+                job_id = %existing.id,
+                name = %job_name,
+                "Cron dedup: updating existing agent job instead of creating duplicate"
+            );
+            crate::elfclaw_log::log_cron_event(
+                &existing.id, job_name, "dedup_update",
+                serde_json::json!({"action": "updated existing agent job"}),
+            );
+            let patch = CronJobPatch {
+                schedule: Some(schedule),
+                prompt: Some(prompt.to_string()),
+                model: model.clone(),
+                delivery: delivery.clone(),
+                session_target: Some(session_target),
+                delete_after_run: Some(delete_after_run),
+                delegate_to: delegate_to.clone(),
+                ..CronJobPatch::default()
+            };
+            return update_job(config, &existing.id, patch);
+        }
+    }
+
     let now = Utc::now();
     validate_schedule(&schedule, now)?;
     let next_run = next_run_for_schedule(&schedule, now)?;
@@ -111,6 +181,11 @@ pub fn add_agent_job(
         .context("Failed to insert cron agent job")?;
         Ok(())
     })?;
+
+    // elfClaw: log new job creation
+    if let Some(ref job_name) = name {
+        crate::elfclaw_log::log_cron_event(&id, job_name, "created", serde_json::json!({"type": "agent"}));
+    }
 
     get_job(config, &id)
 }

@@ -241,8 +241,12 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
 
         // ── Build whole-file prompt (one agent turn) ──
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M %Z");
+        // elfClaw: inject log health check — check errors from the last heartbeat interval
+        let since_mins = u64::from(interval_mins);
         let prompt = format!(
             "[Heartbeat] 当前时间: {now}\n\n\
+             **自动日志检查（必做）**：先使用 `check_logs` 工具（level=error, since_minutes={since_mins}）\
+             检查最近 {since_mins} 分钟内的系统错误。如有错误，将摘要包含在汇报中；无错误则无需提及。\n\n\
              以下是 HEARTBEAT.md 的完整内容：\n\n\
              {content}\n\n\
              请执行以下步骤：\n\
@@ -295,6 +299,8 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
             Err(e) => {
                 crate::health::mark_component_error("heartbeat", e.to_string());
                 tracing::warn!("Heartbeat task failed: {e}");
+                // elfClaw: log heartbeat failure
+                crate::elfclaw_log::log_error("heartbeat", &format!("Heartbeat failed: {e}"), serde_json::json!({}));
             }
         }
 

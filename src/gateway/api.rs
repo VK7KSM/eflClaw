@@ -571,6 +571,41 @@ pub async fn handle_api_pairing_device_revoke(
     Json(serde_json::json!({"status": "ok", "revoked": true, "id": id})).into_response()
 }
 
+// elfClaw: historical logs REST endpoint — feeds Logs web page on mount
+/// GET /api/logs/recent — return recent log entries from elfclaw-logs.db.
+///
+/// Query params (all optional):
+///   - `limit`         max entries to return (default 100, capped 500)
+///   - `level`         filter by level: debug | info | warn | error
+///   - `category`      filter by category (snake_case)
+///   - `since_minutes` only entries from the last N minutes
+pub async fn handle_api_logs_recent(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<LogsRecentParams>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let limit = params.limit.unwrap_or(100).min(500);
+    let entries = crate::elfclaw_log::query_recent(
+        limit,
+        params.level.as_deref(),
+        params.category.as_deref(),
+        params.since_minutes,
+    );
+    Json(entries).into_response()
+}
+
+#[derive(Deserialize)]
+pub struct LogsRecentParams {
+    pub limit: Option<usize>,
+    pub level: Option<String>,
+    pub category: Option<String>,
+    pub since_minutes: Option<u64>,
+}
+
 // ── Helpers ─────────────────────────────────────────────────────
 
 fn normalize_dashboard_config_toml(root: &mut toml::Value) {

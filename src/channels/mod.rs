@@ -555,6 +555,16 @@ fn build_runtime_status_section(config: &crate::config::Config) -> String {
         }
     }
 
+    // elfClaw: explicit log inspection rule — prevents agent from defaulting to shell commands
+    section.push_str(
+        "\n**⚠️ 日志查询规则（必须遵守）**：\
+         当用户要求查看、检查、查询运行日志、错误记录或系统状态时，\
+         **必须首先使用 `check_logs` 工具**。\
+         禁止使用 shell 命令（tail/cat/grep/Get-Content 在 Windows 环境不可用且可能被安全策略拦截）。\
+         `check_logs` 支持过滤：level=error/warn/info/debug，\
+         category=tool_call/cron_job/llm_call/channel_message/system，since_minutes=N。\n"
+    );
+
     section
 }
 
@@ -1645,6 +1655,8 @@ async fn process_channel_message(
         msg.sender,
         truncate_with_ellipsis(&msg.content, 200)
     );
+    // elfClaw: log incoming channel message
+    crate::elfclaw_log::log_channel_message(&msg.channel, "incoming", &msg.sender, &msg.reply_target);
     runtime_trace::record_event(
         "channel_message_inbound",
         Some(msg.channel.as_str()),
@@ -1734,7 +1746,14 @@ async fn process_channel_message(
         .is_some_and(|turns| !turns.is_empty());
 
     // Preserve user turn before the LLM call so interrupted requests keep context.
-    append_sender_turn(ctx.as_ref(), &history_key, ChatMessage::user(&msg.content));
+    // elfClaw: prefix user messages with timestamp for temporal context
+    let ts_prefix = crate::elfclaw_log::format_unix_timestamp(msg.timestamp);
+    let timestamped_content = if ts_prefix.is_empty() {
+        msg.content.clone()
+    } else {
+        format!("{ts_prefix} {}", msg.content)
+    };
+    append_sender_turn(ctx.as_ref(), &history_key, ChatMessage::user(&timestamped_content));
 
     // Persist user turn to local chat log
     if ctx.chat_log_config.enabled && msg.channel == "telegram" {
@@ -2141,10 +2160,23 @@ async fn process_channel_message(
                 format!("{tool_summary}\n{delivered_response}")
             };
 
+            // elfClaw: prefix assistant response with timestamp
+            let asst_ts = crate::elfclaw_log::format_unix_timestamp(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            );
+            let timestamped_response = if asst_ts.is_empty() {
+                history_response.clone()
+            } else {
+                format!("{asst_ts} {history_response}")
+            };
+
             append_sender_turn(
                 ctx.as_ref(),
                 &history_key,
-                ChatMessage::assistant(&history_response),
+                ChatMessage::assistant(&timestamped_response),
             );
 
             // Persist assistant turn to local chat log
@@ -3551,8 +3583,9 @@ pub async fn start_channels(config: Config) -> Result<()> {
         );
     }
 
+    // elfClaw: wrap observer with ElfClawObserver for SQLite logging + SSE broadcast
     let observer: Arc<dyn Observer> =
-        Arc::from(observability::create_observer(&config.observability));
+        Arc::new(crate::elfclaw_log::wrap_observer(observability::create_observer(&config.observability)));
     let runtime: Arc<dyn runtime::RuntimeAdapter> =
         Arc::from(runtime::create_runtime(&config.runtime)?);
     let security = Arc::new(SecurityPolicy::from_config(

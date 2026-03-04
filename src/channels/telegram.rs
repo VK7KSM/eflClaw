@@ -737,10 +737,7 @@ impl TelegramChannel {
             reply_target,
             content,
             channel: "telegram".to_string(),
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
+            timestamp: Self::extract_message_timestamp(message), // elfClaw: use Telegram message.date
             thread_ts: thread_id,
         })
     }
@@ -1637,10 +1634,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             reply_target,
             content,
             channel: "telegram".to_string(),
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
+            timestamp: Self::extract_message_timestamp(message), // elfClaw: use Telegram message.date
             thread_ts: thread_id,
         })
     }
@@ -1785,10 +1779,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             reply_target,
             content,
             channel: "telegram".to_string(),
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
+            timestamp: Self::extract_message_timestamp(message), // elfClaw: use Telegram message.date
             thread_ts: thread_id,
         })
     }
@@ -1812,6 +1803,20 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             username.clone()
         };
         (username, sender_id, sender_identity)
+    }
+
+    // elfClaw: extract Unix timestamp from Telegram message.date field,
+    // falling back to SystemTime::now() if the field is missing.
+    fn extract_message_timestamp(message: &serde_json::Value) -> u64 {
+        message
+            .get("date")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+            })
     }
 
     /// Extract reply context from a Telegram `reply_to_message`, if present.
@@ -1944,10 +1949,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             reply_target,
             content,
             channel: "telegram".to_string(),
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
+            timestamp: Self::extract_message_timestamp(message), // elfClaw: use Telegram message.date
             thread_ts: thread_id,
         })
     }

@@ -2,6 +2,152 @@
 
 ---
 
+## 2026-03-04 — Fix 15: runtime_trace 权限错误修复 + Logs 页面历史记录
+
+### Fix 15a: `src/config/schema.rs` — `default_runtime_trace_mode()` 改回 `"none"`
+
+- **原因**：Fix 13 把默认值改为 `"rolling"`，导致高并发时 Windows 文件锁冲突（os error 5）
+- `elfclaw-logs.db`（SQLite WAL）已完整覆盖 runtime_trace 功能，后者为冗余
+- `default_runtime_trace_mode()` 注释改为说明原因
+- 同步更新单元测试 `observability_config_default`（断言改为 `"none"`）
+
+### Fix 15b: `资料/config.toml` — `runtime_trace_mode = "none"`
+
+- 用户配置与默认值同步，重启后立即停止 runtime-trace.jsonl 写入
+
+### Fix 15c: `src/gateway/api.rs` — 新增历史日志端点
+
+- 新增 `pub async fn handle_api_logs_recent()` 和 `LogsRecentParams` struct
+- 调用 `crate::elfclaw_log::query_recent()` 查询 SQLite，返回 JSON
+- 参数：`limit`（默认100，上限500）、`level`、`category`、`since_minutes`
+- 鉴权通过 `require_auth()` 实现
+
+### Fix 15d: `src/gateway/mod.rs` — 注册 `/api/logs/recent` 路由
+
+- 紧接 `/api/events` SSE 路由之后注册，1 行改动
+
+### Fix 15e: `web/src/types/api.ts` — 新增 `ElfClawLogEntry` 接口
+
+- 镜像后端 `src/elfclaw_log/types.rs` 的 `LogEntry` 结构
+- 字段：`id`, `timestamp`, `level`, `category`, `component`, `message`, `details`
+
+### Fix 15f: `web/src/pages/Logs.tsx` — 挂载时加载历史
+
+- 新增 `loadHistory()` 异步函数：`apiFetch('/api/logs/recent?limit=100')` 读取历史
+- 历史条目转换为 `LogEntry[]`，倒序（最旧在前）注入 `entries` 初始状态
+- 与 SSE 连接并发执行（`void loadHistory()`），不阻塞实时流
+- 失败静默处理，不影响实时 SSE 功能
+- 引入 `apiFetch` 和 `ElfClawLogEntry` 类型
+
+---
+
+## 2026-03-04 — Fix 14: check_logs 工具 + 系统提示感知 + 心跳自动日志分析
+
+### 背景
+Agent 不知道 `check_logs` 工具存在，遇到"查看日志"请求时会尝试 shell 命令（tail/grep/Get-Content），
+在 Windows 环境下这些命令要么不可用要么被安全策略拦截，导致浪费大量 LLM 调用和时间。
+Fix 14 通过三步骤解决：新建查询工具、系统提示感知注入、心跳自动诊断。
+
+### Fix 14a: `elfclaw_log/store.rs` — `query_recent` 加 `since_minutes` 参数
+
+- `query_recent()` 签名新增第4个参数 `since_minutes: Option<u64>`
+- `since_minutes` 非 `None` 时在 SQL 加 `AND timestamp >= ?N` 条件（cutoff = now - N分钟）
+- 更新同文件内 3 处测试调用（加 `None` 第4参数）
+
+### Fix 14b: `elfclaw_log/mod.rs` — 暴露公开查询 API
+
+- 新增 `pub fn query_recent(limit, level_filter, category_filter, since_minutes) -> Vec<LogEntry>`
+- 委托给全局 `LOGGER` store，失败时 warn + 返回空 vec（不崩溃）
+- Agent 通过此函数零 shell 调用直接读取日志 DB
+
+### Fix 14c: `src/tools/check_logs.rs` — 新建 CheckLogsTool（~100行）
+
+- `name()`: `"check_logs"`
+- `description()`: 明确说明"无需 shell 命令，直接查询数据库"
+- 参数：`limit`（默认20，上限100）、`level`（debug/info/warn/error）、`category`（8种）、`since_minutes`
+- `execute()`: 调用 `crate::elfclaw_log::query_recent()`，格式化为人类可读文本
+  - warn/error 条目附加 `details` JSON，便于诊断
+  - 时间戳截取 RFC3339 的 `MM-DDThh:mm` 段
+
+### Fix 14d: `src/tools/mod.rs` — 注册 CheckLogsTool
+
+- 新增 `pub mod check_logs;` 和 `pub use check_logs::CheckLogsTool;`
+- 在 `all_tools_with_runtime()` Composio 块之后无条件注册（所有 agent 均可用）
+
+### Fix 14e: `src/channels/mod.rs` — 系统提示感知
+
+- `build_runtime_status_section()` 末尾追加一行诊断提示：
+  "Use `check_logs` tool to query runtime logs directly (no shell needed). Supports filters: ..."
+- 每次 agent 启动时即知道该工具，无需先搜索
+
+### Fix 14f: `src/daemon/mod.rs` — 心跳自动日志分析
+
+- heartbeat prompt 构建段：在 HEARTBEAT.md 内容之前注入 **自动日志检查** 段落
+- 每次心跳 tick 自动执行 `check_logs level=error since_minutes={interval_mins}`
+- `since_mins` 与心跳间隔对齐，只检查上一个周期的错误
+- 无错误时明确告知 agent "无需提及"，避免冗余汇报
+
+### 验证结果
+
+- `cargo build` ✅ 编译通过
+- lib test 编译失败 31 处 → 均为预存在的 Fix 13 遗留问题（schema.rs/delegate.rs 中 `Option<String>` 类型不匹配），与本次改动无关
+
+---
+
+
+### 背景
+elfClaw 部署后完全没有日志系统（`backend = "none"` + `runtime_trace_mode = "none"`），无法诊断运行状态。Gemini 无法区分新旧消息（缺少时间戳）。Cron job 可能因重复 heartbeat 创建多个同名任务。
+
+### Fix 13a (P0): Cron Job 同名幂等去重
+
+**`src/cron/store.rs`**
+- 新增 `find_job_by_name()` 函数：按 name 字段查找已有 job
+- `add_shell_job()` 加去重逻辑：同名 job 存在时自动转 `update_job()`
+- `add_agent_job()` 加去重逻辑：同名 job 存在时自动转 `update_job()`
+- 创建和去重更新时写 `elfclaw_log::log_cron_event()` 日志
+
+### Fix 13b (P1): 消息时间戳注入
+
+**`src/channels/telegram.rs`**
+- 新增 `extract_message_timestamp()` 辅助函数：从 Telegram API `message.date` 提取 Unix 时间戳，缺失时 fallback 到 `SystemTime::now()`
+- 4 处 `SystemTime::now()` 替换为 `Self::extract_message_timestamp(message)`（callback_query、attachment、voice、text message）
+
+**`src/channels/mod.rs`**
+- 用户消息存入历史时加 `[MM-DD HH:MM]` 前缀（`format_unix_timestamp(msg.timestamp)`）
+- 助手响应存入历史时也加 `[MM-DD HH:MM]` 时间戳前缀
+
+### Fix 13c (P2): elfClaw 日志系统
+
+**新模块 `src/elfclaw_log/`（4 文件）**
+- `types.rs`: `LogEntry`、`LogLevel`（Debug/Info/Warn/Error）、`LogCategory`（AgentLifecycle/LlmCall/ToolCall/CronJob/Heartbeat/ChannelMessage/WorkerStatus/System）
+- `store.rs`: SQLite WAL 存储（`state/elfclaw-logs.db`）+ JSONL 追加写入（`state/elfclaw-logs.jsonl`）+ 启动时 prune 7 天旧日志 + 3 个单测
+- `observer.rs`: `ElfClawObserver` 包装 base Observer，同时写 SQLite + 广播 SSE JSON 事件；序列化逻辑与 `gateway/sse.rs:BroadcastObserver` 一致
+- `mod.rs`: 全局 `LazyLock` 单例（`LOGGER` + `GLOBAL_EVENT_TX`）+ `init()`/`log()`/`wrap_observer()`/`global_event_tx()` + 便捷函数（`log_tool_call`/`log_cron_event`/`log_channel_message`/`log_agent_start`/`log_agent_end`/`log_error`）+ `format_chat_timestamp`/`format_unix_timestamp`
+
+**改动的现有文件**
+- `src/lib.rs`: 注册 `pub mod elfclaw_log;`
+- `src/main.rs`: 注册 `mod elfclaw_log;` + 启动时调用 `elfclaw_log::init()`
+- `src/gateway/mod.rs`: `broadcast::channel(256)` → `elfclaw_log::global_event_tx()`；`BroadcastObserver::new()` → `elfclaw_log::wrap_observer()`
+- `src/channels/mod.rs`: observer 替换为 `elfclaw_log::wrap_observer()`；incoming 消息加 `log_channel_message()` 调用
+- `src/agent/loop_.rs`: 2 处 observer 替换为 `elfclaw_log::wrap_observer()`；`tool_loop_exhausted` 加 `log_error()` 调用
+- `src/cron/scheduler.rs`: `execute_and_persist_job()` 加 `log_cron_event()` 的 started/completed/failed 日志
+- `src/daemon/mod.rs`: heartbeat 失败加 `log_error()` 调用
+- `src/config/schema.rs`: `ObservabilityConfig` 默认值 `backend: "log"`、`runtime_trace_mode: "rolling"`；更新对应测试断言
+- `资料/config.toml`: `backend = "log"`, `runtime_trace_mode = "rolling"`
+
+### 架构要点
+- `ElfClawObserver` 放在 `elfclaw_log` 模块（不是 `gateway`），避免 channels→gateway 循环依赖
+- 全局 `GLOBAL_EVENT_TX` (`broadcast::channel(512)`) 统一 SSE 事件总线，gateway/channels/agent 三方共享
+- 日志写入失败不崩溃主流程（catch + warn）
+- SQLite WAL 模式避免写阻塞读
+
+### 编译验证
+- `cargo build` ✅ 通过
+- `cargo build --release` ✅ 通过
+- `cargo test` 编译失败是预先存在的问题（`git stash` 后同样失败），与本次改动无关
+
+---
+
 ## 2026-03-04 — Fix 12: send_telegram 消息分片 + 失败日志 + Cron Prompt 强化
 
 ### 背景

@@ -22,6 +22,7 @@ pub mod bg_run;
 pub mod browser;
 pub mod browser_open;
 pub mod channel_ack_config;
+pub mod check_logs;
 pub mod cli_discovery;
 pub mod composio;
 pub mod content_search;
@@ -138,6 +139,7 @@ pub use proxy_config::ProxyConfigTool;
 pub use pushover::PushoverTool;
 pub use schedule::ScheduleTool;
 #[allow(unused_imports)]
+pub use check_logs::CheckLogsTool;
 pub use schema::{CleaningStrategy, SchemaCleanr};
 pub use screenshot::ScreenshotTool;
 pub use search_chat_log::SearchChatLogTool;
@@ -571,6 +573,9 @@ pub fn all_tools_with_runtime(
             )));
         }
     }
+
+    // elfClaw: check_logs tool — always available so agent can query runtime logs
+    tool_arcs.push(Arc::new(CheckLogsTool::new()));
 
     // Add delegation and sub-agent orchestration tools when agents are configured
     if !agents.is_empty() {

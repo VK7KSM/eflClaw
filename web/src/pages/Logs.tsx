@@ -6,8 +6,9 @@ import {
   ArrowDown,
   Filter,
 } from 'lucide-react';
-import type { SSEEvent } from '@/types/api';
+import type { SSEEvent, ElfClawLogEntry } from '@/types/api';
 import { SSEClient } from '@/lib/sse';
+import { apiFetch } from '@/lib/api';
 
 function formatTimestamp(ts?: string): string {
   if (!ts) return new Date().toLocaleTimeString();
@@ -58,6 +59,27 @@ export default function Logs() {
   }, [paused]);
 
   useEffect(() => {
+    // elfClaw: load historical entries from SQLite on mount so the page is not blank
+    const loadHistory = async () => {
+      try {
+        const historical = await apiFetch<ElfClawLogEntry[]>('/api/logs/recent?limit=100');
+        const histEntries: LogEntry[] = historical.reverse().map((e, i) => ({
+          id: `hist-${i}`,
+          event: {
+            type: e.level,
+            timestamp: e.timestamp,
+            message: `[${e.category}] ${e.component}: ${e.message}`,
+          },
+        }));
+        setEntries(histEntries);
+      } catch (_) {
+        // silent — historical log unavailable, real-time stream still works
+      }
+    };
+
+    // Start history fetch and SSE connection concurrently (don't await)
+    void loadHistory();
+
     const client = new SSEClient();
 
     client.onConnect = () => {
