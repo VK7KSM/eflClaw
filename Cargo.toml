@@ -183,7 +183,7 @@ tempfile = "3.14"
 
 # WASM plugin runtime (optional, enable with --features wasm-tools)
 # Uses WASI stdio protocol — tools read JSON from stdin, write JSON to stdout.
-wasmtime = { version = "36.0.6", optional = true, default-features = false, features = ["cranelift", "runtime"] }
+wasmtime = { version = "42.0.1", optional = true, default-features = false, features = ["cranelift", "runtime"] }
 wasmtime-wasi = { version = "36.0.6", optional = true, default-features = false, features = ["preview1"] }
 
 # Terminal QR rendering for WhatsApp Web pairing flow.
