@@ -4090,7 +4090,7 @@ fn default_active_hours_end() -> String {
 }
 
 fn default_heartbeat_max_tool_iterations() -> usize {
-    25
+    8
 }
 
 /// Parse `"HH:MM"` into total minutes since midnight. Returns `None` on invalid input.
@@ -9674,7 +9674,7 @@ ws_url = "ws://127.0.0.1:3002"
                 to: Some("123456".into()),
                 active_hours_start: "06:30".into(),
                 active_hours_end: "23:00".into(),
-                max_tool_iterations: 25,
+                max_tool_iterations: 8,
             },
             cron: CronConfig::default(),
             goal_loop: GoalLoopConfig::default(),

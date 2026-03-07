@@ -31,7 +31,9 @@
       "Bash(grep provider_max_backoff_ms:*)",
       "Bash(cd /c/Dev/zeroclaw && cargo test --lib 2>&1 | grep -E \"\\(error\\\\[E0063\\\\]|-->\\)\" 2>&1)",
       "Bash(cmp:*)",
-      "Bash(test:*)"
+      "Bash(test:*)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(python3:*)"
     ]
   }
 }

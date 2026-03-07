@@ -2,6 +2,180 @@
 
 ---
 
+## 2026-03-07 — v0.3.1 综合修复：Heartbeat 死循环 + source_sync HTTP 回退 + self_check 架构重设计
+
+### 问题背景
+
+1. **Heartbeat Worker 死循环**：弱模型（gemini-flash-lite）被提示词强制调用 `check_logs`，看到错误后不知如何处理，反复调用 check_logs + cron_list 直到耗尽 25 次迭代上限。每个 heartbeat 周期重复一次。
+2. **source_sync 无 git 回退**：生产 Windows 服务器未安装 git，source_sync 直接失败。
+3. **self_check 内部 LLM 调用**：self_check 内部使用次级模型做搜索规划/文件筛选/报告撰写，关键分析绕过主模型。
+4. **GitHub MCP 工具提示缺失**：系统提示未提及已配置的 GitHub MCP 工具。
+
+### 修改文件
+
+#### `src/daemon/mod.rs`
+- **简化 heartbeat 提示词**：移除 `check_logs` 强制调用指令（死循环直接触发点）
+- 弱模型只做 cron 同步（对比 HEARTBEAT.md 和 cron_list），明确禁止调用 check_logs
+- 日志诊断统一到 self_check，由用户通过主模型触发
+
+#### `src/config/schema.rs`
+- **降低 heartbeat max_tool_iterations 默认值**：25 → 8
+- Heartbeat 只需 cron_list + 少量 cron_add/update = 5-6 次够用，8 留余量但不会失控
+- 更新对应测试断言
+
+#### `src/tools/source_sync.rs`
+- **新增 HTTP ZIP 下载回退**：git 不可用时通过 GitHub ZIP archive API 下载源码
+- `git_available()` — OnceLock 缓存 git 可用性检查
+- `fetch_latest_commit(api_url)` — GitHub API 获取 commit SHA（best-effort）
+- `sync_via_http(repo_id)` — reqwest 下载 ZIP + zip crate 解压
+- `extract_zip()` — 独立函数，strip GitHub ZIP 前缀目录
+- `sync_repo()` — git 可用走 git，不可用走 HTTP
+- `repo_status()` — 同时检查 `.git` 和 `Cargo.toml` 判断目录存在性
+- 新增 `ALLOWED_REPOS_HTTP` 白名单常量
+- 新增 `extract_zip_strips_prefix` 测试
+
+#### `src/tools/self_check.rs`
+- **架构重设计**：从"内置 LLM 管线"改为"纯 Rust 数据收集器"
+- 删除全部 3 处内部 LLM 调用（create_provider + chat_with_system）
+- 新增 `action="collect"`：纯 Rust，零 LLM — sync 源码 → 查 DB 收集日志 → ripgrep 搜索关键词 → 读取关键文件 → 返回结构化 JSON
+- 新增 `action="save_report"`：接收主模型撰写的报告文本，写入 homework/
+- 保留依赖：source_sync、content_search、file_read（纯 Rust 调用）
+- 新增辅助函数：extract_search_keywords、determine_search_paths
+- 更新测试：schema_has_action_param、save_report_requires_report_param、rejects_unknown_action 等
+
+#### `src/channels/mod.rs`
+- 更新 `build_runtime_status_section` 中 self_check 工具说明（反映新的两阶段架构）
+- 新增 GitHub MCP 工具使用指引
+
+### 验证
+- `cargo check` 通过（lib + bin），无新增 warning
+- 已有测试编译错误（delegate.rs、subagent_spawn.rs 等）为历史遗留，非本次改动引入
+
+---
+
+## 2026-03-06 — Fix: SelfCheckTool v2 — 修复首次部署 3 个关键缺陷
+
+### 问题背景
+
+SelfCheckTool 首次部署到生产环境（Windows + Gemini），暴露三个缺陷：
+1. source_sync 失败 — daemon 进程 PATH 中没有 git
+2. LLM 幻觉报告 — 源码不可用时 LLM₃ 编造文件路径、commit hash、代码片段
+3. 报告写错目录 — file_write 沙箱将报告写到 workspace/ 而非用户 config 目录
+
+### 修改文件
+
+#### `src/tools/source_sync.rs`
+- 新增 `find_git()` 方法：`OnceLock` 缓存，先尝试 PATH 中的 git，失败后探测常见 Windows 路径（`C:\Program Files\Git\{bin,cmd}\git.exe`、PROGRAMFILES 环境变量）
+- `run_git()` 改用 `Self::find_git()` 替代硬编码 `"git"`
+
+#### `src/tools/self_check.rs`
+- **反幻觉门禁 1**：source_sync 后检查源码目录是否存在（`source_dir_exists()`），不存在则标记 `has_source_code = false`
+- **反幻觉门禁 2**：搜索结果为空时跳过 LLM₂ 和文件精读（Steps 7-9）
+- **双模板分流**：`code_sections` 为空时使用日志-only prompt，显式禁止编造代码；非空时使用完整 prompt 并加入反编造指令
+- **报告路径修正**：移除 `file_write` 依赖，改用 `tokio::fs::write` 直接写入 `config_dir/homework/`
+- 新增 `report_dir()` 方法从 `config.config_path` 推导报告目录
+- 新增 `source_dir_exists()` 方法检查 `workspace/github/{repo}/Cargo.toml`
+- ToolResult 输出增加模式标记（日志-only / 完整）
+- `write_clean_report()` 同步改用 `tokio::fs::write`
+
+#### `src/tools/mod.rs`
+- SelfCheckTool 构造移除 `file_write` 参数（从 6 参数变 5 参数）
+
+### 验证
+- `cargo check` 通过（lib + bin），无新增 warning
+
+---
+
+## 2026-03-06 — Feature: SelfCheckTool — 程序化自检工具（第 54 号工具）
+
+### 背景
+
+旧的 debug 工作流仅靠 system prompt 文字指引 LLM 手动执行 6 步操作，不可靠。
+SelfCheckTool 用 Rust 程序控制整个流程，外部 LLM 只需 1 次 tool call。
+
+### 新建文件
+
+#### `src/tools/self_check.rs`（~500 行，含 13 个单测）
+- `SelfCheckTool` 实现 `Tool` trait，11 步流水线：
+  1. source_sync × 2 — 同步 elfclaw + zeroclaw 源码，捕获 commit hash
+  2. elfclaw_log::query_recent() — 直接调库获取 Vec<LogEntry>（不经 CheckLogsTool）
+  3. 错误分组去重 — HashMap<key, Vec<LogEntry>>，保持首次出现顺序
+  4. LLM₁ — 日志 → 搜索计划 JSON（temp=0.1）
+  5. content_search × N — 按搜索计划执行
+  6. LLM₂ — 搜索结果 → 精读文件列表 JSON（temp=0.1）
+  7. file_read × N — 读 elfclaw 文件
+  8. 自动配对 — 每个 elfclaw 文件自动读 zeroclaw 同路径文件（程序保证）
+  9. LLM₃ — 全量数据 → 结构化诊断报告（temp=0.3）
+  10. file_write — 报告写入 homework/debug_代码修改计划_YYYY-MM-DD.md
+- 报告受众：AI 编程助手，含文件路径+行号+代码片段+修改建议
+- 健壮 JSON 提取：支持直接 JSON、```json 包裹、前后有多余文字
+- 降级策略：source_sync 失败继续、LLM₂ 失败跳过精读、LLM₁/₃ 失败中止
+- 安全：can_act() + record_action() 两道闸门
+
+### 修改文件
+
+#### `src/tools/mod.rs`
+- 添加 `pub mod self_check` + `pub use self_check::SelfCheckTool`
+- 重构 `all_tools_with_runtime()` 中文件系统工具注册：
+  - 提取 `source_sync_arc` 命名 Arc（避免重复构造）
+  - 在 `has_filesystem_access` 块内构造 SelfCheckTool 并传入子工具引用
+- SourceSyncTool 注册改用命名 Arc
+
+#### `src/channels/mod.rs`
+- 删除旧的 14 行手动 debug 工作流系统提示（568-581 行）
+- 替换为 3 行 self_check 工具说明
+
+### 验证
+- `cargo check` 通过（lib + bin）
+- `cargo test --lib` 有 31 个预先存在的编译错误（DelegateAgentConfig 字段类型变更），非本次修改引起
+
+---
+
+## 2026-03-06 — Feature: 源码级 Debug 分析能力 + GitHub MCP
+
+### 背景
+
+elfClaw 有 `check_logs` 读日志，但不知道自己的源码，无法将日志错误映射到代码行做根因分析。
+本次添加两个能力：(1) source_sync 工具将源码 clone 到本地分析；(2) GitHub MCP 查阅 issues/PRs。
+
+### 新建文件
+
+#### `src/tools/source_sync.rs`（~250 行）
+- `SourceSyncTool` 实现 `Tool` trait
+- 参数：`repo_id`（elfclaw/zeroclaw）、`action`（sync/status）
+- URL 白名单硬编码：仅允许 elfClaw 和 zeroclaw 两个仓库
+- 目标路径固定 `<workspace>/workspace/github/<repo_id>/`
+- sync: 未 clone 时 `git clone --depth=1`；已存在时 `git fetch --depth=1` + `git reset --hard`
+- status: 检查当前 branch/commit
+- 安全：`can_act()` + `record_action()` 两道闸门，120s 超时
+- 直接调 `tokio::process::Command::new("git")`，不走 shell 工具链
+- 6 个单元测试（白名单、大小写、ReadOnly 阻止、未知 action）
+
+### 修改文件
+
+#### `src/tools/mod.rs`
+- 添加 `pub mod source_sync` + `pub use source_sync::SourceSyncTool`
+- 在 `all_tools_with_runtime()` 中注册（紧跟 CheckLogsTool 之后）
+
+#### `src/channels/mod.rs`
+- `build_runtime_status_section()` 末尾追加 debug 工作流指令（~15 行）
+- 包含 6 步流程 + 日志 category → 源码目录映射表
+
+#### `资料/config.toml`
+- 新增 `[mcp]` section，配置 GitHub MCP server（stdio 模式）
+- command 指向 `tools/github-mcp-server.exe`
+- token 占位符需用户替换
+
+#### `.gitignore`
+- 添加 `/tools/` 排除外部二进制
+
+### GitHub MCP Server
+- 来源：GitHub 官方（github/github-mcp-server v0.31.0）
+- 已下载 Windows x86_64 二进制到 `tools/github-mcp-server.exe`（20MB）
+- elfClaw 已有完整 MCP 基础设施，启动时自动连接并注册工具
+
+---
+
 ## 2026-03-04 — Fix 15: runtime_trace 权限错误修复 + Logs 页面历史记录
 
 ### Fix 15a: `src/config/schema.rs` — `default_runtime_trace_mode()` 改回 `"none"`
@@ -2779,3 +2953,191 @@ cross 编译依赖 Docker + cross-rs 工具链，在上游大规模 merge 后可
 
 **下一步**：检查 `D:\ZeroClaw_Workspace\config.toml` 中 `default_model` 字段，以及 cron jobs 的 SQLite 数据（`jobs.db` 或 `cron.db`）是否有 `model` 字段值。若要恢复 Haiku 处理 cron，可对每个 cron job 设置 `model = "claude-haiku-4-5-20251001"` 或修改调度器默认逻辑。
 
+---
+
+## 2026-03-06 — 独立项目初始化：cf-crawler 双语 README
+
+### 概述
+
+未修改 elfClaw 代码。本次仅在仓库外新建独立项目目录 `C:\Dev\cf-crawler`，用于承载 Cloudflare + 本地 sidecar 抓取工具，并写入中英文 README 作为后续开发基线。
+
+### 新增内容
+
+- `C:\Dev\cf-crawler\README.md`
+  - 英文项目说明
+  - 明确该工具为独立 CLI，不并入 elfClaw 主二进制
+  - 确认 Cloudflare Worker `/v1/fetch`、`/v1/render`、`/v1/health` 作为远端执行面
+- `C:\Dev\cf-crawler\README.zh-CN.md`
+  - 中文项目说明
+  - 明确本地只做调度与数据处理，不使用本地浏览器
+  - 确认 `scrape-page` / `crawl-site` 作为对外命令形态
+
+### 设计决策
+
+1. `cf-crawler` 保持为独立项目，源码不写入 `zeroclaw` 主仓库。
+2. `elfClaw` 只作为调用方，后续通过外部工具方式对接。
+3. `Agent-Reach` 保持独立，不与 `cf-crawler` 合并。
+
+---
+
+## 2026-03-06 — cf-crawler README 中英文重写（按产品化说明）
+
+### 概述
+
+未修改 elfClaw 业务代码。本次仅重写独立项目 `C:\Dev\cf-crawler` 的中英文 README，覆盖项目背景、参考来源、Cloudflare 免费资源与额度、部署方式、目录与数据结构、与 zeroclaw/elfclaw 的对接改动、与 Agent-Reach 联动效果、以及致谢链接。
+
+### 修改文件
+
+- `C:\Dev\cf-crawler\README.md`
+- `C:\Dev\cf-crawler\README.zh-CN.md`
+
+### 文档新增要点
+
+1. 明确项目创建原因与低配机器目标（无本地浏览器）。
+2. 明确参考项目（Crawlee、Agent-Reach）与分工边界。
+3. 汇总 Cloudflare 免费资源与调用额度，并给出 Browser Rendering 每日可用调用次数估算表。
+4. 给出 zeroclaw/elfclaw 需要补充的代码改动点和 workflow 提示词改动点。
+5. 补充程序目录规划与核心数据结构规划。
+6. 明确与 Agent-Reach 联动后的能力提升。
+7. 增加致谢与 GitHub 地址。
+
+---
+
+## 2026-03-06 — cf-crawler 初版可运行骨架（CLI + Worker）
+
+### 概述
+
+在独立目录 `C:\Dev\cf-crawler` 完成第一版代码落地。目标是：本地不运行浏览器，仅做调度与数据处理；远端通过 Cloudflare Worker 执行 `fetch/render`。
+
+### 新增文件（核心）
+
+- 根项目
+  - `package.json`
+  - `tsconfig.json`
+  - `.gitignore`
+  - `.env.example`
+- CLI 与类型
+  - `src/types.ts`
+  - `src/cli/index.ts`
+  - `src/cli/commands/scrape-page.ts`
+  - `src/cli/commands/crawl-site.ts`
+- 核心调度
+  - `src/core/scheduler.ts`
+  - `src/core/queue.ts`
+  - `src/core/dedupe.ts`
+  - `src/core/retry.ts`
+  - `src/core/rate_limit.ts`
+- 执行器
+  - `src/executors/types.ts`
+  - `src/executors/decision.ts`
+  - `src/executors/cf_fetch.ts`
+  - `src/executors/cf_render.ts`
+  - `src/executors/cf_health.ts`
+- 提取器
+  - `src/extractors/article.ts`
+  - `src/extractors/listing.ts`
+  - `src/extractors/pagination.ts`
+- 存储与联动
+  - `src/storage/files.ts`
+  - `src/storage/sqlite.ts`
+  - `src/agent_reach/bridge.ts`
+- Worker 子项目
+  - `worker/package.json`
+  - `worker/tsconfig.json`
+  - `worker/wrangler.toml`
+  - `worker/src/index.ts`
+- 示例
+  - `examples/scrape-page.json`
+  - `examples/crawl-site.json`
+
+### README 更新
+
+- `C:\Dev\cf-crawler\README.md`
+- `C:\Dev\cf-crawler\README.zh-CN.md`
+
+新增本地与 Worker 快速运行命令，便于直接 smoke test。
+
+### 关键实现点
+
+1. 对外命令固定为 `scrape-page` / `crawl-site`（JSON 输入输出）。
+2. `scrape-page`：默认先 `fetch`，命中反爬信号后自动升级 `render`。
+3. `crawl-site`：实现队列、去重、限速、分页发现、低并发递进抓取。
+4. Worker 提供 `/v1/fetch`、`/v1/render`、`/v1/health` 三个端点。
+5. `render` 采用“已配置则调用、未配置则返回可解释错误”策略。
+
+### 验证结果
+
+- 根项目依赖安装：通过
+- 根项目 `npm.cmd run check`：通过
+- 根项目 `npm.cmd run build`：通过
+- Worker 项目依赖安装：通过
+- Worker 项目 `npm.cmd run build`：通过
+- CLI smoke test：`node dist/index.js health --pretty` 输出成功 JSON
+
+### 兼容性说明
+
+- 当前为可运行骨架版本，优先确保结构、协议和调用链成立。
+- 生产可用前仍需补充：更完整的反封策略、更严格的输入校验、落盘 schema 扩展、以及与 zeroclaw/elfclaw 的正式工具注册对接。
+
+## 2026-03-06 — cf-crawler 第二轮增强（安全策略 + Agent-Reach 自愈）
+
+### 主要改动
+
+1. 增加统一运行配置模块 `src/runtime_config.ts`：
+   - `CF_CRAWLER_HOST_COOLDOWN_MS`
+   - `CF_CRAWLER_MAX_RETRIES`
+   - `CF_CRAWLER_ALLOWED_HOSTS`
+   - `CF_CRAWLER_BLOCK_PRIVATE_IP`
+   - `AGENT_REACH_*` 系列参数
+2. 增加 URL 安全策略 `src/security/url_policy.ts`：
+   - 仅允许 `http/https`
+   - 可选域名白名单
+   - 默认拦截私网/本地地址（SSRF 防护）
+3. 强化抓取执行链路：
+   - `scrape-page` / `crawl-site` 接入 URL policy
+   - 重试次数与主机冷却时间改为可配置
+   - `strategy=edge_browser|edge_fetch|auto` 行为更明确
+4. 增加 `agent-reach-ensure` 命令：
+   - 自动探测 Agent-Reach
+   - 缺失时自动安装（uv/pip 兜底）
+   - 可选版本更新检查
+   - 执行 `doctor` 返回诊断结果
+5. Worker 增强 `worker/src/index.ts`：
+   - 反爬信号识别（状态码+正文特征）
+   - 可选 KV 短缓存
+   - 实际请求耗时回传
+
+### 验证
+
+- `C:\Dev\cf-crawler`：
+  - `npm.cmd run check` 通过
+  - `npm.cmd run build` 通过
+- `C:\Dev\cf-crawler\worker`：
+  - `npm.cmd run build` 通过
+- `agent-reach-ensure`：
+  - 已可成功探测到 `python -m agent_reach.cli`
+  - 当前环境返回 `current_version: 1.3.0` 且 `doctor` 可执行
+- `health/scrape/crawl` 当前仍返回 `ECONNREFUSED 127.0.0.1:8787`（预期，因本地未启动 Worker dev 或未指向已部署 CF endpoint）
+
+## 2026-03-06 — Windows EXE 打包与 GitHub CI 工作流
+
+### 已完成
+
+1. 在 `C:\Dev\cf-crawler` 增加 EXE 打包脚本：
+   - `build:exe:bundle`（`esbuild` 打包到 `dist-exe/index.cjs`）
+   - `build:exe`（`@yao-pkg/pkg` 生成 `release/cf-crawler-win-x64.exe`）
+   - `build:ci`（本地模拟 CI 全流程）
+2. 增加 GitHub Actions：
+   - `C:\Dev\cf-crawler\.github\workflows\build-windows-exe.yml`
+   - 在 `windows-latest` 上执行 `npm ci -> check -> build -> build:worker -> build:exe`
+   - 上传 `release/cf-crawler-win-x64.exe` 为 artifact（`cf-crawler-win-x64`）
+3. 本地成功产出可执行文件：
+   - `C:\Dev\cf-crawler\release\cf-crawler-win-x64.exe`
+   - 当前大小约 `58.6 MB`
+
+### 验证
+
+- `npm.cmd run build:ci`：通过
+- EXE 运行验证：
+  - `health --pretty` 可执行（未连上 Worker 时返回 `ECONNREFUSED`，符合预期）
+  - `agent-reach-ensure --pretty` 在放开子进程权限后可成功执行

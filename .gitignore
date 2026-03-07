@@ -12,6 +12,8 @@ __pycache__/
 docker-compose.override.yml
 site/node_modules/
 site/.vite/
+# elfClaw: external tool binaries (github-mcp-server etc.)
+/tools/
 site/public/docs-content/
 gh-pages/
 

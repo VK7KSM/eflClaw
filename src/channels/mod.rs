@@ -565,6 +565,23 @@ fn build_runtime_status_section(config: &crate::config::Config) -> String {
          category=tool_call/cron_job/llm_call/channel_message/system，since_minutes=N。\n"
     );
 
+    // elfClaw: self_check tool — two-phase diagnostics (collect → analyze → save)
+    section.push_str(
+        "\n`self_check` 工具：用户说「自检」「健康检查」「debug自检」时调用。\
+         第一步：调用 self_check(action=\"collect\") 收集日志和源码信息。\
+         第二步：你（主模型）分析返回的数据，用 file_read/content_search 深入查看源码。\
+         第三步：撰写诊断报告，调用 self_check(action=\"save_report\", report=\"...\") 保存。\
+         报告应包含具体的文件路径、行号、代码片段和修复方案。\n"
+    );
+
+    // elfClaw: GitHub MCP tool guidance
+    section.push_str(
+        "\nGitHub MCP 工具（如果已配置）：\
+         当需要手动查阅源码时，可使用 github__search_code、\
+         github__get_file_contents 等 MCP 工具直接查询 elfClaw/zeroclaw 仓库源码。\
+         这些工具通过 GitHub API 工作，不需要本地安装 git。\n"
+    );
+
     section
 }
 
