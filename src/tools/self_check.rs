@@ -1,12 +1,12 @@
-// elfClaw: self_check tool — pure data collector for source-level diagnostics
+// elfClaw: self_check tool — autonomous diagnostics with isolated analysis
 //
-// Architecture (v0.3.1): zero internal LLM calls.
+// Architecture (v0.3.2):
+// - action="analyze" (default): collect + isolated agent::run() + save report.
+//   Runs analysis in a separate process context with full 1M token window,
+//   avoiding the 8K truncation problem in shared conversation history.
 // - action="collect": sync source → collect logs → search error keywords →
-//   read key files → return structured JSON to the main model.
-// - action="save_report": receive report text from main model → write to homework/.
-//
-// The main model (default_model) is responsible for all analysis and report writing.
-// This ensures the strongest model participates in the entire diagnostic process.
+//   read key files → return structured JSON (for direct inspection).
+// - action="save_report": receive report text → write to homework/.
 
 use super::content_search::ContentSearchTool;
 use super::file_read::FileReadTool;
@@ -18,6 +18,7 @@ use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -26,6 +27,15 @@ use std::time::Duration;
 const MAX_SEARCH_RESULT_CHARS: usize = 3_000;
 const MAX_FILE_READ_CHARS: usize = 4_000;
 const SYNC_TIMEOUT_SECS: u64 = 120;
+
+/// Prevent concurrent/recursive analyze calls.
+static ANALYZE_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+/// Maximum wall-clock time for the isolated analysis agent.
+const ANALYZE_TIMEOUT_SECS: u64 = 300;
+/// Maximum agentic iterations for the analysis agent.
+const ANALYZE_MAX_ITERATIONS: usize = 15;
+/// Max chars of the analysis report returned to the main conversation.
+const REPORT_SUMMARY_CHARS: usize = 800;
 
 /// Keywords to search in source code based on common error patterns.
 const ERROR_SEARCH_KEYWORDS: &[(&str, &str)] = &[
@@ -98,6 +108,25 @@ impl SelfCheckTool {
     /// Collect diagnostic data: sync sources, gather logs, search code, read files.
     /// Returns structured JSON — zero LLM calls.
     async fn collect(&self, since_minutes: u64) -> anyhow::Result<ToolResult> {
+        // ── Phase 0: Environment info ─────────────────────────────────
+        let has_rg = which::which("rg").is_ok();
+        let has_grep = which::which("grep").is_ok();
+        let has_findstr = which::which("findstr").is_ok();
+
+        let environment = json!({
+            "os": std::env::consts::OS,
+            "arch": std::env::consts::ARCH,
+            "hostname": hostname::get()
+                .map(|h| h.to_string_lossy().to_string())
+                .unwrap_or_else(|_| "unknown".into()),
+            "search_backend": if has_rg { "rg" } else if has_grep { "grep" }
+                else if has_findstr { "findstr" } else { "none" },
+            "cli_tools": {
+                "rg": has_rg, "grep": has_grep, "findstr": has_findstr,
+                "git": which::which("git").is_ok(),
+            },
+        });
+
         // ── Step 1: Sync source repos ─────────────────────────────────
         let mut sync_status: Vec<String> = Vec::new();
 
@@ -161,6 +190,7 @@ impl SelfCheckTool {
             return Ok(ToolResult {
                 success: true,
                 output: json!({
+                    "environment": environment,
                     "mode": mode,
                     "sync_status": sync_status.join("; "),
                     "source_base_path": "github/elfclaw",
@@ -180,6 +210,7 @@ impl SelfCheckTool {
             return Ok(ToolResult {
                 success: true,
                 output: json!({
+                    "environment": environment,
                     "mode": mode,
                     "sync_status": sync_status.join("; "),
                     "source_base_path": "github/elfclaw",
@@ -283,6 +314,7 @@ impl SelfCheckTool {
         }
 
         let result = json!({
+            "environment": environment,
             "mode": mode,
             "sync_status": sync_status.join("; "),
             "source_base_path": "github/elfclaw",
@@ -298,6 +330,102 @@ impl SelfCheckTool {
             output: result.to_string(),
             error: None,
         })
+    }
+
+    /// Run full autonomous analysis: collect → isolated agent analysis → save report.
+    async fn analyze(&self, since_minutes: u64) -> anyhow::Result<ToolResult> {
+        // Prevent concurrent/recursive analyze calls
+        if ANALYZE_IN_PROGRESS
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("self_check analyze 已在运行中".into()),
+            });
+        }
+        let result = self.analyze_inner(since_minutes).await;
+        ANALYZE_IN_PROGRESS.store(false, Ordering::SeqCst);
+        result
+    }
+
+    async fn analyze_inner(&self, since_minutes: u64) -> anyhow::Result<ToolResult> {
+        // 1. Collect full diagnostic data (internal call, not truncated by history)
+        let collect_result = self.collect(since_minutes).await?;
+        if !collect_result.success {
+            return Ok(collect_result);
+        }
+
+        // 2. Build analysis prompt
+        let prompt = format!(
+            "你是 elfClaw 系统的自检分析器。\n\
+             以下是自动收集的完整系统诊断数据 JSON。\n\n\
+             ## 分析要求\n\
+             1. 先阅读 environment 部分，了解运行环境（OS、可用工具）\n\
+             2. 分析 logs 中的错误，找出根因和模式\n\
+             3. 检查 search_results 和 key_files 中的相关代码\n\
+             4. 如需查看更多源码，使用 file_read(path: \"github/elfclaw/src/xxx.rs\")\n\
+             5. 最多额外查看 5 个文件，不要过度探索\n\n\
+             ## 报告格式（中文）\n\
+             1. **运行环境概况**（OS、架构、可用工具）\n\
+             2. **系统健康状态**\n\
+             3. **发现的问题**（按严重程度排列）\n\
+             4. **根因分析**\n\
+             5. **修复建议**（具体操作步骤）\n\n\
+             ## 禁止使用的工具\n\
+             shell、git_operations、content_search、self_check\n\n\
+             直接输出报告文本。\n\n\
+             ---\n\
+             诊断数据：\n{}",
+            collect_result.output
+        );
+
+        // 3. Run analysis in isolated context (uses default_model, full context window)
+        let report = tokio::time::timeout(
+            Duration::from_secs(ANALYZE_TIMEOUT_SECS),
+            crate::agent::loop_::run(
+                (*self.config).clone(),
+                Some(prompt),
+                None,   // provider: config default
+                None,   // model: config default
+                0.3,    // low temperature for analytical precision
+                vec![],
+                false,
+                Some(ANALYZE_MAX_ITERATIONS),
+                crate::agent::RunContext::Interactive, // use default_model (primary)
+            ),
+        )
+        .await;
+
+        match report {
+            Ok(Ok(report_text)) => {
+                // 4. Save full report
+                let save_result = self.save_report(&report_text).await?;
+
+                // 5. Return summary to main conversation
+                let summary = format!(
+                    "自检分析完成。{}\n\n报告摘要：\n{}",
+                    save_result.output,
+                    truncate_if_needed(&report_text, REPORT_SUMMARY_CHARS)
+                );
+                Ok(ToolResult {
+                    success: true,
+                    output: summary,
+                    error: None,
+                })
+            }
+            Ok(Err(e)) => Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!("分析失败: {e}")),
+            }),
+            Err(_) => Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!("分析超时（{}秒）", ANALYZE_TIMEOUT_SECS)),
+            }),
+        }
     }
 
     /// Save a report written by the main model to homework/.
@@ -326,11 +454,11 @@ impl Tool for SelfCheckTool {
     }
 
     fn description(&self) -> &str {
-        "Two-phase self-check tool. \
-         Phase 1: self_check(action=\"collect\") — syncs source code, collects error logs, \
-         searches source for error keywords, reads key files. Returns structured JSON. Zero LLM calls. \
-         Phase 2: self_check(action=\"save_report\", report=\"...\") — saves the main model's \
-         diagnostic report to homework/. \
+        "Autonomous self-check tool. \
+         Default action: self_check(action=\"analyze\") — collects diagnostics, runs isolated \
+         analysis in a dedicated agent process (full context window, no truncation), saves report, \
+         returns summary. One-step invocation — no follow-up calls needed. \
+         Other actions: 'collect' (raw JSON data), 'save_report' (save text to file). \
          Trigger: 自检/self-check/健康检查/debug自检."
     }
 
@@ -340,13 +468,13 @@ impl Tool for SelfCheckTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["collect", "save_report"],
-                    "description": "Action: 'collect' = gather logs + source data (default), 'save_report' = save report text to file",
-                    "default": "collect"
+                    "enum": ["analyze", "collect", "save_report"],
+                    "description": "Action: 'analyze' = full autonomous diagnostics (default), 'collect' = raw JSON data, 'save_report' = save report text",
+                    "default": "analyze"
                 },
                 "since_minutes": {
                     "type": "integer",
-                    "description": "Log lookback window in minutes. Default: 60. Only used with action='collect'.",
+                    "description": "Log lookback window in minutes. Default: 60. Used with 'analyze' and 'collect'.",
                     "default": 60
                 },
                 "report": {
@@ -377,9 +505,16 @@ impl Tool for SelfCheckTool {
         let action = args
             .get("action")
             .and_then(|v| v.as_str())
-            .unwrap_or("collect");
+            .unwrap_or("analyze");
 
         match action {
+            "analyze" => {
+                let since_minutes = args
+                    .get("since_minutes")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(60);
+                self.analyze(since_minutes).await
+            }
             "collect" => {
                 let since_minutes = args
                     .get("since_minutes")
@@ -400,7 +535,7 @@ impl Tool for SelfCheckTool {
                 success: false,
                 output: String::new(),
                 error: Some(format!(
-                    "Unknown action '{other}'. Use 'collect' or 'save_report'."
+                    "Unknown action '{other}'. Use 'analyze', 'collect', or 'save_report'."
                 )),
             }),
         }

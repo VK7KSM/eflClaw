@@ -46,6 +46,7 @@ pub mod transcription;
 pub mod tts;
 pub mod wati;
 pub mod whatsapp;
+pub mod xiaozhi;
 #[cfg(feature = "whatsapp-web")]
 pub mod whatsapp_storage;
 #[cfg(feature = "whatsapp-web")]
@@ -75,6 +76,7 @@ pub use slack::SlackChannel;
 pub use telegram::TelegramChannel;
 pub(crate) use telegram::split_message_for_telegram;
 pub use traits::{Channel, SendMessage};
+pub use xiaozhi::XiaozhiChannel;
 pub use wati::WatiChannel;
 pub use whatsapp::WhatsAppChannel;
 #[cfg(feature = "whatsapp-web")]
@@ -565,15 +567,12 @@ fn build_runtime_status_section(config: &crate::config::Config) -> String {
          category=tool_call/cron_job/llm_call/channel_message/system，since_minutes=N。\n"
     );
 
-    // elfClaw: self_check tool — two-phase diagnostics (collect → analyze → save)
+    // elfClaw: self_check tool — autonomous diagnostics (analyze action)
     section.push_str(
-        "\n`self_check` 工具：用户说「自检」「健康检查」「debug自检」时调用。\
-         第一步：调用 self_check(action=\"collect\") 收集日志、搜索结果和关键文件内容。\
-         第二步：直接分析 collect 返回的 JSON 数据（其中已包含 search_results 和 key_files）。\
-         如确实需要额外查看文件，使用返回的 source_base_path 前缀调用 file_read，\
-         例如 file_read(path: \"github/elfclaw/src/xxx.rs\")。\
-         **禁止**使用 shell/git/findstr 命令探索源码。\
-         第三步：撰写诊断报告，调用 self_check(action=\"save_report\", report=\"...\") 保存。\n"
+        "\n`self_check` 工具：用户说「自检」「健康检查」「debug自检」或问「什么出问题了」时调用。\
+         只需一步：调用 self_check(action=\"analyze\")。\
+         工具会在独立进程中完成完整诊断（收集数据 → 分析 → 保存报告）。\
+         你只需将返回的摘要呈现给用户。\n"
     );
 
     // elfClaw: GitHub MCP tool guidance
@@ -3403,6 +3402,17 @@ fn collect_configured_channels(
         channels.push(ConfiguredChannel {
             display_name: "ClawdTalk",
             channel: Arc::new(ClawdTalkChannel::new(ct.clone())),
+        });
+    }
+
+    if let Some(ref xz) = config.channels_config.xiaozhi {
+        channels.push(ConfiguredChannel {
+            display_name: "Xiaozhi",
+            channel: Arc::new(XiaozhiChannel::new(
+                xz.clone(),
+                config.transcription.clone(),
+                config.tts.clone(),
+            )),
         });
     }
 

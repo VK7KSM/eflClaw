@@ -2,6 +2,162 @@
 
 ---
 
+## 2026-03-07 — self_check 独立进程 + content_search Windows 兼容 + source_sync 本地优先
+
+### 问题
+
+1. **自检 token 爆炸**：collect() 返回 ~104K JSON → `MAX_TOOL_RESULT_IN_HISTORY_CHARS=8000` 截断到 8K → 模型丢失 92% 数据 → 探索循环 → 603K token → 超时
+2. **content_search 在 Windows 无后端**：系统无 rg/grep 时搜索完全失败
+3. **source_sync 每次重下**：HTTP 模式不检查本地版本，每次自检都重新下载 ZIP
+4. **预存测试编译错误**：`DelegateAgentConfig` 的 `provider/model` 改为 `Option<String>` 后测试代码未同步
+
+### 修改内容
+
+**`src/tools/self_check.rs`**：
+- 新增 `action="analyze"`（默认）：collect + 独立 `agent::run()` + save
+- `analyze()` 使用 `AtomicBool` 防递归，5分钟超时，15次迭代上限
+- `analyze_inner()` 在隔离上下文运行分析（独立 1M token 窗口，完整 104K 数据无截断）
+- `collect()` 新增 `environment` 字段：OS/arch/hostname/search_backend/cli_tools
+- 主对话只收到 ~800 字符摘要，不爆 token
+- `description()/schema()` 更新为 analyze 优先
+
+**`src/tools/content_search.rs`**：
+- 新增 `has_grep` 字段，构造函数检测 rg + grep
+- 新增 `build_findstr_command()` Windows 后端（literal 模式，安全）
+- `execute()` 三级后端选择：rg → grep → findstr → 报错
+- 新增 `strip_unc_prefix()` 解决 Windows UNC 路径 (`\\?\...`) 兼容问题
+- grep/findstr 命令和输出 relativize 均使用 stripped 路径
+- 删除冗余的 `format_rg_output/format_grep_output` wrapper
+- 修复 `content_search_rejects_absolute_path` 测试的 Windows 兼容性
+
+**`src/tools/source_sync.rs`**：
+- `sync_via_http()` 新增本地版本检查：写入 `.elfclaw_sync_sha` 版本标记
+- 流程：检查本地 Cargo.toml → 读取本地 SHA → 对比 GitHub latest → 相同则跳过下载
+- GitHub API 不可达时，使用已有本地副本（不报错）
+- `repo_status()` 显示本地 SHA 信息
+
+**`src/channels/mod.rs`**：
+- 自检提示词改为一步式：`self_check(action="analyze")`，无需多步操作
+
+**`src/doctor/mod.rs` + `src/migration.rs`**（预存修复）：
+- `DelegateAgentConfig` 测试代码同步：`provider/model` 包裹 `Some()`
+
+### 验证
+
+- `cargo check` — 通过（只有预存 warnings）
+- `cargo build` — 通过
+- `cargo test --lib -- tools::self_check tools::content_search tools::source_sync` — 37 passed, 0 failed
+
+---
+
+## 2026-03-07 — XiaozhiChannel token 移除（fix/v0.3.1-heartbeat-selfcheck）
+
+### 问题
+
+`XiaozhiConfig` 有 `token: Option<String>` 字段，但实现存在流程缺陷：
+- OTA 响应没有把 token 告知设备
+- 设备不会在 hello JSON 中发送 token（固件读取 OTA → Authorization header，不是 hello field）
+- 服务端检查 hello JSON 的 `json["token"]`，永远收不到 → 设备被拒绝
+
+### 决策
+
+局域网设备，不需要 token 验证。直接移除 token，消除这个坏死路径。
+
+### 修改内容
+
+**`src/channels/xiaozhi.rs`**：
+- `XiaozhiConfig` 删除 `pub token: Option<String>` 字段
+- `handle_connection()` 删除 `token: Option<String>` 参数，删除 token 验证代码块
+- `listen()` 删除 `let token = self.config.token.clone()` 和相关传递
+- 3 个测试中删除 `token: None` 字段（`xiaozhi_config_defaults`、`server_ip_*`、`channel_name_*`）
+
+### 验证
+
+- `cargo check` — 通过，无错误（其他预存 `Option<String>` 类型错误与本次修改无关）
+
+---
+
+
+
+### 实现范围
+
+为 AI-VOX3（ESP32-S3，固件 1.9.0）实现 elfClaw 服务端支持，设备无需改固件，仅需将 OTA URL 重定向到 elfClaw。
+
+### 新增 / 修改文件
+
+#### `src/channels/xiaozhi.rs` [NEW, ~600 行]
+
+- `XiaozhiConfig` — 配置结构体（port/host/token/ota_port/server_ip，全部有默认值）
+- `XiaozhiChannel` — 实现 `Channel` trait
+- `listen()` — 同时启动 OTA mock HTTP 和 WebSocket 服务器
+- `send()` — 调用 `synthesize_to_ogg_opus()` 合成 24kHz OGG Opus，推到设备 session channel
+- `handle_connection()` — 每个设备连接的独立 task，完整状态机：
+  - hello 握手 → 收帧（Opus binary WS 帧）→ OGG 封装 → Groq STT → 转发 agent → 等 TTS → 播放
+  - 支持 abort 消息，Ping/Pong 保活
+- `wrap_opus_frames_in_ogg()` — 将裸 Opus 帧封装为 RFC 7845 OGG Opus 容器（用于 Groq STT）
+  - OpusHead（19 bytes）+ OpusTags + 音频页，granule 位置按 48kHz/960 samples/frame
+- `send_ogg_to_ws()` — 将 OGG Opus 逐帧发送到 WebSocket（跳过前两个 header 包）
+- `serve_ota()` / `respond_ota()` — 纯 tokio TCP 实现的 OTA mock HTTP，返回 elfClaw WebSocket 地址 JSON
+- 5 个单元测试：OGG magic 验证、config defaults、server_ip 逻辑、channel name
+
+#### `src/channels/tts.rs`
+
+- 新增 `synthesize_to_ogg_opus()` — Edge TTS 合成 24kHz OGG Opus（音频格式 `ogg-24khz-16bit-mono-opus`），返回 `Vec<u8>`，不写临时文件
+
+#### `src/channels/mod.rs`
+
+- 添加 `pub mod xiaozhi;` 和 `pub use xiaozhi::XiaozhiChannel;`
+- `collect_configured_channels()` 末尾注册 Xiaozhi
+
+#### `src/config/schema.rs`
+
+- `ChannelsConfig` 添加 `pub xiaozhi: Option<crate::channels::xiaozhi::XiaozhiConfig>` 字段
+- `Default for ChannelsConfig` 添加 `xiaozhi: None`
+- `channels_except_webhook()` 添加 Xiaozhi 条目
+- 3 处直接构造 `ChannelsConfig` 的测试各补 `xiaozhi: None`
+
+#### `Cargo.toml`
+
+- 添加 `ogg = "0.9"` — 纯 Rust OGG 容器读写
+
+### 关键设计决策
+
+- TTS 在 `XiaozhiChannel::send()` 中完成，`handle_connection` 只等 channel 推来的字节，不做合成
+- OGG Opus 对于 Groq Whisper：裸 Opus → OGG 封装（需要 `ogg` crate）
+- OGG Opus 对于 TTS 下行：Edge TTS 直接返回 OGG 容器，不需要手动封装
+- ogg 0.9 API：`write_packet` 接受 `Into<Cow<[u8]>>`，直接传 `Vec<u8>`（不需要 `into_boxed_slice()`）
+
+### 验证
+
+- `cargo check` 通过
+- `cargo clippy -- -D warnings`：xiaozhi.rs 无新警告/错误（其余错误均为预存在的旧代码问题）
+- 单元测试（OGG、config defaults、server_ip）在 lib 编译通过
+
+---
+
+## 2026-03-07 — v0.3.1 热修复 #2：self_check 路径 bug 四连修
+
+### 问题背景
+
+v0.3.1 部署后 self_check 运行 50 次工具迭代无结果。根因分析发现 4 个 bug 协同导致：
+
+### 修改内容
+
+**`src/tools/source_sync.rs`**
+- **Bug 0（根因）**：`SOURCE_DIR = "workspace/github"` 与 `workspace_dir`（已含 workspace 后缀）拼接产生双 workspace 路径。源码下载到 `workspace/workspace/github/elfclaw` 而非 `workspace/github/elfclaw`。修复：改为 `"github"`。
+
+**`src/tools/self_check.rs`**
+- **Bug 1a**：`source_dir_exists()` 第 92 行 `.join("workspace/github")` → `.join("github")`
+- **Bug 1b**：content_search 路径（第 208-211 行）从绝对路径 `format!("{}/workspace/github/elfclaw/...", workspace_dir)` 改为相对路径 `format!("github/elfclaw/...", search_path)`。绝对路径被 `content_search.rs:174` 的安全检查拒绝。
+- **Bug 1c**：file_read 路径（第 239-242 行）同样改为相对路径。绝对路径被 `policy.rs:1073` 的 `workspace_only` 检查拒绝。
+- **Bug 1d**：source_tree 路径（第 267 行）`.join("workspace/github/elfclaw/src")` → `.join("github/elfclaw/src")`
+- **Bug 2**：3 个 JSON return 点添加 `source_base_path` 和 `usage_hint` 字段。
+
+**`src/channels/mod.rs`**
+- **Bug 3**：self_check 系统提示从"用 file_read/content_search 深入查看源码"改为"直接分析 collect 返回的 JSON 数据"，并明确禁止 shell/git 命令。
+
+---
+
 ## 2026-03-07 — v0.3.1 综合修复：Heartbeat 死循环 + source_sync HTTP 回退 + self_check 架构重设计
 
 ### 问题背景

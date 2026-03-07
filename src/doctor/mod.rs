@@ -1275,8 +1275,8 @@ mod tests {
         config.agents.insert(
             "zeta".into(),
             crate::config::DelegateAgentConfig {
-                provider: "totally-fake".into(),
-                model: "model-z".into(),
+                provider: Some("totally-fake".into()),
+                model: Some("model-z".into()),
                 system_prompt: None,
                 api_key: None,
                 temperature: None,
@@ -1289,8 +1289,8 @@ mod tests {
         config.agents.insert(
             "alpha".into(),
             crate::config::DelegateAgentConfig {
-                provider: "totally-fake".into(),
-                model: "model-a".into(),
+                provider: Some("totally-fake".into()),
+                model: Some("model-a".into()),
                 system_prompt: None,
                 api_key: None,
                 temperature: None,

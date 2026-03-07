@@ -177,6 +177,7 @@ impl SourceSyncTool {
     }
 
     /// Sync a repo via HTTP ZIP download (fallback when git is unavailable).
+    /// Checks local version marker first — skips download if already up-to-date.
     async fn sync_via_http(&self, repo_id: &str) -> anyhow::Result<String> {
         let normalized = repo_id.trim().to_lowercase();
         let (_, zip_url, api_url) = ALLOWED_REPOS_HTTP
@@ -185,11 +186,41 @@ impl SourceSyncTool {
             .ok_or_else(|| anyhow::anyhow!("No HTTP fallback for repo '{repo_id}'"))?;
 
         let local_path = self.security.workspace_dir.join(SOURCE_DIR).join(&normalized);
+        let version_file = local_path.join(".elfclaw_sync_sha");
 
-        // Fetch commit SHA (best-effort, for display)
-        let commit_sha = Self::fetch_latest_commit(api_url).await;
+        // 1. Fetch latest commit SHA from GitHub API
+        let remote_sha = Self::fetch_latest_commit(api_url).await;
 
-        // Download ZIP
+        // 2. Check local version — skip download if up-to-date
+        if local_path.join("Cargo.toml").exists() {
+            if let Some(ref remote) = remote_sha {
+                if let Ok(local_sha) = tokio::fs::read_to_string(&version_file).await {
+                    let local_sha = local_sha.trim().to_string();
+                    if local_sha == *remote {
+                        return Ok(format!(
+                            "{repo_id}: already up-to-date ({})\nPath: {}",
+                            remote,
+                            local_path.display()
+                        ));
+                    }
+                    tracing::info!(
+                        repo = repo_id,
+                        local = local_sha.as_str(),
+                        remote = remote.as_str(),
+                        "source out of date, re-downloading"
+                    );
+                }
+            }
+            // If we can't fetch remote SHA, skip download and use existing local copy
+            if remote_sha.is_none() {
+                return Ok(format!(
+                    "{repo_id}: using existing local copy (GitHub API unreachable)\nPath: {}",
+                    local_path.display()
+                ));
+            }
+        }
+
+        // 3. Download ZIP
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(HTTP_TIMEOUT_SECS))
             .user_agent("elfClaw-source-sync")
@@ -217,7 +248,7 @@ impl SourceSyncTool {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to read response body: {e}"))?;
 
-        // Remove old directory if exists, then extract
+        // 4. Remove old directory if exists, then extract
         if local_path.exists() {
             tokio::fs::remove_dir_all(&local_path).await.ok();
         }
@@ -234,9 +265,11 @@ impl SourceSyncTool {
         .await
         .map_err(|e| anyhow::anyhow!("ZIP extraction task failed: {e}"))??;
 
-        let commit_info = commit_sha
-            .as_deref()
-            .unwrap_or("unknown");
+        // 5. Write version marker for future skip-download check
+        let commit_info = remote_sha.as_deref().unwrap_or("unknown");
+        if let Some(ref sha) = remote_sha {
+            tokio::fs::write(&version_file, sha).await.ok();
+        }
 
         Ok(format!(
             "Synced {repo_id} via HTTP ZIP\nLatest: {commit_info}\nPath: {}",
@@ -342,9 +375,14 @@ impl SourceSyncTool {
                 local_path.display()
             ))
         } else {
-            // HTTP-synced or git unavailable
+            // HTTP-synced or git unavailable — show version marker if present
+            let version_file = local_path.join(".elfclaw_sync_sha");
+            let sha_info = tokio::fs::read_to_string(&version_file)
+                .await
+                .map(|s| format!("Local SHA: {}", s.trim()))
+                .unwrap_or_else(|_| "Local SHA: unknown".into());
             Ok(format!(
-                "{repo_id}: synced (HTTP ZIP)\nPath: {}",
+                "{repo_id}: synced (HTTP ZIP)\n{sha_info}\nPath: {}",
                 local_path.display()
             ))
         }
