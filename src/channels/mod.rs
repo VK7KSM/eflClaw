@@ -568,10 +568,12 @@ fn build_runtime_status_section(config: &crate::config::Config) -> String {
     // elfClaw: self_check tool — two-phase diagnostics (collect → analyze → save)
     section.push_str(
         "\n`self_check` 工具：用户说「自检」「健康检查」「debug自检」时调用。\
-         第一步：调用 self_check(action=\"collect\") 收集日志和源码信息。\
-         第二步：你（主模型）分析返回的数据，用 file_read/content_search 深入查看源码。\
-         第三步：撰写诊断报告，调用 self_check(action=\"save_report\", report=\"...\") 保存。\
-         报告应包含具体的文件路径、行号、代码片段和修复方案。\n"
+         第一步：调用 self_check(action=\"collect\") 收集日志、搜索结果和关键文件内容。\
+         第二步：直接分析 collect 返回的 JSON 数据（其中已包含 search_results 和 key_files）。\
+         如确实需要额外查看文件，使用返回的 source_base_path 前缀调用 file_read，\
+         例如 file_read(path: \"github/elfclaw/src/xxx.rs\")。\
+         **禁止**使用 shell/git/findstr 命令探索源码。\
+         第三步：撰写诊断报告，调用 self_check(action=\"save_report\", report=\"...\") 保存。\n"
     );
 
     // elfClaw: GitHub MCP tool guidance

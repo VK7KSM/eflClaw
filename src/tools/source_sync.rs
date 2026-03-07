@@ -42,7 +42,7 @@ const ALLOWED_REPOS_HTTP: &[(&str, &str, &str)] = &[
 ];
 
 /// Subdirectory under workspace where source repos are cloned.
-const SOURCE_DIR: &str = "workspace/github";
+const SOURCE_DIR: &str = "github";
 
 pub struct SourceSyncTool {
     security: Arc<SecurityPolicy>,

@@ -89,7 +89,7 @@ impl SelfCheckTool {
         let marker = self
             .security
             .workspace_dir
-            .join("workspace/github")
+            .join("github")
             .join(repo_id)
             .join("Cargo.toml");
         marker.exists()
@@ -163,6 +163,8 @@ impl SelfCheckTool {
                 output: json!({
                     "mode": mode,
                     "sync_status": sync_status.join("; "),
+                    "source_base_path": "github/elfclaw",
+                    "usage_hint": "如需查看源码，使用 file_read(path: \"github/elfclaw/src/xxx.rs\")。禁止使用 shell/git 命令。",
                     "logs": [],
                     "search_results": [],
                     "key_files": {},
@@ -180,6 +182,8 @@ impl SelfCheckTool {
                 output: json!({
                     "mode": mode,
                     "sync_status": sync_status.join("; "),
+                    "source_base_path": "github/elfclaw",
+                    "usage_hint": "如需查看源码，使用 file_read(path: \"github/elfclaw/src/xxx.rs\")。禁止使用 shell/git 命令。",
                     "logs": [],
                     "search_results": [],
                     "key_files": {},
@@ -205,9 +209,8 @@ impl SelfCheckTool {
                 let search_paths = determine_search_paths(&entries);
 
                 for search_path in search_paths.iter().take(4) {
-                    let full_path = format!(
-                        "{}/workspace/github/elfclaw/{}",
-                        self.security.workspace_dir.display(),
+                    let relative_path = format!(
+                        "github/elfclaw/{}",
                         search_path
                     );
 
@@ -215,7 +218,7 @@ impl SelfCheckTool {
                         .content_search
                         .execute(json!({
                             "pattern": keyword,
-                            "path": &full_path,
+                            "path": &relative_path,
                             "output_mode": "content",
                             "context_before": 3,
                             "context_after": 5,
@@ -236,16 +239,15 @@ impl SelfCheckTool {
 
             // ── Step 4: Read key files ────────────────────────────────
             for key_file in KEY_FILES {
-                let full_path = format!(
-                    "{}/workspace/github/elfclaw/{}",
-                    self.security.workspace_dir.display(),
+                let relative_path = format!(
+                    "github/elfclaw/{}",
                     key_file
                 );
 
                 if let Ok(r) = self
                     .file_read
                     .execute(json!({
-                        "path": &full_path,
+                        "path": &relative_path,
                         "offset": 1,
                         "limit": 80
                     }))
@@ -264,7 +266,7 @@ impl SelfCheckTool {
             let src_dir = self
                 .security
                 .workspace_dir
-                .join("workspace/github/elfclaw/src");
+                .join("github/elfclaw/src");
             if src_dir.exists() {
                 if let Ok(entries) = std::fs::read_dir(&src_dir) {
                     for entry in entries.flatten() {
@@ -283,6 +285,8 @@ impl SelfCheckTool {
         let result = json!({
             "mode": mode,
             "sync_status": sync_status.join("; "),
+            "source_base_path": "github/elfclaw",
+            "usage_hint": "如需查看源码，使用 file_read(path: \"github/elfclaw/src/xxx.rs\")。禁止使用 shell/git 命令。",
             "logs": logs_json,
             "search_results": search_results,
             "key_files": key_files_map,
