@@ -2,6 +2,226 @@
 
 ---
 
+## 2026-03-08 — 自检报告质量 v3 + MCP 全局集成 + 看门狗错误学习
+
+### 三大改进方向
+
+| 方向 | 文件 | 改动要点 |
+|------|------|---------|
+| A. 自检报告质量 | self_check.rs, channels/mod.rs, source_sync.rs | 多级别日志+分类标注+反编造 prompt+二次复核 |
+| B. MCP 全局集成 | loop_.rs | 子 agent（自检/cron 等）也能使用 MCP 工具 |
+| C. 看门狗错误学习 | detection.rs, loop_.rs, channels/mod.rs | 失败数据暴露+记忆存储+恢复注入 |
+
+### Part A：自检报告质量修复
+
+#### `src/tools/self_check.rs`
+- **collect()**：同时收集 error(80条)+warn(30条)，不再二选一
+- **source_hint**：每条日志加 `source_hint` 分类（ToolCall→"user-triggered tool execution"，System→"system/daemon lifecycle" 等）
+- **分析 prompt**：增加反编造规则（只报有直接证据的问题、标注 timestamp+component、禁止编造版本号）、按严重程度分级（🔴/🟡/🔵）、解释禁止工具的原因
+
+#### `src/channels/mod.rs`
+- 自检引导 prompt 改为三步：调用 analyze → 二次复核（check_logs 验证最多 3 次）→ 标注 ✅/⚠️/❌
+
+#### `src/tools/source_sync.rs`
+- `sync_via_http()` 三处新增 `tracing::info!`：
+  - SHA 匹配：`"source up-to-date, skipping download"`
+  - 版本文件不存在：`"local source exists but no version marker, will re-download"`
+  - API 不可达：`"GitHub API unreachable, using existing local copy"`
+
+### Part B：MCP 全局集成
+
+#### `src/agent/loop_.rs`
+- 在 `run()` 中 peripheral tools 之后添加 MCP 工具初始化
+- 与 channels/mod.rs 中的模式完全一致：`McpRegistry::connect_all` → `McpToolWrapper` 注册
+- 效果：自检分析 agent、cron agent 等所有通过 `loop_::run()` 创建的 agent 自动获得 MCP 工具
+
+### Part C：看门狗错误学习
+
+#### `src/agent/loop_/detection.rs`
+- 新增 `last_failed_args: HashMap<String, String>` 字段，`record_call()` 失败时记录参数（截取200字符）
+- 新增 `failure_summary()` — 返回所有失败工具+连续失败次数
+- 新增 `last_failed_args()` — 返回最后失败参数
+
+#### `src/agent/loop_.rs`
+- hard stop 处理增强：构建详细 `error_report`（中断原因+失败工具列表+参数+教训）
+- 输出格式：`⚠️ [循环检测] + 📋 失败摘要`，包含具体工具名+次数+参数
+
+#### `src/channels/mod.rs`
+- **错误记忆存储**：当 response 包含 `📋 失败摘要` 时，提取摘要存入 `MemoryCategory::Daily`（key: `error_watchdog_YYYYMMDD_HHMM`）
+- **看门狗恢复注入**：检测到上一轮 assistant 消息是 watchdog hard stop 时，注入恢复指引：
+  - 禁止重复同一工具+参数
+  - 0ms 失败 = 安全策略拦截 → 切换方法
+  - 自然衰减：成功完成一轮后不再注入
+
+### 验证
+- `cargo check` ✅ 通过（0 个新增 warning）
+- `cargo test --lib -- tools::self_check tools::source_sync agent::loop_::detection` ✅ 30/30 通过
+
+---
+
+## 2026-03-08 — Xiaozhi 第三轮修复（STT 挂死 + 帧收集超时 + 日志可见化 + OGG granule）
+
+### 问题
+
+上轮 Fix 1-4（stt:start ACK）确认在运行（日志显示 `listen:start (session=...)`），但 99 秒内仍零后续日志。
+
+根因分析：
+1. **STT HTTP 无超时**：`transcription.rs` 使用 `build_runtime_proxy_client`（无 timeout）。Groq API 若无响应 → HTTP 永久挂起 → 完全符合"99 秒零日志"现象。
+2. **帧收集循环无超时**：设备若不发 `listen:stop` → `source.next().await` 永久挂起。
+3. **关键日志不可见**：`listen:stop` 是 `debug!` 级别，INFO 模式看不到；`frames.is_empty()` 和 STT 返回空字符串均无日志 → 无法区分三种失败模式。
+4. **OGG granule 错误**：device 用 `frame_duration=60ms`，但代码写的是 `samples_per_frame=960`（20ms），应为 `2880`（60ms × 48kHz / 1000）。
+
+### 改动
+
+#### `src/channels/transcription.rs`（Fix 5）
+- 行 83：将 `build_runtime_proxy_client` 换为 `build_runtime_proxy_client_with_timeouts("transcription.groq", 20, 10)`
+- total timeout 20s，connect timeout 10s — 避免 STT 调用永久挂死
+
+#### `src/channels/xiaozhi.rs`（Fix 6 + Fix 7）
+- **帧收集循环**（Fix 6）：
+  - `source.next().await` → `tokio::time::timeout(30s, source.next()).await`，超时 warn + continue 'outer
+  - `listen:stop` 日志从 `debug!` 升为 `info!`（INFO 模式可见）
+  - `frames.is_empty()` 加 `warn!`（之前完全无日志）
+  - STT 返回空字符串加 `warn!`（之前完全无日志）
+  - 帧收集 WS 错误：精确的 warn/debug 替代原来的 `_ => break 'outer`
+- **granule position**（Fix 7）：`samples_per_frame: u64 = 960 → 2880`（正确反映 60ms 帧时长）
+
+### 验证
+
+`cargo check` 通过，无新增 warnings/errors。
+
+### 期望日志序列（修复后）
+
+```
+listen:start (session=...)          ← 已有
+listen:stop (N frames collected)    ← Fix 6 新增（N>0 = 音频到达）
+Xiaozhi: device_id → "说话内容"   ← STT 成功
+```
+
+如出现 warn：
+- `frame collection timeout` → 设备未发 `listen:stop`（协议/固件问题）
+- `listen:stop received but no audio frames` → VAD 问题
+- `STT returned empty result` → 音质/API 问题
+- `STT failed: ...` → 含超时原因的 API 错误
+
+---
+
+## 2026-03-07 — Xiaozhi 三问题修复（STT ACK + tts:idle + 语音感知 + 主动推送）
+
+### 问题
+
+1. **问题 1（阻塞性 bug）**：说话无反应，STT 完全失效。根因：v3 协议要求收到 `listen:start` 后 server 必须回发 `stt:start` ACK，设备收到 ACK 才会开始发送 Binary Opus 音频帧。代码直接 `break` 进入帧收集循环，从未发 ACK → 设备永远卡在"聆听中" → Binary 帧为零。
+2. **问题 2**：多轮对话不工作。TTS 播放完后缺少 `tts:idle` 信号 → 设备不知道可以进入下一轮。
+3. **问题 3**：Agent 不知道这是语音设备 → 可能返回 markdown/列表/长文本。
+4. **附加**：主动推送架构不完整 — 设备空闲时 `tts_rx` 不被消费。
+
+### 修改内容
+
+**`src/channels/xiaozhi.rs`**：
+
+- **Fix 1**（行 ~401）：`listen:start` 分支提取 `session_id`，发送 `stt:start` ACK（含 session_id 或不含），然后再 `break` 进入帧收集。
+- **Fix 2**（行 ~541）：`tts:stop` 发送之后追加 `tts:idle`，重置设备到就绪状态，保证多轮对话。
+- **Fix 4**：等待 `listen:start` 的内层 `loop` 改为 `tokio::select!`，同时监听：
+  - `source.next()` — 设备 WebSocket 消息（原有逻辑不变，缩进调整）
+  - `tts_rx.recv()` — 主动推送分支：收到 OGG 后直接发 `tts:start` → Binary 帧 → `tts:stop` → `tts:idle`，继续等待（不 break）
+
+**`src/channels/mod.rs`**：
+
+- **Fix 3**（`channel_delivery_instructions()` 函数）：添加 `"xiaozhi"` 分支，指示 agent 回复简短口语化、不用 markdown、不用列表、数字自然拼读。
+
+### 验证
+
+- `cargo check` — 通过（仅预存 warnings，与本次修改无关）
+
+---
+
+## 2026-03-07 — cf-crawler Skill 运行失败修复（路径 + Windows shell 兼容）
+
+### 问题
+
+cf-crawler skill 在 elfClaw 上首次测试运行失败，日志分析发现 3 个需要代码修复的问题：
+
+1. **路径错误**：SKILL.toml 命令路径写 `workspace/tools/cf-crawler-win-x64.exe`，但 shell 的 cwd 已经是 workspace 目录，导致解析为 `workspace/workspace/tools/`（双重 workspace）→ CommandNotFoundException
+2. **环境变量未传递**：`shell_env_passthrough` 只透传父进程中已存在的环境变量，目标机器未设置 `CF_CRAWLER_ENDPOINT` / `CF_CRAWLER_TOKEN` → cf-crawler 默认连 `localhost:8787` → ECONNREFUSED
+3. **SkillToolHandler Windows 不兼容**：`tool_handler.rs` 硬编码 `sh -c` 执行 skill 工具命令，Windows 上若无 Git Bash 则 `sh` 不存在，所有 SKILL.toml 的 shell 工具都会失败
+
+### 修改内容
+
+**`资料/skills/cf-crawler/SKILL.toml`**：
+
+- 所有 6 处 `workspace/tools/cf-crawler-win-x64.exe` → `.\tools\cf-crawler-win-x64.exe`（使用 `.\` 前缀 + 反斜杠，PowerShell 执行相对路径的必要格式）
+
+**`资料/skills/cf-crawler/SKILL.md`**：
+
+- 所有 8 处路径同步修改：`workspace/tools/cf-crawler-win-x64.exe` → `.\tools\cf-crawler-win-x64.exe`
+
+**`src/skills/tool_handler.rs`**（第 391 行）：
+
+- 原代码：无条件 `sh -c` 执行命令
+- 新代码：`#[cfg(windows)]` 分支 — 先尝试 `sh -c`（Git Bash），失败则 fallback 到 `powershell -NoProfile -NonInteractive -Command`；同时处理 `python3` → `python` 重写（Windows 上 Python 通常不提供 `python3` 命令）
+- `#[cfg(not(windows))]` 分支 — 保持原有 `sh -c` 不变
+
+### 环境变量（手动操作）
+
+目标机器需设置用户级环境变量后重启 zeroclaw：
+```powershell
+[System.Environment]::SetEnvironmentVariable("CF_CRAWLER_ENDPOINT", "https://cf-crawler-worker.kangarooo-network.workers.dev", "User")
+[System.Environment]::SetEnvironmentVariable("CF_CRAWLER_TOKEN", "CFCRAWLER20260307KANGAROOAUTHKEY", "User")
+```
+
+### 验证
+
+- `cargo check` — 通过（仅预存 warnings，与本次修改无关）
+
+---
+
+## 2026-03-07 — Xiaozhi AI-VOX3 闪退 v3 精确修复（tts:idle session_id + hello 协议完整化）
+
+### 问题（v3 根因分析）
+
+1. **主根因（最高置信度）**：`tts:idle` 消息含多余 `session_id` 字段 → ESP32 固件 cJSON 解析路径异常 → TCP RST → AI 程序闪退
+   - 时序：connected 日志 → tts:idle 发出 → 设备瞬间崩溃（完全吻合）
+2. **协议兼容问题（高置信度）**：hello 响应格式不完整 — 缺 `version:3`、`transport`、`frame_duration:60`；`sample_rate` 为 24000（应为 16000 告知设备录音采样率）
+
+### 修改内容
+
+**`src/channels/xiaozhi.rs`**：
+
+- **Fix A（最高优先级）**：`tts:idle` 去掉 `session_id` 字段，只发 `{"type":"tts","state":"idle"}`；hello 循环同步改为只返回 `device_id`（`session_id` 仅在 hello 内部使用）
+- **Fix B（高优先级）**：hello 响应补全 xiaozhi v3 标准格式：添加 `version:3`、`transport:"websocket"`、`frame_duration:60`；`sample_rate` 从 24000 改为 16000（与 `wrap_opus_frames_in_ogg(&frames, 16000)` 一致；TTS 输出仍是 24kHz 不受影响）
+- **Fix C**：`listen:start` 日志级别从 `debug!` 改为 `info!`，提升可见性
+- **doc comment**：文件顶部协议示例更新为完整 v3 hello 格式
+
+### 验证
+
+- `cargo check` — 通过（只有预存 warnings，与本次修改无关）
+
+---
+
+## 2026-03-07 — Xiaozhi AI-VOX3 闪退 & 版本卡死修复
+
+### 问题
+
+1. **设备连接后 27 秒静默断开**：服务端发完 hello 响应后未发 `tts:idle` 信号，AI-VOX3 固件等待服务端就绪确认，超时后发 Close 帧断开
+2. **断开原因无日志**：WS 错误 / 流关闭 / 设备主动 Close 三种情况都静默 `break 'outer`，无法定位根因
+3. **OTA 响应含顶层 version 字段**：Nulllab 固件可能将其解读为固件版本，触发 OTA 检查流程（约 1 分钟超时）才连 WebSocket
+4. **listen:detect 消息被静默丢弃**：设备在自动检测模式发送的 `listen:detect` 落入 `_ => {}` 无日志，调试困难
+
+### 修改内容
+
+**`src/channels/xiaozhi.rs`**：
+
+- **Fix 1（主修复）**：hello 循环改为 break `(id, sid)` 返回元组；`info!("connected")` 之后立即发送 `{"type":"tts","state":"idle","session_id":"..."}` 信号；idle 发送失败时清理 sessions 后 return
+- **Fix 2**：Phase 2 等待 listen:start 的内层 loop — `Some(Err(e))` 分支加 `warn!`，`None` 分支加 `debug!`，`Message::Close(frame)` 加 `debug!`，不再静默 break
+- **Fix 3**：`match json["type"].as_str()` 添加 `Some("listen") if state == "detect"` 分支，打印 debug 日志
+- **Fix 4**：`respond_ota()` 的 JSON body 去掉顶层 `"version": "1.9.0"` 字段，只保留 `{"websocket":{"url":"..."}}`
+
+### 验证
+
+- `cargo check` — 通过（只有预存 warnings）
+
+---
+
 ## 2026-03-07 — self_check 独立进程 + content_search Windows 兼容 + source_sync 本地优先
 
 ### 问题

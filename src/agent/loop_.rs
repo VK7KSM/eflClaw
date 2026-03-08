@@ -1026,7 +1026,26 @@ pub(crate) async fn run_tool_call_loop(
 
         // elfClaw: if loop detection triggered a hard stop, exit the outer iteration loop
         if let Some(reason) = loop_hard_stop.take() {
-            last_response_text = format!("⚠️ [循环检测：已停止。原因：{}]", reason);
+            // Build failure summary for error learning
+            let failures = loop_detector.failure_summary();
+            let failed_args = loop_detector.last_failed_args();
+            let mut error_report = format!("中断原因: {}\n失败工具:\n", reason);
+            for (tool, count) in &failures {
+                error_report.push_str(&format!("- {} (连续失败 {} 次)", tool, count));
+                if let Some(args) = failed_args.get(tool) {
+                    error_report.push_str(&format!("，最后参数: {}", args));
+                }
+                error_report.push('\n');
+            }
+            error_report.push_str(
+                "教训: 上述工具在当前环境下不可用或参数有误，请勿重试相同操作。"
+            );
+            tracing::info!("Loop detection hard stop — failure summary:\n{}", error_report);
+
+            last_response_text = format!(
+                "⚠️ [循环检测：已停止。原因：{}]\n\n📋 失败摘要：\n{}",
+                reason, error_report
+            );
             break;
         }
 
@@ -1247,6 +1266,35 @@ pub async fn run(
     if !peripheral_tools.is_empty() {
         tracing::info!(count = peripheral_tools.len(), "Peripheral tools added");
         tools_registry.extend(peripheral_tools);
+    }
+
+    // elfClaw: wire MCP tools into isolated agent registries (self_check, cron, etc.)
+    // Matches the pattern in channels/mod.rs so all agent contexts get MCP access.
+    if config.mcp.enabled && !config.mcp.servers.is_empty() {
+        match crate::tools::mcp_client::McpRegistry::connect_all(&config.mcp.servers).await {
+            Ok(registry) => {
+                let registry = std::sync::Arc::new(registry);
+                let names = registry.tool_names();
+                let mut mcp_added = 0usize;
+                for name in names {
+                    if let Some(def) = registry.get_tool_def(&name).await {
+                        let wrapper = crate::tools::McpToolWrapper::new(
+                            name,
+                            def,
+                            std::sync::Arc::clone(&registry),
+                        );
+                        tools_registry.push(Box::new(wrapper));
+                        mcp_added += 1;
+                    }
+                }
+                if mcp_added > 0 {
+                    tracing::info!(count = mcp_added, "MCP tools added to agent");
+                }
+            }
+            Err(e) => {
+                tracing::warn!("MCP registry connection failed (non-fatal): {e:#}");
+            }
+        }
     }
 
     // ── Resolve provider ─────────────────────────────────────────

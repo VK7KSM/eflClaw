@@ -160,21 +160,31 @@ impl SelfCheckTool {
         let has_source_code =
             self.source_dir_exists("elfclaw") || self.source_dir_exists("zeroclaw");
 
-        // ── Step 2: Collect structured logs ─────────────────────────────
-        let mut entries: Vec<LogEntry> =
-            elfclaw_log::query_recent(100, Some("error"), None, Some(since_minutes));
+        // ── Step 2: Collect structured logs (error + warn combined) ────
+        let error_entries =
+            elfclaw_log::query_recent(80, Some("error"), None, Some(since_minutes));
+        let warn_entries =
+            elfclaw_log::query_recent(30, Some("warn"), None, Some(since_minutes));
+        let entries: Vec<LogEntry> = error_entries.into_iter().chain(warn_entries).collect();
 
-        if entries.is_empty() {
-            entries = elfclaw_log::query_recent(50, Some("warn"), None, Some(since_minutes));
-        }
-
-        // Convert log entries to JSON
+        // Convert log entries to JSON with source_hint classification
         let logs_json: Vec<Value> = entries
             .iter()
             .map(|e| {
+                let source_hint = match e.category {
+                    elfclaw_log::LogCategory::ToolCall => "user-triggered tool execution",
+                    elfclaw_log::LogCategory::CronJob => "scheduled background task",
+                    elfclaw_log::LogCategory::LlmCall => "LLM API interaction",
+                    elfclaw_log::LogCategory::ChannelMessage => "user chat message handling",
+                    elfclaw_log::LogCategory::Heartbeat => "heartbeat periodic task",
+                    elfclaw_log::LogCategory::AgentLifecycle => "agent start/stop lifecycle",
+                    elfclaw_log::LogCategory::WorkerStatus => "worker process status",
+                    elfclaw_log::LogCategory::System => "system/daemon lifecycle",
+                };
                 json!({
                     "level": e.level.as_str(),
                     "category": e.category.as_str(),
+                    "source_hint": source_hint,
                     "component": &e.component,
                     "message": &e.message,
                     "timestamp": &e.timestamp,
@@ -357,24 +367,42 @@ impl SelfCheckTool {
             return Ok(collect_result);
         }
 
-        // 2. Build analysis prompt
+        // 2. Build analysis prompt with anti-hallucination rules
         let prompt = format!(
             "你是 elfClaw 系统的自检分析器。\n\
              以下是自动收集的完整系统诊断数据 JSON。\n\n\
              ## 分析要求\n\
-             1. 先阅读 environment 部分，了解运行环境（OS、可用工具）\n\
-             2. 分析 logs 中的错误，找出根因和模式\n\
-             3. 检查 search_results 和 key_files 中的相关代码\n\
-             4. 如需查看更多源码，使用 file_read(path: \"github/elfclaw/src/xxx.rs\")\n\
-             5. 最多额外查看 5 个文件，不要过度探索\n\n\
+             1. 先阅读 environment 部分，了解运行环境（OS、架构、可用工具）\n\
+             2. 使用 source_hint 字段区分日志来源：\n\
+                - \"user-triggered tool execution\" = 用户操作触发的工具调用\n\
+                - \"scheduled background task\" = 定时任务\n\
+                - \"LLM API interaction\" = LLM 调用\n\
+                - \"system/daemon lifecycle\" = 系统启停\n\
+                用户操作记录（如 shell 命令失败）不是系统缺陷，应归类为「用户操作记录」\n\
+             3. 分析 logs 中的错误，找出根因和模式\n\
+             4. 检查 search_results 和 key_files 中的相关代码\n\
+             5. 如需查看更多源码，使用 file_read(path: \"github/elfclaw/src/xxx.rs\")\n\
+             6. 最多额外查看 5 个文件，不要过度探索\n\n\
+             ## 反编造规则（必须遵守）\n\
+             - 只报告数据中有直接证据的问题，禁止推测或编造不存在的错误\n\
+             - 每个问题必须标注 timestamp 和 component\n\
+             - 禁止引用数据中没有的版本号、数字或统计\n\
+             - 禁止使用「你」「您」等个人称呼，使用「系统」「运行环境」等客观表述\n\
+             - 如果日志为空或无异常，直接报告「系统正常」即可\n\n\
              ## 报告格式（中文）\n\
              1. **运行环境概况**（OS、架构、可用工具）\n\
-             2. **系统健康状态**\n\
-             3. **发现的问题**（按严重程度排列）\n\
-             4. **根因分析**\n\
+             2. **系统健康状态**（正常/有问题/严重）\n\
+             3. **发现的问题**（按严重程度排列，每条标注 timestamp + component）\n\
+                - 🔴 严重（影响核心功能）\n\
+                - 🟡 中等（影响体验但不致命）\n\
+                - 🔵 信息（用户操作记录，非系统缺陷）\n\
+             4. **根因分析**（仅基于日志和代码证据）\n\
              5. **修复建议**（具体操作步骤）\n\n\
              ## 禁止使用的工具\n\
-             shell、git_operations、content_search、self_check\n\n\
+             - shell — 防止产生副作用\n\
+             - git_operations — 防止修改仓库状态\n\
+             - content_search — Windows 兼容性问题，使用 file_read 替代\n\
+             - self_check — 防止递归调用\n\n\
              直接输出报告文本。\n\n\
              ---\n\
              诊断数据：\n{}",

@@ -462,6 +462,17 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - Keep normal text outside markers and never wrap markers in code fences.\n\
              - Use tool results silently: answer the latest user message directly, and do not narrate delayed/internal tool execution bookkeeping.",
         ),
+        "xiaozhi" => Some(
+            "You are responding to a voice-only AI speaker device (Xiaozhi AI-VOX3). \
+             Your text reply will be synthesized to speech and played aloud. Rules:\n\
+             - Keep responses SHORT and conversational (1-3 sentences when possible)\n\
+             - Use plain spoken language — NO markdown, NO bullet points, NO code blocks\n\
+             - No headers, no **bold**, no *italic*, no `backticks`\n\
+             - Spell out numbers naturally ('three hundred', not '300')\n\
+             - Avoid lists; use natural spoken connectors ('first... then... finally...')\n\
+             - Skip filler phrases like 'Great question!' or 'Certainly!'\n\
+             - If the answer is complex, give a spoken summary and offer to elaborate",
+        ),
         _ => None,
     }
 }
@@ -567,12 +578,16 @@ fn build_runtime_status_section(config: &crate::config::Config) -> String {
          category=tool_call/cron_job/llm_call/channel_message/system，since_minutes=N。\n"
     );
 
-    // elfClaw: self_check tool — autonomous diagnostics (analyze action)
+    // elfClaw: self_check tool — autonomous diagnostics with two-pass verification
     section.push_str(
-        "\n`self_check` 工具：用户说「自检」「健康检查」「debug自检」或问「什么出问题了」时调用。\
-         只需一步：调用 self_check(action=\"analyze\")。\
-         工具会在独立进程中完成完整诊断（收集数据 → 分析 → 保存报告）。\
-         你只需将返回的摘要呈现给用户。\n"
+        "\n`self_check` 工具：用户说「自检」「健康检查」「debug自检」或问「什么出问题了」时调用。\n\
+         第一步：调用 self_check(action=\"analyze\")\n\
+         第二步（必须执行）：收到报告后进行二次复核：\n\
+           - 检查每个「🔴严重/🟡中等」问题是否有日志证据\n\
+           - 对有疑问的部分调用 check_logs 验证（最多 3 次工具调用）\n\
+           - 检查版本号、数字是否在数据范围内\n\
+           - 检查是否有用户操作错误被误归为系统缺陷\n\
+         第三步：向用户呈现：原始报告（完整保留）+ 复核结论（标注 ✅确认/⚠️存疑/❌误报）\n"
     );
 
     // elfClaw: GitHub MCP tool guidance
@@ -1871,6 +1886,27 @@ async fn process_channel_message(
         }
     }
 
+    // elfClaw: watchdog recovery injection — if the LAST assistant message was a
+    // hard stop from loop detection, inject recovery guidance so the LLM doesn't
+    // repeat the same failing operations when the user says "continue".
+    let prior_watchdog_stop = prior_turns.iter().rev()
+        .find(|m| m.role == "assistant")
+        .map(|m| m.content.contains("⚠️ [循环检测：已停止"))
+        .unwrap_or(false);
+
+    if prior_watchdog_stop {
+        let recovery_hint = "[SYSTEM] ⚠️ 你的上一轮操作被循环检测机制中断。\n\
+             用户现在要求你继续。请遵守以下恢复规则：\n\
+             1. 查看上方历史中的「📋 失败摘要」，了解哪些操作失败及原因\n\
+             2. 禁止重复使用同一工具+相同参数的组合\n\
+             3. 如果某个工具被安全策略拦截（0ms 失败），说明该工具在此环境不可用，切换到其他方法\n\
+             4. 如果无法完成任务，向用户说明原因并建议替代方案\n\
+             5. 优先使用 file_read、content_search 等安全工具，避免 shell 命令".to_string();
+        // Insert before the latest user message
+        let insert_pos = prior_turns.len().saturating_sub(1);
+        prior_turns.insert(insert_pos, ChatMessage::user(recovery_hint));
+    }
+
     // Save system prompt for potential context-overflow retry
     let system_prompt_for_retry = system_prompt.clone();
     let mut history = vec![ChatMessage::system(system_prompt)];
@@ -2086,6 +2122,26 @@ async fn process_channel_message(
             }
         }
         LlmExecutionResult::Completed(Ok(Ok(response))) => {
+            // elfClaw: store watchdog error pattern to memory for cross-session learning
+            if response.contains("📋 失败摘要") {
+                let error_key = format!(
+                    "error_watchdog_{}",
+                    chrono::Local::now().format("%Y%m%d_%H%M")
+                );
+                // Extract just the failure summary section
+                let summary = response
+                    .split("📋 失败摘要：\n")
+                    .nth(1)
+                    .unwrap_or(&response);
+                let _ = ctx.memory.store(
+                    &error_key,
+                    summary,
+                    crate::memory::MemoryCategory::Daily,
+                    None,
+                ).await;
+                tracing::info!(key = %error_key, "Stored watchdog error pattern to memory");
+            }
+
             // ── Hook: on_message_sending (modifying) ─────────
             let mut outbound_response = response;
             if let Some(hooks) = &ctx.hooks {

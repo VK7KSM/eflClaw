@@ -197,6 +197,11 @@ impl SourceSyncTool {
                 if let Ok(local_sha) = tokio::fs::read_to_string(&version_file).await {
                     let local_sha = local_sha.trim().to_string();
                     if local_sha == *remote {
+                        tracing::info!(
+                            repo = repo_id,
+                            sha = remote.as_str(),
+                            "source up-to-date, skipping download"
+                        );
                         return Ok(format!(
                             "{repo_id}: already up-to-date ({})\nPath: {}",
                             remote,
@@ -209,10 +214,19 @@ impl SourceSyncTool {
                         remote = remote.as_str(),
                         "source out of date, re-downloading"
                     );
+                } else {
+                    tracing::info!(
+                        repo = repo_id,
+                        "local source exists but no version marker, will re-download"
+                    );
                 }
             }
             // If we can't fetch remote SHA, skip download and use existing local copy
             if remote_sha.is_none() {
+                tracing::info!(
+                    repo = repo_id,
+                    "GitHub API unreachable, using existing local copy"
+                );
                 return Ok(format!(
                     "{repo_id}: using existing local copy (GitHub API unreachable)\nPath: {}",
                     local_path.display()
