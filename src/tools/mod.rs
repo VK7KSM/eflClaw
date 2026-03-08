@@ -71,10 +71,12 @@ pub mod schedule;
 pub mod schema;
 pub mod screenshot;
 pub mod search_chat_log;
+pub mod self_check;
 pub mod send_email;
 pub mod send_telegram;
 pub mod send_voice;
 pub mod shell;
+pub mod source_sync;
 pub mod subagent_list;
 pub mod subagent_manage;
 pub mod subagent_registry;
@@ -143,10 +145,12 @@ pub use check_logs::CheckLogsTool;
 pub use schema::{CleaningStrategy, SchemaCleanr};
 pub use screenshot::ScreenshotTool;
 pub use search_chat_log::SearchChatLogTool;
+pub use self_check::SelfCheckTool;
 pub use send_email::SendEmailTool;
 pub use send_telegram::SendTelegramTool;
 pub use send_voice::SendVoiceTool;
 pub use shell::ShellTool;
+pub use source_sync::SourceSyncTool;
 pub use subagent_list::SubAgentListTool;
 pub use subagent_manage::SubAgentManageTool;
 pub use subagent_registry::SubAgentRegistry;
@@ -404,17 +408,35 @@ pub fn all_tools_with_runtime(
         )));
     }
 
+    // elfClaw: source_sync tool — clone/pull source repos for debug analysis
+    let source_sync_arc: Arc<dyn Tool> = Arc::new(SourceSyncTool::new(security.clone()));
+
     if has_filesystem_access {
         tool_arcs.push(Arc::new(OpenClawMigrationTool::new(
             config.clone(),
             security.clone(),
         )));
-        tool_arcs.push(Arc::new(FileReadTool::new(security.clone())));
-        tool_arcs.push(Arc::new(FileWriteTool::new(security.clone())));
+        let file_read_arc: Arc<dyn Tool> = Arc::new(FileReadTool::new(security.clone()));
+        let file_write_arc: Arc<dyn Tool> = Arc::new(FileWriteTool::new(security.clone()));
+        let content_search_arc: Arc<dyn Tool> = Arc::new(ContentSearchTool::new(security.clone()));
+        tool_arcs.push(file_read_arc.clone());
+        tool_arcs.push(file_write_arc.clone());
         tool_arcs.push(Arc::new(FileEditTool::new(security.clone())));
         tool_arcs.push(Arc::new(ApplyPatchTool::new()));
         tool_arcs.push(Arc::new(GlobSearchTool::new(security.clone())));
-        tool_arcs.push(Arc::new(ContentSearchTool::new(security.clone())));
+        tool_arcs.push(content_search_arc.clone());
+
+        // elfClaw: self_check tool — programmatic source-level diagnostics
+        tool_arcs.push(Arc::new(SelfCheckTool::new(
+            security.clone(),
+            Arc::new(root_config.clone()),
+            // Safety: we know the concrete types behind these Arc<dyn Tool>.
+            // SelfCheckTool stores them as Arc<ConcreteType> so we need to
+            // construct fresh instances that share SecurityPolicy.
+            Arc::new(SourceSyncTool::new(security.clone())),
+            Arc::new(ContentSearchTool::new(security.clone())),
+            Arc::new(FileReadTool::new(security.clone())),
+        )));
     }
     if runtime.as_any().is::<crate::runtime::WasmRuntime>() {
         tool_arcs.push(Arc::new(WasmModuleTool::new(
@@ -576,6 +598,9 @@ pub fn all_tools_with_runtime(
 
     // elfClaw: check_logs tool — always available so agent can query runtime logs
     tool_arcs.push(Arc::new(CheckLogsTool::new()));
+
+    // elfClaw: source_sync tool — clone/pull source repos for debug analysis
+    tool_arcs.push(source_sync_arc);
 
     // Add delegation and sub-agent orchestration tools when agents are configured
     if !agents.is_empty() {

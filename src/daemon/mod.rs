@@ -241,19 +241,18 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
 
         // ── Build whole-file prompt (one agent turn) ──
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M %Z");
-        // elfClaw: inject log health check — check errors from the last heartbeat interval
-        let since_mins = u64::from(interval_mins);
+        // elfClaw: simplified heartbeat — cron sync only, no log diagnostics
+        // Log diagnostics are handled by self_check (triggered by user via main model).
+        // This keeps heartbeat within weak-model capability and avoids runaway tool loops.
         let prompt = format!(
             "[Heartbeat] 当前时间: {now}\n\n\
-             **自动日志检查（必做）**：先使用 `check_logs` 工具（level=error, since_minutes={since_mins}）\
-             检查最近 {since_mins} 分钟内的系统错误。如有错误，将摘要包含在汇报中；无错误则无需提及。\n\n\
              以下是 HEARTBEAT.md 的完整内容：\n\n\
              {content}\n\n\
              请执行以下步骤：\n\
-             1. 用 cron_list 检查现有新闻推送 Cron 任务是否与上面的时间表一致\n\
+             1. 用 cron_list 检查现有 Cron 任务是否与上面的时间表一致\n\
              2. 如果不一致，用 cron_add/cron_update/cron_remove 同步（delivery 设为 announce 到 telegram）\n\
-             3. 检查是否有其他需要汇报的事项\n\
-             4. 如果一切正常且无需汇报，回复 HEARTBEAT_OK"
+             3. 如果一切正常且无需变更，回复 HEARTBEAT_OK\n\n\
+             注意：不要调用 check_logs。日志诊断由 self_check 工具负责，不在 heartbeat 范围内。"
         );
 
         let temp = config.default_temperature;
