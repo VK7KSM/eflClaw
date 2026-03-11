@@ -584,8 +584,9 @@ fn build_runtime_status_section(config: &crate::config::Config) -> String {
          第一步：调用 self_check(action=\"analyze\")\n\
          第二步（必须执行）：收到报告后进行二次复核：\n\
            - 检查每个「🔴严重/🟡中等」问题是否有日志证据\n\
-           - 对有疑问的部分调用 check_logs 验证（最多 3 次工具调用）\n\
-           - 检查版本号、数字是否在数据范围内\n\
+           - 如果用户询问了特定服务/功能（如 MCP、cron、推送），用 check_logs 查询相关 INFO 日志\n\
+             示例：check_logs(level=\"info\", category=\"agent_lifecycle\", since_minutes=60)\n\
+           - 对有疑问的部分调用 check_logs 验证（最多 5 次工具调用）\n\
            - 检查是否有用户操作错误被误归为系统缺陷\n\
          第三步：向用户呈现：原始报告（完整保留）+ 复核结论（标注 ✅确认/⚠️存疑/❌误报）\n"
     );
@@ -596,6 +597,27 @@ fn build_runtime_status_section(config: &crate::config::Config) -> String {
          当需要手动查阅源码时，可使用 github__search_code、\
          github__get_file_contents 等 MCP 工具直接查询 elfClaw/zeroclaw 仓库源码。\
          这些工具通过 GitHub API 工作，不需要本地安装 git。\n"
+    );
+
+    // elfClaw: capability boundary declaration for deployed daemon
+    section.push_str("\n## Capability Boundaries\n\n");
+    section.push_str(
+        "You are a DEPLOYED agent running as a compiled binary. \
+         You are NOT in a development environment and have NO access to source code.\n\
+         FORBIDDEN actions:\n\
+         - Modifying config.toml — changes require admin to edit and restart the service\n\
+         - Creating or editing .rs/.toml/.yaml source files — you are a compiled binary, not a dev setup\n\
+         - Restarting or stopping your own process\n\
+         - Installing packages or system dependencies\n\n\
+         ALLOWED actions:\n\
+         - Reading and writing files in your workspace directory\n\
+         - Using shell commands for information gathering\n\
+         - Using all registered tools (within their permission gates)\n\
+         - Memory operations (recall, store, search)\n\
+         - Sending messages via configured channels\n\
+         - Managing cron jobs via cron_add/cron_list/cron_remove\n\n\
+         If asked to modify config or code, explain that you are a deployed daemon \
+         and these changes require the administrator to edit files and restart the service.\n"
     );
 
     section
@@ -1718,6 +1740,24 @@ async fn process_channel_message(
     } else {
         msg
     };
+    // elfClaw: mutable for /selfcheck command rewrite
+    let mut msg = msg;
+
+    // ── elfClaw: /selfcheck command — open gate and rewrite message ──
+    let is_selfcheck_command = msg.content.starts_with("/selfcheck");
+    if is_selfcheck_command {
+        let user_prompt = msg.content.strip_prefix("/selfcheck").unwrap_or("").trim();
+        let user_prompt = if user_prompt.is_empty() {
+            "执行全面自检：检查系统日志、错误模式、服务健康状态".to_string()
+        } else {
+            user_prompt.to_string()
+        };
+        crate::tools::self_check::SelfCheckGate::open(&user_prompt);
+        msg.content = format!(
+            "请立即调用 self_check 工具（action=\"analyze\"）执行自检：{}",
+            user_prompt
+        );
+    }
 
     let target_channel = ctx.channels_by_name.get(&msg.channel).cloned();
     if let Err(err) = maybe_apply_runtime_config_update(ctx.as_ref()).await {
@@ -1755,7 +1795,10 @@ async fn process_channel_message(
             return;
         }
     };
-    if ctx.auto_save_memory && msg.content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
+    if ctx.auto_save_memory
+        && msg.content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
+        && !is_selfcheck_command // elfClaw: diagnostic data must not pollute memory
+    {
         let autosave_key = conversation_memory_key(&msg);
         let _ = ctx
             .memory
@@ -2041,6 +2084,26 @@ async fn process_channel_message(
         excluded
     };
 
+    // elfClaw: build effective excluded_tools with self_check gate
+    let effective_excluded_tools: Vec<String> = {
+        let mut excluded = if msg.channel == "cli" {
+            vec![]
+        } else if msg.id.starts_with("email-digest-") {
+            email_digest_excluded_tools.clone()
+        } else {
+            ctx.non_cli_excluded_tools.as_ref().clone()
+        };
+        // self_check + check_logs gated: excluded unless user opened via /selfcheck
+        if !crate::tools::self_check::SelfCheckGate::is_open() {
+            for tool_name in &["self_check", "check_logs"] {
+                if !excluded.iter().any(|t| t == tool_name) {
+                    excluded.push(tool_name.to_string());
+                }
+            }
+        }
+        excluded
+    };
+
     let timeout_budget_secs =
         channel_message_timeout_budget_secs(ctx.message_timeout_secs, ctx.max_tool_iterations);
     let llm_result = tokio::select! {
@@ -2063,19 +2126,15 @@ async fn process_channel_message(
                 Some(cancellation_token.clone()),
                 delta_tx,
                 ctx.hooks.as_deref(),
-                if msg.channel == "cli" {
-                    &[]
-                } else if msg.id.starts_with("email-digest-") {
-                    // Email monitor digests: exclude send_email so the agent only
-                    // reports to the user and doesn't auto-reply to emails.
-                    // User decides what to do after seeing the notification.
-                    &email_digest_excluded_tools
-                } else {
-                    ctx.non_cli_excluded_tools.as_ref()
-                },
+                &effective_excluded_tools,
             ),
         ) => LlmExecutionResult::Completed(result),
     };
+
+    // elfClaw: close self-check gate after processing, regardless of success/failure
+    if is_selfcheck_command {
+        crate::tools::self_check::SelfCheckGate::close();
+    }
 
     if let Some(handle) = draft_updater {
         let _ = handle.await;
@@ -2122,26 +2181,6 @@ async fn process_channel_message(
             }
         }
         LlmExecutionResult::Completed(Ok(Ok(response))) => {
-            // elfClaw: store watchdog error pattern to memory for cross-session learning
-            if response.contains("📋 失败摘要") {
-                let error_key = format!(
-                    "error_watchdog_{}",
-                    chrono::Local::now().format("%Y%m%d_%H%M")
-                );
-                // Extract just the failure summary section
-                let summary = response
-                    .split("📋 失败摘要：\n")
-                    .nth(1)
-                    .unwrap_or(&response);
-                let _ = ctx.memory.store(
-                    &error_key,
-                    summary,
-                    crate::memory::MemoryCategory::Daily,
-                    None,
-                ).await;
-                tracing::info!(key = %error_key, "Stored watchdog error pattern to memory");
-            }
-
             // ── Hook: on_message_sending (modifying) ─────────
             let mut outbound_response = response;
             if let Some(hooks) = &ctx.hooks {
@@ -3746,9 +3785,17 @@ pub async fn start_channels(config: Config) -> Result<()> {
         }
     }
 
+    // elfClaw: register SKILL.toml tools (web_scrape, web_crawl, web_login, etc.)
+    let skills = crate::skills::load_skills_with_config(&workspace, &config);
+    let skill_tools = crate::skills::create_skill_tools(&skills, Arc::clone(&security), &workspace);
+    if !skill_tools.is_empty() {
+        tracing::info!(count = skill_tools.len(), "Skill tools registered in daemon");
+        built_tools.extend(skill_tools);
+    }
+
     let tools_registry = Arc::new(built_tools);
 
-    let skills = crate::skills::load_skills_with_config(&workspace, &config);
+    // skills already loaded above for tool registration
 
     // Collect tool descriptions for the prompt
     let mut tool_descs: Vec<(&str, &str)> = vec![

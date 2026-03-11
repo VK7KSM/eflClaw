@@ -211,6 +211,31 @@ impl Tool for CronAddTool {
                     }
                 };
 
+                // elfClaw: dedup — if an agent job with the same name already exists,
+                // return success immediately instead of failing on recurring_confirmed.
+                // This prevents weak models (gemini-flash-lite) from failing repeatedly
+                // when heartbeat tries to re-add existing cron jobs every hour.
+                if let Some(ref job_name) = name {
+                    if let Ok(jobs) = cron::list_jobs(&self.config) {
+                        if let Some(existing) = jobs.iter().find(|j| {
+                            j.name.as_deref() == Some(job_name.as_str())
+                        }) {
+                            return Ok(ToolResult {
+                                success: true,
+                                output: serde_json::to_string_pretty(&json!({
+                                    "id": existing.id,
+                                    "name": &existing.name,
+                                    "action": "already_exists",
+                                    "message": format!("Job '{}' already exists, no action needed", job_name),
+                                    "schedule": &existing.schedule,
+                                    "next_run": &existing.next_run,
+                                }))?,
+                                error: None,
+                            });
+                        }
+                    }
+                }
+
                 let session_target = match args.get("session_target") {
                     Some(v) => match serde_json::from_value::<SessionTarget>(v.clone()) {
                         Ok(target) => target,

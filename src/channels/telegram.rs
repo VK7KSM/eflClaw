@@ -979,6 +979,7 @@ impl TelegramChannel {
                 { "command": "new", "description": "Start a new conversation" },
                 { "command": "model", "description": "Show or switch the current model" },
                 { "command": "models", "description": "Show or switch the current provider" },
+                { "command": "selfcheck", "description": "Run system self-check diagnostics" },
             ]
         });
 

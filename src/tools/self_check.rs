@@ -30,6 +30,44 @@ const SYNC_TIMEOUT_SECS: u64 = 120;
 
 /// Prevent concurrent/recursive analyze calls.
 static ANALYZE_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+
+// ── elfClaw: SelfCheckGate — hard runtime gate for self_check + check_logs ──
+// Default: disabled. Only user `/selfcheck <prompt>` command opens the gate.
+// Prevents LLM from self-initiating diagnostic loops that pollute context/memory.
+static SELF_CHECK_ENABLED: AtomicBool = AtomicBool::new(false);
+static SELF_CHECK_PROMPT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Global gate controlling self_check + check_logs tool availability.
+/// Default: closed (disabled). Opened by user command, auto-closed after completion.
+pub struct SelfCheckGate;
+
+impl SelfCheckGate {
+    /// Open the gate with a user-provided prompt describing what to check.
+    pub fn open(prompt: &str) {
+        *SELF_CHECK_PROMPT.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(prompt.to_string());
+        SELF_CHECK_ENABLED.store(true, Ordering::SeqCst);
+    }
+
+    /// Close the gate and clear the prompt.
+    pub fn close() {
+        SELF_CHECK_ENABLED.store(false, Ordering::SeqCst);
+        *SELF_CHECK_PROMPT.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// Check if the gate is currently open.
+    pub fn is_open() -> bool {
+        SELF_CHECK_ENABLED.load(Ordering::SeqCst)
+    }
+
+    /// Take the stored prompt (returns and clears it).
+    pub fn take_prompt() -> Option<String> {
+        SELF_CHECK_PROMPT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+    }
+}
 /// Maximum wall-clock time for the isolated analysis agent.
 const ANALYZE_TIMEOUT_SECS: u64 = 300;
 /// Maximum agentic iterations for the analysis agent.
@@ -193,6 +231,33 @@ impl SelfCheckTool {
             })
             .collect();
 
+        // ── Collect INFO logs as independent context (does not affect entries empty check) ──
+        let info_entries =
+            elfclaw_log::query_recent(30, Some("info"), None, Some(since_minutes));
+        let info_json: Vec<Value> = info_entries
+            .iter()
+            .map(|e| {
+                let source_hint = match e.category {
+                    elfclaw_log::LogCategory::ToolCall => "user-triggered tool execution",
+                    elfclaw_log::LogCategory::CronJob => "scheduled background task",
+                    elfclaw_log::LogCategory::LlmCall => "LLM API interaction",
+                    elfclaw_log::LogCategory::ChannelMessage => "user chat message handling",
+                    elfclaw_log::LogCategory::Heartbeat => "heartbeat periodic task",
+                    elfclaw_log::LogCategory::AgentLifecycle => "agent start/stop lifecycle",
+                    elfclaw_log::LogCategory::WorkerStatus => "worker process status",
+                    elfclaw_log::LogCategory::System => "system/daemon lifecycle",
+                };
+                json!({
+                    "level": "info",
+                    "category": e.category.as_str(),
+                    "source_hint": source_hint,
+                    "component": &e.component,
+                    "message": &e.message,
+                    "timestamp": &e.timestamp,
+                })
+            })
+            .collect();
+
         let mode = if has_source_code { "full" } else { "log_only" };
 
         // If no logs and no source, return early
@@ -206,6 +271,7 @@ impl SelfCheckTool {
                     "source_base_path": "github/elfclaw",
                     "usage_hint": "如需查看源码，使用 file_read(path: \"github/elfclaw/src/xxx.rs\")。禁止使用 shell/git 命令。",
                     "logs": [],
+                    "info_context": info_json,
                     "search_results": [],
                     "key_files": {},
                     "source_tree": [],
@@ -226,6 +292,7 @@ impl SelfCheckTool {
                     "source_base_path": "github/elfclaw",
                     "usage_hint": "如需查看源码，使用 file_read(path: \"github/elfclaw/src/xxx.rs\")。禁止使用 shell/git 命令。",
                     "logs": [],
+                    "info_context": info_json,
                     "search_results": [],
                     "key_files": {},
                     "source_tree": [],
@@ -330,6 +397,7 @@ impl SelfCheckTool {
             "source_base_path": "github/elfclaw",
             "usage_hint": "如需查看源码，使用 file_read(path: \"github/elfclaw/src/xxx.rs\")。禁止使用 shell/git 命令。",
             "logs": logs_json,
+            "info_context": info_json,
             "search_results": search_results,
             "key_files": key_files_map,
             "source_tree": source_tree,
@@ -367,10 +435,22 @@ impl SelfCheckTool {
             return Ok(collect_result);
         }
 
+        // elfClaw: inject user's focus prompt from SelfCheckGate if available
+        let user_focus = SelfCheckGate::take_prompt().unwrap_or_default();
+        let focus_section = if user_focus.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n## 用户重点检查方向\n\
+                 用户要求重点检查以下方面，请优先分析：\n{user_focus}\n"
+            )
+        };
+
         // 2. Build analysis prompt with anti-hallucination rules
         let prompt = format!(
             "你是 elfClaw 系统的自检分析器。\n\
-             以下是自动收集的完整系统诊断数据 JSON。\n\n\
+             以下是自动收集的完整系统诊断数据 JSON。\n\
+             {focus_section}\n\
              ## 分析要求\n\
              1. 先阅读 environment 部分，了解运行环境（OS、架构、可用工具）\n\
              2. 使用 source_hint 字段区分日志来源：\n\
@@ -380,9 +460,15 @@ impl SelfCheckTool {
                 - \"system/daemon lifecycle\" = 系统启停\n\
                 用户操作记录（如 shell 命令失败）不是系统缺陷，应归类为「用户操作记录」\n\
              3. 分析 logs 中的错误，找出根因和模式\n\
-             4. 检查 search_results 和 key_files 中的相关代码\n\
-             5. 如需查看更多源码，使用 file_read(path: \"github/elfclaw/src/xxx.rs\")\n\
-             6. 最多额外查看 5 个文件，不要过度探索\n\n\
+             4. 利用 info_context 字段了解系统运行上下文：\n\
+                - agent_lifecycle：agent 启停、MCP 连接状态\n\
+                - cron_job：定时任务触发时间和结果\n\
+                - tool_call：成功的工具调用记录\n\
+                - system：daemon 生命周期事件\n\
+                INFO 日志不是问题本身，但能帮助理解问题发生时的系统状态\n\
+             5. 检查 search_results 和 key_files 中的相关代码\n\
+             6. 如需查看更多源码，使用 file_read(path: \"github/elfclaw/src/xxx.rs\")\n\
+             7. 最多额外查看 5 个文件，不要过度探索\n\n\
              ## 反编造规则（必须遵守）\n\
              - 只报告数据中有直接证据的问题，禁止推测或编造不存在的错误\n\
              - 每个问题必须标注 timestamp 和 component\n\
@@ -409,7 +495,9 @@ impl SelfCheckTool {
             collect_result.output
         );
 
-        // 3. Run analysis in isolated context (uses default_model, full context window)
+        // 3. Run analysis in isolated context (uses worker_model — self_check prompt contains all
+        //    diagnostic data explicitly; worker model is sufficient for log analysis and avoids
+        //    competing with interactive user sessions for the primary model's rate limit)
         let report = tokio::time::timeout(
             Duration::from_secs(ANALYZE_TIMEOUT_SECS),
             crate::agent::loop_::run(
@@ -421,7 +509,9 @@ impl SelfCheckTool {
                 vec![],
                 false,
                 Some(ANALYZE_MAX_ITERATIONS),
-                crate::agent::RunContext::Interactive, // use default_model (primary)
+                crate::agent::RunContext::Background, // elfClaw: use worker model; avoids rate limit
+                                                      // competition with interactive user sessions
+                None, // elfClaw: no tool filtering for self_check
             ),
         )
         .await;
@@ -482,12 +572,14 @@ impl Tool for SelfCheckTool {
     }
 
     fn description(&self) -> &str {
-        "Autonomous self-check tool. \
-         Default action: self_check(action=\"analyze\") — collects diagnostics, runs isolated \
-         analysis in a dedicated agent process (full context window, no truncation), saves report, \
-         returns summary. One-step invocation — no follow-up calls needed. \
-         Other actions: 'collect' (raw JSON data), 'save_report' (save text to file). \
-         Trigger: 自检/self-check/健康检查/debug自检."
+        "Self-check diagnostic tool. \
+         CONFIRMATION REQUIRED: Before calling this tool, you MUST ask the user for explicit \
+         confirmation. Only call if the user's current message clearly and explicitly requests a \
+         self-check (e.g., '请执行自检', 'run self-check', '健康检查'). \
+         Do NOT call automatically in response to errors, cron failures, tool failures, or \
+         system events — those are not triggers for self-check. \
+         Actions: 'analyze' (default — collects diagnostics, runs analysis via worker model, saves \
+         report, returns summary), 'collect' (raw JSON data), 'save_report' (save text to file)."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -514,6 +606,19 @@ impl Tool for SelfCheckTool {
     }
 
     async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
+        // ── elfClaw: hard gate — only runs when user explicitly opens via /selfcheck ──
+        // elfClaw: return success:true so weak models don't try to "fix" the failure
+        // by attempting manual diagnosis with shell/file_read/glob_search
+        if !SelfCheckGate::is_open() {
+            return Ok(ToolResult {
+                success: true,
+                output: "self_check is currently disabled. \
+                         Please tell the user: 自检功能当前未启用。如需运行自检，请发送 /selfcheck 命令。"
+                    .into(),
+                error: None,
+            });
+        }
+
         // ── Security gate ───────────────────────────────────────────────
         if !self.security.can_act() {
             return Ok(ToolResult {

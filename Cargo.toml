@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "zeroclaw"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 authors = ["theonlyhennygod"]
 license = "MIT OR Apache-2.0"
@@ -147,6 +147,9 @@ async-imap = { version = "0.11",features = ["runtime-tokio"], default-features =
 
 # Text-to-Speech via Microsoft Edge Read Aloud API (free, no API key needed)
 msedge-tts = "0.3"
+
+# OGG container read/write (Xiaozhi Opus framing for STT upload + TTS playback)
+ogg = "0.9"
 
 # HTTP server (gateway) — replaces raw TCP for proper HTTP/1.1 compliance
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query", "ws", "macros"] }

@@ -2,6 +2,506 @@
 
 ---
 
+## 2026-03-11 — Fix: skill tool CWD + stdin_json 输入模式（web_scrape 双重根因修复）
+
+### 根因分析
+
+K3 上 `web_scrape` 约 70% 失败率，双重原因：
+
+1. **问题 A — CWD 缺失**：`SkillToolHandler.execute()` 不设置 `current_dir()`，
+   相对路径 `.\tools\cf-crawler-win-x64.exe` 依赖 zeroclaw.exe 的启动位置。
+   对比 `src/runtime/native.rs:60` 正确设置了 `.current_dir(workspace_dir)`。
+2. **问题 B — 弱模型 JSON 构造不稳定**：SKILL.toml 要求 LLM 在 `json_input` 字符串参数中
+   手动构造 JSON。gemini-flash-lite 有时发 `{url: "..."}`（无引号属性名），解析失败。
+
+K3 agent 用 `file_edit` 将路径改为绝对路径（绕过了 OTP gated_actions 不含 file_edit 的安全漏洞），
+虽然能临时解决问题 A，但不可移植。
+
+### 修复方案（3 项代码改动）
+
+| 文件 | 修改 |
+|------|------|
+| `src/skills/mod.rs` | `SkillTool` 新增 `input_mode: String` 字段（`#[serde(default)]`，默认 "args"）；`create_skill_tools()` 新增 `workspace_dir` 参数 |
+| `src/skills/tool_handler.rs` | `SkillToolHandler` 新增 `workspace_dir: PathBuf` 字段；所有 `Command` 添加 `.current_dir(&self.workspace_dir)`；新增 `execute_stdin_json()` 方法：序列化 args → JSON，通过 stdin pipe 传给进程，完全绕过 shell 引号问题 |
+| `src/agent/loop_.rs` (2处) + `src/channels/mod.rs` (1处) | 3 个调用点传入 `workspace_dir` |
+| `资料/skills/cf-crawler/SKILL.toml` | web_scrape/web_crawl/web_login 改为 `input_mode = "stdin_json"` + 独立参数；所有命令还原为相对路径 |
+
+### stdin_json 模式工作原理
+- LLM 填独立 typed 参数（url、goal、mode 等），不再需要手动构造 JSON 字符串
+- tool handler 用 `serde_json::to_string(&args)` 序列化，保证 JSON 格式正确
+- 通过 Rust stdin pipe 直传 exe，完全绕过 `echo|pipe` + shell 引号问题
+- `extract_parameters()` 对 stdin_json 模式从 `args` HashMap 提取参数（而非 command 占位符）
+- 参数描述中含 "required" 的自动标记为必填
+
+### 编译验证
+`cargo build --release --features wasm-tools` — ✅ 成功
+
+### 测试修复（补充）
+`tool_handler.rs` 6 个单测构造 `SkillTool` 时缺少 `input_mode` 字段，`SkillToolHandler::new()` 缺少 `workspace_dir` 参数。
+已修复：所有测试添加 `input_mode: String::new()` + `PathBuf::from(".")`。`cargo check` 编译通过。
+
+---
+
+## 2026-03-11 — Fix: 自检门拒绝消息 + Telegram 菜单 + Agent 能力边界
+
+### 问题 1：自检门拒绝后 LLM 不停止
+gate 关闭时 self_check/check_logs 返回 `success:false`，gemini-flash 把失败解读为"任务未完成"，
+转而用 memory_recall → shell → file_read → glob_search 手动诊断，浪费 131 秒 + ~67000 tokens。
+
+**修复**：将 gate 返回改为 `success:true`。LLM 看到"成功"就不会去补偿。output 包含让 LLM 转述的中文提示。
+
+- `src/tools/self_check.rs:610-620` — success:true + 引导消息
+- `src/tools/check_logs.rs:67-77` — 同上
+
+### 问题 2：Telegram 菜单缺少 /selfcheck
+实现自检权限笼时遗漏了菜单注册。
+
+**修复**：`src/channels/telegram.rs:978-982` — commands 数组添加 selfcheck 项。
+
+### 问题 3：Agent 不知能力边界
+主 agent 尝试修改 config.toml 和源代码，不知道自己是已部署的编译二进制。
+
+**修复**：`src/channels/mod.rs` `build_runtime_status_section()` 末尾追加 Capability Boundaries 段落，
+注入 FORBIDDEN/ALLOWED 列表到 system prompt。
+
+---
+
+## 2026-03-11 — Fix: Heartbeat cron_add 循环失败 + K3 SSH 远程运维
+
+### 问题
+K3 上的 elfClaw 每小时 heartbeat 触发时，gemini-flash-lite 反复尝试用 cron_add 重新创建已有的 cron 任务：
+- 弱模型不带 `recurring_confirmed=true` → 0ms 瞬间失败
+- 连续失败 4 次 → "Tool loop exhausted after 25 iterations"
+- 过去 2 天 cron_list 被调用 199 次，大量 cron_add 0ms 失败
+
+### 根因
+1. Heartbeat prompt 说"如果不一致就 cron_add 同步"，弱模型每小时都误判为"不一致"
+2. `cron_add.rs` 的 `recurring_confirmed` 校验让无参数的 cron_add 瞬间失败
+3. 弱模型有时还把 UTC 时间当悉尼时间
+
+### 修改内容
+
+| 文件 | 修改 |
+|------|------|
+| `src/daemon/mod.rs:247-256` | 重写 heartbeat prompt：职责从"同步 cron"改为"验证 cron"；新增时区规则（Australia/Sydney）；明确"已存在不要 cron_add"、"失败不重试" |
+| `src/tools/cron_add.rs:~202` | Agent job 去重：在 recurring_confirmed 检查前检测同名任务，存在则返回 success（action=already_exists） |
+| `CLAUDE.md` | 新增 §17 K3 远程运维：SSH 连接信息、运行目录、日志路径、常用命令 |
+
+### K3 SSH 配置完成
+- K3 IP: 192.168.2.21，用户: JiJiWa，SSH 别名: `ssh k3`
+- 密钥: `~/.ssh/id_k3`（ed25519）
+- elfClaw 运行目录: `D:\ZeroClaw_Workspace\`
+- 日志 JSONL: `D:\ZeroClaw_Workspace\workspace\state\elfclaw-logs.jsonl`
+- 推荐日志获取方式: `scp k3:D:/ZeroClaw_Workspace/workspace/state/elfclaw-logs.jsonl /tmp/`
+
+---
+
+## 2026-03-11 — Feature: 自检模块权限笼（SelfCheckGate）
+
+### 问题
+LLM（尤其是弱模型）自行调用 self_check/check_logs 工具，导致：上下文污染、记忆污染（错误信息被强化）、发疯循环。
+
+### 设计：三层防线
+
+| 层次 | 机制 | 防护目标 |
+|------|------|----------|
+| 展示层 | excluded_tools 默认排除 self_check + check_logs | LLM 看不到这些工具 |
+| 执行层 | execute() 内硬性 gate 检查 | LLM 幻觉调用 / cron worker → 被拦截 |
+| 心理层 | 拒绝消息明确指令"不要重试" | 防止错误消息堆积 |
+
+### 修改内容
+
+| 文件 | 修改 |
+|------|------|
+| `src/tools/self_check.rs` | 新增 `SelfCheckGate`（AtomicBool + Mutex prompt）；execute() 加 gate 检查；analyze 注入用户 focus prompt |
+| `src/tools/check_logs.rs` | execute() 加 gate 检查（双保险） |
+| `src/channels/mod.rs` | 识别 `/selfcheck` 命令开门；默认排除 self_check+check_logs；自检消息跳过 autosave；完成后关门 |
+
+### 用户交互
+- `/selfcheck 检查cron任务` → 开门 → 执行 → 返回结果 → 自动关门
+- `/selfcheck`（无参数）→ 全面自检
+- 正常对话 → self_check/check_logs 不可见也不可执行
+
+---
+
+## 2026-03-11 — Fix: Cron 任务工具调用死循环（seen_tool_signatures 作用域修正）
+
+### 问题
+Cron 任务使用 `gemini-3.1-flash-lite-preview` 执行时，触发 25 轮迭代上限被截断。根因是 `seen_tool_signatures: HashSet` 定义在 `for iteration` 循环**外部**（line 344），导致跨轮去重：任何与历史轮次签名相同的工具调用都被静默跳过，LoopDetector 完全看不到这些调用，无法触发循环检测。
+
+### 修改
+| 文件 | 修改 |
+|------|------|
+| `src/agent/loop_.rs` | 将 `seen_tool_signatures` 从循环外移入 `for iteration` 循环体内部，每轮迭代重置。单轮内重复仍被去重（正确），跨轮重复由 LoopDetector 处理（3次后警告 → HardStop） |
+
+### 效果
+- 同轮内 2 个相同调用：第 2 个仍被去重 ✅
+- 跨轮合理重试：正常执行 ✅
+- 跨轮死循环：LoopDetector 3 次后 InjectWarning → 继续则 HardStop ✅
+
+---
+
+## 2026-03-10 — Fix: web_scrape 不可用 + cron job 多余中间 Agent（方案 C）
+
+### 问题 1：`create_skill_tools()` 从未被调用
+`src/skills/mod.rs:861` 定义了 `create_skill_tools()`，但全代码库无任何调用。SKILL.toml 注册的工具（web_scrape / web_crawl / web_login）永远不进入工具注册表。
+
+### 问题 2：cron job 有无用的中间 Agent
+当 cron job 配置了 `delegate_to`，scheduler 不直接运行目标 agent，而是启动一个中间 Agent 来调用 `delegate` 工具。浪费 ~55K tokens + 2 次 LLM call。
+
+### 修复内容（方案 C：给 run() 加 allowed_tools 参数）
+
+| 文件 | 修改 |
+|------|------|
+| `src/agent/loop_.rs` | `run()` 加 `allowed_tools: Option<Vec<String>>` 参数；load_skills 后调用 `create_skill_tools()` 注册 SKILL.toml 工具；加 allowed_tools 过滤逻辑 |
+| `src/agent/loop_.rs` | `process_message()` 也加 `create_skill_tools()` 调用 |
+| `src/cron/scheduler.rs` | `run_agent_job()` — delegate_to 分支不再生成 "Use the delegate tool" prompt，改为直接解析 agent config 的 allowed_tools + max_iterations，传给 run() |
+| `src/daemon/mod.rs` | heartbeat 调用 run() 加 `None`（无工具过滤）|
+| `src/tools/self_check.rs` | self_check 调用 run() 加 `None` |
+| `src/main.rs` | CLI 入口调用 run() 加 `None` |
+| `src/channels/mod.rs` | daemon 启动时在 `Arc::new(built_tools)` 前调用 `create_skill_tools()` 注册 skill tools |
+
+### 与原方案 B 对比
+- 零代码重复（不需要复制 run() 初始化逻辑）
+- 全部功能保留（observer/MCP/system prompt/memory）
+- 新增代码 ~30 行 vs 方案 B ~100 行
+
+### 编译验证
+`cargo build --release --features wasm-tools` — ✅ 成功
+
+---
+
+## 2026-03-10 — Fix: SKILL.toml 命令模板双重引号 Bug（web_scrape 从未真正工作）
+
+**问题**：`web_scrape` / `web_crawl` / `web_login` 工具调用始终失败，LLM 降级使用 `http_request`，CF 仪表板无记录。
+
+**根因**：`资料/skills/cf-crawler/SKILL.toml` 命令模板：
+```
+command = "echo '{json_input}' | .\tools\cf-crawler-win-x64.exe scrape-page --pretty"
+```
+`{json_input}` 两侧已有单引号。但 `src/skills/tool_handler.rs` 的 `render_command` 对 String 参数**再次**包单引号，生成：
+```bash
+echo ''{"url":"...","goal":"..."}'' | .\tools\cf-crawler-win-x64.exe scrape-page
+```
+在 bash/sh 中，`''value''` 使 JSON 变成裸字符串，双引号被 shell 解析掉，EXE 收到损坏的 JSON → `SyntaxError: Unexpected token 'u', "url:https:"...`
+
+**本机验证**（`C:\Dev\cf-crawler\release\cf-crawler-win-x64.exe`）：
+- 双层引号版本：`SyntaxError` 失败 ✅ 复现
+- 单层引号版本：`success=true`，TWZ RSS 正确返回新闻+链接 ✅
+
+**修改**：`资料/skills/cf-crawler/SKILL.toml` — 3 条命令模板去掉 `{json_input}` 两侧的 `'...'`，让 render_command 统一处理引号：
+- `web_scrape`（scrape-page）
+- `web_crawl`（crawl-site）
+- `web_login`（login）
+
+**无需编译**，部署后下次 cron 触发即可验证 CF 仪表板出现 Worker 执行记录。
+
+---
+
+## 2026-03-10 — Fix: cf-crawler 工具未被调用 + 新闻推送格式修复
+
+**问题**：news_fetcher worker 跳过 `web_scrape`，直接用 `http_request` 抓 RSS，完成后生成幻觉报告声称"cf-crawler 成功"。Telegram 消息头显示时间（`03:45`）而非日期，新闻条目无链接。
+
+**根因**：
+1. **模型弱**：news_fetcher 使用 `gemini-3.1-flash-lite-preview`（超轻量），指令遵循能力弱，面对多步协议（web_scrape → http_request → web_search）直接跳步。
+2. **指令歧义**：HEARTBEAT.md 执行铁律写"先用 cf-crawler"，但 LLM 不理解这等同于"调用 web_scrape 工具"。
+3. **格式规范缺失**：news_fetcher.md 本地文件标题用 `HH:MM`，LLM 把时间格式复用到 Telegram 消息头；格式示例中无链接要求。
+
+**修改文件**：
+- `资料/config.toml`：`[agents.news_fetcher]` 新增 `model = "gemini-3-flash-preview"`，从 flash-lite 升级到 flash，提升指令遵循能力
+- `资料/workers/news_fetcher.md`：
+  - CRITICAL 节末尾加"防幻觉铁律"（工具必须实际调用，报告必须列出工具链路，否则整批作废）
+  - 本地文件标题格式注释：明确 `HH:MM` 仅用于本地去重，不用于 Telegram
+  - Telegram 无突发格式：消息头改为 `YYYY-MM-DD（AEST）`，每条新闻加 `[标题](URL)` 链接
+  - 突发事件格式：`[日期]` 改为 `YYYY-MM-DD（AEST）`，常规新闻也加链接
+- `资料/HEARTBEAT.md`：
+  - 所有 6 个 cron 任务的执行铁律第 1 条：`先用 cf-crawler` → `` 先用 `web_scrape` 工具 ``（消除歧义，直接写明工具名）
+  - 推送格式要求节：加"消息头必须是日期"和"每条新闻必须附链接"规则
+- `资料/skills/cf-crawler/SKILL.md`：开头补充"原生工具调用"对照表（web_scrape/web_crawl/web_login 等与 shell 命令的对应关系）
+
+**验证**：等待下次 cron 触发，预期：CF 仪表板有 Worker 执行记录 + Telegram 消息头显示日期 + 每条新闻有可点击链接。
+
+---
+
+## 2026-03-10 — Fix: Memory 页面黑屏（MemoryCategory 序列化修复）
+
+**问题**：Web 前端 `/memory` 页面完全黑屏，其他页面正常。
+
+**根因**：`MemoryCategory::Custom("newslog")` 经 serde（`rename_all = "snake_case"`）序列化为 JSON 对象 `{"custom":"newslog"}` 而非字符串。前端 `Memory.tsx:149`（categories 下拉 `{cat}`）和 `Memory.tsx:301`（表格 `{entry.category}`）尝试渲染该对象，React 抛出 "Objects are not valid as a React child"。无 ErrorBoundary → 整个 app 静默卸载 → 黑屏。初期只有 Core/Daily/Conversation unit variant（序列化为字符串，正常），agent 使用后产生了自定义类别条目触发 bug。
+
+**修改文件**：`src/gateway/api.rs`
+- 新增 `MemoryEntryDto` struct（`category: String`）和 `From<MemoryEntry>` impl
+- 使用 `e.category.to_string()`（已有 Display trait，`Custom("newslog")→"newslog"`）
+- `handle_api_memory_list` 的 search 分支（recall）和 list 分支各修改一处 `Ok(entries)` 块，改为先转 DTO 再序列化
+- 前端无需改动，`web/dist` 无需重建
+
+**编译结果**：`cargo build` exit code 0，2m16s，无新增 warning
+
+---
+
+ + 通用 shell 失败引导防螺旋
+
+**问题**：news_fetcher worker 用 `shell` 工具调 cf-crawler.exe（echo pipe 方式），在 Windows 环境不稳定，大概率失败。LLM 收到冷冰冰的错误输出，无引导 → 调查报错 → 越走越偏 → 25 轮截断。
+
+**根因链**：shell 调用不稳定 → 失败无引导 → LLM 进入调查螺旋 → 轮次耗尽。用 `web_scrape` 工具直接调用立即成功（Telegram 截图验证）。
+
+### 三层防御方案
+
+**第一层（预防）`资料/workers/news_fetcher.md`**：
+- 在文件顶部第 3 行后插入 `## ⚠️ CRITICAL` 节，覆盖 5 种场景的 `web_scrape` 调用示例
+- 明确禁止用 `shell` 调用 cf-crawler.exe
+- 明确禁止用模型内置搜索 / 凭记忆生成新闻
+- "Shell 运行规则 > cf-crawler 调用示例" → 改为指向 CRITICAL 节的一行说明（删除 bash 示例）
+- 步骤 2a：`shell 调用 cf-crawler` → `用 web_scrape 工具抓取（见 CRITICAL 节 5 种场景）`
+- "cf-crawler 命令参考" 小节：删除 bash 命令，改为 `工具调用格式见文件顶部 CRITICAL 节`
+
+**第二层（通用引导）`src/tools/shell.rs`**：
+- 在 `if !output.status.success()` 块末尾追加通用提示 `stderr.push_str(...)`
+- 提示内容：检查 allowed_tools 是否有专用工具，列举 web_scrape 等
+- 标注 `// elfClaw:` + 说明为通用引导，不专属 cf-crawler
+
+**第三层（自文档）`C:\Dev\cf-crawler\src\cli\index.ts`**：
+- `allowedCommands` 集合增加 `"help"`，usage 文本更新
+- `main()` 函数中 health 前插入 `help` 命令处理，输出 JSON `{success, command, help}`
+- `main().catch()` 的输出对象增加 `hint` 字段，引导使用 skill 工具
+
+**`资料/skills/cf-crawler/SKILL.toml`**：
+- 新增工具 6：`web_help`，调用 `cf-crawler help --pretty`，用于报错时自查
+- prompts 末尾追加两条规则：报错先 web_health + web_help；不要用 shell 调用 cf-crawler.exe
+
+**`资料/config.toml` `[agents.news_fetcher]`**：
+- 新增 `"web_search_tool"` 到 `allowed_tools`（步骤 2c fallback，防止 LLM 无工具可用时凭记忆生成虚假新闻）
+- `max_iterations = 8` → `15`（7 步工作流需要足够轮次空间）
+
+**需要编译**：zeroclaw（shell.rs 改动）；cf-crawler（index.ts 改动，重新 `npm run build:exe`）
+
+---
+
+## 2026-03-08 — Fix: 双进程竞争 + 诊断工具确认门（日志分析根因修复）
+
+### 问题（日志文件：资料/运行日志.txt）
+
+cron 新闻推送触发后同时出现两个进程竞争 Gemini API 速率：
+- **进程 1**（主模型 gemini-3-flash-preview）：self_check analyze 自动触发，180,576 tokens
+- **进程 2**（news_fetcher delegate）：工具调用死循环，每轮 +15K tokens，共 30 轮
+- 结果：320 万 tokens / 4.5 分钟，worker model 被速率限制阻塞
+
+三个根因：
+1. `self_check.analyze_inner()` 使用 `RunContext::Interactive`（主模型），与用户会话竞争速率
+2. `news_fetcher.max_iterations = 30`，工具失败时反复重试，token 爆炸
+3. `self_check` 和 `check_logs` 描述有强诱导词，LLM 出错时自动调用
+
+### 修改（6处）
+
+#### 1. `src/tools/self_check.rs:460`（RunContext）
+`analyze_inner()` 中 `agent::loop_::run()` 的 RunContext 从 `Interactive` 改为 `Background`。
+效果：self_check 内部 agent 使用 worker model（gemini-3.1-flash-lite-preview），
+不再与主模型竞争 API 速率配额。
+
+#### 2. `src/agent/loop_.rs:1488-1498`（auto-save）
+Background 任务（cron/delegate/self_check）不再 auto-save 机器生成的 prompt 到 memory。
+防止 self_check 诊断数据（数千字）污染未来 Interactive 会话的 recall 结果。
+
+#### 3. `src/tools/self_check.rs:520-526`（description）
+删除 `Trigger: 自检/self-check/健康检查/debug自检`（主要诱导源），删除 `Autonomous`。
+加入 `CONFIRMATION REQUIRED`：明确要求用户显式确认才能调用，禁止出错时自动触发。
+
+#### 4. `src/tools/check_logs.rs:26-33`（description）
+删除 `PREFERRED`（强诱导词）和宽泛触发条件（errors/failures/diagnosing）。
+加入 `USER-INITIATED ONLY`：禁止错误场景自动调用。保留 self_check 内部无需再次确认的 Exception。
+
+#### 5. `src/cron/scheduler.rs:205-228`（cron prompt）
+delegate 路径和非 delegate 路径的 cron prompt 中均加入禁止调用 self_check/check_logs 的规则。
+
+#### 6. `资料/config.toml:580-588`（news_fetcher 配置）
+- `max_iterations`: 30 → 8（防止工具失败时 30 次重试导致 token 爆炸）
+- `allowed_tools` 新增 `web_scrape`（cf-crawler skill 工具），LLM 直接用格式化参数调用，
+  不再需要手动拼 shell 命令，避免幻觉参数问题（`web_search_tool.exe` 为 LLM 幻觉，不存在）
+
+### 验证
+
+`cargo build --release --features wasm-tools` 编译通过，无新增错误。
+
+---
+
+## 2026-03-08 — Fix: Background 任务跳过记忆召回（Cron 新闻推送污染根因）
+
+### 问题
+
+Cron 新闻推送被诊断报告覆盖。根因：`error_watchdog_*` 条目被 `mem.recall()` 返回，
+因为语义相似度（delegate/agent/shell/news_fetcher 关键词重叠），导致 gemini-flash-lite 看到
+诊断报告格式后输出诊断报告而不调用 delegate 工具。
+
+上一轮 Fix（删除 MCP 工具注册、改存储键前缀）未解决问题，tokens 从 36K 升至 44K，
+证明是记忆库积累了多条诊断条目被 recall，而非工具问题。
+
+### 修改
+
+**`src/agent/loop_.rs:1496-1504`**（原 1496-1498）
+
+- 在 `build_context()` 调用前加 Background 判断
+- `RunContext::Background`（cron/delegate）→ 返回空串，跳过记忆召回
+- `RunContext::Interactive`（用户交互）→ 正常召回记忆（行为不变）
+
+### 为什么安全
+
+- Background 任务有明确的指令（"Use delegate tool now..."），不需要记忆上下文
+- 主 agent 交互和 self_check 内部调用均使用 Interactive，不受影响
+- 修改范围极小（3 行 → 7 行，逻辑一目了然）
+
+### 验证
+
+`cargo check` 通过，6 个预先存在的警告，无新增错误。
+
+### 后续（在运行机器上）
+
+清理 SQLite 记忆库中遗留的 error_watchdog_* 污染条目：
+```sql
+DELETE FROM memories WHERE key LIKE 'error_watchdog_%';
+```
+或通过 Telegram 让 agent 使用 memory_forget 工具清理。
+
+---
+
+## 2026-03-08 — Python 服务端 STT 修复：DTX 检测 + OGG 封装
+
+### 问题
+
+Python 测试服务端运行期间 STT 从未被触发，原因有二：
+
+| 问题 | 根因 |
+|------|------|
+| STT 从未触发 | 触发点在 `listen:stop` 分支；realtime 模式设备永远不发此消息 |
+| 即使触发也会失败 | `b"".join(opus_frames)` = 裸 Opus 拼接，无 OGG 容器；Groq 需要完整容器 |
+
+### 修改内容（`xiaozhi/server.py`）
+
+#### 1. DTX 静音检测（等价于 Rust 实现）
+- 新增常量：`DTX_MAX_BYTES = 1`、`DTX_SILENCE_TRIGGER = 8`
+- Binary 帧处理：≤1 字节的帧视为 DTX 静音，累计连续计数；真实音频帧重置计数
+- 连续 8 个静音帧（480ms）直接触发 STT，无需等待 `listen:stop`
+- 新增 `do_stt_and_respond(websocket, opus_frames)` 函数，被 DTX 和 `listen:stop` 共用
+
+#### 2. OGG 封装（等价于 Rust `wrap_opus_frames_in_ogg`）
+- 新增 `_ogg_crc_table()` / `_ogg_crc32()` — RFC 3533 标准 CRC32（多项式 0x04c11db7，非反射）
+- 新增 `_make_ogg_page()` — 构造单个 OGG 页面，含正确 CRC
+- 新增 `wrap_opus_frames_in_ogg()` — 完整 OGG Opus 容器：OpusHead(BOS) + OpusTags + 音频页（每帧一页，EOS 标记最后一帧）
+- `transcribe_with_groq()` 改为调用 `wrap_opus_frames_in_ogg()` 并以 `"voice.ogg"` / `"audio/ogg"` 发给 Groq
+
+#### 3. elfClaw `资料/config.toml` transcription 配置分析
+- `[transcription]` 节：`enabled = true`，有 `api_url` 和 `model`，**无 `api_key`**
+- 运行时回退顺序：`config.api_key`（None）→ `GROQ_API_KEY` 环境变量
+- **结论**：elfClaw STT 需要在启动时设置 `GROQ_API_KEY` 环境变量，否则 STT 静默失败
+- 修复方案：在 `资料/config.toml` 的 `[transcription]` 节添加 `api_key = "gsk_..."` 即可
+
+### 验证
+- `python -c "import ast; ast.parse(open('xiaozhi/server.py').read())"` 语法检查通过
+- 实际 STT 测试需要真实设备 + `GROQ_API_KEY` 环境变量
+
+---
+
+## 2026-03-08 — Xiaozhi 协议修复 v4（基于真实设备测试数据）
+
+### 问题根因（Python 测试服务端实测确认）
+通过 Python 测试服务端与真实 AI-VOX3 设备对话，得到精确协议数据：
+- 设备使用**协议版本 v1（裸 Opus，无帧头）**，此前 v3 假设完全错误
+- 设备连上后**立即发 `listen:start mode=realtime`**，不等任何 ACK
+- `realtime` 模式**永远不发 `listen:stop`**，靠 DTX 静音帧判断说话结束
+- `stt:start` ACK 是错误假设，直接导致原代码阻塞在发 ACK 后的 `break`
+- `tts:idle` 固件无此处理分支，徒增噪音
+- server hello 的 `sample_rate` 是服务端**下行** TTS 音频率（24000），不是设备录音率
+
+### 修改内容（`src/channels/xiaozhi.rs`）
+
+| 位置 | 改动 |
+|------|------|
+| 模块注释 | 更新为实测确认的正确协议流程 |
+| 新增常量 | `DTX_MAX_BYTES=1`, `DTX_SILENCE_TRIGGER=8`（8帧×60ms=480ms静音） |
+| `respond_ota` | OTA JSON 加 `"version":1`，覆盖设备 NVS 历史配置 |
+| server hello | 删除 `version:3`/`format`/`channels`，`sample_rate` 改为 24000 |
+| hello 后 | **删除** `tts:idle`（固件无此处理分支） |
+| idle loop | **删除** `stt:start` ACK（设备不等 ACK 直接发帧） |
+| 帧收集循环 | **重写**：计数连续 1B DTX 帧，达到阈值触发 STT；兼容 auto 模式 `listen:stop` |
+| TTS 后 | **删除** `tts:idle`（两处均删除） |
+
+### 验证
+`cargo check` 通过，0 error，warnings 均为预存无关项。
+
+---
+
+## 2026-03-08 — Xiaozhi 协议调试：Python 最小化测试服务端
+
+### 目标
+用 Python 最小服务端验证官方 v1.9.0 固件的真实协议行为，避免继续基于假设修改 Rust 实现。
+
+### 新增文件
+- `xiaozhi/server.py` — 测试服务端主体
+- `xiaozhi/requirements.txt` — 依赖声明（`websockets>=12.0`, `requests`）
+
+### 架构：双端口
+| 端口 | 协议 | 用途 |
+|------|------|------|
+| 8765 | WebSocket | 主对话端口 |
+| 8766 | HTTP | OTA mock（设备启动时拉取 WS 地址） |
+
+### 关键设计决策（基于 v1.9.0 源码）
+1. **OTA 返回 version=1**：强制设备使用裸 Opus（最简解析路径），覆盖设备 NVS 中可能残留的历史配置
+2. **server hello 中 sample_rate=24000**：这是服务端**下行**音频采样率，不是设备录音率（之前误填 16000）
+3. **transport 必须是 "websocket"**：否则设备固件直接报错
+4. **移除 stt:start ACK**：v1.9.0 源码中无此逻辑，设备发完 listen:start 立即发帧
+5. **移除 tts:idle**：application.cc 中无任何 tts:idle 处理分支
+6. **支持 v1/v2/v3 帧解析**：打印帧元信息，验证设备实际使用的协议版本
+7. **自动检测本机 IP**：也支持 `--ip` 参数手动指定
+
+### 日志标签设计
+`[CONNECT]` → `[HELLO]` → `[SEND]` → `[BINARY/TEXT]` × N → `[FRAMES]` → `[STT]` → `[SEND]×3`
+
+### 使用方法（本机 IP: 192.168.2.54）
+```bash
+pip install -r xiaozhi/requirements.txt
+python xiaozhi/server.py --ip 192.168.2.54
+# 填入设备配置: http://192.168.2.54:8766/xiaozhi/ota/
+```
+
+---
+
+## 2026-03-08 — P0 修复：Cron 新闻推送恢复 + 自检 INFO 日志覆盖
+
+### 根因
+上一轮 commit `746380d3` 的 Part B（MCP 全局集成）和 Part C3（watchdog 错误记忆）导致 cron 新闻推送彻底失效：
+- MCP 初始化在 `loop_::run()` 中 spawn 新进程，注入 33 个 MCP tool schema（+25K tokens）
+- error_watchdog 记忆被 `mem.recall()` 语义匹配到 cron prompt（关键词重叠：delegate, news_fetcher）
+- haiku 收到 36,531 input tokens（正常 ~7000），被 MCP tools + 诊断记忆淹没，输出诊断报告而非调用 delegate
+
+### Fix 1 [P0]: 删除 loop_.rs MCP 初始化
+- **文件**: `src/agent/loop_.rs`
+- **操作**: 整块删除 29 行 MCP 初始化代码（`McpRegistry::connect_all` + `McpToolWrapper` 注册）
+- **原因**: self_check/cron/delegate 不需要 MCP 工具；主 agent MCP（channels/mod.rs）不受影响
+
+### Fix 2 [P0]: 删除 error_watchdog 记忆存储
+- **文件**: `src/channels/mod.rs`
+- **操作**: 删除 `error_watchdog_*` 记忆存储代码（response 含 `📋 失败摘要` 时存入 Daily 记忆）
+- **原因**: error_watchdog key 不被 `is_assistant_autosave_key()` 过滤，build_context 的 recall 会将诊断记忆匹配到 cron prompt
+- **保留**: watchdog 恢复注入（prior_turns 检查）和 hard stop 格式化输出不受影响
+
+### Fix 3 [P1]: collect() 增加 INFO 日志独立字段
+- **文件**: `src/tools/self_check.rs`
+- **操作**: 收集 30 条 INFO 日志，作为独立 `info_context` 字段（不混入 entries/logs）
+- **设计决策**: INFO 不进 entries 是因为：(1) entries.is_empty() 检查会失效 (2) 避免 extract_search_keywords 提取无关关键词 (3) 避免 determine_search_paths 扩大搜索范围
+- 三个返回路径（无日志无源码、无日志有源码、完整结果）均包含 info_context
+
+### Fix 4 [P1]: 分析 prompt 增加 INFO 使用指引
+- **文件**: `src/tools/self_check.rs`
+- **操作**: analyze_inner prompt 新增第 4 条：利用 info_context 了解 agent_lifecycle/cron_job/tool_call/system 上下文
+- 原第 4-6 条顺延为第 5-7 条
+
+### Fix 5 [P1]: 二次复核 prompt 增加 INFO 覆盖
+- **文件**: `src/channels/mod.rs`
+- **操作**: self_check 引导 prompt 增加 INFO 查询场景和示例（`check_logs(level="info", category="agent_lifecycle", since_minutes=60)`）
+- 最大工具调用次数从 3 次增加到 5 次
+
+---
+
 ## 2026-03-08 — 自检报告质量 v3 + MCP 全局集成 + 看门狗错误学习
 
 ### 三大改进方向
@@ -3517,3 +4017,38 @@ cross 编译依赖 Docker + cross-rs 工具链，在上游大规模 merge 后可
 - EXE 运行验证：
   - `health --pretty` 可执行（未连上 Worker 时返回 `ECONNREFUSED`，符合预期）
   - `agent-reach-ensure --pretty` 在放开子进程权限后可成功执行
+---
+
+## 2026-03-12 — Fix: http_request 语义化 4xx 错误 + K3 file_write 配置补全（v0.4.0）
+
+### 诊断背景
+
+K3 上 news_fetcher cron 任务两个工具反复失败（2026-03-11 全天统计）：
+- `http_request` 失败 40 次（FT.com 403 付费墙 → 弱模型无引导，连续重试 → loop exhausted 88 次）
+- `file_write` 失败 5 次（均 0ms）→ news_fetcher allowed_tools 缺失 file_write 配置
+
+### 修复一：http_request 语义化 4xx 错误消息
+
+**文件**：`src/tools/http_request.rs`
+
+将 `error` 字段从简单的 `"HTTP 403"` 改为含操作指导的消息：
+- 401: 提示用 web_scrape + strategy=edge_browser
+- 403: 明确说明是付费墙/机器人检测，切换到 web_scrape mode=article
+- 429: 说明限速，不要立即重试
+- 410: 资源永久消失，从源列表移除
+- 其他 4xx: 不要重试同一 URL
+- 5xx: 可换方式重试一次
+
+**效果**：gemini-flash-lite 收到结构化引导后能正确判断切换 web_scrape 抓取 FT.com 标题/导语。
+
+### 修复二：K3 config.toml 补全 file_write
+
+**操作**：SSH 编辑 `D:\ZeroClaw_Workspace\config.toml`，在 `[agents.news_fetcher]` 的 `allowed_tools` 中添加 `"file_write"`。
+
+**根因**：news_fetcher agent 的 allowed_tools 白名单缺少 file_write，导致 LLM 无法调用该工具，
+在 final response 报告"缺少工具"。日志中 `file_write (0ms)` 是 agent loop 拒绝调用不可见工具时的记录。
+
+### 版本号更新
+
+`Cargo.toml` `0.3.0` → `0.4.0`（积累多天的功能性更新：TTS/语音、Email Monitor→Telegram 通知、
+聊天日志持久化、web_scrape 双重修复、heartbeat 可配置化、MCP 集成、自检改进等）

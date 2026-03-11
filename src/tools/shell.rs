@@ -300,6 +300,14 @@ impl Tool for ShellTool {
                             "PATH diagnostic: command not found in child process PATH"
                         );
                     }
+
+                    // elfClaw: when shell execution fails, suggest checking for native skill tools.
+                    // This is generic guidance for any external tool invoked via shell.
+                    stderr.push_str(
+                        "\n提示：如果此命令调用的是外部工具（如 .exe 程序），\
+                        检查你的 allowed_tools 中是否有对应的专用工具（更稳定，无需 shell）。\
+                        例如：web_scrape、web_crawl、web_login 等工具可替代直接调用 cf-crawler.exe。",
+                    );
                 }
 
                 Ok(ToolResult {

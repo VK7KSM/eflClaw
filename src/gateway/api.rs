@@ -59,6 +59,36 @@ pub struct MemoryStoreBody {
     pub category: Option<String>,
 }
 
+// ── Memory API response DTO ───────────────────────────────────────
+
+/// Gateway-layer DTO: flatten MemoryCategory enum to a plain string for the web frontend.
+/// MemoryCategory::Custom("newslog") serializes via serde as {"custom":"newslog"} (an object),
+/// but the frontend expects a plain string. Use Display::to_string() to produce "newslog".
+#[derive(serde::Serialize)]
+struct MemoryEntryDto {
+    id: String,
+    key: String,
+    content: String,
+    category: String, // Core→"core", Custom("newslog")→"newslog"
+    timestamp: String,
+    session_id: Option<String>,
+    score: Option<f64>,
+}
+
+impl From<crate::memory::MemoryEntry> for MemoryEntryDto {
+    fn from(e: crate::memory::MemoryEntry) -> Self {
+        Self {
+            id: e.id,
+            key: e.key,
+            content: e.content,
+            category: e.category.to_string(), // Display impl in src/memory/traits.rs
+            timestamp: e.timestamp,
+            session_id: e.session_id,
+            score: e.score,
+        }
+    }
+}
+
 #[derive(Deserialize)]
 pub struct CronAddBody {
     pub name: Option<String>,
@@ -385,7 +415,11 @@ pub async fn handle_api_memory_list(
     if let Some(ref query) = params.query {
         // Search mode
         match state.mem.recall(query, 50, None).await {
-            Ok(entries) => Json(serde_json::json!({"entries": entries})).into_response(),
+            Ok(entries) => {
+                let dto: Vec<MemoryEntryDto> =
+                    entries.into_iter().map(MemoryEntryDto::from).collect();
+                Json(serde_json::json!({"entries": dto})).into_response()
+            }
             Err(e) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": format!("Memory recall failed: {e}")})),
@@ -402,7 +436,11 @@ pub async fn handle_api_memory_list(
         });
 
         match state.mem.list(category.as_ref(), None).await {
-            Ok(entries) => Json(serde_json::json!({"entries": entries})).into_response(),
+            Ok(entries) => {
+                let dto: Vec<MemoryEntryDto> =
+                    entries.into_iter().map(MemoryEntryDto::from).collect();
+                Json(serde_json::json!({"entries": dto})).into_response()
+            }
             Err(e) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": format!("Memory list failed: {e}")})),

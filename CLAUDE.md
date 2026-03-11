@@ -796,3 +796,54 @@ GH=/c/Users/x/AppData/Local/gh-cli/bin/gh.exe
 - Cargo.toml `version` 字段与 tag 同步更新
 - 不使用 `v0.1.7.1` 这类四段式（与 semver 不兼容）
 
+## 17) K3 远程运维（SSH）
+
+### 17.1 连接信息
+
+- **K3 IP**：`192.168.2.21`（局域网）
+- **用户名**：`JiJiWa`（管理员）
+- **SSH 别名**：`ssh k3`（已配置在 `~/.ssh/config`）
+- **密钥**：`~/.ssh/id_k3`（ed25519）
+
+### 17.2 elfClaw 运行目录
+
+| 路径 | 说明 |
+|------|------|
+| `D:\ZeroClaw_Workspace\` | 程序根目录 |
+| `D:\ZeroClaw_Workspace\zeroclaw.exe` | 可执行文件 |
+| `D:\ZeroClaw_Workspace\config.toml` | 配置文件 |
+| `D:\ZeroClaw_Workspace\workspace\` | Workspace 目录 |
+| `D:\ZeroClaw_Workspace\workspace\state\elfclaw-logs.db` | 日志 SQLite 数据库 |
+| `D:\ZeroClaw_Workspace\workspace\state\elfclaw-logs.jsonl` | 日志 JSONL（可直接 grep） |
+| `D:\ZeroClaw_Workspace\workspace\cron\jobs.db` | Cron 任务数据库 |
+| `D:\ZeroClaw_Workspace\workspace\memory\brain.db` | Memory 数据库 |
+| `D:\ZeroClaw_Workspace\workspace\HEARTBEAT.md` | Heartbeat 定时任务配置 |
+
+### 17.3 常用远程命令
+
+```bash
+# 查看进程状态
+ssh k3 "tasklist | findstr zeroclaw"
+
+# 拷贝日志到本地分析（推荐方式，避免 PowerShell 转义问题）
+scp k3:D:/ZeroClaw_Workspace/workspace/state/elfclaw-logs.jsonl /tmp/k3-elfclaw-logs.jsonl
+
+# 读取最近 N 行日志
+ssh k3 "powershell -Command \"Get-Content 'D:\\ZeroClaw_Workspace\\workspace\\state\\elfclaw-logs.jsonl' | Select-Object -Last 50\""
+
+# 读取配置文件
+ssh k3 "powershell -Command \"Get-Content 'D:\\ZeroClaw_Workspace\\config.toml'\""
+
+# 终止进程
+ssh k3 "taskkill /IM zeroclaw.exe /F"
+
+# 列出目录
+ssh k3 "powershell -Command \"Get-ChildItem 'D:\\ZeroClaw_Workspace' | Select-Object Name, Length, LastWriteTime\""
+```
+
+### 17.4 注意事项
+
+- SSH 通过 PowerShell 执行命令时，bash 的 `$_` 会被本地 shell 展开，复杂过滤建议用 scp 拷贝到本地再 grep
+- K3 的 cmd.exe 中文输出会乱码，用 `powershell -Command` 包裹命令
+- 日志无文本文件，只有 SQLite (.db) 和 JSONL (.jsonl)，JSONL 可直接 grep
+

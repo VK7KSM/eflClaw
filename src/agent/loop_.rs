@@ -341,7 +341,6 @@ pub(crate) async fn run_tool_call_loop(
         .collect();
     let use_native_tools = provider.supports_native_tools() && !tool_specs.is_empty();
     let turn_id = Uuid::new_v4().to_string();
-    let mut seen_tool_signatures: HashSet<(String, String)> = HashSet::new();
     let mut last_response_text = String::new();
     let mut missing_tool_call_retry_used = false;
     let mut missing_tool_call_retry_prompt: Option<String> = None;
@@ -353,6 +352,9 @@ pub(crate) async fn run_tool_call_loop(
     let mut used_action_tools: HashSet<String> = HashSet::new();
 
     for iteration in 0..max_iterations {
+        // elfClaw: per-iteration dedup — prevents duplicate calls within ONE LLM response,
+        // while allowing cross-iteration repeats to be caught by LoopDetector instead.
+        let mut seen_tool_signatures: HashSet<(String, String)> = HashSet::new();
         if cancellation_token
             .as_ref()
             .is_some_and(CancellationToken::is_cancelled)
@@ -1207,6 +1209,7 @@ pub async fn run(
     interactive: bool,
     max_tool_iterations_override: Option<usize>,
     run_context: super::RunContext, // elfClaw: task origin for model routing
+    allowed_tools: Option<Vec<String>>, // elfClaw: filter tool registry for named agents
 ) -> Result<String> {
     // ── Wire up agnostic subsystems ──────────────────────────────
     // elfClaw: wrap observer with ElfClawObserver for SQLite logging + SSE broadcast
@@ -1266,35 +1269,6 @@ pub async fn run(
     if !peripheral_tools.is_empty() {
         tracing::info!(count = peripheral_tools.len(), "Peripheral tools added");
         tools_registry.extend(peripheral_tools);
-    }
-
-    // elfClaw: wire MCP tools into isolated agent registries (self_check, cron, etc.)
-    // Matches the pattern in channels/mod.rs so all agent contexts get MCP access.
-    if config.mcp.enabled && !config.mcp.servers.is_empty() {
-        match crate::tools::mcp_client::McpRegistry::connect_all(&config.mcp.servers).await {
-            Ok(registry) => {
-                let registry = std::sync::Arc::new(registry);
-                let names = registry.tool_names();
-                let mut mcp_added = 0usize;
-                for name in names {
-                    if let Some(def) = registry.get_tool_def(&name).await {
-                        let wrapper = crate::tools::McpToolWrapper::new(
-                            name,
-                            def,
-                            std::sync::Arc::clone(&registry),
-                        );
-                        tools_registry.push(Box::new(wrapper));
-                        mcp_added += 1;
-                    }
-                }
-                if mcp_added > 0 {
-                    tracing::info!(count = mcp_added, "MCP tools added to agent");
-                }
-            }
-            Err(e) => {
-                tracing::warn!("MCP registry connection failed (non-fatal): {e:#}");
-            }
-        }
     }
 
     // ── Resolve provider ─────────────────────────────────────────
@@ -1368,6 +1342,26 @@ pub async fn run(
 
     // ── Build system prompt from workspace MD files (OpenClaw framework) ──
     let skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
+
+    // elfClaw: register SKILL.toml tools (web_scrape, web_crawl, web_login, etc.)
+    let skill_tools = crate::skills::create_skill_tools(&skills, Arc::clone(&security), &config.workspace_dir);
+    if !skill_tools.is_empty() {
+        tracing::info!(count = skill_tools.len(), "Skill tools registered");
+        tools_registry.extend(skill_tools);
+    }
+
+    // elfClaw: filter tool registry when running as a named delegate agent (cron delegate_to)
+    if let Some(ref allowed) = allowed_tools {
+        let allowed_set: std::collections::HashSet<&str> =
+            allowed.iter().map(|s| s.as_str()).collect();
+        tools_registry.retain(|t| allowed_set.contains(t.name()));
+        tracing::info!(
+            remaining = tools_registry.len(),
+            allowed = ?allowed,
+            "Tool registry filtered by allowed_tools"
+        );
+    }
+
     let mut tool_descs: Vec<(&str, &str)> = vec![
         (
             "shell",
@@ -1514,17 +1508,28 @@ pub async fn run(
     let mut final_output = String::new();
 
     if let Some(msg) = message {
-        // Auto-save user message to memory (skip short/trivial messages)
-        if config.memory.auto_save && msg.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
+        // Auto-save user message to memory (skip short/trivial messages and Background tasks).
+        // elfClaw: Background tasks (cron/delegate/self_check) have machine-generated prompts,
+        // not user conversations — saving them would pollute memory recall for future sessions.
+        if config.memory.auto_save
+            && run_context != super::RunContext::Background
+            && msg.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
+        {
             let user_key = autosave_memory_key("user_msg");
             let _ = mem
                 .store(&user_key, &msg, MemoryCategory::Conversation, None)
                 .await;
         }
 
-        // Inject memory + hardware RAG context into user message
-        let mem_context =
-            build_context(mem.as_ref(), &msg, config.memory.min_relevance_score).await;
+        // Inject memory + hardware RAG context into user message.
+        // elfClaw: Background tasks (cron/delegate) skip memory recall — they have explicit
+        // instructions and memory context can contaminate task execution with unrelated
+        // conversation history (e.g. error_watchdog_* entries overriding cron prompts).
+        let mem_context = if run_context == super::RunContext::Background {
+            String::new()
+        } else {
+            build_context(mem.as_ref(), &msg, config.memory.min_relevance_score).await
+        };
         let rag_limit = if config.agent.compact_context { 2 } else { 5 };
         let hw_context = hardware_rag
             .as_ref()
@@ -1820,6 +1825,14 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         .collect();
 
     let skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
+
+    // elfClaw: register SKILL.toml tools (web_scrape, web_crawl, web_login, etc.)
+    let skill_tools = crate::skills::create_skill_tools(&skills, Arc::clone(&security), &config.workspace_dir);
+    if !skill_tools.is_empty() {
+        tracing::info!(count = skill_tools.len(), "Skill tools registered in process_message");
+        tools_registry.extend(skill_tools);
+    }
+
     let mut tool_descs: Vec<(&str, &str)> = vec![
         ("shell", "Execute terminal commands."),
         ("file_read", "Read file contents."),

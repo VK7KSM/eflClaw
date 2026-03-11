@@ -241,7 +241,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
 
         // ── Build whole-file prompt (one agent turn) ──
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M %Z");
-        // elfClaw: simplified heartbeat — cron sync only, no log diagnostics
+        // elfClaw: simplified heartbeat — verify cron only, no log diagnostics
         // Log diagnostics are handled by self_check (triggered by user via main model).
         // This keeps heartbeat within weak-model capability and avoids runaway tool loops.
         let prompt = format!(
@@ -249,10 +249,20 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
              以下是 HEARTBEAT.md 的完整内容：\n\n\
              {content}\n\n\
              请执行以下步骤：\n\
-             1. 用 cron_list 检查现有 Cron 任务是否与上面的时间表一致\n\
-             2. 如果不一致，用 cron_add/cron_update/cron_remove 同步（delivery 设为 announce 到 telegram）\n\
-             3. 如果一切正常且无需变更，回复 HEARTBEAT_OK\n\n\
-             注意：不要调用 check_logs。日志诊断由 self_check 工具负责，不在 heartbeat 范围内。"
+             1. 用 cron_list 检查现有 Cron 任务\n\
+             2. 对比 HEARTBEAT.md 中的时间表\n\
+             3. 如果所有任务都已存在（名称匹配即可），直接回复 HEARTBEAT_OK\n\
+             4. 只有在某个任务**完全不存在于 cron_list 结果中**时，才用 cron_add 创建\n\
+                （必须设置 recurring_confirmed=true，delivery 设为 announce 到 telegram:495916105）\n\
+             5. 如果任务已存在但时间略有不同，这是正常的，回复 HEARTBEAT_OK\n\n\
+             严格规则：\n\
+             - 已存在的任务绝对不要用 cron_add 重新创建\n\
+             - cron_add 失败后不要重试，回复 HEARTBEAT_OK 即可\n\
+             - 不要调用 check_logs、self_check\n\
+             - 大多数情况下所有任务都已存在，你只需要回复 HEARTBEAT_OK\n\
+             - ⚠️ 时区规则：所有 cron 时间都是悉尼时间（AEST/AEDT）。\
+               创建 cron_add 时必须设置 schedule.tz=\"Australia/Sydney\"。\
+               绝对不要使用 UTC 时间，HEARTBEAT.md 中写的时间就是悉尼本地时间。"
         );
 
         let temp = config.default_temperature;
@@ -266,6 +276,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
             false,
             Some(config.heartbeat.max_tool_iterations),
             crate::agent::RunContext::Background, // elfClaw: heartbeat uses worker_model
+            None, // elfClaw: no tool filtering for heartbeat
         )
         .await
         {
