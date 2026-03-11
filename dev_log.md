@@ -2,6 +2,1056 @@
 
 ---
 
+## 2026-03-11 — Fix: skill tool CWD + stdin_json 输入模式（web_scrape 双重根因修复）
+
+### 根因分析
+
+K3 上 `web_scrape` 约 70% 失败率，双重原因：
+
+1. **问题 A — CWD 缺失**：`SkillToolHandler.execute()` 不设置 `current_dir()`，
+   相对路径 `.\tools\cf-crawler-win-x64.exe` 依赖 zeroclaw.exe 的启动位置。
+   对比 `src/runtime/native.rs:60` 正确设置了 `.current_dir(workspace_dir)`。
+2. **问题 B — 弱模型 JSON 构造不稳定**：SKILL.toml 要求 LLM 在 `json_input` 字符串参数中
+   手动构造 JSON。gemini-flash-lite 有时发 `{url: "..."}`（无引号属性名），解析失败。
+
+K3 agent 用 `file_edit` 将路径改为绝对路径（绕过了 OTP gated_actions 不含 file_edit 的安全漏洞），
+虽然能临时解决问题 A，但不可移植。
+
+### 修复方案（3 项代码改动）
+
+| 文件 | 修改 |
+|------|------|
+| `src/skills/mod.rs` | `SkillTool` 新增 `input_mode: String` 字段（`#[serde(default)]`，默认 "args"）；`create_skill_tools()` 新增 `workspace_dir` 参数 |
+| `src/skills/tool_handler.rs` | `SkillToolHandler` 新增 `workspace_dir: PathBuf` 字段；所有 `Command` 添加 `.current_dir(&self.workspace_dir)`；新增 `execute_stdin_json()` 方法：序列化 args → JSON，通过 stdin pipe 传给进程，完全绕过 shell 引号问题 |
+| `src/agent/loop_.rs` (2处) + `src/channels/mod.rs` (1处) | 3 个调用点传入 `workspace_dir` |
+| `资料/skills/cf-crawler/SKILL.toml` | web_scrape/web_crawl/web_login 改为 `input_mode = "stdin_json"` + 独立参数；所有命令还原为相对路径 |
+
+### stdin_json 模式工作原理
+- LLM 填独立 typed 参数（url、goal、mode 等），不再需要手动构造 JSON 字符串
+- tool handler 用 `serde_json::to_string(&args)` 序列化，保证 JSON 格式正确
+- 通过 Rust stdin pipe 直传 exe，完全绕过 `echo|pipe` + shell 引号问题
+- `extract_parameters()` 对 stdin_json 模式从 `args` HashMap 提取参数（而非 command 占位符）
+- 参数描述中含 "required" 的自动标记为必填
+
+### 编译验证
+`cargo build --release --features wasm-tools` — ✅ 成功
+
+### 测试修复（补充）
+`tool_handler.rs` 6 个单测构造 `SkillTool` 时缺少 `input_mode` 字段，`SkillToolHandler::new()` 缺少 `workspace_dir` 参数。
+已修复：所有测试添加 `input_mode: String::new()` + `PathBuf::from(".")`。`cargo check` 编译通过。
+
+---
+
+## 2026-03-11 — Fix: 自检门拒绝消息 + Telegram 菜单 + Agent 能力边界
+
+### 问题 1：自检门拒绝后 LLM 不停止
+gate 关闭时 self_check/check_logs 返回 `success:false`，gemini-flash 把失败解读为"任务未完成"，
+转而用 memory_recall → shell → file_read → glob_search 手动诊断，浪费 131 秒 + ~67000 tokens。
+
+**修复**：将 gate 返回改为 `success:true`。LLM 看到"成功"就不会去补偿。output 包含让 LLM 转述的中文提示。
+
+- `src/tools/self_check.rs:610-620` — success:true + 引导消息
+- `src/tools/check_logs.rs:67-77` — 同上
+
+### 问题 2：Telegram 菜单缺少 /selfcheck
+实现自检权限笼时遗漏了菜单注册。
+
+**修复**：`src/channels/telegram.rs:978-982` — commands 数组添加 selfcheck 项。
+
+### 问题 3：Agent 不知能力边界
+主 agent 尝试修改 config.toml 和源代码，不知道自己是已部署的编译二进制。
+
+**修复**：`src/channels/mod.rs` `build_runtime_status_section()` 末尾追加 Capability Boundaries 段落，
+注入 FORBIDDEN/ALLOWED 列表到 system prompt。
+
+---
+
+## 2026-03-11 — Fix: Heartbeat cron_add 循环失败 + K3 SSH 远程运维
+
+### 问题
+K3 上的 elfClaw 每小时 heartbeat 触发时，gemini-flash-lite 反复尝试用 cron_add 重新创建已有的 cron 任务：
+- 弱模型不带 `recurring_confirmed=true` → 0ms 瞬间失败
+- 连续失败 4 次 → "Tool loop exhausted after 25 iterations"
+- 过去 2 天 cron_list 被调用 199 次，大量 cron_add 0ms 失败
+
+### 根因
+1. Heartbeat prompt 说"如果不一致就 cron_add 同步"，弱模型每小时都误判为"不一致"
+2. `cron_add.rs` 的 `recurring_confirmed` 校验让无参数的 cron_add 瞬间失败
+3. 弱模型有时还把 UTC 时间当悉尼时间
+
+### 修改内容
+
+| 文件 | 修改 |
+|------|------|
+| `src/daemon/mod.rs:247-256` | 重写 heartbeat prompt：职责从"同步 cron"改为"验证 cron"；新增时区规则（Australia/Sydney）；明确"已存在不要 cron_add"、"失败不重试" |
+| `src/tools/cron_add.rs:~202` | Agent job 去重：在 recurring_confirmed 检查前检测同名任务，存在则返回 success（action=already_exists） |
+| `CLAUDE.md` | 新增 §17 K3 远程运维：SSH 连接信息、运行目录、日志路径、常用命令 |
+
+### K3 SSH 配置完成
+- K3 IP: 192.168.2.21，用户: JiJiWa，SSH 别名: `ssh k3`
+- 密钥: `~/.ssh/id_k3`（ed25519）
+- elfClaw 运行目录: `D:\ZeroClaw_Workspace\`
+- 日志 JSONL: `D:\ZeroClaw_Workspace\workspace\state\elfclaw-logs.jsonl`
+- 推荐日志获取方式: `scp k3:D:/ZeroClaw_Workspace/workspace/state/elfclaw-logs.jsonl /tmp/`
+
+---
+
+## 2026-03-11 — Feature: 自检模块权限笼（SelfCheckGate）
+
+### 问题
+LLM（尤其是弱模型）自行调用 self_check/check_logs 工具，导致：上下文污染、记忆污染（错误信息被强化）、发疯循环。
+
+### 设计：三层防线
+
+| 层次 | 机制 | 防护目标 |
+|------|------|----------|
+| 展示层 | excluded_tools 默认排除 self_check + check_logs | LLM 看不到这些工具 |
+| 执行层 | execute() 内硬性 gate 检查 | LLM 幻觉调用 / cron worker → 被拦截 |
+| 心理层 | 拒绝消息明确指令"不要重试" | 防止错误消息堆积 |
+
+### 修改内容
+
+| 文件 | 修改 |
+|------|------|
+| `src/tools/self_check.rs` | 新增 `SelfCheckGate`（AtomicBool + Mutex prompt）；execute() 加 gate 检查；analyze 注入用户 focus prompt |
+| `src/tools/check_logs.rs` | execute() 加 gate 检查（双保险） |
+| `src/channels/mod.rs` | 识别 `/selfcheck` 命令开门；默认排除 self_check+check_logs；自检消息跳过 autosave；完成后关门 |
+
+### 用户交互
+- `/selfcheck 检查cron任务` → 开门 → 执行 → 返回结果 → 自动关门
+- `/selfcheck`（无参数）→ 全面自检
+- 正常对话 → self_check/check_logs 不可见也不可执行
+
+---
+
+## 2026-03-11 — Fix: Cron 任务工具调用死循环（seen_tool_signatures 作用域修正）
+
+### 问题
+Cron 任务使用 `gemini-3.1-flash-lite-preview` 执行时，触发 25 轮迭代上限被截断。根因是 `seen_tool_signatures: HashSet` 定义在 `for iteration` 循环**外部**（line 344），导致跨轮去重：任何与历史轮次签名相同的工具调用都被静默跳过，LoopDetector 完全看不到这些调用，无法触发循环检测。
+
+### 修改
+| 文件 | 修改 |
+|------|------|
+| `src/agent/loop_.rs` | 将 `seen_tool_signatures` 从循环外移入 `for iteration` 循环体内部，每轮迭代重置。单轮内重复仍被去重（正确），跨轮重复由 LoopDetector 处理（3次后警告 → HardStop） |
+
+### 效果
+- 同轮内 2 个相同调用：第 2 个仍被去重 ✅
+- 跨轮合理重试：正常执行 ✅
+- 跨轮死循环：LoopDetector 3 次后 InjectWarning → 继续则 HardStop ✅
+
+---
+
+## 2026-03-10 — Fix: web_scrape 不可用 + cron job 多余中间 Agent（方案 C）
+
+### 问题 1：`create_skill_tools()` 从未被调用
+`src/skills/mod.rs:861` 定义了 `create_skill_tools()`，但全代码库无任何调用。SKILL.toml 注册的工具（web_scrape / web_crawl / web_login）永远不进入工具注册表。
+
+### 问题 2：cron job 有无用的中间 Agent
+当 cron job 配置了 `delegate_to`，scheduler 不直接运行目标 agent，而是启动一个中间 Agent 来调用 `delegate` 工具。浪费 ~55K tokens + 2 次 LLM call。
+
+### 修复内容（方案 C：给 run() 加 allowed_tools 参数）
+
+| 文件 | 修改 |
+|------|------|
+| `src/agent/loop_.rs` | `run()` 加 `allowed_tools: Option<Vec<String>>` 参数；load_skills 后调用 `create_skill_tools()` 注册 SKILL.toml 工具；加 allowed_tools 过滤逻辑 |
+| `src/agent/loop_.rs` | `process_message()` 也加 `create_skill_tools()` 调用 |
+| `src/cron/scheduler.rs` | `run_agent_job()` — delegate_to 分支不再生成 "Use the delegate tool" prompt，改为直接解析 agent config 的 allowed_tools + max_iterations，传给 run() |
+| `src/daemon/mod.rs` | heartbeat 调用 run() 加 `None`（无工具过滤）|
+| `src/tools/self_check.rs` | self_check 调用 run() 加 `None` |
+| `src/main.rs` | CLI 入口调用 run() 加 `None` |
+| `src/channels/mod.rs` | daemon 启动时在 `Arc::new(built_tools)` 前调用 `create_skill_tools()` 注册 skill tools |
+
+### 与原方案 B 对比
+- 零代码重复（不需要复制 run() 初始化逻辑）
+- 全部功能保留（observer/MCP/system prompt/memory）
+- 新增代码 ~30 行 vs 方案 B ~100 行
+
+### 编译验证
+`cargo build --release --features wasm-tools` — ✅ 成功
+
+---
+
+## 2026-03-10 — Fix: SKILL.toml 命令模板双重引号 Bug（web_scrape 从未真正工作）
+
+**问题**：`web_scrape` / `web_crawl` / `web_login` 工具调用始终失败，LLM 降级使用 `http_request`，CF 仪表板无记录。
+
+**根因**：`资料/skills/cf-crawler/SKILL.toml` 命令模板：
+```
+command = "echo '{json_input}' | .\tools\cf-crawler-win-x64.exe scrape-page --pretty"
+```
+`{json_input}` 两侧已有单引号。但 `src/skills/tool_handler.rs` 的 `render_command` 对 String 参数**再次**包单引号，生成：
+```bash
+echo ''{"url":"...","goal":"..."}'' | .\tools\cf-crawler-win-x64.exe scrape-page
+```
+在 bash/sh 中，`''value''` 使 JSON 变成裸字符串，双引号被 shell 解析掉，EXE 收到损坏的 JSON → `SyntaxError: Unexpected token 'u', "url:https:"...`
+
+**本机验证**（`C:\Dev\cf-crawler\release\cf-crawler-win-x64.exe`）：
+- 双层引号版本：`SyntaxError` 失败 ✅ 复现
+- 单层引号版本：`success=true`，TWZ RSS 正确返回新闻+链接 ✅
+
+**修改**：`资料/skills/cf-crawler/SKILL.toml` — 3 条命令模板去掉 `{json_input}` 两侧的 `'...'`，让 render_command 统一处理引号：
+- `web_scrape`（scrape-page）
+- `web_crawl`（crawl-site）
+- `web_login`（login）
+
+**无需编译**，部署后下次 cron 触发即可验证 CF 仪表板出现 Worker 执行记录。
+
+---
+
+## 2026-03-10 — Fix: cf-crawler 工具未被调用 + 新闻推送格式修复
+
+**问题**：news_fetcher worker 跳过 `web_scrape`，直接用 `http_request` 抓 RSS，完成后生成幻觉报告声称"cf-crawler 成功"。Telegram 消息头显示时间（`03:45`）而非日期，新闻条目无链接。
+
+**根因**：
+1. **模型弱**：news_fetcher 使用 `gemini-3.1-flash-lite-preview`（超轻量），指令遵循能力弱，面对多步协议（web_scrape → http_request → web_search）直接跳步。
+2. **指令歧义**：HEARTBEAT.md 执行铁律写"先用 cf-crawler"，但 LLM 不理解这等同于"调用 web_scrape 工具"。
+3. **格式规范缺失**：news_fetcher.md 本地文件标题用 `HH:MM`，LLM 把时间格式复用到 Telegram 消息头；格式示例中无链接要求。
+
+**修改文件**：
+- `资料/config.toml`：`[agents.news_fetcher]` 新增 `model = "gemini-3-flash-preview"`，从 flash-lite 升级到 flash，提升指令遵循能力
+- `资料/workers/news_fetcher.md`：
+  - CRITICAL 节末尾加"防幻觉铁律"（工具必须实际调用，报告必须列出工具链路，否则整批作废）
+  - 本地文件标题格式注释：明确 `HH:MM` 仅用于本地去重，不用于 Telegram
+  - Telegram 无突发格式：消息头改为 `YYYY-MM-DD（AEST）`，每条新闻加 `[标题](URL)` 链接
+  - 突发事件格式：`[日期]` 改为 `YYYY-MM-DD（AEST）`，常规新闻也加链接
+- `资料/HEARTBEAT.md`：
+  - 所有 6 个 cron 任务的执行铁律第 1 条：`先用 cf-crawler` → `` 先用 `web_scrape` 工具 ``（消除歧义，直接写明工具名）
+  - 推送格式要求节：加"消息头必须是日期"和"每条新闻必须附链接"规则
+- `资料/skills/cf-crawler/SKILL.md`：开头补充"原生工具调用"对照表（web_scrape/web_crawl/web_login 等与 shell 命令的对应关系）
+
+**验证**：等待下次 cron 触发，预期：CF 仪表板有 Worker 执行记录 + Telegram 消息头显示日期 + 每条新闻有可点击链接。
+
+---
+
+## 2026-03-10 — Fix: Memory 页面黑屏（MemoryCategory 序列化修复）
+
+**问题**：Web 前端 `/memory` 页面完全黑屏，其他页面正常。
+
+**根因**：`MemoryCategory::Custom("newslog")` 经 serde（`rename_all = "snake_case"`）序列化为 JSON 对象 `{"custom":"newslog"}` 而非字符串。前端 `Memory.tsx:149`（categories 下拉 `{cat}`）和 `Memory.tsx:301`（表格 `{entry.category}`）尝试渲染该对象，React 抛出 "Objects are not valid as a React child"。无 ErrorBoundary → 整个 app 静默卸载 → 黑屏。初期只有 Core/Daily/Conversation unit variant（序列化为字符串，正常），agent 使用后产生了自定义类别条目触发 bug。
+
+**修改文件**：`src/gateway/api.rs`
+- 新增 `MemoryEntryDto` struct（`category: String`）和 `From<MemoryEntry>` impl
+- 使用 `e.category.to_string()`（已有 Display trait，`Custom("newslog")→"newslog"`）
+- `handle_api_memory_list` 的 search 分支（recall）和 list 分支各修改一处 `Ok(entries)` 块，改为先转 DTO 再序列化
+- 前端无需改动，`web/dist` 无需重建
+
+**编译结果**：`cargo build` exit code 0，2m16s，无新增 warning
+
+---
+
+ + 通用 shell 失败引导防螺旋
+
+**问题**：news_fetcher worker 用 `shell` 工具调 cf-crawler.exe（echo pipe 方式），在 Windows 环境不稳定，大概率失败。LLM 收到冷冰冰的错误输出，无引导 → 调查报错 → 越走越偏 → 25 轮截断。
+
+**根因链**：shell 调用不稳定 → 失败无引导 → LLM 进入调查螺旋 → 轮次耗尽。用 `web_scrape` 工具直接调用立即成功（Telegram 截图验证）。
+
+### 三层防御方案
+
+**第一层（预防）`资料/workers/news_fetcher.md`**：
+- 在文件顶部第 3 行后插入 `## ⚠️ CRITICAL` 节，覆盖 5 种场景的 `web_scrape` 调用示例
+- 明确禁止用 `shell` 调用 cf-crawler.exe
+- 明确禁止用模型内置搜索 / 凭记忆生成新闻
+- "Shell 运行规则 > cf-crawler 调用示例" → 改为指向 CRITICAL 节的一行说明（删除 bash 示例）
+- 步骤 2a：`shell 调用 cf-crawler` → `用 web_scrape 工具抓取（见 CRITICAL 节 5 种场景）`
+- "cf-crawler 命令参考" 小节：删除 bash 命令，改为 `工具调用格式见文件顶部 CRITICAL 节`
+
+**第二层（通用引导）`src/tools/shell.rs`**：
+- 在 `if !output.status.success()` 块末尾追加通用提示 `stderr.push_str(...)`
+- 提示内容：检查 allowed_tools 是否有专用工具，列举 web_scrape 等
+- 标注 `// elfClaw:` + 说明为通用引导，不专属 cf-crawler
+
+**第三层（自文档）`C:\Dev\cf-crawler\src\cli\index.ts`**：
+- `allowedCommands` 集合增加 `"help"`，usage 文本更新
+- `main()` 函数中 health 前插入 `help` 命令处理，输出 JSON `{success, command, help}`
+- `main().catch()` 的输出对象增加 `hint` 字段，引导使用 skill 工具
+
+**`资料/skills/cf-crawler/SKILL.toml`**：
+- 新增工具 6：`web_help`，调用 `cf-crawler help --pretty`，用于报错时自查
+- prompts 末尾追加两条规则：报错先 web_health + web_help；不要用 shell 调用 cf-crawler.exe
+
+**`资料/config.toml` `[agents.news_fetcher]`**：
+- 新增 `"web_search_tool"` 到 `allowed_tools`（步骤 2c fallback，防止 LLM 无工具可用时凭记忆生成虚假新闻）
+- `max_iterations = 8` → `15`（7 步工作流需要足够轮次空间）
+
+**需要编译**：zeroclaw（shell.rs 改动）；cf-crawler（index.ts 改动，重新 `npm run build:exe`）
+
+---
+
+## 2026-03-08 — Fix: 双进程竞争 + 诊断工具确认门（日志分析根因修复）
+
+### 问题（日志文件：资料/运行日志.txt）
+
+cron 新闻推送触发后同时出现两个进程竞争 Gemini API 速率：
+- **进程 1**（主模型 gemini-3-flash-preview）：self_check analyze 自动触发，180,576 tokens
+- **进程 2**（news_fetcher delegate）：工具调用死循环，每轮 +15K tokens，共 30 轮
+- 结果：320 万 tokens / 4.5 分钟，worker model 被速率限制阻塞
+
+三个根因：
+1. `self_check.analyze_inner()` 使用 `RunContext::Interactive`（主模型），与用户会话竞争速率
+2. `news_fetcher.max_iterations = 30`，工具失败时反复重试，token 爆炸
+3. `self_check` 和 `check_logs` 描述有强诱导词，LLM 出错时自动调用
+
+### 修改（6处）
+
+#### 1. `src/tools/self_check.rs:460`（RunContext）
+`analyze_inner()` 中 `agent::loop_::run()` 的 RunContext 从 `Interactive` 改为 `Background`。
+效果：self_check 内部 agent 使用 worker model（gemini-3.1-flash-lite-preview），
+不再与主模型竞争 API 速率配额。
+
+#### 2. `src/agent/loop_.rs:1488-1498`（auto-save）
+Background 任务（cron/delegate/self_check）不再 auto-save 机器生成的 prompt 到 memory。
+防止 self_check 诊断数据（数千字）污染未来 Interactive 会话的 recall 结果。
+
+#### 3. `src/tools/self_check.rs:520-526`（description）
+删除 `Trigger: 自检/self-check/健康检查/debug自检`（主要诱导源），删除 `Autonomous`。
+加入 `CONFIRMATION REQUIRED`：明确要求用户显式确认才能调用，禁止出错时自动触发。
+
+#### 4. `src/tools/check_logs.rs:26-33`（description）
+删除 `PREFERRED`（强诱导词）和宽泛触发条件（errors/failures/diagnosing）。
+加入 `USER-INITIATED ONLY`：禁止错误场景自动调用。保留 self_check 内部无需再次确认的 Exception。
+
+#### 5. `src/cron/scheduler.rs:205-228`（cron prompt）
+delegate 路径和非 delegate 路径的 cron prompt 中均加入禁止调用 self_check/check_logs 的规则。
+
+#### 6. `资料/config.toml:580-588`（news_fetcher 配置）
+- `max_iterations`: 30 → 8（防止工具失败时 30 次重试导致 token 爆炸）
+- `allowed_tools` 新增 `web_scrape`（cf-crawler skill 工具），LLM 直接用格式化参数调用，
+  不再需要手动拼 shell 命令，避免幻觉参数问题（`web_search_tool.exe` 为 LLM 幻觉，不存在）
+
+### 验证
+
+`cargo build --release --features wasm-tools` 编译通过，无新增错误。
+
+---
+
+## 2026-03-08 — Fix: Background 任务跳过记忆召回（Cron 新闻推送污染根因）
+
+### 问题
+
+Cron 新闻推送被诊断报告覆盖。根因：`error_watchdog_*` 条目被 `mem.recall()` 返回，
+因为语义相似度（delegate/agent/shell/news_fetcher 关键词重叠），导致 gemini-flash-lite 看到
+诊断报告格式后输出诊断报告而不调用 delegate 工具。
+
+上一轮 Fix（删除 MCP 工具注册、改存储键前缀）未解决问题，tokens 从 36K 升至 44K，
+证明是记忆库积累了多条诊断条目被 recall，而非工具问题。
+
+### 修改
+
+**`src/agent/loop_.rs:1496-1504`**（原 1496-1498）
+
+- 在 `build_context()` 调用前加 Background 判断
+- `RunContext::Background`（cron/delegate）→ 返回空串，跳过记忆召回
+- `RunContext::Interactive`（用户交互）→ 正常召回记忆（行为不变）
+
+### 为什么安全
+
+- Background 任务有明确的指令（"Use delegate tool now..."），不需要记忆上下文
+- 主 agent 交互和 self_check 内部调用均使用 Interactive，不受影响
+- 修改范围极小（3 行 → 7 行，逻辑一目了然）
+
+### 验证
+
+`cargo check` 通过，6 个预先存在的警告，无新增错误。
+
+### 后续（在运行机器上）
+
+清理 SQLite 记忆库中遗留的 error_watchdog_* 污染条目：
+```sql
+DELETE FROM memories WHERE key LIKE 'error_watchdog_%';
+```
+或通过 Telegram 让 agent 使用 memory_forget 工具清理。
+
+---
+
+## 2026-03-08 — Python 服务端 STT 修复：DTX 检测 + OGG 封装
+
+### 问题
+
+Python 测试服务端运行期间 STT 从未被触发，原因有二：
+
+| 问题 | 根因 |
+|------|------|
+| STT 从未触发 | 触发点在 `listen:stop` 分支；realtime 模式设备永远不发此消息 |
+| 即使触发也会失败 | `b"".join(opus_frames)` = 裸 Opus 拼接，无 OGG 容器；Groq 需要完整容器 |
+
+### 修改内容（`xiaozhi/server.py`）
+
+#### 1. DTX 静音检测（等价于 Rust 实现）
+- 新增常量：`DTX_MAX_BYTES = 1`、`DTX_SILENCE_TRIGGER = 8`
+- Binary 帧处理：≤1 字节的帧视为 DTX 静音，累计连续计数；真实音频帧重置计数
+- 连续 8 个静音帧（480ms）直接触发 STT，无需等待 `listen:stop`
+- 新增 `do_stt_and_respond(websocket, opus_frames)` 函数，被 DTX 和 `listen:stop` 共用
+
+#### 2. OGG 封装（等价于 Rust `wrap_opus_frames_in_ogg`）
+- 新增 `_ogg_crc_table()` / `_ogg_crc32()` — RFC 3533 标准 CRC32（多项式 0x04c11db7，非反射）
+- 新增 `_make_ogg_page()` — 构造单个 OGG 页面，含正确 CRC
+- 新增 `wrap_opus_frames_in_ogg()` — 完整 OGG Opus 容器：OpusHead(BOS) + OpusTags + 音频页（每帧一页，EOS 标记最后一帧）
+- `transcribe_with_groq()` 改为调用 `wrap_opus_frames_in_ogg()` 并以 `"voice.ogg"` / `"audio/ogg"` 发给 Groq
+
+#### 3. elfClaw `资料/config.toml` transcription 配置分析
+- `[transcription]` 节：`enabled = true`，有 `api_url` 和 `model`，**无 `api_key`**
+- 运行时回退顺序：`config.api_key`（None）→ `GROQ_API_KEY` 环境变量
+- **结论**：elfClaw STT 需要在启动时设置 `GROQ_API_KEY` 环境变量，否则 STT 静默失败
+- 修复方案：在 `资料/config.toml` 的 `[transcription]` 节添加 `api_key = "gsk_..."` 即可
+
+### 验证
+- `python -c "import ast; ast.parse(open('xiaozhi/server.py').read())"` 语法检查通过
+- 实际 STT 测试需要真实设备 + `GROQ_API_KEY` 环境变量
+
+---
+
+## 2026-03-08 — Xiaozhi 协议修复 v4（基于真实设备测试数据）
+
+### 问题根因（Python 测试服务端实测确认）
+通过 Python 测试服务端与真实 AI-VOX3 设备对话，得到精确协议数据：
+- 设备使用**协议版本 v1（裸 Opus，无帧头）**，此前 v3 假设完全错误
+- 设备连上后**立即发 `listen:start mode=realtime`**，不等任何 ACK
+- `realtime` 模式**永远不发 `listen:stop`**，靠 DTX 静音帧判断说话结束
+- `stt:start` ACK 是错误假设，直接导致原代码阻塞在发 ACK 后的 `break`
+- `tts:idle` 固件无此处理分支，徒增噪音
+- server hello 的 `sample_rate` 是服务端**下行** TTS 音频率（24000），不是设备录音率
+
+### 修改内容（`src/channels/xiaozhi.rs`）
+
+| 位置 | 改动 |
+|------|------|
+| 模块注释 | 更新为实测确认的正确协议流程 |
+| 新增常量 | `DTX_MAX_BYTES=1`, `DTX_SILENCE_TRIGGER=8`（8帧×60ms=480ms静音） |
+| `respond_ota` | OTA JSON 加 `"version":1`，覆盖设备 NVS 历史配置 |
+| server hello | 删除 `version:3`/`format`/`channels`，`sample_rate` 改为 24000 |
+| hello 后 | **删除** `tts:idle`（固件无此处理分支） |
+| idle loop | **删除** `stt:start` ACK（设备不等 ACK 直接发帧） |
+| 帧收集循环 | **重写**：计数连续 1B DTX 帧，达到阈值触发 STT；兼容 auto 模式 `listen:stop` |
+| TTS 后 | **删除** `tts:idle`（两处均删除） |
+
+### 验证
+`cargo check` 通过，0 error，warnings 均为预存无关项。
+
+---
+
+## 2026-03-08 — Xiaozhi 协议调试：Python 最小化测试服务端
+
+### 目标
+用 Python 最小服务端验证官方 v1.9.0 固件的真实协议行为，避免继续基于假设修改 Rust 实现。
+
+### 新增文件
+- `xiaozhi/server.py` — 测试服务端主体
+- `xiaozhi/requirements.txt` — 依赖声明（`websockets>=12.0`, `requests`）
+
+### 架构：双端口
+| 端口 | 协议 | 用途 |
+|------|------|------|
+| 8765 | WebSocket | 主对话端口 |
+| 8766 | HTTP | OTA mock（设备启动时拉取 WS 地址） |
+
+### 关键设计决策（基于 v1.9.0 源码）
+1. **OTA 返回 version=1**：强制设备使用裸 Opus（最简解析路径），覆盖设备 NVS 中可能残留的历史配置
+2. **server hello 中 sample_rate=24000**：这是服务端**下行**音频采样率，不是设备录音率（之前误填 16000）
+3. **transport 必须是 "websocket"**：否则设备固件直接报错
+4. **移除 stt:start ACK**：v1.9.0 源码中无此逻辑，设备发完 listen:start 立即发帧
+5. **移除 tts:idle**：application.cc 中无任何 tts:idle 处理分支
+6. **支持 v1/v2/v3 帧解析**：打印帧元信息，验证设备实际使用的协议版本
+7. **自动检测本机 IP**：也支持 `--ip` 参数手动指定
+
+### 日志标签设计
+`[CONNECT]` → `[HELLO]` → `[SEND]` → `[BINARY/TEXT]` × N → `[FRAMES]` → `[STT]` → `[SEND]×3`
+
+### 使用方法（本机 IP: 192.168.2.54）
+```bash
+pip install -r xiaozhi/requirements.txt
+python xiaozhi/server.py --ip 192.168.2.54
+# 填入设备配置: http://192.168.2.54:8766/xiaozhi/ota/
+```
+
+---
+
+## 2026-03-08 — P0 修复：Cron 新闻推送恢复 + 自检 INFO 日志覆盖
+
+### 根因
+上一轮 commit `746380d3` 的 Part B（MCP 全局集成）和 Part C3（watchdog 错误记忆）导致 cron 新闻推送彻底失效：
+- MCP 初始化在 `loop_::run()` 中 spawn 新进程，注入 33 个 MCP tool schema（+25K tokens）
+- error_watchdog 记忆被 `mem.recall()` 语义匹配到 cron prompt（关键词重叠：delegate, news_fetcher）
+- haiku 收到 36,531 input tokens（正常 ~7000），被 MCP tools + 诊断记忆淹没，输出诊断报告而非调用 delegate
+
+### Fix 1 [P0]: 删除 loop_.rs MCP 初始化
+- **文件**: `src/agent/loop_.rs`
+- **操作**: 整块删除 29 行 MCP 初始化代码（`McpRegistry::connect_all` + `McpToolWrapper` 注册）
+- **原因**: self_check/cron/delegate 不需要 MCP 工具；主 agent MCP（channels/mod.rs）不受影响
+
+### Fix 2 [P0]: 删除 error_watchdog 记忆存储
+- **文件**: `src/channels/mod.rs`
+- **操作**: 删除 `error_watchdog_*` 记忆存储代码（response 含 `📋 失败摘要` 时存入 Daily 记忆）
+- **原因**: error_watchdog key 不被 `is_assistant_autosave_key()` 过滤，build_context 的 recall 会将诊断记忆匹配到 cron prompt
+- **保留**: watchdog 恢复注入（prior_turns 检查）和 hard stop 格式化输出不受影响
+
+### Fix 3 [P1]: collect() 增加 INFO 日志独立字段
+- **文件**: `src/tools/self_check.rs`
+- **操作**: 收集 30 条 INFO 日志，作为独立 `info_context` 字段（不混入 entries/logs）
+- **设计决策**: INFO 不进 entries 是因为：(1) entries.is_empty() 检查会失效 (2) 避免 extract_search_keywords 提取无关关键词 (3) 避免 determine_search_paths 扩大搜索范围
+- 三个返回路径（无日志无源码、无日志有源码、完整结果）均包含 info_context
+
+### Fix 4 [P1]: 分析 prompt 增加 INFO 使用指引
+- **文件**: `src/tools/self_check.rs`
+- **操作**: analyze_inner prompt 新增第 4 条：利用 info_context 了解 agent_lifecycle/cron_job/tool_call/system 上下文
+- 原第 4-6 条顺延为第 5-7 条
+
+### Fix 5 [P1]: 二次复核 prompt 增加 INFO 覆盖
+- **文件**: `src/channels/mod.rs`
+- **操作**: self_check 引导 prompt 增加 INFO 查询场景和示例（`check_logs(level="info", category="agent_lifecycle", since_minutes=60)`）
+- 最大工具调用次数从 3 次增加到 5 次
+
+---
+
+## 2026-03-08 — 自检报告质量 v3 + MCP 全局集成 + 看门狗错误学习
+
+### 三大改进方向
+
+| 方向 | 文件 | 改动要点 |
+|------|------|---------|
+| A. 自检报告质量 | self_check.rs, channels/mod.rs, source_sync.rs | 多级别日志+分类标注+反编造 prompt+二次复核 |
+| B. MCP 全局集成 | loop_.rs | 子 agent（自检/cron 等）也能使用 MCP 工具 |
+| C. 看门狗错误学习 | detection.rs, loop_.rs, channels/mod.rs | 失败数据暴露+记忆存储+恢复注入 |
+
+### Part A：自检报告质量修复
+
+#### `src/tools/self_check.rs`
+- **collect()**：同时收集 error(80条)+warn(30条)，不再二选一
+- **source_hint**：每条日志加 `source_hint` 分类（ToolCall→"user-triggered tool execution"，System→"system/daemon lifecycle" 等）
+- **分析 prompt**：增加反编造规则（只报有直接证据的问题、标注 timestamp+component、禁止编造版本号）、按严重程度分级（🔴/🟡/🔵）、解释禁止工具的原因
+
+#### `src/channels/mod.rs`
+- 自检引导 prompt 改为三步：调用 analyze → 二次复核（check_logs 验证最多 3 次）→ 标注 ✅/⚠️/❌
+
+#### `src/tools/source_sync.rs`
+- `sync_via_http()` 三处新增 `tracing::info!`：
+  - SHA 匹配：`"source up-to-date, skipping download"`
+  - 版本文件不存在：`"local source exists but no version marker, will re-download"`
+  - API 不可达：`"GitHub API unreachable, using existing local copy"`
+
+### Part B：MCP 全局集成
+
+#### `src/agent/loop_.rs`
+- 在 `run()` 中 peripheral tools 之后添加 MCP 工具初始化
+- 与 channels/mod.rs 中的模式完全一致：`McpRegistry::connect_all` → `McpToolWrapper` 注册
+- 效果：自检分析 agent、cron agent 等所有通过 `loop_::run()` 创建的 agent 自动获得 MCP 工具
+
+### Part C：看门狗错误学习
+
+#### `src/agent/loop_/detection.rs`
+- 新增 `last_failed_args: HashMap<String, String>` 字段，`record_call()` 失败时记录参数（截取200字符）
+- 新增 `failure_summary()` — 返回所有失败工具+连续失败次数
+- 新增 `last_failed_args()` — 返回最后失败参数
+
+#### `src/agent/loop_.rs`
+- hard stop 处理增强：构建详细 `error_report`（中断原因+失败工具列表+参数+教训）
+- 输出格式：`⚠️ [循环检测] + 📋 失败摘要`，包含具体工具名+次数+参数
+
+#### `src/channels/mod.rs`
+- **错误记忆存储**：当 response 包含 `📋 失败摘要` 时，提取摘要存入 `MemoryCategory::Daily`（key: `error_watchdog_YYYYMMDD_HHMM`）
+- **看门狗恢复注入**：检测到上一轮 assistant 消息是 watchdog hard stop 时，注入恢复指引：
+  - 禁止重复同一工具+参数
+  - 0ms 失败 = 安全策略拦截 → 切换方法
+  - 自然衰减：成功完成一轮后不再注入
+
+### 验证
+- `cargo check` ✅ 通过（0 个新增 warning）
+- `cargo test --lib -- tools::self_check tools::source_sync agent::loop_::detection` ✅ 30/30 通过
+
+---
+
+## 2026-03-08 — Xiaozhi 第三轮修复（STT 挂死 + 帧收集超时 + 日志可见化 + OGG granule）
+
+### 问题
+
+上轮 Fix 1-4（stt:start ACK）确认在运行（日志显示 `listen:start (session=...)`），但 99 秒内仍零后续日志。
+
+根因分析：
+1. **STT HTTP 无超时**：`transcription.rs` 使用 `build_runtime_proxy_client`（无 timeout）。Groq API 若无响应 → HTTP 永久挂起 → 完全符合"99 秒零日志"现象。
+2. **帧收集循环无超时**：设备若不发 `listen:stop` → `source.next().await` 永久挂起。
+3. **关键日志不可见**：`listen:stop` 是 `debug!` 级别，INFO 模式看不到；`frames.is_empty()` 和 STT 返回空字符串均无日志 → 无法区分三种失败模式。
+4. **OGG granule 错误**：device 用 `frame_duration=60ms`，但代码写的是 `samples_per_frame=960`（20ms），应为 `2880`（60ms × 48kHz / 1000）。
+
+### 改动
+
+#### `src/channels/transcription.rs`（Fix 5）
+- 行 83：将 `build_runtime_proxy_client` 换为 `build_runtime_proxy_client_with_timeouts("transcription.groq", 20, 10)`
+- total timeout 20s，connect timeout 10s — 避免 STT 调用永久挂死
+
+#### `src/channels/xiaozhi.rs`（Fix 6 + Fix 7）
+- **帧收集循环**（Fix 6）：
+  - `source.next().await` → `tokio::time::timeout(30s, source.next()).await`，超时 warn + continue 'outer
+  - `listen:stop` 日志从 `debug!` 升为 `info!`（INFO 模式可见）
+  - `frames.is_empty()` 加 `warn!`（之前完全无日志）
+  - STT 返回空字符串加 `warn!`（之前完全无日志）
+  - 帧收集 WS 错误：精确的 warn/debug 替代原来的 `_ => break 'outer`
+- **granule position**（Fix 7）：`samples_per_frame: u64 = 960 → 2880`（正确反映 60ms 帧时长）
+
+### 验证
+
+`cargo check` 通过，无新增 warnings/errors。
+
+### 期望日志序列（修复后）
+
+```
+listen:start (session=...)          ← 已有
+listen:stop (N frames collected)    ← Fix 6 新增（N>0 = 音频到达）
+Xiaozhi: device_id → "说话内容"   ← STT 成功
+```
+
+如出现 warn：
+- `frame collection timeout` → 设备未发 `listen:stop`（协议/固件问题）
+- `listen:stop received but no audio frames` → VAD 问题
+- `STT returned empty result` → 音质/API 问题
+- `STT failed: ...` → 含超时原因的 API 错误
+
+---
+
+## 2026-03-07 — Xiaozhi 三问题修复（STT ACK + tts:idle + 语音感知 + 主动推送）
+
+### 问题
+
+1. **问题 1（阻塞性 bug）**：说话无反应，STT 完全失效。根因：v3 协议要求收到 `listen:start` 后 server 必须回发 `stt:start` ACK，设备收到 ACK 才会开始发送 Binary Opus 音频帧。代码直接 `break` 进入帧收集循环，从未发 ACK → 设备永远卡在"聆听中" → Binary 帧为零。
+2. **问题 2**：多轮对话不工作。TTS 播放完后缺少 `tts:idle` 信号 → 设备不知道可以进入下一轮。
+3. **问题 3**：Agent 不知道这是语音设备 → 可能返回 markdown/列表/长文本。
+4. **附加**：主动推送架构不完整 — 设备空闲时 `tts_rx` 不被消费。
+
+### 修改内容
+
+**`src/channels/xiaozhi.rs`**：
+
+- **Fix 1**（行 ~401）：`listen:start` 分支提取 `session_id`，发送 `stt:start` ACK（含 session_id 或不含），然后再 `break` 进入帧收集。
+- **Fix 2**（行 ~541）：`tts:stop` 发送之后追加 `tts:idle`，重置设备到就绪状态，保证多轮对话。
+- **Fix 4**：等待 `listen:start` 的内层 `loop` 改为 `tokio::select!`，同时监听：
+  - `source.next()` — 设备 WebSocket 消息（原有逻辑不变，缩进调整）
+  - `tts_rx.recv()` — 主动推送分支：收到 OGG 后直接发 `tts:start` → Binary 帧 → `tts:stop` → `tts:idle`，继续等待（不 break）
+
+**`src/channels/mod.rs`**：
+
+- **Fix 3**（`channel_delivery_instructions()` 函数）：添加 `"xiaozhi"` 分支，指示 agent 回复简短口语化、不用 markdown、不用列表、数字自然拼读。
+
+### 验证
+
+- `cargo check` — 通过（仅预存 warnings，与本次修改无关）
+
+---
+
+## 2026-03-07 — cf-crawler Skill 运行失败修复（路径 + Windows shell 兼容）
+
+### 问题
+
+cf-crawler skill 在 elfClaw 上首次测试运行失败，日志分析发现 3 个需要代码修复的问题：
+
+1. **路径错误**：SKILL.toml 命令路径写 `workspace/tools/cf-crawler-win-x64.exe`，但 shell 的 cwd 已经是 workspace 目录，导致解析为 `workspace/workspace/tools/`（双重 workspace）→ CommandNotFoundException
+2. **环境变量未传递**：`shell_env_passthrough` 只透传父进程中已存在的环境变量，目标机器未设置 `CF_CRAWLER_ENDPOINT` / `CF_CRAWLER_TOKEN` → cf-crawler 默认连 `localhost:8787` → ECONNREFUSED
+3. **SkillToolHandler Windows 不兼容**：`tool_handler.rs` 硬编码 `sh -c` 执行 skill 工具命令，Windows 上若无 Git Bash 则 `sh` 不存在，所有 SKILL.toml 的 shell 工具都会失败
+
+### 修改内容
+
+**`资料/skills/cf-crawler/SKILL.toml`**：
+
+- 所有 6 处 `workspace/tools/cf-crawler-win-x64.exe` → `.\tools\cf-crawler-win-x64.exe`（使用 `.\` 前缀 + 反斜杠，PowerShell 执行相对路径的必要格式）
+
+**`资料/skills/cf-crawler/SKILL.md`**：
+
+- 所有 8 处路径同步修改：`workspace/tools/cf-crawler-win-x64.exe` → `.\tools\cf-crawler-win-x64.exe`
+
+**`src/skills/tool_handler.rs`**（第 391 行）：
+
+- 原代码：无条件 `sh -c` 执行命令
+- 新代码：`#[cfg(windows)]` 分支 — 先尝试 `sh -c`（Git Bash），失败则 fallback 到 `powershell -NoProfile -NonInteractive -Command`；同时处理 `python3` → `python` 重写（Windows 上 Python 通常不提供 `python3` 命令）
+- `#[cfg(not(windows))]` 分支 — 保持原有 `sh -c` 不变
+
+### 环境变量（手动操作）
+
+目标机器需设置用户级环境变量后重启 zeroclaw：
+```powershell
+[System.Environment]::SetEnvironmentVariable("CF_CRAWLER_ENDPOINT", "https://cf-crawler-worker.kangarooo-network.workers.dev", "User")
+[System.Environment]::SetEnvironmentVariable("CF_CRAWLER_TOKEN", "CFCRAWLER20260307KANGAROOAUTHKEY", "User")
+```
+
+### 验证
+
+- `cargo check` — 通过（仅预存 warnings，与本次修改无关）
+
+---
+
+## 2026-03-07 — Xiaozhi AI-VOX3 闪退 v3 精确修复（tts:idle session_id + hello 协议完整化）
+
+### 问题（v3 根因分析）
+
+1. **主根因（最高置信度）**：`tts:idle` 消息含多余 `session_id` 字段 → ESP32 固件 cJSON 解析路径异常 → TCP RST → AI 程序闪退
+   - 时序：connected 日志 → tts:idle 发出 → 设备瞬间崩溃（完全吻合）
+2. **协议兼容问题（高置信度）**：hello 响应格式不完整 — 缺 `version:3`、`transport`、`frame_duration:60`；`sample_rate` 为 24000（应为 16000 告知设备录音采样率）
+
+### 修改内容
+
+**`src/channels/xiaozhi.rs`**：
+
+- **Fix A（最高优先级）**：`tts:idle` 去掉 `session_id` 字段，只发 `{"type":"tts","state":"idle"}`；hello 循环同步改为只返回 `device_id`（`session_id` 仅在 hello 内部使用）
+- **Fix B（高优先级）**：hello 响应补全 xiaozhi v3 标准格式：添加 `version:3`、`transport:"websocket"`、`frame_duration:60`；`sample_rate` 从 24000 改为 16000（与 `wrap_opus_frames_in_ogg(&frames, 16000)` 一致；TTS 输出仍是 24kHz 不受影响）
+- **Fix C**：`listen:start` 日志级别从 `debug!` 改为 `info!`，提升可见性
+- **doc comment**：文件顶部协议示例更新为完整 v3 hello 格式
+
+### 验证
+
+- `cargo check` — 通过（只有预存 warnings，与本次修改无关）
+
+---
+
+## 2026-03-07 — Xiaozhi AI-VOX3 闪退 & 版本卡死修复
+
+### 问题
+
+1. **设备连接后 27 秒静默断开**：服务端发完 hello 响应后未发 `tts:idle` 信号，AI-VOX3 固件等待服务端就绪确认，超时后发 Close 帧断开
+2. **断开原因无日志**：WS 错误 / 流关闭 / 设备主动 Close 三种情况都静默 `break 'outer`，无法定位根因
+3. **OTA 响应含顶层 version 字段**：Nulllab 固件可能将其解读为固件版本，触发 OTA 检查流程（约 1 分钟超时）才连 WebSocket
+4. **listen:detect 消息被静默丢弃**：设备在自动检测模式发送的 `listen:detect` 落入 `_ => {}` 无日志，调试困难
+
+### 修改内容
+
+**`src/channels/xiaozhi.rs`**：
+
+- **Fix 1（主修复）**：hello 循环改为 break `(id, sid)` 返回元组；`info!("connected")` 之后立即发送 `{"type":"tts","state":"idle","session_id":"..."}` 信号；idle 发送失败时清理 sessions 后 return
+- **Fix 2**：Phase 2 等待 listen:start 的内层 loop — `Some(Err(e))` 分支加 `warn!`，`None` 分支加 `debug!`，`Message::Close(frame)` 加 `debug!`，不再静默 break
+- **Fix 3**：`match json["type"].as_str()` 添加 `Some("listen") if state == "detect"` 分支，打印 debug 日志
+- **Fix 4**：`respond_ota()` 的 JSON body 去掉顶层 `"version": "1.9.0"` 字段，只保留 `{"websocket":{"url":"..."}}`
+
+### 验证
+
+- `cargo check` — 通过（只有预存 warnings）
+
+---
+
+## 2026-03-07 — self_check 独立进程 + content_search Windows 兼容 + source_sync 本地优先
+
+### 问题
+
+1. **自检 token 爆炸**：collect() 返回 ~104K JSON → `MAX_TOOL_RESULT_IN_HISTORY_CHARS=8000` 截断到 8K → 模型丢失 92% 数据 → 探索循环 → 603K token → 超时
+2. **content_search 在 Windows 无后端**：系统无 rg/grep 时搜索完全失败
+3. **source_sync 每次重下**：HTTP 模式不检查本地版本，每次自检都重新下载 ZIP
+4. **预存测试编译错误**：`DelegateAgentConfig` 的 `provider/model` 改为 `Option<String>` 后测试代码未同步
+
+### 修改内容
+
+**`src/tools/self_check.rs`**：
+- 新增 `action="analyze"`（默认）：collect + 独立 `agent::run()` + save
+- `analyze()` 使用 `AtomicBool` 防递归，5分钟超时，15次迭代上限
+- `analyze_inner()` 在隔离上下文运行分析（独立 1M token 窗口，完整 104K 数据无截断）
+- `collect()` 新增 `environment` 字段：OS/arch/hostname/search_backend/cli_tools
+- 主对话只收到 ~800 字符摘要，不爆 token
+- `description()/schema()` 更新为 analyze 优先
+
+**`src/tools/content_search.rs`**：
+- 新增 `has_grep` 字段，构造函数检测 rg + grep
+- 新增 `build_findstr_command()` Windows 后端（literal 模式，安全）
+- `execute()` 三级后端选择：rg → grep → findstr → 报错
+- 新增 `strip_unc_prefix()` 解决 Windows UNC 路径 (`\\?\...`) 兼容问题
+- grep/findstr 命令和输出 relativize 均使用 stripped 路径
+- 删除冗余的 `format_rg_output/format_grep_output` wrapper
+- 修复 `content_search_rejects_absolute_path` 测试的 Windows 兼容性
+
+**`src/tools/source_sync.rs`**：
+- `sync_via_http()` 新增本地版本检查：写入 `.elfclaw_sync_sha` 版本标记
+- 流程：检查本地 Cargo.toml → 读取本地 SHA → 对比 GitHub latest → 相同则跳过下载
+- GitHub API 不可达时，使用已有本地副本（不报错）
+- `repo_status()` 显示本地 SHA 信息
+
+**`src/channels/mod.rs`**：
+- 自检提示词改为一步式：`self_check(action="analyze")`，无需多步操作
+
+**`src/doctor/mod.rs` + `src/migration.rs`**（预存修复）：
+- `DelegateAgentConfig` 测试代码同步：`provider/model` 包裹 `Some()`
+
+### 验证
+
+- `cargo check` — 通过（只有预存 warnings）
+- `cargo build` — 通过
+- `cargo test --lib -- tools::self_check tools::content_search tools::source_sync` — 37 passed, 0 failed
+
+---
+
+## 2026-03-07 — XiaozhiChannel token 移除（fix/v0.3.1-heartbeat-selfcheck）
+
+### 问题
+
+`XiaozhiConfig` 有 `token: Option<String>` 字段，但实现存在流程缺陷：
+- OTA 响应没有把 token 告知设备
+- 设备不会在 hello JSON 中发送 token（固件读取 OTA → Authorization header，不是 hello field）
+- 服务端检查 hello JSON 的 `json["token"]`，永远收不到 → 设备被拒绝
+
+### 决策
+
+局域网设备，不需要 token 验证。直接移除 token，消除这个坏死路径。
+
+### 修改内容
+
+**`src/channels/xiaozhi.rs`**：
+- `XiaozhiConfig` 删除 `pub token: Option<String>` 字段
+- `handle_connection()` 删除 `token: Option<String>` 参数，删除 token 验证代码块
+- `listen()` 删除 `let token = self.config.token.clone()` 和相关传递
+- 3 个测试中删除 `token: None` 字段（`xiaozhi_config_defaults`、`server_ip_*`、`channel_name_*`）
+
+### 验证
+
+- `cargo check` — 通过，无错误（其他预存 `Option<String>` 类型错误与本次修改无关）
+
+---
+
+
+
+### 实现范围
+
+为 AI-VOX3（ESP32-S3，固件 1.9.0）实现 elfClaw 服务端支持，设备无需改固件，仅需将 OTA URL 重定向到 elfClaw。
+
+### 新增 / 修改文件
+
+#### `src/channels/xiaozhi.rs` [NEW, ~600 行]
+
+- `XiaozhiConfig` — 配置结构体（port/host/token/ota_port/server_ip，全部有默认值）
+- `XiaozhiChannel` — 实现 `Channel` trait
+- `listen()` — 同时启动 OTA mock HTTP 和 WebSocket 服务器
+- `send()` — 调用 `synthesize_to_ogg_opus()` 合成 24kHz OGG Opus，推到设备 session channel
+- `handle_connection()` — 每个设备连接的独立 task，完整状态机：
+  - hello 握手 → 收帧（Opus binary WS 帧）→ OGG 封装 → Groq STT → 转发 agent → 等 TTS → 播放
+  - 支持 abort 消息，Ping/Pong 保活
+- `wrap_opus_frames_in_ogg()` — 将裸 Opus 帧封装为 RFC 7845 OGG Opus 容器（用于 Groq STT）
+  - OpusHead（19 bytes）+ OpusTags + 音频页，granule 位置按 48kHz/960 samples/frame
+- `send_ogg_to_ws()` — 将 OGG Opus 逐帧发送到 WebSocket（跳过前两个 header 包）
+- `serve_ota()` / `respond_ota()` — 纯 tokio TCP 实现的 OTA mock HTTP，返回 elfClaw WebSocket 地址 JSON
+- 5 个单元测试：OGG magic 验证、config defaults、server_ip 逻辑、channel name
+
+#### `src/channels/tts.rs`
+
+- 新增 `synthesize_to_ogg_opus()` — Edge TTS 合成 24kHz OGG Opus（音频格式 `ogg-24khz-16bit-mono-opus`），返回 `Vec<u8>`，不写临时文件
+
+#### `src/channels/mod.rs`
+
+- 添加 `pub mod xiaozhi;` 和 `pub use xiaozhi::XiaozhiChannel;`
+- `collect_configured_channels()` 末尾注册 Xiaozhi
+
+#### `src/config/schema.rs`
+
+- `ChannelsConfig` 添加 `pub xiaozhi: Option<crate::channels::xiaozhi::XiaozhiConfig>` 字段
+- `Default for ChannelsConfig` 添加 `xiaozhi: None`
+- `channels_except_webhook()` 添加 Xiaozhi 条目
+- 3 处直接构造 `ChannelsConfig` 的测试各补 `xiaozhi: None`
+
+#### `Cargo.toml`
+
+- 添加 `ogg = "0.9"` — 纯 Rust OGG 容器读写
+
+### 关键设计决策
+
+- TTS 在 `XiaozhiChannel::send()` 中完成，`handle_connection` 只等 channel 推来的字节，不做合成
+- OGG Opus 对于 Groq Whisper：裸 Opus → OGG 封装（需要 `ogg` crate）
+- OGG Opus 对于 TTS 下行：Edge TTS 直接返回 OGG 容器，不需要手动封装
+- ogg 0.9 API：`write_packet` 接受 `Into<Cow<[u8]>>`，直接传 `Vec<u8>`（不需要 `into_boxed_slice()`）
+
+### 验证
+
+- `cargo check` 通过
+- `cargo clippy -- -D warnings`：xiaozhi.rs 无新警告/错误（其余错误均为预存在的旧代码问题）
+- 单元测试（OGG、config defaults、server_ip）在 lib 编译通过
+
+---
+
+## 2026-03-07 — v0.3.1 热修复 #2：self_check 路径 bug 四连修
+
+### 问题背景
+
+v0.3.1 部署后 self_check 运行 50 次工具迭代无结果。根因分析发现 4 个 bug 协同导致：
+
+### 修改内容
+
+**`src/tools/source_sync.rs`**
+- **Bug 0（根因）**：`SOURCE_DIR = "workspace/github"` 与 `workspace_dir`（已含 workspace 后缀）拼接产生双 workspace 路径。源码下载到 `workspace/workspace/github/elfclaw` 而非 `workspace/github/elfclaw`。修复：改为 `"github"`。
+
+**`src/tools/self_check.rs`**
+- **Bug 1a**：`source_dir_exists()` 第 92 行 `.join("workspace/github")` → `.join("github")`
+- **Bug 1b**：content_search 路径（第 208-211 行）从绝对路径 `format!("{}/workspace/github/elfclaw/...", workspace_dir)` 改为相对路径 `format!("github/elfclaw/...", search_path)`。绝对路径被 `content_search.rs:174` 的安全检查拒绝。
+- **Bug 1c**：file_read 路径（第 239-242 行）同样改为相对路径。绝对路径被 `policy.rs:1073` 的 `workspace_only` 检查拒绝。
+- **Bug 1d**：source_tree 路径（第 267 行）`.join("workspace/github/elfclaw/src")` → `.join("github/elfclaw/src")`
+- **Bug 2**：3 个 JSON return 点添加 `source_base_path` 和 `usage_hint` 字段。
+
+**`src/channels/mod.rs`**
+- **Bug 3**：self_check 系统提示从"用 file_read/content_search 深入查看源码"改为"直接分析 collect 返回的 JSON 数据"，并明确禁止 shell/git 命令。
+
+---
+
+## 2026-03-07 — v0.3.1 综合修复：Heartbeat 死循环 + source_sync HTTP 回退 + self_check 架构重设计
+
+### 问题背景
+
+1. **Heartbeat Worker 死循环**：弱模型（gemini-flash-lite）被提示词强制调用 `check_logs`，看到错误后不知如何处理，反复调用 check_logs + cron_list 直到耗尽 25 次迭代上限。每个 heartbeat 周期重复一次。
+2. **source_sync 无 git 回退**：生产 Windows 服务器未安装 git，source_sync 直接失败。
+3. **self_check 内部 LLM 调用**：self_check 内部使用次级模型做搜索规划/文件筛选/报告撰写，关键分析绕过主模型。
+4. **GitHub MCP 工具提示缺失**：系统提示未提及已配置的 GitHub MCP 工具。
+
+### 修改文件
+
+#### `src/daemon/mod.rs`
+- **简化 heartbeat 提示词**：移除 `check_logs` 强制调用指令（死循环直接触发点）
+- 弱模型只做 cron 同步（对比 HEARTBEAT.md 和 cron_list），明确禁止调用 check_logs
+- 日志诊断统一到 self_check，由用户通过主模型触发
+
+#### `src/config/schema.rs`
+- **降低 heartbeat max_tool_iterations 默认值**：25 → 8
+- Heartbeat 只需 cron_list + 少量 cron_add/update = 5-6 次够用，8 留余量但不会失控
+- 更新对应测试断言
+
+#### `src/tools/source_sync.rs`
+- **新增 HTTP ZIP 下载回退**：git 不可用时通过 GitHub ZIP archive API 下载源码
+- `git_available()` — OnceLock 缓存 git 可用性检查
+- `fetch_latest_commit(api_url)` — GitHub API 获取 commit SHA（best-effort）
+- `sync_via_http(repo_id)` — reqwest 下载 ZIP + zip crate 解压
+- `extract_zip()` — 独立函数，strip GitHub ZIP 前缀目录
+- `sync_repo()` — git 可用走 git，不可用走 HTTP
+- `repo_status()` — 同时检查 `.git` 和 `Cargo.toml` 判断目录存在性
+- 新增 `ALLOWED_REPOS_HTTP` 白名单常量
+- 新增 `extract_zip_strips_prefix` 测试
+
+#### `src/tools/self_check.rs`
+- **架构重设计**：从"内置 LLM 管线"改为"纯 Rust 数据收集器"
+- 删除全部 3 处内部 LLM 调用（create_provider + chat_with_system）
+- 新增 `action="collect"`：纯 Rust，零 LLM — sync 源码 → 查 DB 收集日志 → ripgrep 搜索关键词 → 读取关键文件 → 返回结构化 JSON
+- 新增 `action="save_report"`：接收主模型撰写的报告文本，写入 homework/
+- 保留依赖：source_sync、content_search、file_read（纯 Rust 调用）
+- 新增辅助函数：extract_search_keywords、determine_search_paths
+- 更新测试：schema_has_action_param、save_report_requires_report_param、rejects_unknown_action 等
+
+#### `src/channels/mod.rs`
+- 更新 `build_runtime_status_section` 中 self_check 工具说明（反映新的两阶段架构）
+- 新增 GitHub MCP 工具使用指引
+
+### 验证
+- `cargo check` 通过（lib + bin），无新增 warning
+- 已有测试编译错误（delegate.rs、subagent_spawn.rs 等）为历史遗留，非本次改动引入
+
+---
+
+## 2026-03-06 — Fix: SelfCheckTool v2 — 修复首次部署 3 个关键缺陷
+
+### 问题背景
+
+SelfCheckTool 首次部署到生产环境（Windows + Gemini），暴露三个缺陷：
+1. source_sync 失败 — daemon 进程 PATH 中没有 git
+2. LLM 幻觉报告 — 源码不可用时 LLM₃ 编造文件路径、commit hash、代码片段
+3. 报告写错目录 — file_write 沙箱将报告写到 workspace/ 而非用户 config 目录
+
+### 修改文件
+
+#### `src/tools/source_sync.rs`
+- 新增 `find_git()` 方法：`OnceLock` 缓存，先尝试 PATH 中的 git，失败后探测常见 Windows 路径（`C:\Program Files\Git\{bin,cmd}\git.exe`、PROGRAMFILES 环境变量）
+- `run_git()` 改用 `Self::find_git()` 替代硬编码 `"git"`
+
+#### `src/tools/self_check.rs`
+- **反幻觉门禁 1**：source_sync 后检查源码目录是否存在（`source_dir_exists()`），不存在则标记 `has_source_code = false`
+- **反幻觉门禁 2**：搜索结果为空时跳过 LLM₂ 和文件精读（Steps 7-9）
+- **双模板分流**：`code_sections` 为空时使用日志-only prompt，显式禁止编造代码；非空时使用完整 prompt 并加入反编造指令
+- **报告路径修正**：移除 `file_write` 依赖，改用 `tokio::fs::write` 直接写入 `config_dir/homework/`
+- 新增 `report_dir()` 方法从 `config.config_path` 推导报告目录
+- 新增 `source_dir_exists()` 方法检查 `workspace/github/{repo}/Cargo.toml`
+- ToolResult 输出增加模式标记（日志-only / 完整）
+- `write_clean_report()` 同步改用 `tokio::fs::write`
+
+#### `src/tools/mod.rs`
+- SelfCheckTool 构造移除 `file_write` 参数（从 6 参数变 5 参数）
+
+### 验证
+- `cargo check` 通过（lib + bin），无新增 warning
+
+---
+
+## 2026-03-06 — Feature: SelfCheckTool — 程序化自检工具（第 54 号工具）
+
+### 背景
+
+旧的 debug 工作流仅靠 system prompt 文字指引 LLM 手动执行 6 步操作，不可靠。
+SelfCheckTool 用 Rust 程序控制整个流程，外部 LLM 只需 1 次 tool call。
+
+### 新建文件
+
+#### `src/tools/self_check.rs`（~500 行，含 13 个单测）
+- `SelfCheckTool` 实现 `Tool` trait，11 步流水线：
+  1. source_sync × 2 — 同步 elfclaw + zeroclaw 源码，捕获 commit hash
+  2. elfclaw_log::query_recent() — 直接调库获取 Vec<LogEntry>（不经 CheckLogsTool）
+  3. 错误分组去重 — HashMap<key, Vec<LogEntry>>，保持首次出现顺序
+  4. LLM₁ — 日志 → 搜索计划 JSON（temp=0.1）
+  5. content_search × N — 按搜索计划执行
+  6. LLM₂ — 搜索结果 → 精读文件列表 JSON（temp=0.1）
+  7. file_read × N — 读 elfclaw 文件
+  8. 自动配对 — 每个 elfclaw 文件自动读 zeroclaw 同路径文件（程序保证）
+  9. LLM₃ — 全量数据 → 结构化诊断报告（temp=0.3）
+  10. file_write — 报告写入 homework/debug_代码修改计划_YYYY-MM-DD.md
+- 报告受众：AI 编程助手，含文件路径+行号+代码片段+修改建议
+- 健壮 JSON 提取：支持直接 JSON、```json 包裹、前后有多余文字
+- 降级策略：source_sync 失败继续、LLM₂ 失败跳过精读、LLM₁/₃ 失败中止
+- 安全：can_act() + record_action() 两道闸门
+
+### 修改文件
+
+#### `src/tools/mod.rs`
+- 添加 `pub mod self_check` + `pub use self_check::SelfCheckTool`
+- 重构 `all_tools_with_runtime()` 中文件系统工具注册：
+  - 提取 `source_sync_arc` 命名 Arc（避免重复构造）
+  - 在 `has_filesystem_access` 块内构造 SelfCheckTool 并传入子工具引用
+- SourceSyncTool 注册改用命名 Arc
+
+#### `src/channels/mod.rs`
+- 删除旧的 14 行手动 debug 工作流系统提示（568-581 行）
+- 替换为 3 行 self_check 工具说明
+
+### 验证
+- `cargo check` 通过（lib + bin）
+- `cargo test --lib` 有 31 个预先存在的编译错误（DelegateAgentConfig 字段类型变更），非本次修改引起
+
+---
+
+## 2026-03-06 — Feature: 源码级 Debug 分析能力 + GitHub MCP
+
+### 背景
+
+elfClaw 有 `check_logs` 读日志，但不知道自己的源码，无法将日志错误映射到代码行做根因分析。
+本次添加两个能力：(1) source_sync 工具将源码 clone 到本地分析；(2) GitHub MCP 查阅 issues/PRs。
+
+### 新建文件
+
+#### `src/tools/source_sync.rs`（~250 行）
+- `SourceSyncTool` 实现 `Tool` trait
+- 参数：`repo_id`（elfclaw/zeroclaw）、`action`（sync/status）
+- URL 白名单硬编码：仅允许 elfClaw 和 zeroclaw 两个仓库
+- 目标路径固定 `<workspace>/workspace/github/<repo_id>/`
+- sync: 未 clone 时 `git clone --depth=1`；已存在时 `git fetch --depth=1` + `git reset --hard`
+- status: 检查当前 branch/commit
+- 安全：`can_act()` + `record_action()` 两道闸门，120s 超时
+- 直接调 `tokio::process::Command::new("git")`，不走 shell 工具链
+- 6 个单元测试（白名单、大小写、ReadOnly 阻止、未知 action）
+
+### 修改文件
+
+#### `src/tools/mod.rs`
+- 添加 `pub mod source_sync` + `pub use source_sync::SourceSyncTool`
+- 在 `all_tools_with_runtime()` 中注册（紧跟 CheckLogsTool 之后）
+
+#### `src/channels/mod.rs`
+- `build_runtime_status_section()` 末尾追加 debug 工作流指令（~15 行）
+- 包含 6 步流程 + 日志 category → 源码目录映射表
+
+#### `资料/config.toml`
+- 新增 `[mcp]` section，配置 GitHub MCP server（stdio 模式）
+- command 指向 `tools/github-mcp-server.exe`
+- token 占位符需用户替换
+
+#### `.gitignore`
+- 添加 `/tools/` 排除外部二进制
+
+### GitHub MCP Server
+- 来源：GitHub 官方（github/github-mcp-server v0.31.0）
+- 已下载 Windows x86_64 二进制到 `tools/github-mcp-server.exe`（20MB）
+- elfClaw 已有完整 MCP 基础设施，启动时自动连接并注册工具
+
+---
+
 ## 2026-03-04 — Fix 15: runtime_trace 权限错误修复 + Logs 页面历史记录
 
 ### Fix 15a: `src/config/schema.rs` — `default_runtime_trace_mode()` 改回 `"none"`
@@ -2779,3 +3829,226 @@ cross 编译依赖 Docker + cross-rs 工具链，在上游大规模 merge 后可
 
 **下一步**：检查 `D:\ZeroClaw_Workspace\config.toml` 中 `default_model` 字段，以及 cron jobs 的 SQLite 数据（`jobs.db` 或 `cron.db`）是否有 `model` 字段值。若要恢复 Haiku 处理 cron，可对每个 cron job 设置 `model = "claude-haiku-4-5-20251001"` 或修改调度器默认逻辑。
 
+---
+
+## 2026-03-06 — 独立项目初始化：cf-crawler 双语 README
+
+### 概述
+
+未修改 elfClaw 代码。本次仅在仓库外新建独立项目目录 `C:\Dev\cf-crawler`，用于承载 Cloudflare + 本地 sidecar 抓取工具，并写入中英文 README 作为后续开发基线。
+
+### 新增内容
+
+- `C:\Dev\cf-crawler\README.md`
+  - 英文项目说明
+  - 明确该工具为独立 CLI，不并入 elfClaw 主二进制
+  - 确认 Cloudflare Worker `/v1/fetch`、`/v1/render`、`/v1/health` 作为远端执行面
+- `C:\Dev\cf-crawler\README.zh-CN.md`
+  - 中文项目说明
+  - 明确本地只做调度与数据处理，不使用本地浏览器
+  - 确认 `scrape-page` / `crawl-site` 作为对外命令形态
+
+### 设计决策
+
+1. `cf-crawler` 保持为独立项目，源码不写入 `zeroclaw` 主仓库。
+2. `elfClaw` 只作为调用方，后续通过外部工具方式对接。
+3. `Agent-Reach` 保持独立，不与 `cf-crawler` 合并。
+
+---
+
+## 2026-03-06 — cf-crawler README 中英文重写（按产品化说明）
+
+### 概述
+
+未修改 elfClaw 业务代码。本次仅重写独立项目 `C:\Dev\cf-crawler` 的中英文 README，覆盖项目背景、参考来源、Cloudflare 免费资源与额度、部署方式、目录与数据结构、与 zeroclaw/elfclaw 的对接改动、与 Agent-Reach 联动效果、以及致谢链接。
+
+### 修改文件
+
+- `C:\Dev\cf-crawler\README.md`
+- `C:\Dev\cf-crawler\README.zh-CN.md`
+
+### 文档新增要点
+
+1. 明确项目创建原因与低配机器目标（无本地浏览器）。
+2. 明确参考项目（Crawlee、Agent-Reach）与分工边界。
+3. 汇总 Cloudflare 免费资源与调用额度，并给出 Browser Rendering 每日可用调用次数估算表。
+4. 给出 zeroclaw/elfclaw 需要补充的代码改动点和 workflow 提示词改动点。
+5. 补充程序目录规划与核心数据结构规划。
+6. 明确与 Agent-Reach 联动后的能力提升。
+7. 增加致谢与 GitHub 地址。
+
+---
+
+## 2026-03-06 — cf-crawler 初版可运行骨架（CLI + Worker）
+
+### 概述
+
+在独立目录 `C:\Dev\cf-crawler` 完成第一版代码落地。目标是：本地不运行浏览器，仅做调度与数据处理；远端通过 Cloudflare Worker 执行 `fetch/render`。
+
+### 新增文件（核心）
+
+- 根项目
+  - `package.json`
+  - `tsconfig.json`
+  - `.gitignore`
+  - `.env.example`
+- CLI 与类型
+  - `src/types.ts`
+  - `src/cli/index.ts`
+  - `src/cli/commands/scrape-page.ts`
+  - `src/cli/commands/crawl-site.ts`
+- 核心调度
+  - `src/core/scheduler.ts`
+  - `src/core/queue.ts`
+  - `src/core/dedupe.ts`
+  - `src/core/retry.ts`
+  - `src/core/rate_limit.ts`
+- 执行器
+  - `src/executors/types.ts`
+  - `src/executors/decision.ts`
+  - `src/executors/cf_fetch.ts`
+  - `src/executors/cf_render.ts`
+  - `src/executors/cf_health.ts`
+- 提取器
+  - `src/extractors/article.ts`
+  - `src/extractors/listing.ts`
+  - `src/extractors/pagination.ts`
+- 存储与联动
+  - `src/storage/files.ts`
+  - `src/storage/sqlite.ts`
+  - `src/agent_reach/bridge.ts`
+- Worker 子项目
+  - `worker/package.json`
+  - `worker/tsconfig.json`
+  - `worker/wrangler.toml`
+  - `worker/src/index.ts`
+- 示例
+  - `examples/scrape-page.json`
+  - `examples/crawl-site.json`
+
+### README 更新
+
+- `C:\Dev\cf-crawler\README.md`
+- `C:\Dev\cf-crawler\README.zh-CN.md`
+
+新增本地与 Worker 快速运行命令，便于直接 smoke test。
+
+### 关键实现点
+
+1. 对外命令固定为 `scrape-page` / `crawl-site`（JSON 输入输出）。
+2. `scrape-page`：默认先 `fetch`，命中反爬信号后自动升级 `render`。
+3. `crawl-site`：实现队列、去重、限速、分页发现、低并发递进抓取。
+4. Worker 提供 `/v1/fetch`、`/v1/render`、`/v1/health` 三个端点。
+5. `render` 采用“已配置则调用、未配置则返回可解释错误”策略。
+
+### 验证结果
+
+- 根项目依赖安装：通过
+- 根项目 `npm.cmd run check`：通过
+- 根项目 `npm.cmd run build`：通过
+- Worker 项目依赖安装：通过
+- Worker 项目 `npm.cmd run build`：通过
+- CLI smoke test：`node dist/index.js health --pretty` 输出成功 JSON
+
+### 兼容性说明
+
+- 当前为可运行骨架版本，优先确保结构、协议和调用链成立。
+- 生产可用前仍需补充：更完整的反封策略、更严格的输入校验、落盘 schema 扩展、以及与 zeroclaw/elfclaw 的正式工具注册对接。
+
+## 2026-03-06 — cf-crawler 第二轮增强（安全策略 + Agent-Reach 自愈）
+
+### 主要改动
+
+1. 增加统一运行配置模块 `src/runtime_config.ts`：
+   - `CF_CRAWLER_HOST_COOLDOWN_MS`
+   - `CF_CRAWLER_MAX_RETRIES`
+   - `CF_CRAWLER_ALLOWED_HOSTS`
+   - `CF_CRAWLER_BLOCK_PRIVATE_IP`
+   - `AGENT_REACH_*` 系列参数
+2. 增加 URL 安全策略 `src/security/url_policy.ts`：
+   - 仅允许 `http/https`
+   - 可选域名白名单
+   - 默认拦截私网/本地地址（SSRF 防护）
+3. 强化抓取执行链路：
+   - `scrape-page` / `crawl-site` 接入 URL policy
+   - 重试次数与主机冷却时间改为可配置
+   - `strategy=edge_browser|edge_fetch|auto` 行为更明确
+4. 增加 `agent-reach-ensure` 命令：
+   - 自动探测 Agent-Reach
+   - 缺失时自动安装（uv/pip 兜底）
+   - 可选版本更新检查
+   - 执行 `doctor` 返回诊断结果
+5. Worker 增强 `worker/src/index.ts`：
+   - 反爬信号识别（状态码+正文特征）
+   - 可选 KV 短缓存
+   - 实际请求耗时回传
+
+### 验证
+
+- `C:\Dev\cf-crawler`：
+  - `npm.cmd run check` 通过
+  - `npm.cmd run build` 通过
+- `C:\Dev\cf-crawler\worker`：
+  - `npm.cmd run build` 通过
+- `agent-reach-ensure`：
+  - 已可成功探测到 `python -m agent_reach.cli`
+  - 当前环境返回 `current_version: 1.3.0` 且 `doctor` 可执行
+- `health/scrape/crawl` 当前仍返回 `ECONNREFUSED 127.0.0.1:8787`（预期，因本地未启动 Worker dev 或未指向已部署 CF endpoint）
+
+## 2026-03-06 — Windows EXE 打包与 GitHub CI 工作流
+
+### 已完成
+
+1. 在 `C:\Dev\cf-crawler` 增加 EXE 打包脚本：
+   - `build:exe:bundle`（`esbuild` 打包到 `dist-exe/index.cjs`）
+   - `build:exe`（`@yao-pkg/pkg` 生成 `release/cf-crawler-win-x64.exe`）
+   - `build:ci`（本地模拟 CI 全流程）
+2. 增加 GitHub Actions：
+   - `C:\Dev\cf-crawler\.github\workflows\build-windows-exe.yml`
+   - 在 `windows-latest` 上执行 `npm ci -> check -> build -> build:worker -> build:exe`
+   - 上传 `release/cf-crawler-win-x64.exe` 为 artifact（`cf-crawler-win-x64`）
+3. 本地成功产出可执行文件：
+   - `C:\Dev\cf-crawler\release\cf-crawler-win-x64.exe`
+   - 当前大小约 `58.6 MB`
+
+### 验证
+
+- `npm.cmd run build:ci`：通过
+- EXE 运行验证：
+  - `health --pretty` 可执行（未连上 Worker 时返回 `ECONNREFUSED`，符合预期）
+  - `agent-reach-ensure --pretty` 在放开子进程权限后可成功执行
+---
+
+## 2026-03-12 — Fix: http_request 语义化 4xx 错误 + K3 file_write 配置补全（v0.4.0）
+
+### 诊断背景
+
+K3 上 news_fetcher cron 任务两个工具反复失败（2026-03-11 全天统计）：
+- `http_request` 失败 40 次（FT.com 403 付费墙 → 弱模型无引导，连续重试 → loop exhausted 88 次）
+- `file_write` 失败 5 次（均 0ms）→ news_fetcher allowed_tools 缺失 file_write 配置
+
+### 修复一：http_request 语义化 4xx 错误消息
+
+**文件**：`src/tools/http_request.rs`
+
+将 `error` 字段从简单的 `"HTTP 403"` 改为含操作指导的消息：
+- 401: 提示用 web_scrape + strategy=edge_browser
+- 403: 明确说明是付费墙/机器人检测，切换到 web_scrape mode=article
+- 429: 说明限速，不要立即重试
+- 410: 资源永久消失，从源列表移除
+- 其他 4xx: 不要重试同一 URL
+- 5xx: 可换方式重试一次
+
+**效果**：gemini-flash-lite 收到结构化引导后能正确判断切换 web_scrape 抓取 FT.com 标题/导语。
+
+### 修复二：K3 config.toml 补全 file_write
+
+**操作**：SSH 编辑 `D:\ZeroClaw_Workspace\config.toml`，在 `[agents.news_fetcher]` 的 `allowed_tools` 中添加 `"file_write"`。
+
+**根因**：news_fetcher agent 的 allowed_tools 白名单缺少 file_write，导致 LLM 无法调用该工具，
+在 final response 报告"缺少工具"。日志中 `file_write (0ms)` 是 agent loop 拒绝调用不可见工具时的记录。
+
+### 版本号更新
+
+`Cargo.toml` `0.3.0` → `0.4.0`（积累多天的功能性更新：TTS/语音、Email Monitor→Telegram 通知、
+聊天日志持久化、web_scrape 双重修复、heartbeat 可配置化、MCP 集成、自检改进等）

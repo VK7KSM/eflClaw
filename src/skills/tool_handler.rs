@@ -41,6 +41,7 @@ use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
 
 /// Regex to extract {placeholder} names from command templates
@@ -70,6 +71,7 @@ pub struct SkillToolHandler {
     tool_def: SkillTool,
     parameters: Vec<SkillToolParameter>,
     security: Arc<SecurityPolicy>,
+    workspace_dir: PathBuf,
 }
 
 impl SkillToolHandler {
@@ -78,6 +80,7 @@ impl SkillToolHandler {
         skill_name: String,
         tool_def: SkillTool,
         security: Arc<SecurityPolicy>,
+        workspace_dir: PathBuf,
     ) -> Result<Self> {
         if !tool_def.kind.eq_ignore_ascii_case("shell") {
             tracing::warn!(
@@ -97,11 +100,28 @@ impl SkillToolHandler {
             tool_def,
             parameters,
             security,
+            workspace_dir,
         })
     }
 
     /// Extract parameter definitions from tool args and command template
     fn extract_parameters(tool_def: &SkillTool) -> Result<Vec<SkillToolParameter>> {
+        // elfClaw: stdin_json mode — parameters come from args keys, not command placeholders
+        if tool_def.input_mode == "stdin_json" {
+            let mut parameters = Vec::new();
+            for (name, description) in &tool_def.args {
+                let param_type = Self::infer_parameter_type(description);
+                let required = description.to_lowercase().contains("required");
+                parameters.push(SkillToolParameter {
+                    name: name.clone(),
+                    description: description.clone(),
+                    required,
+                    param_type,
+                });
+            }
+            return Ok(parameters);
+        }
+
         let placeholders = Self::extract_placeholders(&tool_def.command);
         let mut parameters = Vec::new();
 
@@ -335,6 +355,100 @@ impl SkillToolHandler {
             _ => bail!("Unsupported argument type: {:?}", value),
         }
     }
+
+    /// elfClaw: execute a command with JSON piped to stdin
+    /// Bypasses shell quoting — LLM fills typed params, we serialize & pipe
+    async fn execute_stdin_json(&self, command: &str, stdin_data: &str) -> Result<ToolResult> {
+        use tokio::io::AsyncWriteExt;
+        use tokio::process::Command;
+
+        #[cfg(windows)]
+        let output = {
+            // Try sh first (Git Bash)
+            let sh_result = Command::new("sh")
+                .arg("-c")
+                .arg(command)
+                .current_dir(&self.workspace_dir)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn();
+
+            match sh_result {
+                Ok(mut child) => {
+                    if let Some(mut stdin) = child.stdin.take() {
+                        let _ = stdin.write_all(stdin_data.as_bytes()).await;
+                        drop(stdin);
+                    }
+                    child.wait_with_output().await
+                        .context("Failed to wait for skill tool process (stdin_json, sh)")?
+                }
+                Err(_) => {
+                    tracing::debug!(
+                        skill = %self.skill_name,
+                        tool = %self.tool_def.name,
+                        "sh not found for stdin_json, falling back to PowerShell"
+                    );
+                    // PowerShell: pipe stdin via process substitution
+                    let ps_command = format!(
+                        "$input_data = @'\n{}\n'@\n$input_data | {}",
+                        stdin_data, command
+                    );
+                    Command::new("powershell")
+                        .args(["-NoProfile", "-NonInteractive", "-Command", &ps_command])
+                        .current_dir(&self.workspace_dir)
+                        .output()
+                        .await
+                        .context("Failed to execute skill tool command (stdin_json, PowerShell)")?
+                }
+            }
+        };
+
+        #[cfg(not(windows))]
+        let output = {
+            let mut child = Command::new("sh")
+                .arg("-c")
+                .arg(command)
+                .current_dir(&self.workspace_dir)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .context("Failed to spawn skill tool process (stdin_json)")?;
+
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(stdin_data.as_bytes()).await;
+                drop(stdin);
+            }
+            child.wait_with_output().await
+                .context("Failed to wait for skill tool process (stdin_json)")?
+        };
+
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let success = output.status.success();
+
+        let scrubbed_stdout = crate::agent::loop_::scrub_credentials(&stdout);
+        let scrubbed_stderr = crate::agent::loop_::scrub_credentials(&stderr);
+
+        tracing::debug!(
+            skill = %self.skill_name,
+            tool = %self.tool_def.name,
+            success = success,
+            exit_code = ?output.status.code(),
+            "Skill tool execution completed (stdin_json)"
+        );
+
+        Ok(ToolResult {
+            success,
+            output: if success {
+                scrubbed_stdout
+            } else {
+                format!("Command failed:\n{}", scrubbed_stderr)
+            },
+            error: if success { None } else { Some(scrubbed_stderr) },
+        })
+    }
 }
 
 #[async_trait]
@@ -358,6 +472,40 @@ impl Tool for SkillToolHandler {
                 success: false,
                 error: None,
             });
+        }
+
+        // elfClaw: stdin_json mode — serialize args as JSON, pipe to stdin
+        // This bypasses shell quoting issues with weak models
+        if self.tool_def.input_mode == "stdin_json" {
+            let stdin_data = serde_json::to_string(&args)
+                .context("Failed to serialize stdin_json args")?;
+
+            // elfClaw: skill commands are user-defined trusted configs — pre-approved
+            if let Err(e) = self.security.validate_command_execution(&self.tool_def.command, true) {
+                return Ok(ToolResult {
+                    output: format!("Blocked by security policy: {e}"),
+                    success: false,
+                    error: None,
+                });
+            }
+
+            if !self.security.record_action() {
+                return Ok(ToolResult {
+                    output: "Action limit exceeded — try again later.".into(),
+                    success: false,
+                    error: None,
+                });
+            }
+
+            tracing::debug!(
+                skill = %self.skill_name,
+                tool = %self.tool_def.name,
+                command = %self.tool_def.command,
+                stdin_len = stdin_data.len(),
+                "Executing skill tool (stdin_json mode)"
+            );
+
+            return self.execute_stdin_json(&self.tool_def.command, &stdin_data).await;
         }
 
         let command = self
@@ -388,9 +536,47 @@ impl Tool for SkillToolHandler {
             "Executing skill tool"
         );
 
+        // elfClaw: on Windows, sh (Git Bash) may not be in PATH.
+        // Try sh first; if unavailable, fall back to PowerShell.
+        #[cfg(windows)]
+        let output = {
+            use tokio::process::Command;
+            // Try sh first (Git Bash)
+            let sh_result = Command::new("sh")
+                .arg("-c")
+                .arg(&command)
+                .current_dir(&self.workspace_dir)
+                .output()
+                .await;
+            match sh_result {
+                Ok(out) => out,
+                Err(_) => {
+                    // sh not found — fall back to PowerShell
+                    tracing::debug!(
+                        skill = %self.skill_name,
+                        tool = %self.tool_def.name,
+                        "sh not found, falling back to PowerShell"
+                    );
+                    let ps_command = if command.starts_with("python3 ") || command == "python3" {
+                        command.replacen("python3", "python", 1)
+                    } else {
+                        command.clone()
+                    };
+                    Command::new("powershell")
+                        .args(["-NoProfile", "-NonInteractive", "-Command", &ps_command])
+                        .current_dir(&self.workspace_dir)
+                        .output()
+                        .await
+                        .context("Failed to execute skill tool command (PowerShell fallback)")?
+                }
+            }
+        };
+
+        #[cfg(not(windows))]
         let output = tokio::process::Command::new("sh")
             .arg("-c")
             .arg(&command)
+            .current_dir(&self.workspace_dir)
             .output()
             .await
             .context("Failed to execute skill tool command")?;
@@ -483,10 +669,11 @@ mod tests {
             .iter()
             .cloned()
             .collect(),
+            input_mode: String::new(),
         };
 
         let security = Arc::new(SecurityPolicy::default());
-        let handler = SkillToolHandler::new("test-skill".to_string(), tool_def, security).unwrap();
+        let handler = SkillToolHandler::new("test-skill".to_string(), tool_def, security, PathBuf::from(".")).unwrap();
         let schema = handler.generate_schema();
 
         assert_eq!(schema["type"], "object");
@@ -510,10 +697,11 @@ mod tests {
             .iter()
             .cloned()
             .collect(),
+            input_mode: String::new(),
         };
 
         let security = Arc::new(SecurityPolicy::default());
-        let handler = SkillToolHandler::new("test".to_string(), tool_def, security).unwrap();
+        let handler = SkillToolHandler::new("test".to_string(), tool_def, security, PathBuf::from(".")).unwrap();
 
         let args = serde_json::json!({
             "limit": 100,
@@ -541,10 +729,11 @@ mod tests {
             .iter()
             .cloned()
             .collect(),
+            input_mode: String::new(),
         };
 
         let security = Arc::new(SecurityPolicy::default());
-        let handler = SkillToolHandler::new("test".to_string(), tool_def, security).unwrap();
+        let handler = SkillToolHandler::new("test".to_string(), tool_def, security, PathBuf::from(".")).unwrap();
 
         let args = serde_json::json!({
             "required": "value"
@@ -567,10 +756,11 @@ mod tests {
                 .iter()
                 .cloned()
                 .collect(),
+            input_mode: String::new(),
         };
 
         let security = Arc::new(SecurityPolicy::default());
-        let handler = SkillToolHandler::new("test".to_string(), tool_def, security).unwrap();
+        let handler = SkillToolHandler::new("test".to_string(), tool_def, security, PathBuf::from(".")).unwrap();
 
         let args = serde_json::json!({
             "message": "hello; rm -rf /"
@@ -601,10 +791,11 @@ mod tests {
             .iter()
             .cloned()
             .collect(),
+            input_mode: String::new(),
         };
 
         let security = Arc::new(SecurityPolicy::default());
-        let handler = SkillToolHandler::new("test".to_string(), tool_def, security).unwrap();
+        let handler = SkillToolHandler::new("test".to_string(), tool_def, security, PathBuf::from(".")).unwrap();
 
         // Only provide contact_name and limit, omit query and date_from
         let args = serde_json::json!({
@@ -640,10 +831,11 @@ mod tests {
             .iter()
             .cloned()
             .collect(),
+            input_mode: String::new(),
         };
 
         let security = Arc::new(SecurityPolicy::default());
-        let handler = SkillToolHandler::new("test".to_string(), tool_def, security).unwrap();
+        let handler = SkillToolHandler::new("test".to_string(), tool_def, security, PathBuf::from(".")).unwrap();
 
         // Model sends contact_name as integer (use i64 for large Telegram IDs)
         let args = serde_json::json!({

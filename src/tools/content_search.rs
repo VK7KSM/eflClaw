@@ -11,22 +11,25 @@ const TIMEOUT_SECS: u64 = 30;
 
 /// Search file contents by regex pattern within the workspace.
 ///
-/// Uses ripgrep (`rg`) when available, falling back to `grep -rn -E`.
+/// Uses ripgrep (`rg`) when available, falling back to `grep -rn -E`,
+/// then to Windows `findstr` as a last resort.
 /// All searches are confined to the workspace directory by security policy.
 pub struct ContentSearchTool {
     security: Arc<SecurityPolicy>,
     has_rg: bool,
+    has_grep: bool,
 }
 
 impl ContentSearchTool {
     pub fn new(security: Arc<SecurityPolicy>) -> Self {
         let has_rg = which::which("rg").is_ok();
-        Self { security, has_rg }
+        let has_grep = which::which("grep").is_ok();
+        Self { security, has_rg, has_grep }
     }
 
     #[cfg(test)]
     fn new_with_backend(security: Arc<SecurityPolicy>, has_rg: bool) -> Self {
-        Self { security, has_rg }
+        Self { security, has_rg, has_grep: false }
     }
 }
 
@@ -231,7 +234,7 @@ impl Tool for ContentSearchTool {
             });
         }
 
-        // --- Multiline check for grep fallback ---
+        // --- Multiline check for grep/findstr fallback ---
         if multiline && !self.has_rg {
             return Ok(ToolResult {
                 success: false,
@@ -243,6 +246,10 @@ impl Tool for ContentSearchTool {
         }
 
         // --- Build and execute command ---
+        // Strip UNC prefix for Windows compatibility — grep and findstr cannot handle \\?\ paths.
+        // rg handles UNC paths natively.
+        let search_path_clean = strip_unc_prefix(&resolved_canon);
+
         let mut cmd = if self.has_rg {
             build_rg_command(
                 pattern,
@@ -254,16 +261,26 @@ impl Tool for ContentSearchTool {
                 context_after,
                 multiline,
             )
-        } else {
+        } else if self.has_grep {
             build_grep_command(
                 pattern,
-                &resolved_canon,
+                &search_path_clean,
                 output_mode,
                 include,
                 case_sensitive,
                 context_before,
                 context_after,
             )
+        } else if cfg!(windows) {
+            build_findstr_command(pattern, &search_path_clean, include, case_sensitive)
+        } else {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(
+                    "No search backend available (install ripgrep or grep).".into(),
+                ),
+            });
         };
 
         // Security: clear environment, keep only safe variables
@@ -317,11 +334,14 @@ impl Tool for ContentSearchTool {
         let workspace_canon =
             std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.clone());
 
-        let formatted = if self.has_rg {
-            format_rg_output(&raw_stdout, &workspace_canon, output_mode, max_results)
+        // rg handles UNC paths natively; grep/findstr use stripped paths, so match accordingly.
+        let rel_base = if self.has_rg {
+            workspace_canon.clone()
         } else {
-            format_grep_output(&raw_stdout, &workspace_canon, output_mode, max_results)
+            strip_unc_prefix(&workspace_canon)
         };
+
+        let formatted = format_line_output(&raw_stdout, &rel_base, output_mode, max_results);
 
         // Truncate output if too large
         let final_output = if formatted.len() > MAX_OUTPUT_BYTES {
@@ -445,25 +465,7 @@ fn build_grep_command(
     cmd
 }
 
-fn format_rg_output(
-    raw: &str,
-    workspace_canon: &std::path::Path,
-    output_mode: &str,
-    max_results: usize,
-) -> String {
-    format_line_output(raw, workspace_canon, output_mode, max_results)
-}
-
-fn format_grep_output(
-    raw: &str,
-    workspace_canon: &std::path::Path,
-    output_mode: &str,
-    max_results: usize,
-) -> String {
-    format_line_output(raw, workspace_canon, output_mode, max_results)
-}
-
-/// Shared formatting for both rg and grep line-based outputs.
+/// Shared formatting for both rg, grep, and findstr line-based outputs.
 ///
 /// Both tools produce similar line-based output in our configuration:
 /// - content mode: `path:line:content` or `path-line-content` (context lines)
@@ -649,6 +651,48 @@ fn truncate_utf8(input: &str, max_bytes: usize) -> &str {
         end -= 1;
     }
     &input[..end]
+}
+
+/// Strip Windows UNC prefix (`\\?\`) from a path.
+/// findstr and some tools cannot handle UNC-prefixed paths.
+fn strip_unc_prefix(path: &std::path::Path) -> std::path::PathBuf {
+    #[cfg(windows)]
+    {
+        let s = path.to_string_lossy();
+        if let Some(stripped) = s.strip_prefix(r"\\?\") {
+            return std::path::PathBuf::from(stripped);
+        }
+    }
+    let _ = path; // suppress unused warning on non-windows
+    path.to_path_buf()
+}
+
+/// Build a Windows findstr command as last-resort search backend.
+/// findstr uses literal string matching (/l) — not regex — for safety.
+#[cfg(windows)]
+fn build_findstr_command(
+    pattern: &str,
+    search_path: &std::path::Path,
+    include: Option<&str>,
+    case_sensitive: bool,
+) -> std::process::Command {
+    let mut cmd = std::process::Command::new("findstr");
+    cmd.arg("/s"); // recursive
+    cmd.arg("/n"); // line numbers
+    cmd.arg("/l"); // literal string match (not regex, for safety)
+    if !case_sensitive {
+        cmd.arg("/i");
+    }
+    cmd.arg(format!("/c:{}", pattern));
+
+    let target = if let Some(glob) = include {
+        search_path.join(glob)
+    } else {
+        search_path.join("*.*")
+    };
+    cmd.arg(target);
+
+    cmd
 }
 
 #[cfg(test)]
@@ -882,8 +926,10 @@ mod tests {
     #[tokio::test]
     async fn content_search_rejects_absolute_path() {
         let tool = ContentSearchTool::new(test_security(std::env::temp_dir()));
+        // Use a platform-appropriate absolute path
+        let abs_path = if cfg!(windows) { "C:\\Windows" } else { "/etc" };
         let result = tool
-            .execute(json!({"pattern": "test", "path": "/etc"}))
+            .execute(json!({"pattern": "test", "path": abs_path}))
             .await
             .unwrap();
 

@@ -80,7 +80,11 @@ pub async fn transcribe_audio(
             "Missing transcription API key: set [transcription].api_key or GROQ_API_KEY environment variable",
         )?;
 
-    let client = crate::config::build_runtime_proxy_client("transcription.groq");
+    let client = crate::config::build_runtime_proxy_client_with_timeouts(
+        "transcription.groq",
+        20, // total request timeout: 20 seconds
+        10, // connect timeout: 10 seconds
+    );
 
     let file_part = Part::bytes(audio_data)
         .file_name(normalized_name)

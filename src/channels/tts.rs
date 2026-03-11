@@ -117,6 +117,66 @@ pub async fn send_voice_to_telegram(
     Ok(())
 }
 
+/// Synthesize text to OGG Opus bytes for the Xiaozhi device (24 kHz mono Opus).
+///
+/// Edge TTS returns a native OGG Opus container when the format is set to
+/// `ogg-24khz-16bit-mono-opus`, so no re-encoding is needed.
+/// The bytes can be sent directly via the Xiaozhi WebSocket protocol.
+pub async fn synthesize_to_ogg_opus(text: &str, config: &TtsConfig) -> Result<Vec<u8>> {
+    if text.is_empty() {
+        anyhow::bail!("Cannot synthesize empty text");
+    }
+
+    let text_to_speak = if text.chars().count() > config.max_chars {
+        let truncated: String = text.chars().take(config.max_chars).collect();
+        warn!(
+            "TTS text truncated from {} to {} chars",
+            text.chars().count(),
+            config.max_chars
+        );
+        truncated
+    } else {
+        text.to_string()
+    };
+
+    let clean_text = strip_markdown_for_speech(&text_to_speak);
+
+    debug!(
+        "Synthesizing {} chars (OGG Opus 24kHz) with voice {}",
+        clean_text.len(),
+        config.voice
+    );
+
+    let speech_config = SpeechConfig {
+        voice_name: config.voice.clone(),
+        audio_format: "ogg-24khz-16bit-mono-opus".to_string(),
+        rate: config.rate,
+        pitch: config.pitch,
+        volume: 0,
+    };
+
+    let mut tts = connect_async()
+        .await
+        .context("Failed to connect to Edge TTS service")?;
+
+    let audio = tts
+        .synthesize(&clean_text, &speech_config)
+        .await
+        .context("Edge TTS synthesis (OGG Opus) failed")?;
+
+    if audio.audio_bytes.is_empty() {
+        anyhow::bail!("Edge TTS returned empty audio (OGG Opus)");
+    }
+
+    info!(
+        "TTS OGG Opus: {} chars → {} bytes",
+        clean_text.len(),
+        audio.audio_bytes.len()
+    );
+
+    Ok(audio.audio_bytes)
+}
+
 /// Clean up a TTS audio file after sending.
 pub async fn cleanup(path: &Path) {
     if let Err(e) = fs::remove_file(path).await {

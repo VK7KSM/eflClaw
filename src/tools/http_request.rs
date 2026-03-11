@@ -423,14 +423,25 @@ impl Tool for HttpRequestTool {
                     response_text
                 );
 
+                // elfClaw: semantic 4xx guidance for weak model fallback
+                let error_hint = if status.is_client_error() || status.is_server_error() {
+                    let hint = match status_code {
+                        401 => " — authentication required. Do NOT retry; use web_scrape with strategy=edge_browser instead.",
+                        403 => " — access denied (paywall or bot-detection). Do NOT retry this URL; switch to web_scrape tool with mode=article and strategy=edge_browser to extract title and summary.",
+                        429 => " — rate limited by server. Do NOT retry immediately; skip this URL or use web_scrape as alternative.",
+                        410 => " — resource permanently gone. Remove this URL from sources.",
+                        _ if status.is_client_error() => " — client error, do NOT retry the same URL.",
+                        _ => " — server error, may retry once with a different approach.",
+                    };
+                    Some(format!("HTTP {}{}", status_code, hint))
+                } else {
+                    None
+                };
+
                 Ok(ToolResult {
                     success: status.is_success(),
                     output,
-                    error: if status.is_client_error() || status.is_server_error() {
-                        Some(format!("HTTP {}", status_code))
-                    } else {
-                        None
-                    },
+                    error: error_hint,
                 })
             }
             Err(e) => Ok(ToolResult {
