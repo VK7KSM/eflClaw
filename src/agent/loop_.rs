@@ -1271,35 +1271,6 @@ pub async fn run(
         tools_registry.extend(peripheral_tools);
     }
 
-    // elfClaw: wire MCP tools into isolated agent registries (self_check, cron, etc.)
-    // Matches the pattern in channels/mod.rs so all agent contexts get MCP access.
-    if config.mcp.enabled && !config.mcp.servers.is_empty() {
-        match crate::tools::mcp_client::McpRegistry::connect_all(&config.mcp.servers).await {
-            Ok(registry) => {
-                let registry = std::sync::Arc::new(registry);
-                let names = registry.tool_names();
-                let mut mcp_added = 0usize;
-                for name in names {
-                    if let Some(def) = registry.get_tool_def(&name).await {
-                        let wrapper = crate::tools::McpToolWrapper::new(
-                            name,
-                            def,
-                            std::sync::Arc::clone(&registry),
-                        );
-                        tools_registry.push(Box::new(wrapper));
-                        mcp_added += 1;
-                    }
-                }
-                if mcp_added > 0 {
-                    tracing::info!(count = mcp_added, "MCP tools added to agent");
-                }
-            }
-            Err(e) => {
-                tracing::warn!("MCP registry connection failed (non-fatal): {e:#}");
-            }
-        }
-    }
-
     // ── Resolve provider ─────────────────────────────────────────
     let provider_name = provider_override
         .as_deref()
