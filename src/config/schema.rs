@@ -4090,7 +4090,7 @@ fn default_active_hours_end() -> String {
 }
 
 fn default_heartbeat_max_tool_iterations() -> usize {
-    25
+    8
 }
 
 /// Parse `"HH:MM"` into total minutes since midnight. Returns `None` on invalid input.
@@ -4325,6 +4325,8 @@ pub struct ChannelsConfig {
     pub nostr: Option<NostrConfig>,
     /// ClawdTalk voice channel configuration.
     pub clawdtalk: Option<crate::channels::clawdtalk::ClawdTalkConfig>,
+    /// Xiaozhi AI-VOX3 voice terminal channel configuration.
+    pub xiaozhi: Option<crate::channels::xiaozhi::XiaozhiConfig>,
     /// ACK emoji reaction policy overrides for channels that support message reactions.
     ///
     /// Use this table to control reaction enable/disable, emoji pools, and conditional rules
@@ -4439,6 +4441,10 @@ impl ChannelsConfig {
                 Box::new(ConfigWrapper::new(self.clawdtalk.as_ref())),
                 self.clawdtalk.is_some(),
             ),
+            (
+                Box::new(ConfigWrapper::new(self.xiaozhi.as_ref())),
+                self.xiaozhi.is_some(),
+            ),
         ]
     }
 
@@ -4484,6 +4490,7 @@ impl Default for ChannelsConfig {
             qq: None,
             nostr: None,
             clawdtalk: None,
+            xiaozhi: None,
             ack_reaction: AckReactionChannelsConfig::default(),
             message_timeout_secs: default_channel_message_timeout_secs(),
         }
@@ -9265,8 +9272,8 @@ mod tests {
         config.agents.insert(
             "worker".into(),
             DelegateAgentConfig {
-                provider: "openrouter".into(),
-                model: "model-test".into(),
+                provider: Some("openrouter".into()),
+                model: Some("model-test".into()),
                 system_prompt: None,
                 api_key: Some("agent-credential".into()),
                 temperature: None,
@@ -9674,7 +9681,7 @@ ws_url = "ws://127.0.0.1:3002"
                 to: Some("123456".into()),
                 active_hours_start: "06:30".into(),
                 active_hours_end: "23:00".into(),
-                max_tool_iterations: 25,
+                max_tool_iterations: 8,
             },
             cron: CronConfig::default(),
             goal_loop: GoalLoopConfig::default(),
@@ -9715,6 +9722,7 @@ ws_url = "ws://127.0.0.1:3002"
                 qq: None,
                 nostr: None,
                 clawdtalk: None,
+                xiaozhi: None,
                 ack_reaction: AckReactionChannelsConfig::default(),
                 message_timeout_secs: 300,
             },
@@ -10187,8 +10195,8 @@ tool_dispatcher = "xml"
         config.agents.insert(
             "worker".into(),
             DelegateAgentConfig {
-                provider: "openrouter".into(),
-                model: "model-test".into(),
+                provider: Some("openrouter".into()),
+                model: Some("model-test".into()),
                 system_prompt: None,
                 api_key: Some("agent-credential".into()),
                 temperature: None,
@@ -10687,6 +10695,7 @@ allowed_users = ["@ops:matrix.org"]
             qq: None,
             nostr: None,
             clawdtalk: None,
+            xiaozhi: None,
             ack_reaction: AckReactionChannelsConfig::default(),
             message_timeout_secs: 300,
         };
@@ -11034,6 +11043,7 @@ channel_id = "C123"
             qq: None,
             nostr: None,
             clawdtalk: None,
+            xiaozhi: None,
             ack_reaction: AckReactionChannelsConfig::default(),
             message_timeout_secs: 300,
         };

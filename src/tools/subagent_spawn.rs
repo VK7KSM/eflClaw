@@ -516,8 +516,8 @@ mod tests {
         agents.insert(
             "researcher".to_string(),
             DelegateAgentConfig {
-                provider: "ollama".to_string(),
-                model: "llama3".to_string(),
+                provider: Some("ollama".to_string()),
+                model: Some("llama3".to_string()),
                 system_prompt: Some("You are a research assistant.".to_string()),
                 api_key: None,
                 temperature: Some(0.3),

@@ -50,6 +50,10 @@ pub struct SkillTool {
     pub command: String,
     #[serde(default)]
     pub args: HashMap<String, String>,
+    /// elfClaw: input mode — "args" (default, placeholder substitution) or "stdin_json"
+    /// (serialize args as JSON and pipe to stdin, bypassing shell quoting issues)
+    #[serde(default)]
+    pub input_mode: String,
 }
 
 /// Skill manifest parsed from SKILL.toml
@@ -861,12 +865,13 @@ pub fn skills_dir(workspace_dir: &Path) -> PathBuf {
 pub fn create_skill_tools(
     skills: &[Skill],
     security: std::sync::Arc<crate::security::SecurityPolicy>,
+    workspace_dir: &std::path::Path,
 ) -> Vec<Box<dyn crate::tools::Tool>> {
     let mut tools: Vec<Box<dyn crate::tools::Tool>> = Vec::new();
 
     for skill in skills {
         for tool_def in &skill.tools {
-            match SkillToolHandler::new(skill.name.clone(), tool_def.clone(), security.clone()) {
+            match SkillToolHandler::new(skill.name.clone(), tool_def.clone(), security.clone(), workspace_dir.to_path_buf()) {
                 Ok(handler) => {
                     tracing::debug!(
                         skill = %skill.name,

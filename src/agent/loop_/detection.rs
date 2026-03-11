@@ -82,6 +82,8 @@ pub(crate) struct LoopDetector {
     success_counts: HashMap<String, usize>,
     /// elfClaw: tracks which action tools have already received a spam warning this turn
     success_spam_warned: HashSet<String>,
+    /// elfClaw: last failed args per tool (for error learning reports)
+    last_failed_args: HashMap<String, String>,
 }
 
 impl LoopDetector {
@@ -93,6 +95,7 @@ impl LoopDetector {
             warning_injected: false,
             success_counts: HashMap::new(),
             success_spam_warned: HashSet::new(),
+            last_failed_args: HashMap::new(),
         }
     }
 
@@ -122,6 +125,11 @@ impl LoopDetector {
                 .consecutive_failures
                 .entry(tool_name.to_owned())
                 .or_insert(0) += 1;
+            // elfClaw: track last failed args for error learning reports
+            self.last_failed_args.insert(
+                tool_name.to_string(),
+                args_sig.chars().take(200).collect(),
+            );
         }
     }
 
@@ -155,6 +163,20 @@ impl LoopDetector {
         }
 
         DetectionVerdict::Continue
+    }
+
+    /// Get a summary of all consecutive failure streaks for error reporting.
+    pub fn failure_summary(&self) -> Vec<(String, usize)> {
+        self.consecutive_failures
+            .iter()
+            .filter(|(_, count)| **count > 0)
+            .map(|(tool, count)| (tool.clone(), *count))
+            .collect()
+    }
+
+    /// Last failed arguments per tool (truncated to 200 chars).
+    pub fn last_failed_args(&self) -> &HashMap<String, String> {
+        &self.last_failed_args
     }
 
     // ── Strategy 1: no-progress repeat ───────────────────────────────────

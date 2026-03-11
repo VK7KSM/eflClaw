@@ -23,14 +23,13 @@ impl Tool for CheckLogsTool {
     }
 
     fn description(&self) -> &str {
-        "PREFERRED tool for log inspection and system diagnostics. \
-         When asked to view, check, query, inspect, or read system logs, runtime records, \
-         errors, or execution history — use this tool INSTEAD OF shell commands. \
-         Shell commands (tail, cat, grep, Get-Content, ls) are unreliable on Windows \
-         and may be blocked by security policy. This tool directly queries \
-         state/elfclaw-logs.db with zero shell commands. \
-         Use for: checking recent errors, tracing tool call failures, \
-         viewing cron job history, verifying if actions completed, diagnosing system issues."
+        "Log inspection tool — queries state/elfclaw-logs.db directly without shell commands. \
+         USER-INITIATED ONLY: Call only when the user explicitly requests log inspection in their \
+         current message. Do NOT call automatically when errors occur, tools fail, or cron jobs \
+         fail — system errors are not a trigger for this tool. \
+         Exception: when called from within an authorized self-check diagnostic session, \
+         log access is pre-authorized and no additional confirmation is needed. \
+         Prefer over shell commands (tail/cat/grep/Get-Content) which are unreliable on Windows."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -64,6 +63,18 @@ impl Tool for CheckLogsTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        // elfClaw: hard gate — only available when user explicitly opens via /selfcheck
+        // elfClaw: return success:true so weak models don't try to compensate
+        if !crate::tools::self_check::SelfCheckGate::is_open() {
+            return Ok(ToolResult {
+                success: true,
+                output: "check_logs is currently disabled. \
+                         Please tell the user: 日志查看功能当前未启用。如需启用，请发送 /selfcheck 命令。"
+                    .into(),
+                error: None,
+            });
+        }
+
         let limit = args
             .get("limit")
             .and_then(|v| v.as_u64())

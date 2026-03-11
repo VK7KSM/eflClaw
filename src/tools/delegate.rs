@@ -1154,8 +1154,8 @@ mod tests {
         agents.insert(
             "broken".to_string(),
             DelegateAgentConfig {
-                provider: "totally-invalid-provider".to_string(),
-                model: "model".to_string(),
+                provider: Some("totally-invalid-provider".to_string()),
+                model: Some("model".to_string()),
                 system_prompt: None,
                 api_key: None,
                 temperature: None,
@@ -1260,8 +1260,8 @@ mod tests {
         agents.insert(
             "tester".to_string(),
             DelegateAgentConfig {
-                provider: "invalid-for-test".to_string(),
-                model: "test-model".to_string(),
+                provider: Some("invalid-for-test".to_string()),
+                model: Some("test-model".to_string()),
                 system_prompt: None,
                 api_key: None,
                 temperature: None,
@@ -1295,8 +1295,8 @@ mod tests {
         agents.insert(
             "tester".to_string(),
             DelegateAgentConfig {
-                provider: "invalid-for-test".to_string(),
-                model: "test-model".to_string(),
+                provider: Some("invalid-for-test".to_string()),
+                model: Some("test-model".to_string()),
                 system_prompt: None,
                 api_key: None,
                 temperature: None,
@@ -1395,7 +1395,7 @@ mod tests {
 
         let provider = OneToolThenFinalProvider;
         let result = tool
-            .execute_agentic("agentic", &config, &provider, "run", 0.2)
+            .execute_agentic("agentic", &config, &provider, "run", 0.2, "openrouter", "model-test")
             .await
             .unwrap();
 
@@ -1417,7 +1417,7 @@ mod tests {
 
         let provider = OneToolThenFinalProvider;
         let result = tool
-            .execute_agentic("agentic", &config, &provider, "run", 0.2)
+            .execute_agentic("agentic", &config, &provider, "run", 0.2, "openrouter", "model-test")
             .await
             .unwrap();
 
@@ -1437,7 +1437,7 @@ mod tests {
 
         let provider = InfiniteToolCallProvider;
         let result = tool
-            .execute_agentic("agentic", &config, &provider, "run", 0.2)
+            .execute_agentic("agentic", &config, &provider, "run", 0.2, "openrouter", "model-test")
             .await
             .unwrap();
 
@@ -1469,7 +1469,7 @@ mod tests {
 
         let provider = FailingProvider;
         let result = tool
-            .execute_agentic("agentic", &config, &provider, "run", 0.2)
+            .execute_agentic("agentic", &config, &provider, "run", 0.2, "openrouter", "model-test")
             .await
             .unwrap();
 
@@ -1487,8 +1487,8 @@ mod tests {
         agents.insert(
             "broken".to_string(),
             DelegateAgentConfig {
-                provider: "totally-invalid-provider".to_string(),
-                model: "model".to_string(),
+                provider: Some("totally-invalid-provider".to_string()),
+                model: Some("model".to_string()),
                 system_prompt: None,
                 api_key: None,
                 temperature: None,
@@ -1556,8 +1556,8 @@ mod tests {
         agents.insert(
             "tester".to_string(),
             DelegateAgentConfig {
-                provider: "openrouter".to_string(),
-                model: "model-test".to_string(),
+                provider: Some("openrouter".to_string()),
+                model: Some("model-test".to_string()),
                 system_prompt: None,
                 api_key: Some("delegate-test-credential".to_string()),
                 temperature: Some(0.2),

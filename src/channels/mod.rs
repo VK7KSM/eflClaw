@@ -46,6 +46,7 @@ pub mod transcription;
 pub mod tts;
 pub mod wati;
 pub mod whatsapp;
+pub mod xiaozhi;
 #[cfg(feature = "whatsapp-web")]
 pub mod whatsapp_storage;
 #[cfg(feature = "whatsapp-web")]
@@ -75,6 +76,7 @@ pub use slack::SlackChannel;
 pub use telegram::TelegramChannel;
 pub(crate) use telegram::split_message_for_telegram;
 pub use traits::{Channel, SendMessage};
+pub use xiaozhi::XiaozhiChannel;
 pub use wati::WatiChannel;
 pub use whatsapp::WhatsAppChannel;
 #[cfg(feature = "whatsapp-web")]
@@ -460,6 +462,17 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - Keep normal text outside markers and never wrap markers in code fences.\n\
              - Use tool results silently: answer the latest user message directly, and do not narrate delayed/internal tool execution bookkeeping.",
         ),
+        "xiaozhi" => Some(
+            "You are responding to a voice-only AI speaker device (Xiaozhi AI-VOX3). \
+             Your text reply will be synthesized to speech and played aloud. Rules:\n\
+             - Keep responses SHORT and conversational (1-3 sentences when possible)\n\
+             - Use plain spoken language — NO markdown, NO bullet points, NO code blocks\n\
+             - No headers, no **bold**, no *italic*, no `backticks`\n\
+             - Spell out numbers naturally ('three hundred', not '300')\n\
+             - Avoid lists; use natural spoken connectors ('first... then... finally...')\n\
+             - Skip filler phrases like 'Great question!' or 'Certainly!'\n\
+             - If the answer is complex, give a spoken summary and offer to elaborate",
+        ),
         _ => None,
     }
 }
@@ -563,6 +576,48 @@ fn build_runtime_status_section(config: &crate::config::Config) -> String {
          禁止使用 shell 命令（tail/cat/grep/Get-Content 在 Windows 环境不可用且可能被安全策略拦截）。\
          `check_logs` 支持过滤：level=error/warn/info/debug，\
          category=tool_call/cron_job/llm_call/channel_message/system，since_minutes=N。\n"
+    );
+
+    // elfClaw: self_check tool — autonomous diagnostics with two-pass verification
+    section.push_str(
+        "\n`self_check` 工具：用户说「自检」「健康检查」「debug自检」或问「什么出问题了」时调用。\n\
+         第一步：调用 self_check(action=\"analyze\")\n\
+         第二步（必须执行）：收到报告后进行二次复核：\n\
+           - 检查每个「🔴严重/🟡中等」问题是否有日志证据\n\
+           - 如果用户询问了特定服务/功能（如 MCP、cron、推送），用 check_logs 查询相关 INFO 日志\n\
+             示例：check_logs(level=\"info\", category=\"agent_lifecycle\", since_minutes=60)\n\
+           - 对有疑问的部分调用 check_logs 验证（最多 5 次工具调用）\n\
+           - 检查是否有用户操作错误被误归为系统缺陷\n\
+         第三步：向用户呈现：原始报告（完整保留）+ 复核结论（标注 ✅确认/⚠️存疑/❌误报）\n"
+    );
+
+    // elfClaw: GitHub MCP tool guidance
+    section.push_str(
+        "\nGitHub MCP 工具（如果已配置）：\
+         当需要手动查阅源码时，可使用 github__search_code、\
+         github__get_file_contents 等 MCP 工具直接查询 elfClaw/zeroclaw 仓库源码。\
+         这些工具通过 GitHub API 工作，不需要本地安装 git。\n"
+    );
+
+    // elfClaw: capability boundary declaration for deployed daemon
+    section.push_str("\n## Capability Boundaries\n\n");
+    section.push_str(
+        "You are a DEPLOYED agent running as a compiled binary. \
+         You are NOT in a development environment and have NO access to source code.\n\
+         FORBIDDEN actions:\n\
+         - Modifying config.toml — changes require admin to edit and restart the service\n\
+         - Creating or editing .rs/.toml/.yaml source files — you are a compiled binary, not a dev setup\n\
+         - Restarting or stopping your own process\n\
+         - Installing packages or system dependencies\n\n\
+         ALLOWED actions:\n\
+         - Reading and writing files in your workspace directory\n\
+         - Using shell commands for information gathering\n\
+         - Using all registered tools (within their permission gates)\n\
+         - Memory operations (recall, store, search)\n\
+         - Sending messages via configured channels\n\
+         - Managing cron jobs via cron_add/cron_list/cron_remove\n\n\
+         If asked to modify config or code, explain that you are a deployed daemon \
+         and these changes require the administrator to edit files and restart the service.\n"
     );
 
     section
@@ -1685,6 +1740,24 @@ async fn process_channel_message(
     } else {
         msg
     };
+    // elfClaw: mutable for /selfcheck command rewrite
+    let mut msg = msg;
+
+    // ── elfClaw: /selfcheck command — open gate and rewrite message ──
+    let is_selfcheck_command = msg.content.starts_with("/selfcheck");
+    if is_selfcheck_command {
+        let user_prompt = msg.content.strip_prefix("/selfcheck").unwrap_or("").trim();
+        let user_prompt = if user_prompt.is_empty() {
+            "执行全面自检：检查系统日志、错误模式、服务健康状态".to_string()
+        } else {
+            user_prompt.to_string()
+        };
+        crate::tools::self_check::SelfCheckGate::open(&user_prompt);
+        msg.content = format!(
+            "请立即调用 self_check 工具（action=\"analyze\"）执行自检：{}",
+            user_prompt
+        );
+    }
 
     let target_channel = ctx.channels_by_name.get(&msg.channel).cloned();
     if let Err(err) = maybe_apply_runtime_config_update(ctx.as_ref()).await {
@@ -1722,7 +1795,10 @@ async fn process_channel_message(
             return;
         }
     };
-    if ctx.auto_save_memory && msg.content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
+    if ctx.auto_save_memory
+        && msg.content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
+        && !is_selfcheck_command // elfClaw: diagnostic data must not pollute memory
+    {
         let autosave_key = conversation_memory_key(&msg);
         let _ = ctx
             .memory
@@ -1851,6 +1927,27 @@ async fn process_channel_message(
                 }
             }
         }
+    }
+
+    // elfClaw: watchdog recovery injection — if the LAST assistant message was a
+    // hard stop from loop detection, inject recovery guidance so the LLM doesn't
+    // repeat the same failing operations when the user says "continue".
+    let prior_watchdog_stop = prior_turns.iter().rev()
+        .find(|m| m.role == "assistant")
+        .map(|m| m.content.contains("⚠️ [循环检测：已停止"))
+        .unwrap_or(false);
+
+    if prior_watchdog_stop {
+        let recovery_hint = "[SYSTEM] ⚠️ 你的上一轮操作被循环检测机制中断。\n\
+             用户现在要求你继续。请遵守以下恢复规则：\n\
+             1. 查看上方历史中的「📋 失败摘要」，了解哪些操作失败及原因\n\
+             2. 禁止重复使用同一工具+相同参数的组合\n\
+             3. 如果某个工具被安全策略拦截（0ms 失败），说明该工具在此环境不可用，切换到其他方法\n\
+             4. 如果无法完成任务，向用户说明原因并建议替代方案\n\
+             5. 优先使用 file_read、content_search 等安全工具，避免 shell 命令".to_string();
+        // Insert before the latest user message
+        let insert_pos = prior_turns.len().saturating_sub(1);
+        prior_turns.insert(insert_pos, ChatMessage::user(recovery_hint));
     }
 
     // Save system prompt for potential context-overflow retry
@@ -1987,6 +2084,26 @@ async fn process_channel_message(
         excluded
     };
 
+    // elfClaw: build effective excluded_tools with self_check gate
+    let effective_excluded_tools: Vec<String> = {
+        let mut excluded = if msg.channel == "cli" {
+            vec![]
+        } else if msg.id.starts_with("email-digest-") {
+            email_digest_excluded_tools.clone()
+        } else {
+            ctx.non_cli_excluded_tools.as_ref().clone()
+        };
+        // self_check + check_logs gated: excluded unless user opened via /selfcheck
+        if !crate::tools::self_check::SelfCheckGate::is_open() {
+            for tool_name in &["self_check", "check_logs"] {
+                if !excluded.iter().any(|t| t == tool_name) {
+                    excluded.push(tool_name.to_string());
+                }
+            }
+        }
+        excluded
+    };
+
     let timeout_budget_secs =
         channel_message_timeout_budget_secs(ctx.message_timeout_secs, ctx.max_tool_iterations);
     let llm_result = tokio::select! {
@@ -2009,19 +2126,15 @@ async fn process_channel_message(
                 Some(cancellation_token.clone()),
                 delta_tx,
                 ctx.hooks.as_deref(),
-                if msg.channel == "cli" {
-                    &[]
-                } else if msg.id.starts_with("email-digest-") {
-                    // Email monitor digests: exclude send_email so the agent only
-                    // reports to the user and doesn't auto-reply to emails.
-                    // User decides what to do after seeing the notification.
-                    &email_digest_excluded_tools
-                } else {
-                    ctx.non_cli_excluded_tools.as_ref()
-                },
+                &effective_excluded_tools,
             ),
         ) => LlmExecutionResult::Completed(result),
     };
+
+    // elfClaw: close self-check gate after processing, regardless of success/failure
+    if is_selfcheck_command {
+        crate::tools::self_check::SelfCheckGate::close();
+    }
 
     if let Some(handle) = draft_updater {
         let _ = handle.await;
@@ -3387,6 +3500,17 @@ fn collect_configured_channels(
         });
     }
 
+    if let Some(ref xz) = config.channels_config.xiaozhi {
+        channels.push(ConfiguredChannel {
+            display_name: "Xiaozhi",
+            channel: Arc::new(XiaozhiChannel::new(
+                xz.clone(),
+                config.transcription.clone(),
+                config.tts.clone(),
+            )),
+        });
+    }
+
     channels
 }
 
@@ -3661,9 +3785,17 @@ pub async fn start_channels(config: Config) -> Result<()> {
         }
     }
 
+    // elfClaw: register SKILL.toml tools (web_scrape, web_crawl, web_login, etc.)
+    let skills = crate::skills::load_skills_with_config(&workspace, &config);
+    let skill_tools = crate::skills::create_skill_tools(&skills, Arc::clone(&security), &workspace);
+    if !skill_tools.is_empty() {
+        tracing::info!(count = skill_tools.len(), "Skill tools registered in daemon");
+        built_tools.extend(skill_tools);
+    }
+
     let tools_registry = Arc::new(built_tools);
 
-    let skills = crate::skills::load_skills_with_config(&workspace, &config);
+    // skills already loaded above for tool registration
 
     // Collect tool descriptions for the prompt
     let mut tool_descs: Vec<(&str, &str)> = vec![

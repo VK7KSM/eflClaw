@@ -199,33 +199,67 @@ async fn run_agent_job(
         "Cron job starting (worker_model via RunContext::Background)"
     );
 
-    let prefixed_prompt = if let Some(ref agent_name) = job.delegate_to {
-        // Escape inner prompt for safe embedding in the instruction string
-        let escaped = prompt.replace('\\', "\\\\").replace('"', "\\\"");
-        format!(
-            "[cron:{} {name}] Use the delegate tool now: delegate(agent=\"{agent_name}\", prompt=\"{escaped}\")",
-            job.id
-        )
-    } else {
-        // elfClaw: strong behavioral guidance for cron agents.
-        // Fix 12b: explicitly instruct that final text IS the user-facing delivery,
-        // prohibit empty "task completed" responses and redundant send_telegram calls.
-        format!(
-            "[cron:{id} {name}] IMPORTANT: You are a scheduled background task.\n\
-             \n\
-             RULES:\n\
-             1. Execute the task directly using your tools.\n\
-             2. Your final text response IS the message delivered to the user — \
-                include ALL results, summaries, and findings in it.\n\
-             3. Do NOT just say \"task completed\" or \"please check above\" — \
-                the user can ONLY see your final text response.\n\
-             4. Do NOT call send_telegram — the system delivers your response automatically.\n\
-             5. Do NOT wait for other agents — you ARE the agent responsible.\n\
-             \n\
-             Task: {prompt}",
-            id = job.id
-        )
-    };
+    // elfClaw: build prompt and resolve agent config for delegate_to (direct execution)
+    let (prefixed_prompt, effective_allowed_tools, effective_max_iterations) =
+        if let Some(ref agent_name) = job.delegate_to {
+            // elfClaw: run named agent directly — no intermediate Agent #1
+            // Previously this created a prompt asking Agent #1 to call delegate(agent=...),
+            // wasting ~55K tokens + 2 LLM calls. Now we resolve the agent config and pass
+            // allowed_tools directly to run().
+            let agent_cfg = config.agents.get(agent_name);
+            let allowed = agent_cfg
+                .map(|c| c.allowed_tools.clone())
+                .filter(|v| !v.is_empty());
+            let max_iter = agent_cfg
+                .map(|c| c.max_iterations)
+                .unwrap_or(config.scheduler.max_tool_iterations);
+            (
+                format!(
+                    "[cron:{id} {name}] IMPORTANT: You are a scheduled background task (agent: {agent_name}).\n\
+                     \n\
+                     RULES:\n\
+                     1. Execute the task directly using your tools.\n\
+                     2. Your final text response IS the message delivered to the user — \
+                        include ALL results, summaries, and findings in it.\n\
+                     3. Do NOT just say \"task completed\" or \"please check above\" — \
+                        the user can ONLY see your final text response.\n\
+                     4. Do NOT call send_telegram — the system delivers your response automatically.\n\
+                     5. Do NOT wait for other agents — you ARE the agent responsible.\n\
+                     6. Do NOT call self_check or check_logs — these are user-initiated diagnostic \
+                        tools and MUST NOT be called from automated background tasks.\n\
+                     \n\
+                     Task: {prompt}",
+                    id = job.id
+                ),
+                allowed,
+                max_iter,
+            )
+        } else {
+            // elfClaw: strong behavioral guidance for cron agents.
+            // Fix 12b: explicitly instruct that final text IS the user-facing delivery,
+            // prohibit empty "task completed" responses and redundant send_telegram calls.
+            (
+                format!(
+                    "[cron:{id} {name}] IMPORTANT: You are a scheduled background task.\n\
+                     \n\
+                     RULES:\n\
+                     1. Execute the task directly using your tools.\n\
+                     2. Your final text response IS the message delivered to the user — \
+                        include ALL results, summaries, and findings in it.\n\
+                     3. Do NOT just say \"task completed\" or \"please check above\" — \
+                        the user can ONLY see your final text response.\n\
+                     4. Do NOT call send_telegram — the system delivers your response automatically.\n\
+                     5. Do NOT wait for other agents — you ARE the agent responsible.\n\
+                     6. Do NOT call self_check or check_logs — these are user-initiated diagnostic \
+                        tools and MUST NOT be called from automated background tasks.\n\
+                     \n\
+                     Task: {prompt}",
+                    id = job.id
+                ),
+                None,
+                config.scheduler.max_tool_iterations,
+            )
+        };
     // elfClaw: cron jobs always use worker_model from current config, not the
     // model snapshot stored at creation time — see RunContext::Background resolution
     let model_override: Option<String> = None;
@@ -240,8 +274,9 @@ async fn run_agent_job(
                 config.default_temperature,
                 vec![],
                 false,
-                Some(config.scheduler.max_tool_iterations),
+                Some(effective_max_iterations),
                 crate::agent::RunContext::Background, // elfClaw: cron uses worker_model
+                effective_allowed_tools, // elfClaw: Some(vec) for delegate_to, None otherwise
             ))
             .await
         }
