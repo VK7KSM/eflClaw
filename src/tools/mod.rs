@@ -16,6 +16,7 @@
 //! [`all_tools_with_runtime`]. See `AGENTS.md` §7.3 for the full change playbook.
 
 pub mod agents_ipc;
+pub mod agent_load_tracker;
 pub mod apply_patch;
 pub mod auth_profile;
 pub mod bg_run;
@@ -93,6 +94,7 @@ pub mod web_search_tool;
 pub mod xlsx_read;
 
 pub use apply_patch::ApplyPatchTool;
+pub use agent_load_tracker::{AgentLoadLease, AgentLoadSnapshot, AgentLoadTracker};
 pub use bg_run::{
     format_bg_result_for_injection, BgJob, BgJobStatus, BgJobStore, BgRunTool, BgStatusTool,
 };
