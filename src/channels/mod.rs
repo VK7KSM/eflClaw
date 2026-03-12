@@ -46,18 +46,22 @@ pub mod transcription;
 pub mod tts;
 pub mod wati;
 pub mod whatsapp;
-pub mod xiaozhi;
 #[cfg(feature = "whatsapp-web")]
 pub mod whatsapp_storage;
 #[cfg(feature = "whatsapp-web")]
 pub mod whatsapp_web;
+pub mod xiaozhi;
 
+// elfClaw: public API re-exports for all channel types; not all are consumed
+// internally (some channels are only loaded dynamically via config).
+#[allow(unused_imports)]
 pub use bluebubbles::BlueBubblesChannel;
 pub use clawdtalk::ClawdTalkChannel;
 pub use cli::CliChannel;
 pub use dingtalk::DingTalkChannel;
 pub use discord::DiscordChannel;
 pub use email_channel::EmailChannel;
+#[allow(unused_imports)]
 pub use github::GitHubChannel;
 pub use imessage::IMessageChannel;
 pub use irc::IrcChannel;
@@ -67,20 +71,21 @@ pub use linq::LinqChannel;
 #[cfg(feature = "channel-matrix")]
 pub use matrix::MatrixChannel;
 pub use mattermost::MattermostChannel;
+#[allow(unused_imports)]
 pub use napcat::NapcatChannel;
 pub use nextcloud_talk::NextcloudTalkChannel;
 pub use nostr::NostrChannel;
 pub use qq::QQChannel;
 pub use signal::SignalChannel;
 pub use slack::SlackChannel;
-pub use telegram::TelegramChannel;
 pub(crate) use telegram::split_message_for_telegram;
+pub use telegram::TelegramChannel;
 pub use traits::{Channel, SendMessage};
-pub use xiaozhi::XiaozhiChannel;
 pub use wati::WatiChannel;
 pub use whatsapp::WhatsAppChannel;
 #[cfg(feature = "whatsapp-web")]
 pub use whatsapp_web::WhatsAppWebChannel;
+pub use xiaozhi::XiaozhiChannel;
 
 use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop, scrub_credentials};
 use crate::config::Config;
@@ -552,12 +557,7 @@ fn build_runtime_status_section(config: &crate::config::Config) -> String {
                     let _ = writeln!(
                         section,
                         "- id=`{}` name=\"{}\" enabled={} type={} delegate={} schedule={}",
-                        job.id,
-                        name,
-                        enabled,
-                        job_type,
-                        delegate,
-                        &job.expression
+                        job.id, name, enabled, job_type, delegate, &job.expression
                     );
                 }
             }
@@ -596,7 +596,7 @@ fn build_runtime_status_section(config: &crate::config::Config) -> String {
         "\nGitHub MCP 工具（如果已配置）：\
          当需要手动查阅源码时，可使用 github__search_code、\
          github__get_file_contents 等 MCP 工具直接查询 elfClaw/zeroclaw 仓库源码。\
-         这些工具通过 GitHub API 工作，不需要本地安装 git。\n"
+         这些工具通过 GitHub API 工作，不需要本地安装 git。\n",
     );
 
     // elfClaw: capability boundary declaration for deployed daemon
@@ -1712,7 +1712,12 @@ async fn process_channel_message(
         truncate_with_ellipsis(&msg.content, 200)
     );
     // elfClaw: log incoming channel message
-    crate::elfclaw_log::log_channel_message(&msg.channel, "incoming", &msg.sender, &msg.reply_target);
+    crate::elfclaw_log::log_channel_message(
+        &msg.channel,
+        "incoming",
+        &msg.sender,
+        &msg.reply_target,
+    );
     runtime_trace::record_event(
         "channel_message_inbound",
         Some(msg.channel.as_str()),
@@ -1798,7 +1803,8 @@ async fn process_channel_message(
     };
     if ctx.auto_save_memory
         && msg.content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
-        && !is_selfcheck_command // elfClaw: diagnostic data must not pollute memory
+        && !is_selfcheck_command
+    // elfClaw: diagnostic data must not pollute memory
     {
         let autosave_key = conversation_memory_key(&msg);
         let _ = ctx
@@ -1830,7 +1836,11 @@ async fn process_channel_message(
     } else {
         format!("{ts_prefix} {}", msg.content)
     };
-    append_sender_turn(ctx.as_ref(), &history_key, ChatMessage::user(&timestamped_content));
+    append_sender_turn(
+        ctx.as_ref(),
+        &history_key,
+        ChatMessage::user(&timestamped_content),
+    );
 
     // Persist user turn to local chat log
     if ctx.chat_log_config.enabled && msg.channel == "telegram" {
@@ -1933,7 +1943,9 @@ async fn process_channel_message(
     // elfClaw: watchdog recovery injection — if the LAST assistant message was a
     // hard stop from loop detection, inject recovery guidance so the LLM doesn't
     // repeat the same failing operations when the user says "continue".
-    let prior_watchdog_stop = prior_turns.iter().rev()
+    let prior_watchdog_stop = prior_turns
+        .iter()
+        .rev()
         .find(|m| m.role == "assistant")
         .map(|m| m.content.contains("⚠️ [循环检测：已停止"))
         .unwrap_or(false);
@@ -1945,7 +1957,8 @@ async fn process_channel_message(
              2. 禁止重复使用同一工具+相同参数的组合\n\
              3. 如果某个工具被安全策略拦截（0ms 失败），说明该工具在此环境不可用，切换到其他方法\n\
              4. 如果无法完成任务，向用户说明原因并建议替代方案\n\
-             5. 优先使用 file_read、content_search 等安全工具，避免 shell 命令".to_string();
+             5. 优先使用 file_read、content_search 等安全工具，避免 shell 命令"
+            .to_string();
         // Insert before the latest user message
         let insert_pos = prior_turns.len().saturating_sub(1);
         prior_turns.insert(insert_pos, ChatMessage::user(recovery_hint));
@@ -3709,8 +3722,9 @@ pub async fn start_channels(config: Config) -> Result<()> {
     }
 
     // elfClaw: wrap observer with ElfClawObserver for SQLite logging + SSE broadcast
-    let observer: Arc<dyn Observer> =
-        Arc::new(crate::elfclaw_log::wrap_observer(observability::create_observer(&config.observability)));
+    let observer: Arc<dyn Observer> = Arc::new(crate::elfclaw_log::wrap_observer(
+        observability::create_observer(&config.observability),
+    ));
     let runtime: Arc<dyn runtime::RuntimeAdapter> =
         Arc::from(runtime::create_runtime(&config.runtime)?);
     let security = Arc::new(SecurityPolicy::from_config(
@@ -3790,7 +3804,10 @@ pub async fn start_channels(config: Config) -> Result<()> {
     let skills = crate::skills::load_skills_with_config(&workspace, &config);
     let skill_tools = crate::skills::create_skill_tools(&skills, Arc::clone(&security), &workspace);
     if !skill_tools.is_empty() {
-        tracing::info!(count = skill_tools.len(), "Skill tools registered in daemon");
+        tracing::info!(
+            count = skill_tools.len(),
+            "Skill tools registered in daemon"
+        );
         built_tools.extend(skill_tools);
     }
 

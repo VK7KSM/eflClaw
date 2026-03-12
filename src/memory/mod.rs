@@ -24,6 +24,8 @@ pub use backend::{
     selectable_memory_backends, MemoryBackendKind, MemoryBackendProfile,
 };
 pub use cortex::CortexMemMemory;
+// elfClaw: public API for memory time-decay; callable by external integrations
+#[allow(unused_imports)]
 pub use decay::apply_time_decay;
 pub use hybrid::SqliteQdrantHybridMemory;
 pub use lucid::LucidMemory;

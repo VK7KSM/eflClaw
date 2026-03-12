@@ -2,7 +2,7 @@ use crate::config::Config;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const DAEMON_STALE_SECONDS: i64 = 30;
 const SCHEDULER_STALE_SECONDS: i64 = 120;
@@ -84,6 +84,7 @@ pub fn diagnose(config: &Config) -> Vec<DiagResult> {
     check_daemon_state(config, &mut items);
     check_environment(&mut items);
     check_cli_tools(&mut items);
+    check_runtime_capabilities(config, &mut items);
 
     items.into_iter().map(DiagItem::into_result).collect()
 }
@@ -1008,6 +1009,116 @@ fn truncate_for_display(input: &str, max_chars: usize) -> String {
     }
 }
 
+// ── Runtime capabilities check ──────────────────────────────────
+
+fn check_runtime_capabilities(config: &Config, items: &mut Vec<DiagItem>) {
+    let cat = "runtime";
+
+    let runtime = match crate::runtime::create_runtime(&config.runtime) {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            items.push(DiagItem::error(
+                cat,
+                format!(
+                    "failed to construct runtime '{}' from config: {}",
+                    config.runtime.kind,
+                    truncate_for_display(&err.to_string(), 180)
+                ),
+            ));
+            return;
+        }
+    };
+
+    items.push(DiagItem::ok(
+        cat,
+        format!("runtime adapter: {}", runtime.name()),
+    ));
+
+    if runtime.has_shell_access() {
+        items.push(DiagItem::ok(cat, "shell tool capability enabled"));
+    } else if runtime.name() == "native" {
+        items.push(DiagItem::error(
+            cat,
+            "native runtime shell capability unavailable — install Git Bash or PowerShell (WSL2 is optional)",
+        ));
+    } else {
+        items.push(DiagItem::warn(
+            cat,
+            format!(
+                "runtime '{}' does not expose shell capability",
+                runtime.name()
+            ),
+        ));
+    }
+
+    if runtime.has_filesystem_access() {
+        items.push(DiagItem::ok(cat, "filesystem capability enabled"));
+    } else {
+        items.push(DiagItem::warn(cat, "filesystem capability disabled"));
+    }
+
+    if runtime.supports_long_running() {
+        items.push(DiagItem::ok(cat, "long-running capability enabled"));
+    } else {
+        items.push(DiagItem::warn(cat, "long-running capability disabled"));
+    }
+
+    if let Some(native) = runtime
+        .as_any()
+        .downcast_ref::<crate::runtime::NativeRuntime>()
+    {
+        if let Some(kind) = native.selected_shell_kind() {
+            let shell_program = native
+                .selected_shell_program()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            items.push(DiagItem::ok(
+                cat,
+                format!("native shell selected: {kind} ({shell_program})"),
+            ));
+
+            if cfg!(target_os = "windows") && kind == "cmd" {
+                items.push(DiagItem::warn(
+                    cat,
+                    "shell fallback is cmd; install Git Bash or PowerShell for best compatibility (WSL2 optional)",
+                ));
+            }
+        } else {
+            items.push(DiagItem::error(
+                cat,
+                "native runtime detected but no usable shell resolved from PATH/COMSPEC",
+            ));
+        }
+    }
+
+    if cfg!(target_os = "windows") {
+        let shell_checks = windows_shell_candidates();
+        let available: Vec<String> = shell_checks
+            .iter()
+            .filter_map(|(name, path)| path.as_ref().map(|p| format!("{name} ({})", p.display())))
+            .collect();
+
+        if available.is_empty() {
+            items.push(DiagItem::warn(
+                cat,
+                "Windows shell candidates not found in PATH (bash/pwsh/powershell/cmd)",
+            ));
+        } else {
+            items.push(DiagItem::ok(
+                cat,
+                format!("Windows shell candidates: {}", available.join(", ")),
+            ));
+        }
+    }
+}
+
+fn windows_shell_candidates() -> Vec<(&'static str, Option<PathBuf>)> {
+    ["bash", "pwsh", "powershell", "cmd"]
+        .iter()
+        .map(|&name| (name, which::which(name).ok()))
+        .collect()
+}
+
 // ── Helpers ──────────────────────────────────────────────────────
 
 fn parse_rfc3339(raw: &str) -> Option<DateTime<Utc>> {
@@ -1284,6 +1395,9 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                enabled: true,
+                capabilities: Vec::new(),
+                priority: 0,
             },
         );
         config.agents.insert(
@@ -1298,6 +1412,9 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                enabled: true,
+                capabilities: Vec::new(),
+                priority: 0,
             },
         );
 

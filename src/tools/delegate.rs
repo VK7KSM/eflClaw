@@ -883,6 +883,9 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                enabled: true,
+                capabilities: Vec::new(),
+                priority: 0,
             },
         );
         agents.insert(
@@ -897,6 +900,9 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                enabled: true,
+                capabilities: Vec::new(),
+                priority: 0,
             },
         );
         agents
@@ -1055,6 +1061,9 @@ mod tests {
             agentic: true,
             allowed_tools,
             max_iterations,
+            enabled: true,
+            capabilities: Vec::new(),
+            priority: 0,
         }
     }
 
@@ -1163,6 +1172,9 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                enabled: true,
+                capabilities: Vec::new(),
+                priority: 0,
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -1269,6 +1281,9 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                enabled: true,
+                capabilities: Vec::new(),
+                priority: 0,
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -1304,6 +1319,9 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                enabled: true,
+                capabilities: Vec::new(),
+                priority: 0,
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -1395,7 +1413,15 @@ mod tests {
 
         let provider = OneToolThenFinalProvider;
         let result = tool
-            .execute_agentic("agentic", &config, &provider, "run", 0.2, "openrouter", "model-test")
+            .execute_agentic(
+                "agentic",
+                &config,
+                &provider,
+                "run",
+                0.2,
+                "openrouter",
+                "model-test",
+            )
             .await
             .unwrap();
 
@@ -1417,7 +1443,15 @@ mod tests {
 
         let provider = OneToolThenFinalProvider;
         let result = tool
-            .execute_agentic("agentic", &config, &provider, "run", 0.2, "openrouter", "model-test")
+            .execute_agentic(
+                "agentic",
+                &config,
+                &provider,
+                "run",
+                0.2,
+                "openrouter",
+                "model-test",
+            )
             .await
             .unwrap();
 
@@ -1437,7 +1471,15 @@ mod tests {
 
         let provider = InfiniteToolCallProvider;
         let result = tool
-            .execute_agentic("agentic", &config, &provider, "run", 0.2, "openrouter", "model-test")
+            .execute_agentic(
+                "agentic",
+                &config,
+                &provider,
+                "run",
+                0.2,
+                "openrouter",
+                "model-test",
+            )
             .await
             .unwrap();
 
@@ -1469,7 +1511,15 @@ mod tests {
 
         let provider = FailingProvider;
         let result = tool
-            .execute_agentic("agentic", &config, &provider, "run", 0.2, "openrouter", "model-test")
+            .execute_agentic(
+                "agentic",
+                &config,
+                &provider,
+                "run",
+                0.2,
+                "openrouter",
+                "model-test",
+            )
             .await
             .unwrap();
 
@@ -1496,6 +1546,9 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                enabled: true,
+                capabilities: Vec::new(),
+                priority: 0,
             },
         );
 
@@ -1565,6 +1618,9 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                enabled: true,
+                capabilities: Vec::new(),
+                priority: 0,
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());

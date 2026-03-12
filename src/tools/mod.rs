@@ -15,8 +15,9 @@
 //! To add a new tool, implement [`Tool`] in a new submodule and register it in
 //! [`all_tools_with_runtime`]. See `AGENTS.md` §7.3 for the full change playbook.
 
-pub mod agents_ipc;
 pub mod agent_load_tracker;
+pub mod agent_selection;
+pub mod agents_ipc;
 pub mod apply_patch;
 pub mod auth_profile;
 pub mod bg_run;
@@ -77,6 +78,8 @@ pub mod send_email;
 pub mod send_telegram;
 pub mod send_voice;
 pub mod shell;
+// elfClaw: Batch 2 upstream merge — orchestration settings loader
+pub mod orchestration_settings;
 pub mod source_sync;
 pub mod subagent_list;
 pub mod subagent_manage;
@@ -93,14 +96,19 @@ pub mod web_search_config;
 pub mod web_search_tool;
 pub mod xlsx_read;
 
-pub use apply_patch::ApplyPatchTool;
+// elfClaw: public API re-exports; used by subagent_spawn and agent_selection via super::
+#[allow(unused_imports)]
 pub use agent_load_tracker::{AgentLoadLease, AgentLoadSnapshot, AgentLoadTracker};
+pub use apply_patch::ApplyPatchTool;
+#[allow(unused_imports)]
 pub use bg_run::{
     format_bg_result_for_injection, BgJob, BgJobStatus, BgJobStore, BgRunTool, BgStatusTool,
 };
 pub use browser::{BrowserTool, ComputerUseConfig};
 pub use browser_open::BrowserOpenTool;
 pub use channel_ack_config::ChannelAckConfigTool;
+#[allow(unused_imports)]
+pub use check_logs::CheckLogsTool;
 pub use composio::ComposioTool;
 pub use content_search::ContentSearchTool;
 pub use cron_add::CronAddTool;
@@ -143,7 +151,6 @@ pub use proxy_config::ProxyConfigTool;
 pub use pushover::PushoverTool;
 pub use schedule::ScheduleTool;
 #[allow(unused_imports)]
-pub use check_logs::CheckLogsTool;
 pub use schema::{CleaningStrategy, SchemaCleanr};
 pub use screenshot::ScreenshotTool;
 pub use search_chat_log::SearchChatLogTool;
@@ -678,10 +685,7 @@ pub fn all_tools_with_runtime(
         )
         // elfClaw: workers without explicit provider/model inherit worker_model from config
         .with_worker_model_fallback(
-            root_config
-                .default_provider
-                .as_deref()
-                .unwrap_or("gemini"),
+            root_config.default_provider.as_deref().unwrap_or("gemini"),
             root_config
                 .worker_model
                 .as_deref()
@@ -736,6 +740,7 @@ pub fn all_tools_with_runtime(
         }
 
         let subagent_registry = Arc::new(SubAgentRegistry::new());
+        let load_tracker = Arc::new(agent_load_tracker::AgentLoadTracker::new());
         tool_arcs.push(Arc::new(SubAgentSpawnTool::new(
             delegate_agents,
             delegate_fallback_credential,
@@ -744,6 +749,8 @@ pub fn all_tools_with_runtime(
             subagent_registry.clone(),
             parent_tools,
             root_config.multimodal.clone(),
+            load_tracker,
+            root_config.agent.subagents.clone(),
         )));
         tool_arcs.push(Arc::new(SubAgentListTool::new(subagent_registry.clone())));
         tool_arcs.push(Arc::new(SubAgentManageTool::new(
@@ -1186,6 +1193,9 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                enabled: true,
+                capabilities: Vec::new(),
+                priority: 0,
             },
         );
 
@@ -1271,6 +1281,9 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                enabled: true,
+                capabilities: Vec::new(),
+                priority: 0,
             },
         );
 

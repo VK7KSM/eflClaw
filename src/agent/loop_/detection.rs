@@ -126,10 +126,8 @@ impl LoopDetector {
                 .entry(tool_name.to_owned())
                 .or_insert(0) += 1;
             // elfClaw: track last failed args for error learning reports
-            self.last_failed_args.insert(
-                tool_name.to_string(),
-                args_sig.chars().take(200).collect(),
-            );
+            self.last_failed_args
+                .insert(tool_name.to_string(), args_sig.chars().take(200).collect());
         }
     }
 

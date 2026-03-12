@@ -43,7 +43,10 @@ const AUTOSAVE_MIN_MESSAGE_CHARS: usize = 20;
 /// Returns true if the provider should be treated as vision-capable.
 /// Includes a guardrail for anthropic routes that may report false negatives
 /// on capability probing even though Claude models accept image inputs.
-fn should_treat_provider_as_vision_capable(provider_name: &str, provider: &dyn crate::providers::Provider) -> bool {
+fn should_treat_provider_as_vision_capable(
+    provider_name: &str,
+    provider: &dyn crate::providers::Provider,
+) -> bool {
     if provider.supports_vision() {
         return true;
     }
@@ -366,7 +369,8 @@ pub(crate) async fn run_tool_call_loop(
         // provider does not support vision input, return a structured capability error.
         // The channel layer catches ProviderCapabilityError and sends a user-friendly reply.
         let image_marker_count = crate::multimodal::count_image_markers(history);
-        let provider_supports_vision = should_treat_provider_as_vision_capable(provider_name, provider);
+        let provider_supports_vision =
+            should_treat_provider_as_vision_capable(provider_name, provider);
         if image_marker_count > 0 && !provider_supports_vision {
             return Err(crate::providers::ProviderCapabilityError {
                 provider: provider_name.to_string(),
@@ -393,7 +397,10 @@ pub(crate) async fn run_tool_call_loop(
                 clean.trim().len()
             })
             .unwrap_or(0);
-        tracing::debug!(caption_chars = caption_chars_before, "before multimodal prepare");
+        tracing::debug!(
+            caption_chars = caption_chars_before,
+            "before multimodal prepare"
+        );
 
         let prepared_messages =
             match multimodal::prepare_messages_for_provider(&stripped, multimodal_config).await {
@@ -418,8 +425,7 @@ pub(crate) async fn run_tool_call_loop(
                         error = %e,
                         "Multimodal image preparation failed; falling back to text-only"
                     );
-                    let text_only =
-                        crate::multimodal::strip_all_image_markers_with_note(&stripped);
+                    let text_only = crate::multimodal::strip_all_image_markers_with_note(&stripped);
                     multimodal::PreparedMessages {
                         messages: text_only,
                         contains_images: false,
@@ -474,17 +480,16 @@ pub(crate) async fn run_tool_call_loop(
         // (OpenAI/Anthropic/OpenRouter/compatible adapters) is honored.
         // elfClaw: Fix 2 — compute per-iteration tool list; exclude action tools already used this turn.
         // Gemini cannot call an action tool it cannot see in the tool_specs.
-        let turn_tool_specs: Vec<crate::tools::ToolSpec> = if !use_native_tools
-            || used_action_tools.is_empty()
-        {
-            tool_specs.clone()
-        } else {
-            tool_specs
-                .iter()
-                .filter(|s| !used_action_tools.contains(&s.name))
-                .cloned()
-                .collect()
-        };
+        let turn_tool_specs: Vec<crate::tools::ToolSpec> =
+            if !use_native_tools || used_action_tools.is_empty() {
+                tool_specs.clone()
+            } else {
+                tool_specs
+                    .iter()
+                    .filter(|s| !used_action_tools.contains(&s.name))
+                    .cloned()
+                    .collect()
+            };
         let request_tools = if use_native_tools && !turn_tool_specs.is_empty() {
             Some(turn_tool_specs.as_slice())
         } else {
@@ -1039,10 +1044,11 @@ pub(crate) async fn run_tool_call_loop(
                 }
                 error_report.push('\n');
             }
-            error_report.push_str(
-                "教训: 上述工具在当前环境下不可用或参数有误，请勿重试相同操作。"
+            error_report.push_str("教训: 上述工具在当前环境下不可用或参数有误，请勿重试相同操作。");
+            tracing::info!(
+                "Loop detection hard stop — failure summary:\n{}",
+                error_report
             );
-            tracing::info!("Loop detection hard stop — failure summary:\n{}", error_report);
 
             last_response_text = format!(
                 "⚠️ [循环检测：已停止。原因：{}]\n\n📋 失败摘要：\n{}",
@@ -1344,7 +1350,8 @@ pub async fn run(
     let skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
 
     // elfClaw: register SKILL.toml tools (web_scrape, web_crawl, web_login, etc.)
-    let skill_tools = crate::skills::create_skill_tools(&skills, Arc::clone(&security), &config.workspace_dir);
+    let skill_tools =
+        crate::skills::create_skill_tools(&skills, Arc::clone(&security), &config.workspace_dir);
     if !skill_tools.is_empty() {
         tracing::info!(count = skill_tools.len(), "Skill tools registered");
         tools_registry.extend(skill_tools);
@@ -1742,8 +1749,9 @@ pub async fn run(
 /// Used by channels (Telegram, Discord, etc.) to enable hardware and tool use.
 pub async fn process_message(config: Config, message: &str) -> Result<String> {
     // elfClaw: wrap observer with ElfClawObserver for SQLite logging + SSE broadcast
-    let observer: Arc<dyn Observer> =
-        Arc::new(crate::elfclaw_log::wrap_observer(observability::create_observer(&config.observability)));
+    let observer: Arc<dyn Observer> = Arc::new(crate::elfclaw_log::wrap_observer(
+        observability::create_observer(&config.observability),
+    ));
     let runtime: Arc<dyn runtime::RuntimeAdapter> =
         Arc::from(runtime::create_runtime(&config.runtime)?);
     let security = Arc::new(SecurityPolicy::from_config(
@@ -1827,9 +1835,13 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     let skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
 
     // elfClaw: register SKILL.toml tools (web_scrape, web_crawl, web_login, etc.)
-    let skill_tools = crate::skills::create_skill_tools(&skills, Arc::clone(&security), &config.workspace_dir);
+    let skill_tools =
+        crate::skills::create_skill_tools(&skills, Arc::clone(&security), &config.workspace_dir);
     if !skill_tools.is_empty() {
-        tracing::info!(count = skill_tools.len(), "Skill tools registered in process_message");
+        tracing::info!(
+            count = skill_tools.len(),
+            "Skill tools registered in process_message"
+        );
         tools_registry.extend(skill_tools);
     }
 
@@ -4237,12 +4249,8 @@ Let me check the result."#;
 
     #[test]
     fn resolve_model_no_config_uses_builtin_fallback() {
-        let result = resolve_model_for_context(
-            None,
-            None,
-            None,
-            crate::agent::RunContext::Interactive,
-        );
+        let result =
+            resolve_model_for_context(None, None, None, crate::agent::RunContext::Interactive);
         assert_eq!(result, "anthropic/claude-sonnet-4");
     }
 }

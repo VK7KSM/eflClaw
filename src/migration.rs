@@ -695,6 +695,18 @@ fn merge_delegate_agent(
         }
     }
 
+    // Merge enabled/capabilities/priority from source when target uses defaults
+    if target.enabled != source.enabled {
+        stats.merge_conflicts_preserved += 1;
+    }
+    if target.priority != source.priority {
+        stats.merge_conflicts_preserved += 1;
+    }
+    if target.capabilities.is_empty() && !source.capabilities.is_empty() {
+        target.capabilities = source.capabilities.clone();
+        changed = true;
+    }
+
     changed
 }
 
@@ -860,6 +872,23 @@ fn parse_source_agent(raw_agent: &Value) -> Option<DelegateAgentConfig> {
         agentic: obj.get("agentic").and_then(Value::as_bool).unwrap_or(false),
         allowed_tools,
         max_iterations: find_usize(obj, &["max_iterations", "maxIterations"]).unwrap_or(10),
+        enabled: obj.get("enabled").and_then(Value::as_bool).unwrap_or(true),
+        capabilities: obj
+            .get("capabilities")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(Value::as_str)
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default(),
+        priority: obj
+            .get("priority")
+            .and_then(Value::as_i64)
+            .map(|v| v as i32)
+            .unwrap_or(0),
     })
 }
 
@@ -1477,6 +1506,9 @@ mod tests {
                 agentic: false,
                 allowed_tools: vec!["shell".to_string()],
                 max_iterations: 10,
+                enabled: true,
+                capabilities: Vec::new(),
+                priority: 0,
             },
         );
         config.save().await.unwrap();

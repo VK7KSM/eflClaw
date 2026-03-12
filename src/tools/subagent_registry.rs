@@ -76,15 +76,20 @@ impl SubAgentRegistry {
     }
 
     /// Atomically check the concurrent session limit and insert if under the cap.
-    /// Returns `Ok(())` if inserted, `Err(running_count)` if at capacity.
-    pub fn try_insert(&self, session: SubAgentSession, max_concurrent: usize) -> Result<(), usize> {
+    /// Returns `Ok(())` if inserted, `Err((running_count, session))` if at capacity.
+    /// The session is returned on failure so the caller can retry or queue.
+    pub fn try_insert(
+        &self,
+        session: SubAgentSession,
+        max_concurrent: usize,
+    ) -> Result<(), (usize, Box<SubAgentSession>)> {
         let mut sessions = self.sessions.write();
         let running = sessions
             .values()
             .filter(|s| matches!(s.status, SubAgentStatus::Running))
             .count();
         if running >= max_concurrent {
-            return Err(running);
+            return Err((running, Box::new(session)));
         }
         sessions.insert(session.id.clone(), session);
         Ok(())

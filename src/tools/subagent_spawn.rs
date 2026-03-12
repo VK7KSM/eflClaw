@@ -6,11 +6,12 @@
 
 use super::subagent_registry::{SubAgentRegistry, SubAgentSession, SubAgentStatus};
 use super::traits::{Tool, ToolResult};
-use crate::config::DelegateAgentConfig;
+use crate::config::{DelegateAgentConfig, SubAgentsConfig};
 use crate::observability::traits::{Observer, ObserverEvent, ObserverMetric};
 use crate::providers::{self, ChatMessage, Provider};
 use crate::security::policy::ToolOperation;
 use crate::security::SecurityPolicy;
+use crate::tools::agent_load_tracker::AgentLoadTracker;
 use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::json;
@@ -20,8 +21,6 @@ use std::time::Duration;
 
 /// Default timeout for background sub-agent provider calls.
 const SPAWN_TIMEOUT_SECS: u64 = 300;
-/// Maximum number of concurrent background sub-agents.
-const MAX_CONCURRENT_SUBAGENTS: usize = 10;
 
 /// Tool that spawns a delegate agent in the background, returning immediately
 /// with a session ID. The sub-agent runs asynchronously and stores its result
@@ -34,6 +33,8 @@ pub struct SubAgentSpawnTool {
     registry: Arc<SubAgentRegistry>,
     parent_tools: Arc<Vec<Arc<dyn Tool>>>,
     multimodal_config: crate::config::MultimodalConfig,
+    load_tracker: Arc<AgentLoadTracker>,
+    subagent_settings: SubAgentsConfig,
 }
 
 impl SubAgentSpawnTool {
@@ -46,6 +47,8 @@ impl SubAgentSpawnTool {
         registry: Arc<SubAgentRegistry>,
         parent_tools: Arc<Vec<Arc<dyn Tool>>>,
         multimodal_config: crate::config::MultimodalConfig,
+        load_tracker: Arc<AgentLoadTracker>,
+        subagent_settings: SubAgentsConfig,
     ) -> Self {
         Self {
             agents: Arc::new(agents),
@@ -55,6 +58,8 @@ impl SubAgentSpawnTool {
             registry,
             parent_tools,
             multimodal_config,
+            load_tracker,
+            subagent_settings,
         }
     }
 }
@@ -223,15 +228,30 @@ impl Tool for SubAgentSpawnTool {
             result: None,
             handle: None,
         };
-        if let Err(_running) = self.registry.try_insert(session, MAX_CONCURRENT_SUBAGENTS) {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!(
-                    "Maximum concurrent sub-agents reached ({MAX_CONCURRENT_SUBAGENTS}). \
-                     Wait for running agents to complete or kill some."
-                )),
-            });
+        if let Err((_running, session)) = self
+            .registry
+            .try_insert(session, self.subagent_settings.max_concurrent)
+        {
+            // Queue: wait for a slot to open up, with timeout
+            let max_concurrent = self.subagent_settings.max_concurrent;
+            match wait_for_slot_and_insert(
+                &self.registry,
+                *session,
+                max_concurrent,
+                self.subagent_settings.queue_wait_ms,
+                self.subagent_settings.queue_poll_ms,
+            )
+            .await
+            {
+                Ok(()) => {} // slot acquired
+                Err(err_msg) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(err_msg),
+                    });
+                }
+            }
         }
 
         // Clone what we need for the spawned task
@@ -287,6 +307,43 @@ impl Tool for SubAgentSpawnTool {
             .to_string(),
             error: None,
         })
+    }
+}
+
+/// Wait for a concurrency slot to open up, then insert the session.
+/// Returns `Ok(())` on success or `Err(message)` on timeout.
+async fn wait_for_slot_and_insert(
+    registry: &SubAgentRegistry,
+    mut session: SubAgentSession,
+    max_concurrent: usize,
+    queue_wait_ms: usize,
+    queue_poll_ms: usize,
+) -> Result<(), String> {
+    if queue_wait_ms == 0 {
+        return Err(format!(
+            "Maximum concurrent sub-agents reached ({max_concurrent}). \
+             Wait for running agents to complete or kill some."
+        ));
+    }
+
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(queue_wait_ms as u64);
+    let poll_interval = Duration::from_millis(queue_poll_ms.max(50) as u64);
+
+    loop {
+        match registry.try_insert(session, max_concurrent) {
+            Ok(()) => return Ok(()),
+            Err((_running, returned_session)) => {
+                session = *returned_session;
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(format!(
+                        "Maximum concurrent sub-agents reached ({max_concurrent}). \
+                         Queued for {queue_wait_ms}ms but no slot opened. \
+                         Wait for running agents to complete or kill some."
+                    ));
+                }
+                tokio::time::sleep(poll_interval).await;
+            }
+        }
     }
 }
 
@@ -453,8 +510,8 @@ async fn run_agentic_background(
             &mut history,
             &sub_tools,
             &noop_observer,
-            &agent_config.provider.as_deref().unwrap_or(""),
-            &agent_config.model.as_deref().unwrap_or(""),
+            agent_config.provider.as_deref().unwrap_or(""),
+            agent_config.model.as_deref().unwrap_or(""),
             temperature,
             true,
             None,
@@ -525,6 +582,9 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                enabled: true,
+                capabilities: Vec::new(),
+                priority: 0,
             },
         );
         agents
@@ -542,6 +602,8 @@ mod tests {
             Arc::new(SubAgentRegistry::new()),
             Arc::new(Vec::new()),
             crate::config::MultimodalConfig::default(),
+            Arc::new(AgentLoadTracker::new()),
+            SubAgentsConfig::default(),
         )
     }
 
@@ -684,9 +746,11 @@ mod tests {
     #[tokio::test]
     async fn spawn_respects_concurrent_limit() {
         let registry = Arc::new(SubAgentRegistry::new());
+        let settings = SubAgentsConfig::default();
+        let max = settings.max_concurrent;
 
         // Fill up the registry with running sessions
-        for i in 0..MAX_CONCURRENT_SUBAGENTS {
+        for i in 0..max {
             registry.insert(SubAgentSession {
                 id: format!("s{i}"),
                 agent_name: "agent".to_string(),
@@ -699,6 +763,7 @@ mod tests {
             });
         }
 
+        // Use queue_wait_ms=0 for immediate fail-fast in test
         let tool = SubAgentSpawnTool::new(
             sample_agents(),
             None,
@@ -707,6 +772,11 @@ mod tests {
             registry,
             Arc::new(Vec::new()),
             crate::config::MultimodalConfig::default(),
+            Arc::new(AgentLoadTracker::new()),
+            SubAgentsConfig {
+                queue_wait_ms: 0,
+                ..SubAgentsConfig::default()
+            },
         );
 
         let result = tool
