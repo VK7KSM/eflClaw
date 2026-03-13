@@ -408,6 +408,8 @@ impl Agent {
                         tool: call.name.clone(),
                         duration: start.elapsed(),
                         success: r.success,
+                        args: None,
+                        error: if r.success { None } else { r.error.clone().or_else(|| Some(r.output.clone())) },
                     });
                     if r.success {
                         r.output
@@ -420,6 +422,8 @@ impl Agent {
                         tool: call.name.clone(),
                         duration: start.elapsed(),
                         success: false,
+                        args: None,
+                        error: Some(format!("{e}")),
                     });
                     format!("Error executing {}: {e}", call.name)
                 }

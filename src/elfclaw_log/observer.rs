@@ -88,11 +88,15 @@ fn serialize_observer_event(event: &ObserverEvent) -> Option<serde_json::Value> 
             tool,
             duration,
             success,
+            args,
+            error,
         } => Some(serde_json::json!({
             "type": "tool_call",
             "tool": tool,
             "duration_ms": duration.as_millis() as u64,
             "success": success,
+            "args": args,
+            "error": error,
             "timestamp": now,
         })),
         ObserverEvent::ToolCallStart { tool } => Some(serde_json::json!({
@@ -238,6 +242,8 @@ fn observer_event_to_log_entry(event: &ObserverEvent) -> Option<super::types::Lo
             tool,
             duration,
             success,
+            args,
+            error,
         } => Some(LogEntry {
             id,
             timestamp: ts,
@@ -258,6 +264,8 @@ fn observer_event_to_log_entry(event: &ObserverEvent) -> Option<super::types::Lo
                 "tool": tool,
                 "duration_ms": duration.as_millis() as u64,
                 "success": success,
+                "args": args,
+                "error": error,
             }),
         }),
         ObserverEvent::Error { component, message } => Some(LogEntry {
