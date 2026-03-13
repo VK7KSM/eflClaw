@@ -14,10 +14,7 @@ pub struct ElfClawObserver {
 }
 
 impl ElfClawObserver {
-    pub fn new(
-        inner: Box<dyn Observer>,
-        event_tx: broadcast::Sender<serde_json::Value>,
-    ) -> Self {
+    pub fn new(inner: Box<dyn Observer>, event_tx: broadcast::Sender<serde_json::Value>) -> Self {
         Self { inner, event_tx }
     }
 }
@@ -187,7 +184,9 @@ fn observer_event_to_log_entry(event: &ObserverEvent) -> Option<super::types::Lo
             }),
         }),
         ObserverEvent::LlmRequest {
-            provider, model, messages_count,
+            provider,
+            model,
+            messages_count,
         } => Some(LogEntry {
             id,
             timestamp: ts,
@@ -208,11 +207,18 @@ fn observer_event_to_log_entry(event: &ObserverEvent) -> Option<super::types::Lo
         } => Some(LogEntry {
             id,
             timestamp: ts,
-            level: if *success { LogLevel::Info } else { LogLevel::Error },
+            level: if *success {
+                LogLevel::Info
+            } else {
+                LogLevel::Error
+            },
             category: LogCategory::LlmCall,
             component: "provider".into(),
             message: if *success {
-                format!("LLM response: {provider}/{model} ({:.1}s)", duration.as_secs_f64())
+                format!(
+                    "LLM response: {provider}/{model} ({:.1}s)",
+                    duration.as_secs_f64()
+                )
             } else {
                 format!(
                     "LLM error: {provider}/{model} — {}",
@@ -235,7 +241,11 @@ fn observer_event_to_log_entry(event: &ObserverEvent) -> Option<super::types::Lo
         } => Some(LogEntry {
             id,
             timestamp: ts,
-            level: if *success { LogLevel::Info } else { LogLevel::Warn },
+            level: if *success {
+                LogLevel::Info
+            } else {
+                LogLevel::Warn
+            },
             category: LogCategory::ToolCall,
             component: "tool".into(),
             message: format!(

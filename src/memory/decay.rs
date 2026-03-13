@@ -98,7 +98,10 @@ mod tests {
 
         let score = entries[0].score.unwrap();
         // 1 hour out of 168 hours (7 days) — decay is tiny
-        assert!(score > 0.99, "1-hour-old memory should barely decay: {score}");
+        assert!(
+            score > 0.99,
+            "1-hour-old memory should barely decay: {score}"
+        );
     }
 
     #[test]

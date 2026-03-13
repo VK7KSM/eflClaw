@@ -217,9 +217,10 @@ impl Tool for CronAddTool {
                 // when heartbeat tries to re-add existing cron jobs every hour.
                 if let Some(ref job_name) = name {
                     if let Ok(jobs) = cron::list_jobs(&self.config) {
-                        if let Some(existing) = jobs.iter().find(|j| {
-                            j.name.as_deref() == Some(job_name.as_str())
-                        }) {
+                        if let Some(existing) = jobs
+                            .iter()
+                            .find(|j| j.name.as_deref() == Some(job_name.as_str()))
+                        {
                             return Ok(ToolResult {
                                 success: true,
                                 output: serde_json::to_string_pretty(&json!({

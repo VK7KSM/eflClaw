@@ -6,8 +6,8 @@
 
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    Provider, ProviderCapabilities, StreamChunk, StreamError, StreamOptions, StreamResult,
-    TokenUsage, ToolCall as ProviderToolCall, ToolsPayload,
+    NormalizedStopReason, Provider, ProviderCapabilities, StreamChunk, StreamError, StreamOptions,
+    StreamResult, TokenUsage, ToolCall as ProviderToolCall, ToolsPayload,
 };
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
@@ -512,7 +512,6 @@ struct ConverseResponse {
     #[serde(default)]
     output: Option<ConverseOutput>,
     #[serde(default)]
-    #[allow(dead_code)]
     stop_reason: Option<String>,
     #[serde(default)]
     usage: Option<BedrockUsage>,
@@ -947,6 +946,11 @@ impl BedrockProvider {
             output_tokens: u.output_tokens,
         });
 
+        let raw_stop_reason = response.stop_reason.clone();
+        let stop_reason = raw_stop_reason
+            .as_deref()
+            .map(NormalizedStopReason::from_bedrock_stop_reason);
+
         if let Some(output) = response.output {
             if let Some(message) = output.message {
                 for block in message.content {
@@ -983,6 +987,8 @@ impl BedrockProvider {
             usage,
             reasoning_content: None,
             quota_metadata: None,
+            stop_reason,
+            raw_stop_reason,
         }
     }
 

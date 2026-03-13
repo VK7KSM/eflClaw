@@ -287,7 +287,8 @@ impl Tool for ShellTool {
 
                     // elfClaw: PATH diagnostic when command not found (helps debug env_clear issues)
                     if stderr.contains("CommandNotFoundException") || stderr.contains("not found") {
-                        let path_val = std::env::var("PATH").unwrap_or_else(|_| "(not set)".to_string());
+                        let path_val =
+                            std::env::var("PATH").unwrap_or_else(|_| "(not set)".to_string());
                         let preview_end = path_val.len().min(500);
                         let mut end = preview_end;
                         while end > 0 && !path_val.is_char_boundary(end) {

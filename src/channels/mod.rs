@@ -2118,6 +2118,56 @@ async fn process_channel_message(
         excluded
     };
 
+    // Build safety heartbeat config for this message processing
+    let channel_safety_hb = if ctx.config.agent.safety_heartbeat_interval > 0 {
+        let hb_security = crate::security::SecurityPolicy::from_config(
+            &ctx.config.autonomy,
+            &ctx.config.workspace_dir,
+        );
+        Some(crate::agent::loop_::SafetyHeartbeatConfig {
+            body: hb_security.summary_for_heartbeat(),
+            interval: ctx.config.agent.safety_heartbeat_interval,
+        })
+    } else {
+        None
+    };
+
+    // Build non-CLI approval context for channels that support interactive approval
+    let (approval_prompt_tx, mut approval_prompt_rx) =
+        tokio::sync::mpsc::unbounded_channel::<crate::agent::loop_::NonCliApprovalPrompt>();
+    let non_cli_approval_ctx = if msg.channel != "cli" {
+        Some(crate::agent::loop_::NonCliApprovalContext {
+            sender: msg.sender.clone(),
+            reply_target: msg.reply_target.clone(),
+            prompt_tx: approval_prompt_tx,
+        })
+    } else {
+        drop(approval_prompt_tx);
+        None
+    };
+
+    // Spawn approval prompt dispatcher: forwards approval requests to the channel
+    let approval_channel_ref = target_channel.clone();
+    let approval_reply_target = msg.reply_target.clone();
+    let approval_dispatcher = tokio::spawn(async move {
+        while let Some(prompt) = approval_prompt_rx.recv().await {
+            if let Some(ref ch) = approval_channel_ref {
+                if let Err(e) = ch
+                    .send_approval_prompt(
+                        &approval_reply_target,
+                        &prompt.request_id,
+                        &prompt.tool_name,
+                        &prompt.arguments,
+                        None,
+                    )
+                    .await
+                {
+                    tracing::warn!("Failed to send approval prompt: {e}");
+                }
+            }
+        }
+    });
+
     let timeout_budget_secs =
         channel_message_timeout_budget_secs(ctx.message_timeout_secs, ctx.max_tool_iterations);
     let llm_result = tokio::select! {
@@ -2141,9 +2191,15 @@ async fn process_channel_message(
                 delta_tx,
                 ctx.hooks.as_deref(),
                 &effective_excluded_tools,
+                channel_safety_hb.as_ref(),
+                non_cli_approval_ctx.as_ref(),
             ),
         ) => LlmExecutionResult::Completed(result),
     };
+
+    // Clean up approval dispatcher (drop sender side so receiver closes)
+    drop(non_cli_approval_ctx);
+    let _ = approval_dispatcher.await;
 
     // elfClaw: close self-check gate after processing, regardless of success/failure
     if is_selfcheck_command {
@@ -2475,6 +2531,8 @@ async fn process_channel_message(
                         None, // no streaming for retry
                         ctx.hooks.as_deref(),
                         excluded,
+                        channel_safety_hb.as_ref(),
+                        None,
                     )
                     .await
                     {

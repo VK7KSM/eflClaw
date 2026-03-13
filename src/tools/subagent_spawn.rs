@@ -522,6 +522,8 @@ async fn run_agentic_background(
             None,
             None,
             &[],
+            None,
+            None,
         ),
     )
     .await;

@@ -293,9 +293,8 @@ mod tests {
         map.insert("sh", "/bin/sh");
         map.insert("bash", "/usr/bin/bash");
 
-        let shell =
-            detect_native_shell_with(false, |name| map.get(name).map(PathBuf::from), None)
-                .expect("unix shell should be detected");
+        let shell = detect_native_shell_with(false, |name| map.get(name).map(PathBuf::from), None)
+            .expect("unix shell should be detected");
 
         assert_eq!(shell.kind, ShellKind::Sh);
     }

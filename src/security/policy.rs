@@ -527,7 +527,9 @@ fn extract_base_command_name(executable: &str) -> &str {
         .next()
         .unwrap_or(executable);
     // Strip common Windows executable extensions for allowlist matching
-    for ext in &[".exe", ".EXE", ".cmd", ".CMD", ".bat", ".BAT", ".com", ".COM"] {
+    for ext in &[
+        ".exe", ".EXE", ".cmd", ".CMD", ".bat", ".BAT", ".com", ".COM",
+    ] {
         if let Some(stripped) = base.strip_suffix(ext) {
             return stripped;
         }

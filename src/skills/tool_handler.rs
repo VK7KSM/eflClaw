@@ -380,7 +380,9 @@ impl SkillToolHandler {
                         let _ = stdin.write_all(stdin_data.as_bytes()).await;
                         drop(stdin);
                     }
-                    child.wait_with_output().await
+                    child
+                        .wait_with_output()
+                        .await
                         .context("Failed to wait for skill tool process (stdin_json, sh)")?
                 }
                 Err(_) => {
@@ -420,7 +422,9 @@ impl SkillToolHandler {
                 let _ = stdin.write_all(stdin_data.as_bytes()).await;
                 drop(stdin);
             }
-            child.wait_with_output().await
+            child
+                .wait_with_output()
+                .await
                 .context("Failed to wait for skill tool process (stdin_json)")?
         };
 
@@ -477,11 +481,14 @@ impl Tool for SkillToolHandler {
         // elfClaw: stdin_json mode — serialize args as JSON, pipe to stdin
         // This bypasses shell quoting issues with weak models
         if self.tool_def.input_mode == "stdin_json" {
-            let stdin_data = serde_json::to_string(&args)
-                .context("Failed to serialize stdin_json args")?;
+            let stdin_data =
+                serde_json::to_string(&args).context("Failed to serialize stdin_json args")?;
 
             // elfClaw: skill commands are user-defined trusted configs — pre-approved
-            if let Err(e) = self.security.validate_command_execution(&self.tool_def.command, true) {
+            if let Err(e) = self
+                .security
+                .validate_command_execution(&self.tool_def.command, true)
+            {
                 return Ok(ToolResult {
                     output: format!("Blocked by security policy: {e}"),
                     success: false,
@@ -505,7 +512,9 @@ impl Tool for SkillToolHandler {
                 "Executing skill tool (stdin_json mode)"
             );
 
-            return self.execute_stdin_json(&self.tool_def.command, &stdin_data).await;
+            return self
+                .execute_stdin_json(&self.tool_def.command, &stdin_data)
+                .await;
         }
 
         let command = self
@@ -673,7 +682,13 @@ mod tests {
         };
 
         let security = Arc::new(SecurityPolicy::default());
-        let handler = SkillToolHandler::new("test-skill".to_string(), tool_def, security, PathBuf::from(".")).unwrap();
+        let handler = SkillToolHandler::new(
+            "test-skill".to_string(),
+            tool_def,
+            security,
+            PathBuf::from("."),
+        )
+        .unwrap();
         let schema = handler.generate_schema();
 
         assert_eq!(schema["type"], "object");
@@ -701,7 +716,9 @@ mod tests {
         };
 
         let security = Arc::new(SecurityPolicy::default());
-        let handler = SkillToolHandler::new("test".to_string(), tool_def, security, PathBuf::from(".")).unwrap();
+        let handler =
+            SkillToolHandler::new("test".to_string(), tool_def, security, PathBuf::from("."))
+                .unwrap();
 
         let args = serde_json::json!({
             "limit": 100,
@@ -733,7 +750,9 @@ mod tests {
         };
 
         let security = Arc::new(SecurityPolicy::default());
-        let handler = SkillToolHandler::new("test".to_string(), tool_def, security, PathBuf::from(".")).unwrap();
+        let handler =
+            SkillToolHandler::new("test".to_string(), tool_def, security, PathBuf::from("."))
+                .unwrap();
 
         let args = serde_json::json!({
             "required": "value"
@@ -760,7 +779,9 @@ mod tests {
         };
 
         let security = Arc::new(SecurityPolicy::default());
-        let handler = SkillToolHandler::new("test".to_string(), tool_def, security, PathBuf::from(".")).unwrap();
+        let handler =
+            SkillToolHandler::new("test".to_string(), tool_def, security, PathBuf::from("."))
+                .unwrap();
 
         let args = serde_json::json!({
             "message": "hello; rm -rf /"
@@ -795,7 +816,9 @@ mod tests {
         };
 
         let security = Arc::new(SecurityPolicy::default());
-        let handler = SkillToolHandler::new("test".to_string(), tool_def, security, PathBuf::from(".")).unwrap();
+        let handler =
+            SkillToolHandler::new("test".to_string(), tool_def, security, PathBuf::from("."))
+                .unwrap();
 
         // Only provide contact_name and limit, omit query and date_from
         let args = serde_json::json!({
@@ -835,7 +858,9 @@ mod tests {
         };
 
         let security = Arc::new(SecurityPolicy::default());
-        let handler = SkillToolHandler::new("test".to_string(), tool_def, security, PathBuf::from(".")).unwrap();
+        let handler =
+            SkillToolHandler::new("test".to_string(), tool_def, security, PathBuf::from("."))
+                .unwrap();
 
         // Model sends contact_name as integer (use i64 for large Telegram IDs)
         let args = serde_json::json!({

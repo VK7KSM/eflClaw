@@ -871,7 +871,12 @@ pub fn create_skill_tools(
 
     for skill in skills {
         for tool_def in &skill.tools {
-            match SkillToolHandler::new(skill.name.clone(), tool_def.clone(), security.clone(), workspace_dir.to_path_buf()) {
+            match SkillToolHandler::new(
+                skill.name.clone(),
+                tool_def.clone(),
+                security.clone(),
+                workspace_dir.to_path_buf(),
+            ) {
                 Ok(handler) => {
                     tracing::debug!(
                         skill = %skill.name,

@@ -5,7 +5,9 @@
 //! - Google Cloud ADC (`GOOGLE_APPLICATION_CREDENTIALS`)
 
 use crate::auth::AuthService;
-use crate::providers::traits::{ChatMessage, ChatResponse, Provider, TokenUsage};
+use crate::providers::traits::{
+    ChatMessage, ChatResponse, NormalizedStopReason, Provider, TokenUsage,
+};
 use async_trait::async_trait;
 use base64::Engine;
 use directories::UserDirs;
@@ -265,6 +267,8 @@ struct InternalGenerateContentResponse {
 struct Candidate {
     #[serde(default)]
     content: Option<CandidateContent>,
+    #[serde(default, rename = "finishReason")]
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -322,7 +326,8 @@ impl CandidateContent {
                 // elfClaw: Gemini 2.5 puts thought_signature on a preceding thought Part;
                 // Gemini 3 puts it directly on the functionCall Part itself. Capture from either
                 // so the signature is never lost, preventing 400 "missing thought_signature" errors.
-                let sig = pending_thought_sig.take()
+                let sig = pending_thought_sig
+                    .take()
                     .or_else(|| part.thought_signature.clone());
                 tool_calls.push(crate::providers::traits::ToolCall {
                     id: uuid::Uuid::new_v4().to_string(),
@@ -1083,11 +1088,13 @@ impl GeminiProvider {
             // "minimal" not available on Pro; levels 3 and 4 both map to max "high"
             let lvl = match level {
                 0 | 1 => "low",
-                2     => "medium",
-                _     => "high",
+                2 => "medium",
+                _ => "high",
             };
-            Some(ThinkingConfig { thinking_level: Some(lvl.to_string()), thinking_budget: None })
-
+            Some(ThinkingConfig {
+                thinking_level: Some(lvl.to_string()),
+                thinking_budget: None,
+            })
         } else if model.contains("gemini-3") {
             // Gemini 3 Flash: thinkingLevel, "minimal" ≈ near-off; levels 3+ map to "high"
             let lvl = match level {
@@ -1096,8 +1103,10 @@ impl GeminiProvider {
                 2 => "medium",
                 _ => "high",
             };
-            Some(ThinkingConfig { thinking_level: Some(lvl.to_string()), thinking_budget: None })
-
+            Some(ThinkingConfig {
+                thinking_level: Some(lvl.to_string()),
+                thinking_budget: None,
+            })
         } else if model.contains("gemini-2.5-flash-lite") {
             // Gemini 2.5 Flash Lite: thinkingBudget 0 (disabled) or 512-24576
             let budget: i32 = match level {
@@ -1107,8 +1116,10 @@ impl GeminiProvider {
                 3 => 12288,
                 _ => 24576,
             };
-            Some(ThinkingConfig { thinking_level: None, thinking_budget: Some(budget) })
-
+            Some(ThinkingConfig {
+                thinking_level: None,
+                thinking_budget: Some(budget),
+            })
         } else if model.contains("gemini-2.5-flash") {
             // Gemini 2.5 Flash: thinkingBudget 0-24576
             let budget: i32 = match level {
@@ -1118,8 +1129,10 @@ impl GeminiProvider {
                 3 => 16384,
                 _ => 24576,
             };
-            Some(ThinkingConfig { thinking_level: None, thinking_budget: Some(budget) })
-
+            Some(ThinkingConfig {
+                thinking_level: None,
+                thinking_budget: Some(budget),
+            })
         } else if model.contains("gemini-2.5-pro") {
             // Gemini 2.5 Pro: thinkingBudget 128-32768, cannot disable (0 → 128)
             let budget: i32 = match level {
@@ -1129,8 +1142,10 @@ impl GeminiProvider {
                 3 => 16384,
                 _ => 32768,
             };
-            Some(ThinkingConfig { thinking_level: None, thinking_budget: Some(budget) })
-
+            Some(ThinkingConfig {
+                thinking_level: None,
+                thinking_budget: Some(budget),
+            })
         } else {
             // Gemini 2.0, 1.5, or unknown: no thinking support
             None
@@ -1148,6 +1163,7 @@ impl GeminiProvider {
         Option<String>,
         Vec<crate::providers::traits::ToolCall>,
         Option<TokenUsage>,
+        Option<String>,
     )> {
         let auth = self.auth.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
@@ -1208,7 +1224,8 @@ impl GeminiProvider {
                 temperature,
                 max_output_tokens: 8192,
                 // elfClaw: 0-4 thinking intensity → model-specific thinkingConfig (or None if unsupported)
-                thinking_config: self.thinking_level
+                thinking_config: self
+                    .thinking_level
                     .and_then(|lvl| Self::build_thinking_config(lvl, model)),
             },
             tools,
@@ -1356,9 +1373,9 @@ impl GeminiProvider {
             output_tokens: u.candidates_token_count,
         });
 
-        let (text, tool_calls) = result
-            .candidates
-            .and_then(|c| c.into_iter().next())
+        let candidate = result.candidates.and_then(|c| c.into_iter().next());
+        let raw_stop_reason = candidate.as_ref().and_then(|c| c.finish_reason.clone());
+        let (text, tool_calls) = candidate
             .and_then(|c| c.content)
             .map(|c| c.extract_tool_calls())
             .unwrap_or_else(|| (None, Vec::new()));
@@ -1368,7 +1385,7 @@ impl GeminiProvider {
             anyhow::bail!("No response from Gemini");
         }
 
-        Ok((text, tool_calls, usage))
+        Ok((text, tool_calls, usage, raw_stop_reason))
     }
 }
 
@@ -1417,7 +1434,7 @@ impl Provider for GeminiProvider {
             parts: vec![Part::text(message)],
         }];
 
-        let (text, _tool_calls, _usage) = self
+        let (text, _tool_calls, _usage, _raw_stop) = self
             .send_generate_content(contents, system_instruction, model, temperature, None)
             .await?;
         Ok(text.unwrap_or_default())
@@ -1463,7 +1480,7 @@ impl Provider for GeminiProvider {
             })
         };
 
-        let (text, _tool_calls, _usage) = self
+        let (text, _tool_calls, _usage, _raw_stop) = self
             .send_generate_content(contents, system_instruction, model, temperature, None)
             .await?;
         Ok(text.unwrap_or_default())
@@ -1554,8 +1571,7 @@ impl Provider for GeminiProvider {
                                 // insert a thought Part before the functionCall Part (Gemini 2.5).
                                 // elfClaw: also set thought_signature on the functionCall Part itself
                                 // (Gemini 3 requires it there to avoid 400 "missing thought_signature").
-                                let sig_opt =
-                                    tc.get("thought_signature").and_then(|v| v.as_str());
+                                let sig_opt = tc.get("thought_signature").and_then(|v| v.as_str());
                                 if let Some(sig) = sig_opt {
                                     parts.push(Part {
                                         text: Some(String::new()),
@@ -1655,7 +1671,7 @@ impl Provider for GeminiProvider {
             }])
         });
 
-        let (text, tool_calls, usage) = self
+        let (text, tool_calls, usage, raw_stop_reason) = self
             .send_generate_content(
                 contents,
                 system_instruction,
@@ -1665,12 +1681,17 @@ impl Provider for GeminiProvider {
             )
             .await?;
 
+        let stop_reason = raw_stop_reason
+            .as_deref()
+            .map(NormalizedStopReason::from_gemini_finish_reason);
         Ok(ChatResponse {
             text,
             tool_calls,
             usage,
             reasoning_content: None,
             quota_metadata: None,
+            stop_reason,
+            raw_stop_reason,
         })
     }
 

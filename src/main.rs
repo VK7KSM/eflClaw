@@ -994,7 +994,7 @@ async fn main() -> Result<()> {
                 interactive,
                 max_tool_iterations,
                 agent::RunContext::Interactive, // elfClaw: CLI is user-initiated
-                None, // elfClaw: no tool filtering for CLI
+                None,                           // elfClaw: no tool filtering for CLI
             ))
             .await
             .map(|_| ())

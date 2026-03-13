@@ -5,8 +5,8 @@
 use crate::multimodal;
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    Provider, StreamChunk, StreamError, StreamOptions, StreamResult, TokenUsage,
-    ToolCall as ProviderToolCall,
+    NormalizedStopReason, Provider, StreamChunk, StreamError, StreamOptions, StreamResult,
+    TokenUsage, ToolCall as ProviderToolCall,
 };
 use async_trait::async_trait;
 use futures_util::{stream, SinkExt, StreamExt};
@@ -448,6 +448,8 @@ struct UsageInfo {
 #[derive(Debug, Deserialize)]
 struct Choice {
     message: ResponseMessage,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 /// Remove `<think>...</think>` blocks from model output.
@@ -938,6 +940,8 @@ fn parse_responses_chat_response(response: ResponsesResponse) -> ProviderChatRes
         usage: None,
         reasoning_content: None,
         quota_metadata: None,
+        stop_reason: None,
+        raw_stop_reason: None,
     }
 }
 
@@ -1582,6 +1586,8 @@ impl OpenAiCompatibleProvider {
             usage: None,
             reasoning_content,
             quota_metadata: None,
+            stop_reason: None,
+            raw_stop_reason: None,
         }
     }
 
@@ -1951,6 +1957,8 @@ impl Provider for OpenAiCompatibleProvider {
                     usage: None,
                     reasoning_content: None,
                     quota_metadata: None,
+                    stop_reason: None,
+                    raw_stop_reason: None,
                 });
             }
         };
@@ -1984,6 +1992,10 @@ impl Provider for OpenAiCompatibleProvider {
 
         let text = choice.message.effective_content_optional();
         let reasoning_content = choice.message.reasoning_content;
+        let raw_stop_reason = choice.finish_reason;
+        let stop_reason = raw_stop_reason
+            .as_deref()
+            .map(NormalizedStopReason::from_openai_finish_reason);
         let tool_calls = choice
             .message
             .tool_calls
@@ -2008,6 +2020,8 @@ impl Provider for OpenAiCompatibleProvider {
             usage,
             reasoning_content,
             quota_metadata: None,
+            stop_reason,
+            raw_stop_reason,
         })
     }
 
@@ -2105,6 +2119,8 @@ impl Provider for OpenAiCompatibleProvider {
                     usage: None,
                     reasoning_content: None,
                     quota_metadata: None,
+                    stop_reason: None,
+                    raw_stop_reason: None,
                 });
             }
 

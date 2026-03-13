@@ -49,8 +49,7 @@ impl LogStore {
         .context("Failed to initialise elfclaw_logs schema")?;
 
         // Prune old entries on startup
-        let cutoff = chrono::Utc::now()
-            - chrono::Duration::days(i64::from(DEFAULT_PRUNE_DAYS));
+        let cutoff = chrono::Utc::now() - chrono::Duration::days(i64::from(DEFAULT_PRUNE_DAYS));
         let cutoff_str = cutoff.to_rfc3339();
         let pruned = conn
             .execute(
@@ -59,7 +58,9 @@ impl LogStore {
             )
             .unwrap_or(0);
         if pruned > 0 {
-            tracing::info!("elfclaw_log: pruned {pruned} log entries older than {DEFAULT_PRUNE_DAYS} days");
+            tracing::info!(
+                "elfclaw_log: pruned {pruned} log entries older than {DEFAULT_PRUNE_DAYS} days"
+            );
         }
 
         Ok(Self {
@@ -185,8 +186,8 @@ impl LogStore {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::types::*;
+    use super::*;
 
     #[test]
     fn init_creates_db_and_writes_entry() {
@@ -215,7 +216,10 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let store = LogStore::init(tmp.path()).unwrap();
 
-        for (i, level) in [LogLevel::Info, LogLevel::Error, LogLevel::Warn].iter().enumerate() {
+        for (i, level) in [LogLevel::Info, LogLevel::Error, LogLevel::Warn]
+            .iter()
+            .enumerate()
+        {
             store.write(&LogEntry {
                 id: format!("id-{i}"),
                 timestamp: chrono::Utc::now().to_rfc3339(),
@@ -230,7 +234,9 @@ mod tests {
         let errors = store.query_recent(10, Some("error"), None, None).unwrap();
         assert_eq!(errors.len(), 1);
 
-        let tools = store.query_recent(10, None, Some("tool_call"), None).unwrap();
+        let tools = store
+            .query_recent(10, None, Some("tool_call"), None)
+            .unwrap();
         assert_eq!(tools.len(), 3);
     }
 
