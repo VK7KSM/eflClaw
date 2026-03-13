@@ -88,6 +88,7 @@ pub use whatsapp_web::WhatsAppWebChannel;
 pub use xiaozhi::XiaozhiChannel;
 
 use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop, scrub_credentials};
+use crate::agent::loop_::detection::LoopDetectionConfig;
 use crate::config::Config;
 use crate::identity;
 use crate::memory::{self, Memory};
@@ -2193,6 +2194,13 @@ async fn process_channel_message(
                 &effective_excluded_tools,
                 channel_safety_hb.as_ref(),
                 non_cli_approval_ctx.as_ref(),
+                Some(LoopDetectionConfig {
+                    no_progress_threshold: ctx.config.agent.loop_detection_no_progress_threshold,
+                    ping_pong_cycles: ctx.config.agent.loop_detection_ping_pong_cycles,
+                    failure_streak_threshold: ctx.config.agent.loop_detection_failure_streak,
+                    total_failure_budget: ctx.config.agent.loop_detection_total_failure_budget,
+                    ..Default::default()
+                }),
             ),
         ) => LlmExecutionResult::Completed(result),
     };
@@ -2533,6 +2541,13 @@ async fn process_channel_message(
                         excluded,
                         channel_safety_hb.as_ref(),
                         None,
+                        Some(LoopDetectionConfig {
+                            no_progress_threshold: ctx.config.agent.loop_detection_no_progress_threshold,
+                            ping_pong_cycles: ctx.config.agent.loop_detection_ping_pong_cycles,
+                            failure_streak_threshold: ctx.config.agent.loop_detection_failure_streak,
+                            total_failure_budget: ctx.config.agent.loop_detection_total_failure_budget,
+                            ..Default::default()
+                        }),
                     )
                     .await
                     {

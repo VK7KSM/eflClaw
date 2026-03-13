@@ -229,7 +229,7 @@ pub(crate) fn scrub_credentials(input: &str) -> String {
 const DEFAULT_MAX_HISTORY_MESSAGES: usize = 50;
 
 mod context;
-mod detection;
+pub(crate) mod detection;
 mod execution;
 mod history;
 mod parsing;
@@ -411,6 +411,7 @@ pub(crate) async fn agent_turn(
         &[],
         None,
         None,
+        None,
     )
     .await
 }
@@ -449,6 +450,7 @@ pub(crate) async fn run_tool_call_loop(
     excluded_tools: &[String],
     safety_heartbeat: Option<&SafetyHeartbeatConfig>,
     non_cli_approval: Option<&NonCliApprovalContext>,
+    loop_detection_config: Option<LoopDetectionConfig>,
 ) -> Result<String> {
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
@@ -466,8 +468,8 @@ pub(crate) async fn run_tool_call_loop(
     let mut last_response_text = String::new();
     let mut missing_tool_call_retry_used = false;
     let mut missing_tool_call_retry_prompt: Option<String> = None;
-    // elfClaw: activate loop detection — detection.rs was dead code, now wired in
-    let mut loop_detector = LoopDetector::new(LoopDetectionConfig::default());
+    // elfClaw: activate loop detection — uses config when provided, otherwise defaults
+    let mut loop_detector = LoopDetector::new(loop_detection_config.unwrap_or_default());
     // When Some, signals a HardStop verdict; checked after inner tool-result loop
     let mut loop_hard_stop: Option<String> = None;
     // elfClaw: Fix 2 — action tools successfully invoked this turn; excluded from next LLM call
@@ -1827,6 +1829,13 @@ pub async fn run(
             &[],
             safety_hb.as_ref(),
             None,
+            Some(LoopDetectionConfig {
+                no_progress_threshold: config.agent.loop_detection_no_progress_threshold,
+                ping_pong_cycles: config.agent.loop_detection_ping_pong_cycles,
+                failure_streak_threshold: config.agent.loop_detection_failure_streak,
+                total_failure_budget: config.agent.loop_detection_total_failure_budget,
+                ..Default::default()
+            }),
         )
         .await?;
         final_output = response.clone();
@@ -1975,6 +1984,13 @@ pub async fn run(
                 &[],
                 interactive_safety_hb.as_ref(),
                 None,
+                Some(LoopDetectionConfig {
+                    no_progress_threshold: config.agent.loop_detection_no_progress_threshold,
+                    ping_pong_cycles: config.agent.loop_detection_ping_pong_cycles,
+                    failure_streak_threshold: config.agent.loop_detection_failure_streak,
+                    total_failure_budget: config.agent.loop_detection_total_failure_budget,
+                    ..Default::default()
+                }),
             )
             .await
             {
@@ -2545,6 +2561,7 @@ mod tests {
             &[],
             None,
             None,
+            None,
         )
         .await
         .expect_err("provider without vision support should fail");
@@ -2637,6 +2654,7 @@ mod tests {
             &[],
             None,
             None,
+            None,
         )
         .await
         .expect("oversized image should degrade gracefully, not error");
@@ -2676,6 +2694,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             None,
         )
@@ -2806,6 +2825,7 @@ mod tests {
             &[],
             None,
             None,
+            None,
         )
         .await
         .expect("parallel execution should complete");
@@ -2877,6 +2897,7 @@ mod tests {
             &[],
             None,
             None,
+            None,
         )
         .await
         .expect("loop should finish after deduplicating repeated calls");
@@ -2933,6 +2954,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             None,
         )

@@ -717,7 +717,12 @@ impl SecurityPolicy {
         approved: bool,
     ) -> Result<CommandRiskLevel, String> {
         if !self.is_command_allowed(command) {
-            return Err(format!("Command not allowed by security policy: {command}"));
+            let summary = self.allowed_commands_summary();
+            return Err(format!(
+                "Command not allowed by security policy: {command}. \
+                 Allowed commands: [{summary}]. \
+                 Use an allowed command or the appropriate built-in tool instead."
+            ));
         }
 
         if let Some(path) = self.forbidden_path_argument(command) {
@@ -756,6 +761,15 @@ impl SecurityPolicy {
         }
 
         Ok(risk)
+    }
+
+    /// Return a comma-separated summary of allowed commands for error messages.
+    pub fn allowed_commands_summary(&self) -> String {
+        if self.allowed_commands.is_empty() {
+            "(none)".to_string()
+        } else {
+            self.allowed_commands.join(", ")
+        }
     }
 
     // ── Layered Command Allowlist ──────────────────────────────────────────

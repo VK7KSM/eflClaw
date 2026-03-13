@@ -318,7 +318,11 @@ impl Tool for ContentSearchTool {
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
-                    error: Some(format!("Search timed out after {TIMEOUT_SECS} seconds.")),
+                    error: Some(format!(
+                        "Search timed out after {TIMEOUT_SECS} seconds. \
+                         Try narrowing the search: use a more specific pattern, \
+                         limit to a subdirectory (path parameter), or search for shorter keywords."
+                    )),
                 });
             }
         };

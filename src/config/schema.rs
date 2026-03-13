@@ -1151,6 +1151,11 @@ pub struct AgentConfig {
     /// Set to `0` to disable. Default: `3`.
     #[serde(default = "default_loop_detection_failure_streak")]
     pub loop_detection_failure_streak: usize,
+    /// Loop detection: total failure budget across ALL tools per turn.
+    /// Triggers when cumulative failures (regardless of tool) reach this count.
+    /// Set to `0` to disable. Default: `8`.
+    #[serde(default = "default_loop_detection_total_failure_budget")]
+    pub loop_detection_total_failure_budget: usize,
     /// Safety heartbeat injection interval inside `run_tool_call_loop`.
     /// Injects a security-constraint reminder every N tool iterations.
     /// Set to `0` to disable. Default: `5`.
@@ -1248,6 +1253,10 @@ fn default_loop_detection_failure_streak() -> usize {
     3
 }
 
+fn default_loop_detection_total_failure_budget() -> usize {
+    8
+}
+
 fn default_safety_heartbeat_interval() -> usize {
     5
 }
@@ -1270,6 +1279,7 @@ impl Default for AgentConfig {
             loop_detection_no_progress_threshold: default_loop_detection_no_progress_threshold(),
             loop_detection_ping_pong_cycles: default_loop_detection_ping_pong_cycles(),
             loop_detection_failure_streak: default_loop_detection_failure_streak(),
+            loop_detection_total_failure_budget: default_loop_detection_total_failure_budget(),
             safety_heartbeat_interval: default_safety_heartbeat_interval(),
             safety_heartbeat_turn_interval: default_safety_heartbeat_turn_interval(),
         }

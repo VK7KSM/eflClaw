@@ -36,6 +36,10 @@ pub(crate) struct LoopDetectionConfig {
     /// At this count the detector injects a warning; above it issues a HardStop.
     /// `0` = disabled.  Default: `1` (warn after 1st, stop after 2nd).
     pub action_success_limit: usize,
+    /// elfClaw: total failure budget across ALL tools in a single turn.
+    /// When cumulative failures (regardless of tool) reach this count, HardStop.
+    /// `0` = disabled.  Default: `8`.
+    pub total_failure_budget: usize,
 }
 
 impl Default for LoopDetectionConfig {
@@ -45,6 +49,7 @@ impl Default for LoopDetectionConfig {
             ping_pong_cycles: 2,
             failure_streak_threshold: 3,
             action_success_limit: 1,
+            total_failure_budget: 8,
         }
     }
 }
@@ -84,6 +89,8 @@ pub(crate) struct LoopDetector {
     success_spam_warned: HashSet<String>,
     /// elfClaw: last failed args per tool (for error learning reports)
     last_failed_args: HashMap<String, String>,
+    /// elfClaw: cumulative failure count across ALL tools (never reset on success)
+    total_tool_failures: usize,
 }
 
 impl LoopDetector {
@@ -96,6 +103,7 @@ impl LoopDetector {
             success_counts: HashMap::new(),
             success_spam_warned: HashSet::new(),
             last_failed_args: HashMap::new(),
+            total_tool_failures: 0,
         }
     }
 
@@ -128,6 +136,8 @@ impl LoopDetector {
             // elfClaw: track last failed args for error learning reports
             self.last_failed_args
                 .insert(tool_name.to_string(), args_sig.chars().take(200).collect());
+            // elfClaw: cumulative failure budget — never reset on success
+            self.total_tool_failures += 1;
         }
     }
 
@@ -157,6 +167,12 @@ impl LoopDetector {
         // elfClaw: Fix 1 — strategy 4: action spam watchdog
         // Fires independently of the existing warning_injected flag.
         if let Some(verdict) = self.check_action_success_spam() {
+            return verdict;
+        }
+
+        // elfClaw: strategy 5: total failure budget
+        // Cumulative failures across ALL tools; never reset on success.
+        if let Some(verdict) = self.check_total_failure_budget() {
             return verdict;
         }
 
@@ -298,6 +314,27 @@ impl LoopDetector {
         }
         None
     }
+
+    // ── elfClaw: Strategy 5: total failure budget ────────────────────────
+
+    /// Check whether cumulative tool failures across ALL tools have exceeded
+    /// the budget. This catches the pattern where an LLM interleaves failing
+    /// tool calls with other tools, preventing consecutive-failure detection.
+    fn check_total_failure_budget(&self) -> Option<DetectionVerdict> {
+        let budget = self.config.total_failure_budget;
+        if budget == 0 {
+            return None;
+        }
+        if self.total_tool_failures >= budget {
+            Some(DetectionVerdict::HardStop(format!(
+                "Total failure budget exhausted: {} tool failures this turn (budget: {}). \
+                 Too many tools are failing — stop and report the issues encountered.",
+                self.total_tool_failures, budget
+            )))
+        } else {
+            None
+        }
+    }
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -342,6 +379,7 @@ mod tests {
             ping_pong_cycles: 0,
             failure_streak_threshold: 0,
             action_success_limit: 0,
+            total_failure_budget: 0,
         }
     }
 
@@ -529,6 +567,7 @@ mod tests {
             failure_streak_threshold: 10,
             ping_pong_cycles: 10,
             action_success_limit: 1,
+            total_failure_budget: 0,
         });
         // shell succeeds many times — should NOT trigger spam watchdog
         for i in 0..5 {
@@ -546,9 +585,69 @@ mod tests {
             ping_pong_cycles: 10,
             failure_streak_threshold: 10,
             action_success_limit: 0,
+            total_failure_budget: 0,
         });
         for _ in 0..5 {
             det.record_call("send_voice", r#"{"text":"x"}"#, "sent", true);
+        }
+        assert_eq!(det.check(), DetectionVerdict::Continue);
+    }
+
+    // 15. elfClaw: Total failure budget triggers HardStop
+    #[test]
+    fn total_failure_budget_triggers_hard_stop() {
+        let mut det = LoopDetector::new(LoopDetectionConfig {
+            no_progress_threshold: 0,
+            ping_pong_cycles: 0,
+            failure_streak_threshold: 0,
+            action_success_limit: 0,
+            total_failure_budget: 4,
+        });
+        // Interleave failures across different tools — consecutive detection won't fire
+        det.record_call("shell", r#"{"cmd":"bad1"}"#, "err1", false);
+        det.record_call("file_read", r#"{"path":"x"}"#, "ok", true); // success doesn't reset budget
+        det.record_call("content_search", r#"{"q":"test"}"#, "err2", false);
+        det.record_call("shell", r#"{"cmd":"bad2"}"#, "err3", false);
+        det.record_call("search_chat_log", r#"{"q":"y"}"#, "err4", false);
+        // 4 failures total → should trigger
+        match det.check() {
+            DetectionVerdict::HardStop(msg) => {
+                assert!(msg.contains("failure budget"), "msg: {msg}");
+                assert!(msg.contains("4"), "msg: {msg}");
+            }
+            other => panic!("expected HardStop, got {other:?}"),
+        }
+    }
+
+    // 16. elfClaw: Total failure budget disabled when 0
+    #[test]
+    fn total_failure_budget_disabled_when_zero() {
+        let mut det = LoopDetector::new(LoopDetectionConfig {
+            no_progress_threshold: 0,
+            ping_pong_cycles: 0,
+            failure_streak_threshold: 0,
+            action_success_limit: 0,
+            total_failure_budget: 0,
+        });
+        for i in 0..20 {
+            det.record_call("shell", &format!(r#"{{"cmd":"fail{i}"}}"#), "err", false);
+        }
+        assert_eq!(det.check(), DetectionVerdict::Continue);
+    }
+
+    // 17. elfClaw: Total failure budget does not fire below threshold
+    #[test]
+    fn total_failure_budget_below_threshold_continues() {
+        let mut det = LoopDetector::new(LoopDetectionConfig {
+            no_progress_threshold: 0,
+            ping_pong_cycles: 0,
+            failure_streak_threshold: 0,
+            action_success_limit: 0,
+            total_failure_budget: 8,
+        });
+        // 7 failures — just below budget of 8
+        for i in 0..7 {
+            det.record_call("shell", &format!(r#"{{"cmd":"fail{i}"}}"#), &format!("err{i}"), false);
         }
         assert_eq!(det.check(), DetectionVerdict::Continue);
     }
