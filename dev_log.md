@@ -2,6 +2,64 @@
 
 ---
 
+## 2026-03-14 — Self-Improving 反思系统 + Gemini Embedding Provider
+
+### 功能概述
+整合 OpenClaw self-improving skill 的反思能力到 elfClaw 现有的 chat_summarizer 管道中，同时新增 Gemini 原生 Embedding Provider 实现语义检索。
+
+### 修改文件
+
+#### `src/memory/embeddings.rs` — 新增 GeminiEmbedding Provider
+- 新增 `GeminiEmbedding` 结构体，实现 `EmbeddingProvider` trait
+- 使用 Gemini 原生 `batchEmbedContents` API（非 OpenAI 兼容层）
+- 认证方式：`x-goog-api-key` header（与主 provider 共享同一 API key）
+- taskType 设为 `SEMANTIC_SIMILARITY`（通用场景，无需区分 query/document）
+- 工厂函数 `create_embedding_provider()` 新增 `"gemini"` 分支
+- 新增 2 个单测：factory_gemini + gemini_embed_empty_batch
+
+#### `src/channels/chat_summarizer.rs` — 扩展离线纠错提取
+- `summarize_chat_logs()` 签名新增 `memory: Option<&dyn Memory>` 参数
+- LLM prompt 新增「纠错」行：要求弱模型从对话中提取用户纠正 agent 的错误
+- `parse_summary_response()` 返回值从 `(String, Option<String>)` 扩展为 `(String, Option<String>, Option<String>)`
+- 新增纠错解析：匹配「纠错：」前缀，「无」时返回 None
+- 当 corrections 非 None 时，写入 Memory（key=`correction_{date}_{chat_id}`, category=Core）
+- 新增 3 个单测：with_corrections / corrections_none_value / missing_corrections_line
+
+#### `src/channels/chat_index.rs` — chat_summaries 表加列
+- `init_schema()` 建表语句新增 `corrections TEXT` 列
+- 新增 ALTER TABLE 迁移：检测 corrections 列是否存在，不存在则 ALTER TABLE ADD COLUMN
+- `upsert_summary()` 签名新增 `corrections: Option<&str>` 参数
+- INSERT/UPDATE 语句同步更新
+
+#### `src/channels/mod.rs` — 纠错注入 + /reflect 命令
+- `process_channel_message()` 中 system_prompt 构建后：从 Memory 加载 `correction_*` 前缀的 Core 记忆，去重后注入到 system prompt 的「已学习的纠错规则」段落（上限 20 条）
+- 新增 `/reflect` 命令识别（类似 `/selfcheck` 模式）：重写消息为反思 prompt，让主模型分析对话历史并用 memory_store 记录教训
+- `/reflect` 不需要 SelfCheckGate（只用 memory_store，非 restricted tier 工具）
+- 自动保存 memory 排除 `/reflect` 命令消息
+
+#### `src/daemon/mod.rs` — 传入 Memory 实例
+- heartbeat loop 中 `summarize_chat_logs()` 调用前创建 Memory 实例
+- 使用 `create_memory()` 标准工厂函数，与 agent 共享 brain.db（WAL 模式支持并发）
+
+#### K3 `config.toml` — 配置变更
+- `[memory]` 段：`embedding_provider = "gemini"`，`embedding_model = "gemini-embedding-001"`，`embedding_dimensions = 768`
+- `[agent]` 段：新增 `system_prompt`，包含纠错学习指令
+
+### 设计决策
+- **不修改 hygiene.rs**：`prune_conversation_rows()` 只删除 `category='conversation'` 的行，Core 类别的 correction_* 记忆不受影响
+- **纠错去重**：注入 system prompt 时按 content 去重，避免实时通道和离线通道产生的重复纠错
+- **弱模型兼容**：纠错提取是简单的模式匹配+文本提取任务，弱模型（gemini-flash-lite）完全能胜任
+
+### 验证
+- `cargo build --release --features wasm-tools` ✅ 编译通过
+- `cargo test` ✅ 4245 passed（11 pre-existing failures 与本次改动无关）
+- chat_summarizer 7/7 tests passed
+- chat_index 8/8 tests passed
+- embeddings 22/22 tests passed
+- 二进制 + 配置已上传 K3
+
+---
+
 ## 2026-03-14 — PR #14 冲突解决（Rebase fix 分支到 main）
 
 ### 背景
