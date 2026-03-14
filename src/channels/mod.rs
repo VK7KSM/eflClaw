@@ -281,6 +281,7 @@ struct ChannelRuntimeContext {
     chat_log_config: crate::config::ChatLogConfig,
     worker_model: Option<String>, // elfClaw: model for background tasks (email digest, etc.)
     config: Arc<crate::config::Config>, // elfClaw: full config for runtime status injection
+    approval_manager: Arc<crate::approval::ApprovalManager>, // elfClaw: non-CLI tool approval
 }
 
 #[derive(Clone)]
@@ -701,6 +702,199 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
         "/new" => Some(ChannelRuntimeCommand::NewSession),
         _ => None,
     }
+}
+
+// ── elfClaw: Non-CLI approval command routing ─────────────────────────
+
+/// Approval commands that can be issued from any non-CLI channel.
+enum ApprovalCommand {
+    /// /approve-allow {request_id} — resolve a pending request with Yes
+    AllowPending(String),
+    /// /approve-deny {request_id} — resolve a pending request with No
+    DenyPending(String),
+    /// /approve-pending — list pending approval requests
+    ListPending,
+    /// /approvals — show current approval status (auto_approve, session, always_ask)
+    ShowApprovals,
+    /// /approve-session {tool} — grant session-level approval for a tool
+    GrantSession(String),
+    /// /approve {tool} — grant persistent (permanent) approval for a tool
+    GrantPersistent(String),
+    /// /unapprove {tool} — revoke persistent approval for a tool
+    Revoke(String),
+}
+
+fn parse_approval_command(content: &str) -> Option<ApprovalCommand> {
+    let trimmed = content.trim();
+    if !trimmed.starts_with('/') {
+        return None;
+    }
+
+    let mut parts = trimmed.split_whitespace();
+    let command_token = parts.next()?;
+    // Strip @botname suffix (Telegram group commands)
+    let base_command = command_token
+        .split('@')
+        .next()
+        .unwrap_or(command_token)
+        .to_ascii_lowercase();
+
+    match base_command.as_str() {
+        "/approve-allow" => {
+            let id = parts.next()?.to_string();
+            Some(ApprovalCommand::AllowPending(id))
+        }
+        "/approve-deny" => {
+            let id = parts.next()?.to_string();
+            Some(ApprovalCommand::DenyPending(id))
+        }
+        "/approve-pending" => Some(ApprovalCommand::ListPending),
+        "/approvals" => Some(ApprovalCommand::ShowApprovals),
+        "/approve-session" => {
+            let tool = parts.next()?.to_string();
+            Some(ApprovalCommand::GrantSession(tool))
+        }
+        "/approve" => {
+            let tool = parts.next()?.to_string();
+            Some(ApprovalCommand::GrantPersistent(tool))
+        }
+        "/unapprove" => {
+            let tool = parts.next()?.to_string();
+            Some(ApprovalCommand::Revoke(tool))
+        }
+        _ => None,
+    }
+}
+
+/// Handle approval commands from any non-CLI channel.
+/// Returns `true` if the message was consumed as an approval command.
+async fn handle_approval_command_if_needed(
+    ctx: &ChannelRuntimeContext,
+    msg: &traits::ChannelMessage,
+    target_channel: Option<&Arc<dyn Channel>>,
+) -> bool {
+    // CLI doesn't use non-CLI approval
+    if msg.channel == "cli" {
+        return false;
+    }
+
+    let Some(command) = parse_approval_command(&msg.content) else {
+        return false;
+    };
+
+    let mgr = ctx.approval_manager.as_ref();
+
+    // elfClaw: identity check for write commands — only configured approval
+    // actors may approve/deny/grant/revoke. Read-only commands (list/show)
+    // are allowed for any user so they can inspect status.
+    let is_write_command = matches!(
+        command,
+        ApprovalCommand::AllowPending(_)
+            | ApprovalCommand::DenyPending(_)
+            | ApprovalCommand::GrantSession(_)
+            | ApprovalCommand::GrantPersistent(_)
+            | ApprovalCommand::Revoke(_)
+    );
+    if is_write_command && !mgr.is_non_cli_approval_actor_allowed(&msg.channel, &msg.sender) {
+        if let Some(channel) = target_channel {
+            let _ = channel
+                .send(
+                    &SendMessage::new(
+                        format!(
+                            "⛔ Permission denied: you are not an authorized approver on `{}`.",
+                            msg.channel
+                        ),
+                        &msg.reply_target,
+                    )
+                    .in_thread(msg.thread_ts.clone()),
+                )
+                .await;
+        }
+        return true;
+    }
+
+    let reply = match command {
+        ApprovalCommand::AllowPending(id) => {
+            mgr.record_non_cli_pending_resolution(&id, crate::approval::ApprovalResponse::Yes);
+            format!("✓ Approved request `{id}`")
+        }
+        ApprovalCommand::DenyPending(id) => {
+            mgr.record_non_cli_pending_resolution(&id, crate::approval::ApprovalResponse::No);
+            format!("✗ Denied request `{id}`")
+        }
+        ApprovalCommand::ListPending => {
+            let pending = mgr.list_non_cli_pending_requests(None, None, None);
+            if pending.is_empty() {
+                "No pending approval requests.".to_string()
+            } else {
+                let mut lines = vec!["Pending approval requests:".to_string()];
+                for req in &pending {
+                    lines.push(format!(
+                        "• `{}` — tool: `{}`, from: {}, channel: {}",
+                        req.request_id, req.tool_name, req.requested_by, req.requested_channel
+                    ));
+                }
+                lines.join("\n")
+            }
+        }
+        ApprovalCommand::ShowApprovals => {
+            let auto = mgr.auto_approve_tools();
+            let session = mgr.non_cli_session_allowlist();
+            let always = mgr.always_ask_tools();
+
+            let mut lines = vec!["Approval status:".to_string()];
+            if auto.is_empty() {
+                lines.push("• auto_approve: (none)".to_string());
+            } else {
+                let mut sorted: Vec<_> = auto.iter().cloned().collect();
+                sorted.sort();
+                lines.push(format!("• auto_approve: {}", sorted.join(", ")));
+            }
+            if session.is_empty() {
+                lines.push("• session grants: (none)".to_string());
+            } else {
+                let mut sorted: Vec<_> = session.iter().cloned().collect();
+                sorted.sort();
+                lines.push(format!("• session grants: {}", sorted.join(", ")));
+            }
+            if always.is_empty() {
+                lines.push("• always_ask: (none)".to_string());
+            } else {
+                let mut sorted: Vec<_> = always.iter().cloned().collect();
+                sorted.sort();
+                lines.push(format!("• always_ask: {}", sorted.join(", ")));
+            }
+            lines.join("\n")
+        }
+        ApprovalCommand::GrantSession(tool) => {
+            mgr.grant_non_cli_session(&tool);
+            format!("✓ Session-level approval granted for `{tool}` (resets on restart)")
+        }
+        ApprovalCommand::GrantPersistent(tool) => {
+            mgr.apply_persistent_runtime_grant(&tool);
+            format!("✓ Persistent approval granted for `{tool}`")
+        }
+        ApprovalCommand::Revoke(tool) => {
+            let removed = mgr.apply_persistent_runtime_revoke(&tool);
+            mgr.revoke_non_cli_session(&tool);
+            if removed {
+                format!("✓ Approval revoked for `{tool}`")
+            } else {
+                format!("Tool `{tool}` was not in auto_approve list (session grant also cleared)")
+            }
+        }
+    };
+
+    if let Some(channel) = target_channel {
+        let _ = channel
+            .send(
+                &SendMessage::new(reply, &msg.reply_target)
+                    .in_thread(msg.thread_ts.clone()),
+            )
+            .await;
+    }
+
+    true
 }
 
 fn resolve_provider_alias(name: &str) -> Option<String> {
@@ -1773,6 +1967,10 @@ async fn process_channel_message(
     if handle_runtime_command_if_needed(ctx.as_ref(), &msg, target_channel.as_ref()).await {
         return;
     }
+    // elfClaw: handle approval commands (/approve, /approve-session, /approvals, etc.)
+    if handle_approval_command_if_needed(ctx.as_ref(), &msg, target_channel.as_ref()).await {
+        return;
+    }
 
     let history_key = conversation_history_key(&msg);
     let mut route = get_route_selection(ctx.as_ref(), &history_key);
@@ -2184,7 +2382,7 @@ async fn process_channel_message(
                 route.model.as_str(),
                 runtime_defaults.temperature,
                 true,
-                None,
+                Some(ctx.approval_manager.as_ref()),
                 msg.channel.as_str(),
                 &ctx.multimodal,
                 ctx.max_tool_iterations,
@@ -2769,7 +2967,16 @@ async fn run_message_dispatch_loop(
                 }
             }
 
-            process_channel_message(worker_ctx, msg, cancellation_token).await;
+            // elfClaw: wrap in task_local scope so tools can discover caller identity
+            let caller = crate::tools::caller_context::CallerInfo {
+                channel: msg.channel.clone(),
+                sender: msg.sender.clone(),
+            };
+            crate::tools::caller_context::CALLER_INFO
+                .scope(caller, async {
+                    process_channel_message(worker_ctx, msg, cancellation_token).await;
+                })
+                .await;
 
             if interrupt_enabled {
                 let mut active = in_flight.lock().await;
@@ -4147,6 +4354,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         chat_log_config: config.chat_log.clone(),
         worker_model: config.worker_model.clone(), // elfClaw
         config: Arc::new(config.clone()), // elfClaw: full config for runtime status injection
+        approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(&config.autonomy)), // elfClaw: non-CLI tool approval
     });
 
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
@@ -4364,6 +4572,7 @@ mod tests {
             chat_log_config: Default::default(),
             worker_model: None,
             config: Arc::new(crate::config::Config::default()), // elfClaw: test default
+            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(&crate::config::AutonomyConfig { level: crate::security::AutonomyLevel::Full, ..Default::default() })), // elfClaw: test default
         };
 
         assert!(compact_sender_history(&ctx, &sender));
@@ -4417,6 +4626,7 @@ mod tests {
             chat_log_config: Default::default(),
             worker_model: None,
             config: Arc::new(crate::config::Config::default()), // elfClaw: test default
+            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(&crate::config::AutonomyConfig { level: crate::security::AutonomyLevel::Full, ..Default::default() })), // elfClaw: test default
         };
 
         append_sender_turn(&ctx, &sender, ChatMessage::user("hello"));
@@ -4473,6 +4683,7 @@ mod tests {
             chat_log_config: Default::default(),
             worker_model: None,
             config: Arc::new(crate::config::Config::default()), // elfClaw: test default
+            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(&crate::config::AutonomyConfig { level: crate::security::AutonomyLevel::Full, ..Default::default() })), // elfClaw: test default
         };
 
         assert!(rollback_orphan_user_turn(&ctx, &sender, "pending"));
@@ -4952,6 +5163,7 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             worker_model: None,
             config: Arc::new(crate::config::Config::default()), // elfClaw: test default
+            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(&crate::config::AutonomyConfig { level: crate::security::AutonomyLevel::Full, ..Default::default() })), // elfClaw: test default
         });
 
         process_channel_message(
@@ -5015,6 +5227,7 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             worker_model: None,
             config: Arc::new(crate::config::Config::default()), // elfClaw: test default
+            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(&crate::config::AutonomyConfig { level: crate::security::AutonomyLevel::Full, ..Default::default() })), // elfClaw: test default
         });
 
         process_channel_message(
@@ -5092,6 +5305,7 @@ BTC is currently around $65,000 based on latest tool output."#
             chat_log_config: Default::default(),
             worker_model: None,
             config: Arc::new(crate::config::Config::default()), // elfClaw: test default
+            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(&crate::config::AutonomyConfig { level: crate::security::AutonomyLevel::Full, ..Default::default() })), // elfClaw: test default
         });
 
         process_channel_message(
@@ -5155,6 +5369,7 @@ BTC is currently around $65,000 based on latest tool output."#
             chat_log_config: Default::default(),
             worker_model: None,
             config: Arc::new(crate::config::Config::default()), // elfClaw: test default
+            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(&crate::config::AutonomyConfig { level: crate::security::AutonomyLevel::Full, ..Default::default() })), // elfClaw: test default
         });
 
         process_channel_message(
@@ -5227,6 +5442,7 @@ BTC is currently around $65,000 based on latest tool output."#
             chat_log_config: Default::default(),
             worker_model: None,
             config: Arc::new(crate::config::Config::default()), // elfClaw: test default
+            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(&crate::config::AutonomyConfig { level: crate::security::AutonomyLevel::Full, ..Default::default() })), // elfClaw: test default
         });
 
         process_channel_message(
@@ -5320,6 +5536,7 @@ BTC is currently around $65,000 based on latest tool output."#
             chat_log_config: Default::default(),
             worker_model: None,
             config: Arc::new(crate::config::Config::default()), // elfClaw: test default
+            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(&crate::config::AutonomyConfig { level: crate::security::AutonomyLevel::Full, ..Default::default() })), // elfClaw: test default
         });
 
         process_channel_message(
@@ -5395,6 +5612,7 @@ BTC is currently around $65,000 based on latest tool output."#
             chat_log_config: Default::default(),
             worker_model: None,
             config: Arc::new(crate::config::Config::default()), // elfClaw: test default
+            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(&crate::config::AutonomyConfig { level: crate::security::AutonomyLevel::Full, ..Default::default() })), // elfClaw: test default
         });
 
         process_channel_message(
@@ -5486,6 +5704,7 @@ BTC is currently around $65,000 based on latest tool output."#
             chat_log_config: Default::default(),
             worker_model: None,
             config: Arc::new(crate::config::Config::default()), // elfClaw: test default
+            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(&crate::config::AutonomyConfig { level: crate::security::AutonomyLevel::Full, ..Default::default() })), // elfClaw: test default
         });
 
         process_channel_message(
@@ -5561,6 +5780,7 @@ BTC is currently around $65,000 based on latest tool output."#
             chat_log_config: Default::default(),
             worker_model: None,
             config: Arc::new(crate::config::Config::default()), // elfClaw: test default
+            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(&crate::config::AutonomyConfig { level: crate::security::AutonomyLevel::Full, ..Default::default() })), // elfClaw: test default
         });
 
         process_channel_message(
@@ -5625,6 +5845,7 @@ BTC is currently around $65,000 based on latest tool output."#
             chat_log_config: Default::default(),
             worker_model: None,
             config: Arc::new(crate::config::Config::default()), // elfClaw: test default
+            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(&crate::config::AutonomyConfig { level: crate::security::AutonomyLevel::Full, ..Default::default() })), // elfClaw: test default
         });
 
         process_channel_message(
@@ -5808,6 +6029,7 @@ BTC is currently around $65,000 based on latest tool output."#
             chat_log_config: Default::default(),
             worker_model: None,
             config: Arc::new(crate::config::Config::default()), // elfClaw: test default
+            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(&crate::config::AutonomyConfig { level: crate::security::AutonomyLevel::Full, ..Default::default() })), // elfClaw: test default
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
@@ -5892,6 +6114,7 @@ BTC is currently around $65,000 based on latest tool output."#
             chat_log_config: Default::default(),
             worker_model: None,
             config: Arc::new(crate::config::Config::default()), // elfClaw: test default
+            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(&crate::config::AutonomyConfig { level: crate::security::AutonomyLevel::Full, ..Default::default() })), // elfClaw: test default
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -5988,6 +6211,7 @@ BTC is currently around $65,000 based on latest tool output."#
             chat_log_config: Default::default(),
             worker_model: None,
             config: Arc::new(crate::config::Config::default()), // elfClaw: test default
+            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(&crate::config::AutonomyConfig { level: crate::security::AutonomyLevel::Full, ..Default::default() })), // elfClaw: test default
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -6066,6 +6290,7 @@ BTC is currently around $65,000 based on latest tool output."#
             chat_log_config: Default::default(),
             worker_model: None,
             config: Arc::new(crate::config::Config::default()), // elfClaw: test default
+            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(&crate::config::AutonomyConfig { level: crate::security::AutonomyLevel::Full, ..Default::default() })), // elfClaw: test default
         });
 
         process_channel_message(
@@ -6129,6 +6354,7 @@ BTC is currently around $65,000 based on latest tool output."#
             chat_log_config: Default::default(),
             worker_model: None,
             config: Arc::new(crate::config::Config::default()), // elfClaw: test default
+            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(&crate::config::AutonomyConfig { level: crate::security::AutonomyLevel::Full, ..Default::default() })), // elfClaw: test default
         });
 
         process_channel_message(
@@ -6655,6 +6881,7 @@ BTC is currently around $65,000 based on latest tool output."#
             chat_log_config: Default::default(),
             worker_model: None,
             config: Arc::new(crate::config::Config::default()), // elfClaw: test default
+            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(&crate::config::AutonomyConfig { level: crate::security::AutonomyLevel::Full, ..Default::default() })), // elfClaw: test default
         });
 
         process_channel_message(
@@ -6744,6 +6971,7 @@ BTC is currently around $65,000 based on latest tool output."#
             chat_log_config: Default::default(),
             worker_model: None,
             config: Arc::new(crate::config::Config::default()), // elfClaw: test default
+            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(&crate::config::AutonomyConfig { level: crate::security::AutonomyLevel::Full, ..Default::default() })), // elfClaw: test default
         });
 
         process_channel_message(
@@ -6833,6 +7061,7 @@ BTC is currently around $65,000 based on latest tool output."#
             chat_log_config: Default::default(),
             worker_model: None,
             config: Arc::new(crate::config::Config::default()), // elfClaw: test default
+            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(&crate::config::AutonomyConfig { level: crate::security::AutonomyLevel::Full, ..Default::default() })), // elfClaw: test default
         });
 
         process_channel_message(
@@ -7392,6 +7621,7 @@ This is an example JSON object for profile settings."#;
             chat_log_config: Default::default(),
             worker_model: None,
             config: Arc::new(crate::config::Config::default()), // elfClaw: test default
+            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(&crate::config::AutonomyConfig { level: crate::security::AutonomyLevel::Full, ..Default::default() })), // elfClaw: test default
         });
 
         // Simulate a photo attachment message with [IMAGE:] marker.
@@ -7462,6 +7692,7 @@ This is an example JSON object for profile settings."#;
             chat_log_config: Default::default(),
             worker_model: None,
             config: Arc::new(crate::config::Config::default()), // elfClaw: test default
+            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(&crate::config::AutonomyConfig { level: crate::security::AutonomyLevel::Full, ..Default::default() })), // elfClaw: test default
         });
 
         process_channel_message(

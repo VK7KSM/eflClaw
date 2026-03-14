@@ -536,6 +536,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         config.gateway.require_pairing,
         &config.gateway.paired_tokens,
     ));
+    // elfClaw: register globally so tools (e.g. generate_pairing_code) can access it
+    crate::security::pairing::register_global_pairing_guard(pairing.clone());
     let rate_limit_max_keys = normalize_max_keys(
         config.gateway.rate_limit_max_keys,
         RATE_LIMIT_MAX_KEYS_DEFAULT,

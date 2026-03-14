@@ -1851,6 +1851,16 @@ pub struct GatewayConfig {
     /// Node-control protocol scaffold (`[gateway.node_control]`).
     #[serde(default)]
     pub node_control: NodeControlConfig,
+
+    /// Channels allowed to invoke the pairing code generation tool (e.g. ["telegram"]).
+    /// Empty = tool not registered.
+    #[serde(default)]
+    pub pairing_tool_allowed_channels: Vec<String>,
+
+    /// Users allowed to invoke the pairing code generation tool (e.g. ["e1vix"]).
+    /// Empty = tool not registered.
+    #[serde(default)]
+    pub pairing_tool_allowed_users: Vec<String>,
 }
 
 /// Node-control scaffold settings under `[gateway.node_control]`.
@@ -1918,6 +1928,8 @@ impl Default for GatewayConfig {
             idempotency_ttl_secs: default_idempotency_ttl_secs(),
             idempotency_max_keys: default_gateway_idempotency_max_keys(),
             node_control: NodeControlConfig::default(),
+            pairing_tool_allowed_channels: Vec::new(),
+            pairing_tool_allowed_users: Vec::new(),
         }
     }
 }
@@ -3541,6 +3553,21 @@ pub struct AutonomyConfig {
     #[serde(default)]
     pub non_cli_natural_language_approval_mode_by_channel:
         HashMap<String, NonCliNaturalLanguageApprovalMode>,
+
+    /// elfClaw: per-tool risk tier overrides (elfClaw original).
+    ///
+    /// Overrides code defaults in `default_tool_risk_tiers()`.
+    /// After config load, `apply_tool_overrides()` derives the correct
+    /// `auto_approve` / `always_ask` / `non_cli_excluded_tools` entries.
+    ///
+    /// Example in config.toml:
+    /// ```toml
+    /// [autonomy.tool_overrides]
+    /// cron_add = "safe"
+    /// shell = "standard"
+    /// ```
+    #[serde(default)]
+    pub tool_overrides: HashMap<String, crate::tools::ToolRiskTier>,
 }
 
 fn default_auto_approve() -> Vec<String> {
@@ -3548,7 +3575,7 @@ fn default_auto_approve() -> Vec<String> {
 }
 
 fn default_always_ask() -> Vec<String> {
-    vec![]
+    vec!["generate_pairing_code".to_string()]
 }
 
 fn default_non_cli_excluded_tools() -> Vec<String> {
@@ -3581,6 +3608,61 @@ fn default_non_cli_excluded_tools() -> Vec<String> {
     .into_iter()
     .map(std::string::ToString::to_string)
     .collect()
+}
+
+impl AutonomyConfig {
+    /// elfClaw: derive auto_approve / always_ask / non_cli_excluded_tools
+    /// from default_tool_risk_tiers() + config tool_overrides.
+    ///
+    /// This merges derived entries INTO the existing lists (union).
+    /// Existing entries in the old lists are preserved for backward compat.
+    /// tool_overrides entries take precedence: if a tool is overridden,
+    /// it is REMOVED from conflicting old lists and ADDED to the correct one.
+    pub fn apply_tool_overrides(&mut self) {
+        if self.tool_overrides.is_empty() {
+            return; // No overrides, keep existing config behavior
+        }
+
+        let defaults = crate::tools::default_tool_risk_tiers();
+
+        for (tool_name, tier) in &self.tool_overrides {
+            // Security: warn if downgrading a Restricted tool
+            if let Some(&code_tier) = defaults.get(tool_name.as_str()) {
+                if code_tier == crate::tools::ToolRiskTier::Restricted
+                    && (*tier == crate::tools::ToolRiskTier::Safe
+                        || *tier == crate::tools::ToolRiskTier::Standard)
+                {
+                    tracing::warn!(
+                        tool = %tool_name,
+                        from = ?code_tier,
+                        to = ?tier,
+                        "Tool risk tier downgraded via config override"
+                    );
+                }
+            }
+
+            // Remove from all old lists first (prevent conflicts)
+            self.auto_approve.retain(|t| t != tool_name);
+            self.always_ask.retain(|t| t != tool_name);
+            self.non_cli_excluded_tools.retain(|t| t != tool_name);
+
+            // Add to the correct list based on tier
+            match tier {
+                crate::tools::ToolRiskTier::Safe => {
+                    self.auto_approve.push(tool_name.clone());
+                }
+                crate::tools::ToolRiskTier::Standard => {
+                    // Standard = default supervised behavior, no list entry needed
+                }
+                crate::tools::ToolRiskTier::Sensitive => {
+                    self.always_ask.push(tool_name.clone());
+                }
+                crate::tools::ToolRiskTier::Restricted => {
+                    self.non_cli_excluded_tools.push(tool_name.clone());
+                }
+            }
+        }
+    }
 }
 
 fn is_valid_env_var_name(name: &str) -> bool {
@@ -3647,6 +3729,7 @@ impl Default for AutonomyConfig {
             non_cli_approval_approvers: Vec::new(),
             non_cli_natural_language_approval_mode: NonCliNaturalLanguageApprovalMode::default(),
             non_cli_natural_language_approval_mode_by_channel: HashMap::new(),
+            tool_overrides: HashMap::new(),
         }
     }
 }
@@ -7542,6 +7625,7 @@ impl Config {
 
             config.apply_env_overrides();
             config.validate()?;
+            config.autonomy.apply_tool_overrides(); // elfClaw: apply unified risk tier overrides
             tracing::info!(
                 path = %config.config_path.display(),
                 workspace = %config.workspace_dir.display(),
@@ -7565,6 +7649,7 @@ impl Config {
 
             config.apply_env_overrides();
             config.validate()?;
+            config.autonomy.apply_tool_overrides(); // elfClaw: apply unified risk tier overrides
             tracing::info!(
                 path = %config.config_path.display(),
                 workspace = %config.workspace_dir.display(),

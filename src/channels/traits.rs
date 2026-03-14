@@ -142,7 +142,7 @@ pub trait Channel: Send + Sync {
             raw_args
         };
         let message = format!(
-            "Approval required for tool `{tool_name}`.\nRequest ID: `{request_id}`\nArgs: `{args_preview}`\nApprove: `/approve-allow {request_id}`\nDeny: `/approve-deny {request_id}`"
+            "🔐 请确认以下操作\n\n执行工具 `{tool_name}`\n参数：`{args_preview}`\n\n允许：`/approve-allow {request_id}`\n拒绝：`/approve-deny {request_id}`"
         );
         self.send(&SendMessage::new(message, recipient).in_thread(thread_ts))
             .await

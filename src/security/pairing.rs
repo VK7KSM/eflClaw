@@ -9,10 +9,27 @@
 // re-pairing.
 
 use parking_lot::Mutex;
+use parking_lot::RwLock as ParkingRwLock;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Instant;
+
+// ── Global PairingGuard registry (supports gateway restart) ──────────
+
+static GLOBAL_PAIRING_GUARD: LazyLock<ParkingRwLock<Option<Arc<PairingGuard>>>> =
+    LazyLock::new(|| ParkingRwLock::new(None));
+
+/// Register the active PairingGuard so tools can access it at runtime.
+/// Uses RwLock (not OnceLock) because gateway restarts create a new guard.
+pub fn register_global_pairing_guard(guard: Arc<PairingGuard>) {
+    *GLOBAL_PAIRING_GUARD.write() = Some(guard);
+}
+
+/// Get the currently registered PairingGuard, if any.
+pub fn get_global_pairing_guard() -> Option<Arc<PairingGuard>> {
+    GLOBAL_PAIRING_GUARD.read().clone()
+}
 
 /// Maximum failed pairing attempts before lockout.
 const MAX_PAIR_ATTEMPTS: u32 = 5;
@@ -358,6 +375,19 @@ impl PairingGuard {
         }
 
         removed
+    }
+
+    /// Force-generate a new pairing code at runtime (for remote code generation).
+    ///
+    /// Returns the new 6-digit code, or an error if pairing is disabled.
+    /// The previous code (if any) is replaced; only the latest code is valid.
+    pub fn force_regenerate_code(&self) -> Result<String, &'static str> {
+        if !self.require_pairing {
+            return Err("pairing is disabled (require_pairing = false)");
+        }
+        let new_code = generate_code();
+        *self.pairing_code.lock() = Some(new_code.clone());
+        Ok(new_code)
     }
 }
 

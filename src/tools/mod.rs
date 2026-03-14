@@ -23,6 +23,7 @@ pub mod auth_profile;
 pub mod bg_run;
 pub mod browser;
 pub mod browser_open;
+pub mod caller_context;
 pub mod channel_ack_config;
 pub mod check_logs;
 pub mod cli_discovery;
@@ -42,6 +43,7 @@ pub mod feishu_doc;
 pub mod file_edit;
 pub mod file_read;
 pub mod file_write;
+pub mod generate_pairing_code;
 pub mod get_time;
 pub mod git_operations;
 pub mod glob_search;
@@ -125,6 +127,7 @@ pub use feishu_doc::FeishuDocTool;
 pub use file_edit::FileEditTool;
 pub use file_read::FileReadTool;
 pub use file_write::FileWriteTool;
+pub use generate_pairing_code::GeneratePairingCodeTool;
 pub use get_time::GetCurrentTimeTool;
 pub use git_operations::GitOperationsTool;
 pub use glob_search::GlobSearchTool;
@@ -168,16 +171,7 @@ pub use task_plan::TaskPlanTool;
 pub use traits::Tool;
 #[allow(unused_imports)]
 pub use traits::{ToolResult, ToolSpec};
-
-/// Risk tier for tool security classification (elfClaw)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ToolRiskTier {
-    Safe,
-    Standard,
-    Sensitive,
-    Restricted,
-}
+pub use traits::ToolRiskTier;
 
 /// Return the risk tier for a tool by name.
 pub fn tool_risk_tier(name: &str) -> ToolRiskTier {
@@ -224,6 +218,51 @@ use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+// elfClaw: centralized tool risk tier defaults (elfClaw original).
+// All tools not listed here default to Standard.
+// Config [autonomy.tool_overrides] can override these at deployment time.
+pub fn default_tool_risk_tiers() -> HashMap<&'static str, ToolRiskTier> {
+    use ToolRiskTier::*;
+    [
+        // Safe: read-only, information queries
+        ("file_read", Safe),
+        ("memory_recall", Safe),
+        ("get_current_time", Safe),
+        ("cron_list", Safe),
+        ("cron_runs", Safe),
+        ("search_chat_log", Safe),
+        // Sensitive: always require approval
+        ("generate_pairing_code", Sensitive),
+        // Restricted: hidden from non-CLI channels
+        ("shell", Restricted),
+        ("file_write", Restricted),
+        ("file_edit", Restricted),
+        ("git_operations", Restricted),
+        ("browser", Restricted),
+        ("browser_open", Restricted),
+        ("http_request", Restricted),
+        ("schedule", Restricted),
+        ("cron_add", Restricted),
+        ("cron_remove", Restricted),
+        ("cron_update", Restricted),
+        ("cron_run", Restricted),
+        ("memory_store", Restricted),
+        ("memory_forget", Restricted),
+        ("proxy_config", Restricted),
+        ("web_search_config", Restricted),
+        ("web_access_config", Restricted),
+        ("model_routing_config", Restricted),
+        ("channel_ack_config", Restricted),
+        ("pushover", Restricted),
+        ("composio", Restricted),
+        ("delegate", Restricted),
+        ("screenshot", Restricted),
+        ("image_info", Restricted),
+    ]
+    .into_iter()
+    .collect()
+}
 
 #[derive(Clone)]
 struct ArcDelegatingTool {
@@ -631,6 +670,16 @@ pub fn all_tools_with_runtime(
                 tg_cfg.bot_token.clone(),
             )));
         }
+    }
+
+    // elfClaw: remote pairing code generation tool (whitelist-gated)
+    if !root_config.gateway.pairing_tool_allowed_channels.is_empty()
+        && !root_config.gateway.pairing_tool_allowed_users.is_empty()
+    {
+        tool_arcs.push(Arc::new(GeneratePairingCodeTool::new(
+            root_config.gateway.pairing_tool_allowed_channels.clone(),
+            root_config.gateway.pairing_tool_allowed_users.clone(),
+        )));
     }
 
     if let Some(key) = composio_key {
