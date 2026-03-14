@@ -9946,6 +9946,7 @@ ws_url = "ws://127.0.0.1:3002"
                 non_cli_natural_language_approval_mode:
                     NonCliNaturalLanguageApprovalMode::RequestConfirm,
                 non_cli_natural_language_approval_mode_by_channel: HashMap::new(),
+                tool_overrides: HashMap::new(),
             },
             security: SecurityConfig::default(),
             runtime: RuntimeConfig {
@@ -10082,7 +10083,7 @@ default_temperature = 0.7
         let parsed: Config = toml::from_str(minimal).unwrap();
         assert!(parsed.api_key.is_none());
         assert!(parsed.default_provider.is_none());
-        assert_eq!(parsed.observability.backend, "none");
+        assert_eq!(parsed.observability.backend, "log");
         assert_eq!(parsed.observability.runtime_trace_mode, "none");
         assert_eq!(parsed.autonomy.level, AutonomyLevel::Supervised);
         assert_eq!(parsed.runtime.kind, "native");
@@ -11420,6 +11421,8 @@ channel_id = "C123"
                 auth_token: Some("node-token".into()),
                 allowed_node_ids: vec!["node-1".into(), "node-2".into()],
             },
+            pairing_tool_allowed_channels: Vec::new(),
+            pairing_tool_allowed_users: Vec::new(),
         };
         let toml_str = toml::to_string(&g).unwrap();
         let parsed: GatewayConfig = toml::from_str(&toml_str).unwrap();

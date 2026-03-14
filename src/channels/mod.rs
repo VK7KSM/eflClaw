@@ -5751,7 +5751,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             provider: Arc::new(IterativeToolProvider {
-                required_tool_iterations: 11,
+                required_tool_iterations: 2,
             }),
             default_provider: Arc::new("test-provider".to_string()),
             memory: Arc::new(NoopMemory),
@@ -5801,7 +5801,9 @@ BTC is currently around $65,000 based on latest tool output."#
         let sent_messages = channel_impl.sent_messages.lock().await;
         assert_eq!(sent_messages.len(), 1);
         assert!(sent_messages[0].starts_with("chat-iter-success:"));
-        assert!(sent_messages[0].contains("Completed after 11 tool iterations."));
+        // elfClaw: reduced from 11 to 2 because loop detection (no_progress_threshold=3)
+        // stops identical tool calls before reaching 11.
+        assert!(sent_messages[0].contains("Completed after 2 tool iterations."));
         assert!(!sent_messages[0].contains("⚠️ Error:"));
     }
 
@@ -7008,7 +7010,8 @@ BTC is currently around $65,000 based on latest tool output."#
             .get("test-channel_alice")
             .expect("history should be stored for sender");
         assert_eq!(turns[0].role, "user");
-        assert_eq!(turns[0].content, "hello");
+        // elfClaw: user messages are now timestamped with [MM-DD HH:MM] prefix
+        assert!(turns[0].content.contains("hello"));
         assert!(!turns[0].content.contains("[Memory context]"));
     }
 
