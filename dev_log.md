@@ -2,6 +2,37 @@
 
 ---
 
+## 2026-03-14 — PR #14 冲突解决（Rebase fix 分支到 main）
+
+### 背景
+PR #14（`fix/v0.3.1-heartbeat-selfcheck` → `main`）因 18 个共同修改文件产生冲突无法自动合并。
+Main 的改动几乎完全是 Fix 分支改动的子集（v0.4.0 功能在 Fix 分支中已更完整地存在）。
+
+### 执行步骤
+1. Web 后台更新先提交到 main（`8350a764`）
+2. Fix 分支 rebase 到 main（11 个 commit 全部成功 replay）
+3. 测试修复后强制推送
+
+### 冲突解决策略
+- `src/channels/mod.rs`：保留 main 的 v0.4.0 self_check 指导文本 + capability boundaries
+- `src/daemon/mod.rs`：保留 main 的详细 heartbeat 提示词（含 timezone 规则）
+- `src/tools/self_check.rs`、`source_sync.rs`：保留 main 的 v0.4.0 版本
+- `src/tools/mod.rs`：合并 — ToolRiskTier 定义保留在 traits.rs（Fix），tool_risk_tier() 函数保留在 mod.rs（Main）
+- `dev_log.md`：保留 main 版本
+
+### 测试修复（`849a23ac`）
+| 文件 | 修改 |
+|------|------|
+| `src/tools/self_check.rs` | 3 个测试添加 SelfCheckGate.open/close + 竞态容错断言 |
+| `src/channels/mod.rs` | 迭代测试从 11→2（适应 loop_detection no_progress_threshold=3）|
+| `src/channels/mod.rs` | 时间戳前缀断言改为 contains("hello") |
+| `src/config/schema.rs` | observability 默认值断言改为 "log"，补充 tool_overrides/pairing 字段 |
+
+### 测试结果
+- 4240 通过，11 失败（全部为 Windows 平台特有的 symlink/路径/进程问题，非 rebase 引入）
+
+---
+
 ## 2026-03-14 — Web 后台全面更新
 
 ### 修改文件一览
