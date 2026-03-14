@@ -74,6 +74,7 @@ impl ChatIndex {
                 date        TEXT NOT NULL,
                 summary     TEXT NOT NULL,
                 topics      TEXT,
+                corrections TEXT,
                 embedding   BLOB,
                 msg_count   INTEGER DEFAULT 0,
                 source_hash TEXT,
@@ -106,6 +107,17 @@ impl ChatIndex {
                 VALUES (new.id, new.chat_name, new.summary, new.topics);
             END;",
         )?;
+
+        // Migration: add corrections column to existing databases
+        let has_corrections: bool = conn
+            .prepare("SELECT corrections FROM chat_summaries LIMIT 0")
+            .is_ok();
+        if !has_corrections {
+            let _ = conn.execute_batch(
+                "ALTER TABLE chat_summaries ADD COLUMN corrections TEXT;",
+            );
+        }
+
         Ok(())
     }
 
@@ -118,6 +130,7 @@ impl ChatIndex {
         date: &str,
         summary: &str,
         topics: Option<&str>,
+        corrections: Option<&str>,
         embedding: Option<&[f32]>,
         msg_count: i64,
         source_hash: &str,
@@ -128,17 +141,18 @@ impl ChatIndex {
 
         conn.execute(
             "INSERT INTO chat_summaries
-                (channel, chat_id, chat_name, date, summary, topics, embedding, msg_count, source_hash, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                (channel, chat_id, chat_name, date, summary, topics, corrections, embedding, msg_count, source_hash, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
              ON CONFLICT(channel, chat_id, date) DO UPDATE SET
                 chat_name   = excluded.chat_name,
                 summary     = excluded.summary,
                 topics      = excluded.topics,
+                corrections = excluded.corrections,
                 embedding   = excluded.embedding,
                 msg_count   = excluded.msg_count,
                 source_hash = excluded.source_hash,
                 updated_at  = excluded.updated_at",
-            params![channel, chat_id, chat_name, date, summary, topics, emb_bytes, msg_count, source_hash, now, now],
+            params![channel, chat_id, chat_name, date, summary, topics, corrections, emb_bytes, msg_count, source_hash, now, now],
         )?;
         Ok(())
     }
@@ -320,6 +334,7 @@ mod tests {
             "2026-02-26",
             "讨论了天气和晚饭",
             Some("天气,晚饭"),
+            None, // corrections
             None,
             15,
             "hash1",
@@ -345,6 +360,7 @@ mod tests {
             "2026-02-26",
             "上午的对话",
             None,
+            None, // corrections
             None,
             5,
             "hash1",
@@ -358,6 +374,7 @@ mod tests {
             "2026-02-26",
             "上午和下午的对话",
             Some("编程"),
+            None, // corrections
             None,
             20,
             "hash2",
@@ -387,6 +404,7 @@ mod tests {
             "2026-02-26",
             "test",
             None,
+            None, // corrections
             None,
             1,
             "abc123",
@@ -411,6 +429,7 @@ mod tests {
             "2026-02-26",
             "discussed weather and dinner plans",
             Some("weather,dinner"),
+            None, // corrections
             None,
             10,
             "h1",
@@ -424,6 +443,7 @@ mod tests {
             "2026-02-26",
             "talked about Python programming",
             Some("programming"),
+            None, // corrections
             None,
             8,
             "h2",
@@ -451,6 +471,7 @@ mod tests {
             "2026-02-26",
             "hello",
             None,
+            None, // corrections
             None,
             1,
             "h1",
@@ -463,6 +484,7 @@ mod tests {
             "2026-02-26",
             "world",
             None,
+            None, // corrections
             None,
             1,
             "h2",
@@ -487,7 +509,7 @@ mod tests {
         let idx = test_index(&tmp);
         assert_eq!(idx.summary_count().unwrap(), 0);
 
-        idx.upsert_summary("telegram", "1", "A", "2026-01-01", "s", None, None, 1, "h")
+        idx.upsert_summary("telegram", "1", "A", "2026-01-01", "s", None, None, None, 1, "h")
             .unwrap();
         assert_eq!(idx.summary_count().unwrap(), 1);
     }

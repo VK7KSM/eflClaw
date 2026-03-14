@@ -320,7 +320,16 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
 
         // ── Chat log summarization (silent, never blocks heartbeat) ──
         if config.chat_log.enabled {
-            match crate::channels::chat_summarizer::summarize_chat_logs(&config).await {
+            // Create Memory instance for correction extraction (self-improving)
+            let memory: Option<Box<dyn crate::memory::Memory>> = crate::memory::create_memory(
+                &config.memory,
+                &config.workspace_dir,
+                config.api_key.as_deref(),
+            )
+            .ok();
+            let memory_ref: Option<&dyn crate::memory::Memory> =
+                memory.as_ref().map(|m| m.as_ref());
+            match crate::channels::chat_summarizer::summarize_chat_logs(&config, memory_ref).await {
                 Ok(report) if report.processed > 0 => {
                     tracing::info!(
                         "Chat summarization: {} processed, {} skipped, {} errors",

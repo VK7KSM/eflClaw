@@ -1960,6 +1960,30 @@ async fn process_channel_message(
         );
     }
 
+    // ── elfClaw: /reflect command — deep self-reflection using main model ──
+    let is_reflect_command = msg.content.starts_with("/reflect");
+    if is_reflect_command {
+        let reflect_focus = msg.content.strip_prefix("/reflect").unwrap_or("").trim();
+        let focus_hint = if reflect_focus.is_empty() {
+            String::new()
+        } else {
+            format!("\n\n重点关注：{reflect_focus}")
+        };
+        msg.content = format!(
+            "请回顾我们最近的对话历史，分析你的表现：\n\
+             1. 我有没有纠正过你的错误？如果有，总结每个纠正\n\
+             2. 有没有反复出现的问题模式？\n\
+             3. 有什么可以改进的地方？\n\n\
+             对于每个发现的教训，用 memory_store 记录：\n\
+             - key: \"correction_<简短英文描述>\"\n\
+             - content: \"错误：<做错了什么>。正确：<应该怎么做>\"\n\
+             - category: \"core\"\n\
+             - 每次纠正最多调用 1 次 memory_store\n\
+             {focus_hint}\n\
+             完成后简短报告你记录了什么。"
+        );
+    }
+
     let target_channel = ctx.channels_by_name.get(&msg.channel).cloned();
     if let Err(err) = maybe_apply_runtime_config_update(ctx.as_ref()).await {
         tracing::warn!("Failed to apply runtime config update: {err}");
@@ -2003,7 +2027,8 @@ async fn process_channel_message(
     if ctx.auto_save_memory
         && msg.content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
         && !is_selfcheck_command
-    // elfClaw: diagnostic data must not pollute memory
+        && !is_reflect_command
+    // elfClaw: diagnostic/reflection data must not pollute memory
     {
         let autosave_key = conversation_memory_key(&msg);
         let _ = ctx
@@ -2093,6 +2118,37 @@ async fn process_channel_message(
     // elfClaw: inject dynamic runtime status (cron jobs, autonomy, agents) so agent
     // knows its current environment and can self-diagnose tool/config issues
     system_prompt.push_str(&build_runtime_status_section(&ctx.config));
+
+    // elfClaw: inject learned correction rules into system prompt (self-improving)
+    {
+        let corrections = ctx
+            .memory
+            .list(Some(&crate::memory::MemoryCategory::Core), None)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|e| e.key.starts_with("correction_"))
+            .collect::<Vec<_>>();
+
+        if !corrections.is_empty() {
+            use std::collections::HashSet;
+            let mut seen = HashSet::new();
+            system_prompt.push_str("\n\n## 已学习的纠错规则\n\n");
+            system_prompt
+                .push_str("以下是从过往对话中学到的纠错。遇到相关场景时必须遵守：\n\n");
+            let mut count = 0;
+            for entry in &corrections {
+                let normalized = entry.content.trim().to_lowercase();
+                if seen.insert(normalized) {
+                    system_prompt.push_str(&format!("- {}\n", entry.content.trim()));
+                    count += 1;
+                    if count >= 20 {
+                        break;
+                    }
+                }
+            }
+        }
+    }
 
     // Inject cross-user chat summaries for the owner only
     if ctx.chat_log_config.enabled && msg.channel == "telegram" {

@@ -154,6 +154,106 @@ impl EmbeddingProvider for OpenAiEmbedding {
     }
 }
 
+// ── Gemini native embedding provider ─────────────────────────
+
+pub struct GeminiEmbedding {
+    api_key: String,
+    model: String,
+    dims: usize,
+}
+
+impl GeminiEmbedding {
+    pub fn new(api_key: &str, model: &str, dims: usize) -> Self {
+        Self {
+            api_key: api_key.to_string(),
+            model: model.to_string(),
+            dims,
+        }
+    }
+
+    fn http_client(&self) -> reqwest::Client {
+        crate::config::build_runtime_proxy_client("memory.embeddings")
+    }
+}
+
+#[async_trait]
+impl EmbeddingProvider for GeminiEmbedding {
+    fn name(&self) -> &str {
+        "gemini"
+    }
+
+    fn dimensions(&self) -> usize {
+        self.dims
+    }
+
+    async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let url = format!(
+            "https://generativelanguage.googleapis.com/v1beta/models/{}:batchEmbedContents",
+            self.model
+        );
+
+        let requests: Vec<_> = texts
+            .iter()
+            .map(|text| {
+                serde_json::json!({
+                    "model": format!("models/{}", self.model),
+                    "content": { "parts": [{ "text": text }] },
+                    "taskType": "SEMANTIC_SIMILARITY",
+                    "outputDimensionality": self.dims,
+                })
+            })
+            .collect();
+
+        let body = serde_json::json!({ "requests": requests });
+
+        let resp = self
+            .http_client()
+            .post(&url)
+            .header("x-goog-api-key", &self.api_key)
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Gemini Embedding API error {status}: {text}");
+        }
+
+        let json: serde_json::Value = resp.json().await?;
+        let embeddings_arr = json
+            .get("embeddings")
+            .and_then(|e| e.as_array())
+            .ok_or_else(|| {
+                anyhow::anyhow!("Invalid Gemini embedding response: missing 'embeddings'")
+            })?;
+
+        let mut result = Vec::with_capacity(embeddings_arr.len());
+        for item in embeddings_arr {
+            let values = item
+                .get("values")
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Invalid Gemini embedding item: missing 'values'")
+                })?;
+
+            #[allow(clippy::cast_possible_truncation)]
+            let vec: Vec<f32> = values
+                .iter()
+                .filter_map(|v| v.as_f64().map(|f| f as f32))
+                .collect();
+            result.push(vec);
+        }
+
+        Ok(result)
+    }
+}
+
 // ── Factory ──────────────────────────────────────────────────
 
 pub fn create_embedding_provider(
@@ -185,6 +285,10 @@ pub fn create_embedding_provider(
             let base_url = name.strip_prefix("custom:").unwrap_or("");
             let key = api_key.unwrap_or("");
             Box::new(OpenAiEmbedding::new(base_url, key, model, dims))
+        }
+        "gemini" => {
+            let key = api_key.unwrap_or("");
+            Box::new(GeminiEmbedding::new(key, model, dims))
         }
         _ => Box::new(NoopEmbedding),
     }
@@ -238,6 +342,21 @@ mod tests {
         let p = create_embedding_provider("custom:http://localhost:1234", None, "model", 768);
         assert_eq!(p.name(), "openai"); // uses OpenAiEmbedding internally
         assert_eq!(p.dimensions(), 768);
+    }
+
+    #[test]
+    fn factory_gemini() {
+        let p =
+            create_embedding_provider("gemini", Some("test-key"), "gemini-embedding-001", 768);
+        assert_eq!(p.name(), "gemini");
+        assert_eq!(p.dimensions(), 768);
+    }
+
+    #[tokio::test]
+    async fn gemini_embed_empty_batch() {
+        let p = GeminiEmbedding::new("key", "gemini-embedding-001", 768);
+        let result = p.embed(&[]).await.unwrap();
+        assert!(result.is_empty());
     }
 
     // ── Edge cases ───────────────────────────────────────────────
