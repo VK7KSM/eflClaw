@@ -2,6 +2,7 @@ pub mod registry;
 
 use crate::config::Config;
 use anyhow::Result;
+use serde_json::json;
 
 /// Integration status
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -64,6 +65,200 @@ pub struct IntegrationEntry {
     pub description: &'static str,
     pub category: IntegrationCategory,
     pub status_fn: fn(&Config) -> IntegrationStatus,
+}
+
+/// Mask a secret value: short strings become "****", longer ones show last 4 chars.
+pub fn mask_secret(value: &str) -> String {
+    if value.len() < 8 {
+        "****".to_string()
+    } else {
+        format!("****{}", &value[value.len() - 4..])
+    }
+}
+
+/// Build integration settings payload matching the frontend `IntegrationSettingsPayload` type.
+///
+/// Returns a JSON value with `revision`, `active_default_provider_integration_id`, and
+/// detailed `integrations` array including credential fields for each integration.
+pub fn integration_settings(config: &Config) -> serde_json::Value {
+    let entries = registry::all_integrations();
+
+    let active_provider_id = config.default_provider.as_deref().unwrap_or("").to_string();
+
+    let integrations: Vec<serde_json::Value> = entries
+        .iter()
+        .map(|entry| {
+            let status = (entry.status_fn)(config);
+            let id = entry.name.to_lowercase().replace(' ', "-");
+            let category = entry.category;
+
+            let (configured, fields) = match category {
+                IntegrationCategory::AiModel => {
+                    build_ai_model_fields(&id, config)
+                }
+                IntegrationCategory::Chat => {
+                    build_chat_fields(entry.name, config)
+                }
+                _ => (false, vec![]),
+            };
+
+            let activates_default_provider = matches!(category, IntegrationCategory::AiModel);
+
+            json!({
+                "id": id,
+                "name": entry.name,
+                "description": entry.description,
+                "category": category,
+                "status": status,
+                "configured": configured || matches!(status, IntegrationStatus::Active),
+                "activates_default_provider": activates_default_provider,
+                "fields": fields,
+            })
+        })
+        .collect();
+
+    json!({
+        "revision": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs().to_string())
+            .unwrap_or_default(),
+        "active_default_provider_integration_id": active_provider_id,
+        "integrations": integrations,
+    })
+}
+
+fn build_ai_model_fields(
+    id: &str,
+    config: &Config,
+) -> (bool, Vec<serde_json::Value>) {
+    // Check if there's a matching provider entry in model_providers
+    let provider_entry = config.model_providers.get(id);
+    let has_provider_key = provider_entry
+        .and_then(|p| p.api_key.as_ref())
+        .map(|k| !k.is_empty())
+        .unwrap_or(false);
+
+    // Fallback to global api_key
+    let has_global_key = config.api_key.as_ref().map(|k| !k.is_empty()).unwrap_or(false);
+    let has_key = has_provider_key || has_global_key;
+
+    let masked = if has_provider_key {
+        provider_entry
+            .and_then(|p| p.api_key.as_deref())
+            .map(mask_secret)
+    } else if has_global_key {
+        config.api_key.as_deref().map(mask_secret)
+    } else {
+        None
+    };
+
+    let fields = vec![json!({
+        "key": "api_key",
+        "label": "API Key",
+        "required": true,
+        "has_value": has_key,
+        "input_type": "secret",
+        "options": [],
+        "masked_value": masked.unwrap_or_default(),
+    })];
+
+    (has_key, fields)
+}
+
+fn build_chat_fields(
+    name: &str,
+    config: &Config,
+) -> (bool, Vec<serde_json::Value>) {
+    match name {
+        "Telegram" => {
+            let configured = config.channels_config.telegram.is_some();
+            let has_token = config
+                .channels_config
+                .telegram
+                .as_ref()
+                .map(|t| !t.bot_token.is_empty())
+                .unwrap_or(false);
+            let masked = config
+                .channels_config
+                .telegram
+                .as_ref()
+                .map(|t| mask_secret(&t.bot_token));
+            let fields = vec![json!({
+                "key": "bot_token",
+                "label": "Bot Token",
+                "required": true,
+                "has_value": has_token,
+                "input_type": "secret",
+                "options": [],
+                "masked_value": masked.unwrap_or_default(),
+            })];
+            (configured, fields)
+        }
+        "Discord" => {
+            let configured = config.channels_config.discord.is_some();
+            let has_token = config
+                .channels_config
+                .discord
+                .as_ref()
+                .map(|d| !d.bot_token.is_empty())
+                .unwrap_or(false);
+            let masked = config
+                .channels_config
+                .discord
+                .as_ref()
+                .map(|d| mask_secret(&d.bot_token));
+            let fields = vec![json!({
+                "key": "bot_token",
+                "label": "Bot Token",
+                "required": true,
+                "has_value": has_token,
+                "input_type": "secret",
+                "options": [],
+                "masked_value": masked.unwrap_or_default(),
+            })];
+            (configured, fields)
+        }
+        "Slack" => {
+            let configured = config.channels_config.slack.is_some();
+            let has_token = config
+                .channels_config
+                .slack
+                .as_ref()
+                .map(|s| !s.bot_token.is_empty())
+                .unwrap_or(false);
+            let masked = config
+                .channels_config
+                .slack
+                .as_ref()
+                .map(|s| mask_secret(&s.bot_token));
+            let fields = vec![json!({
+                "key": "bot_token",
+                "label": "Bot Token",
+                "required": true,
+                "has_value": has_token,
+                "input_type": "secret",
+                "options": [],
+                "masked_value": masked.unwrap_or_default(),
+            })];
+            (configured, fields)
+        }
+        "Email" => {
+            let configured = config.channels_config.email.is_some();
+            let fields = vec![json!({
+                "key": "imap_server",
+                "label": "IMAP Server",
+                "required": true,
+                "has_value": configured,
+                "input_type": "text",
+                "options": [],
+            })];
+            (configured, fields)
+        }
+        _ => {
+            // For other chat integrations, provide empty fields
+            (false, vec![])
+        }
+    }
 }
 
 /// Handle the `integrations` CLI command

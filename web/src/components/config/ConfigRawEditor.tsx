@@ -1,3 +1,9 @@
+import CodeMirror from '@uiw/react-codemirror';
+import { StreamLanguage } from '@codemirror/language';
+import { toml } from '@codemirror/legacy-modes/mode/toml';
+import { oneDark } from '@codemirror/theme-one-dark';
+import { EditorView } from '@codemirror/view';
+
 interface Props {
   rawToml: string;
   onChange: (raw: string) => void;
@@ -15,14 +21,22 @@ export default function ConfigRawEditor({ rawToml, onChange, disabled }: Props) 
           {rawToml.split('\n').length} lines
         </span>
       </div>
-      <textarea
+      <CodeMirror
         value={rawToml}
-        onChange={(e) => onChange(e.target.value)}
-        disabled={disabled}
-        spellCheck={false}
-        aria-label="Raw TOML configuration editor"
-        className="w-full min-h-[500px] bg-gray-950 text-gray-200 font-mono text-sm p-4 resize-y focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-inset disabled:opacity-50"
-        style={{ tabSize: 4 }}
+        onChange={onChange}
+        readOnly={disabled}
+        theme={oneDark}
+        extensions={[
+          StreamLanguage.define(toml),
+          EditorView.lineWrapping,
+        ]}
+        minHeight="500px"
+        basicSetup={{
+          lineNumbers: true,
+          foldGutter: true,
+          highlightActiveLine: true,
+          bracketMatching: true,
+        }}
       />
     </div>
   );

@@ -2,6 +2,35 @@
 
 ---
 
+## 2026-03-14 — Web 后台全面更新
+
+### 修改文件一览
+
+| 文件 | 改动 |
+|------|------|
+| `src/integrations/mod.rs` | 新增 `mask_secret()`, `integration_settings()`, `build_ai_model_fields()`, `build_chat_fields()` |
+| `src/gateway/api.rs` | 新增 `handle_api_integration_settings()`, `handle_api_integration_credentials()`；`handle_api_tools()` 增加 `risk_tier` 字段 |
+| `src/gateway/mod.rs` | 新增 `/api/integrations/settings` GET + `/api/integrations/{id}/credentials` PUT 路由 |
+| `src/tools/mod.rs` | 新增 `ToolRiskTier` 枚举 + `tool_risk_tier()` 函数 |
+| `web/package.json` | 新增 5 个 CodeMirror 依赖 |
+| `web/src/components/config/ConfigRawEditor.tsx` | textarea → CodeMirror（语法高亮 + 行号） |
+| `web/src/types/api.ts` | `ToolSpec` 新增 `risk_tier` 可选字段 |
+| `web/src/pages/Tools.tsx` | 工具卡片显示风险等级彩色标签（safe/sensitive/restricted） |
+| `web/src/pages/Logs.tsx` | 新增 level/category 过滤下拉框，支持后端查询参数 |
+| `web/src/pages/AgentChat.tsx` | 添加 `ChatMessage[]` 显式类型注解 |
+
+### 各改动说明
+
+**Integrations 后端 API（P0）**：前端 `getIntegrationSettings()` 请求 `GET /api/integrations/settings`，该端点不存在导致 SPA fallback 返回 HTML → JSON.parse 失败。新增 `integration_settings()` 函数返回匹配前端类型的 JSON，所有敏感字段通过 `mask_secret()` 处理。PUT credentials 端点返回 501。
+
+**CodeMirror 编辑器（P1）**：Config 页面 TOML 编辑器从 `<textarea>` 升级为 CodeMirror，支持 TOML 语法高亮、行号、代码折叠。
+
+**Tools 风险等级（P1）**：新增 `ToolRiskTier` 四级分类（safe/standard/sensitive/restricted），Tools 页面卡片右上角显示彩色标签，standard 级不显示以减少视觉噪音。
+
+**Logs 过滤（P2）**：新增 level（debug/info/warn/error）和 category 下拉过滤，后端 `/api/logs/recent` 已支持这些查询参数。
+
+---
+
 ## 2026-03-11 — Fix: skill tool CWD + stdin_json 输入模式（web_scrape 双重根因修复）
 
 ### 根因分析

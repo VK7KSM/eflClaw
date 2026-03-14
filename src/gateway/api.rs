@@ -239,6 +239,7 @@ pub async fn handle_api_tools(
                 "name": spec.name,
                 "description": spec.description,
                 "parameters": spec.parameters,
+                "risk_tier": crate::tools::tool_risk_tier(&spec.name),
             })
         })
         .collect();
@@ -364,6 +365,38 @@ pub async fn handle_api_integrations(
         .collect();
 
     Json(serde_json::json!({"integrations": integrations})).into_response()
+}
+
+/// GET /api/integrations/settings — detailed integration settings with credential fields
+pub async fn handle_api_integration_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let config = state.config.lock().clone();
+    let payload = crate::integrations::integration_settings(&config);
+    Json(payload).into_response()
+}
+
+/// PUT /api/integrations/:id/credentials — placeholder (501 Not Implemented)
+pub async fn handle_api_integration_credentials(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(serde_json::json!({
+            "error": "Credential updates via API are not yet supported. Edit config.toml directly."
+        })),
+    )
+        .into_response()
 }
 
 /// POST /api/doctor — run diagnostics
