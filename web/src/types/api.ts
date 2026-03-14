@@ -30,6 +30,7 @@ export interface ToolSpec {
   name: string;
   description: string;
   parameters: any;
+  risk_tier?: 'safe' | 'standard' | 'sensitive' | 'restricted';
 }
 
 export interface CronJob {

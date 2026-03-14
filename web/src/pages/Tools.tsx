@@ -6,9 +6,35 @@ import {
   ChevronRight,
   Terminal,
   Package,
+  Shield,
 } from 'lucide-react';
 import type { ToolSpec, CliTool } from '@/types/api';
 import { getTools, getCliTools } from '@/lib/api';
+
+function riskTierBadge(tier?: string) {
+  switch (tier) {
+    case 'safe':
+      return (
+        <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium bg-green-900/50 text-green-400 border border-green-700/50">
+          <Shield className="h-2.5 w-2.5" /> safe
+        </span>
+      );
+    case 'sensitive':
+      return (
+        <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium bg-orange-900/50 text-orange-400 border border-orange-700/50">
+          <Shield className="h-2.5 w-2.5" /> sensitive
+        </span>
+      );
+    case 'restricted':
+      return (
+        <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium bg-red-900/50 text-red-400 border border-red-700/50">
+          <Shield className="h-2.5 w-2.5" /> restricted
+        </span>
+      );
+    default:
+      return null; // 'standard' — don't show badge
+  }
+}
 
 export default function Tools() {
   const [tools, setTools] = useState<ToolSpec[]>([]);
@@ -104,6 +130,7 @@ export default function Tools() {
                         <h3 className="text-sm font-semibold text-white truncate">
                           {tool.name}
                         </h3>
+                        {riskTierBadge(tool.risk_tier)}
                       </div>
                       {isExpanded ? (
                         <ChevronDown className="h-4 w-4 text-gray-400 flex-shrink-0" />

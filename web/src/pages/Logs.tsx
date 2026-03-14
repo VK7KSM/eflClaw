@@ -47,6 +47,8 @@ export default function Logs() {
   const [connected, setConnected] = useState(false);
   const [autoScroll, setAutoScroll] = useState(true);
   const [typeFilters, setTypeFilters] = useState<Set<string>>(new Set());
+  const [levelFilter, setLevelFilter] = useState('');
+  const [categoryFilter, setCategoryFilter] = useState('');
 
   const containerRef = useRef<HTMLDivElement>(null);
   const sseRef = useRef<SSEClient | null>(null);
@@ -59,10 +61,13 @@ export default function Logs() {
   }, [paused]);
 
   useEffect(() => {
-    // elfClaw: load historical entries from SQLite on mount so the page is not blank
+    // elfClaw: load historical entries from SQLite, re-fetch when filters change
     const loadHistory = async () => {
       try {
-        const historical = await apiFetch<ElfClawLogEntry[]>('/api/logs/recent?limit=100');
+        const params = new URLSearchParams({ limit: '100' });
+        if (levelFilter) params.set('level', levelFilter);
+        if (categoryFilter) params.set('category', categoryFilter);
+        const historical = await apiFetch<ElfClawLogEntry[]>(`/api/logs/recent?${params}`);
         const histEntries: LogEntry[] = historical.reverse().map((e, i) => ({
           id: `hist-${i}`,
           event: {
@@ -76,10 +81,11 @@ export default function Logs() {
         // silent — historical log unavailable, real-time stream still works
       }
     };
-
-    // Start history fetch and SSE connection concurrently (don't await)
     void loadHistory();
+  }, [levelFilter, categoryFilter]);
 
+  useEffect(() => {
+    // SSE connection — mount once
     const client = new SSEClient();
 
     client.onConnect = () => {
@@ -174,6 +180,33 @@ export default function Logs() {
           <span className="text-xs text-gray-500 ml-2">
             {filteredEntries.length} events
           </span>
+          {/* elfClaw: level and category filters for historical logs */}
+          <select
+            value={levelFilter}
+            onChange={(e) => setLevelFilter(e.target.value)}
+            className="ml-3 bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs text-gray-300 focus:outline-none focus:ring-1 focus:ring-blue-500"
+          >
+            <option value="">All Levels</option>
+            <option value="debug">Debug</option>
+            <option value="info">Info</option>
+            <option value="warn">Warn</option>
+            <option value="error">Error</option>
+          </select>
+          <select
+            value={categoryFilter}
+            onChange={(e) => setCategoryFilter(e.target.value)}
+            className="ml-1 bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs text-gray-300 focus:outline-none focus:ring-1 focus:ring-blue-500"
+          >
+            <option value="">All Categories</option>
+            <option value="agent">Agent</option>
+            <option value="channel">Channel</option>
+            <option value="tool">Tool</option>
+            <option value="provider">Provider</option>
+            <option value="security">Security</option>
+            <option value="gateway">Gateway</option>
+            <option value="cron">Cron</option>
+            <option value="system">System</option>
+          </select>
         </div>
 
         <div className="flex items-center gap-2">

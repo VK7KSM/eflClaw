@@ -159,6 +159,44 @@ pub use task_plan::TaskPlanTool;
 pub use traits::Tool;
 #[allow(unused_imports)]
 pub use traits::{ToolResult, ToolSpec};
+
+/// Risk tier for tool security classification (elfClaw)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolRiskTier {
+    Safe,
+    Standard,
+    Sensitive,
+    Restricted,
+}
+
+/// Return the risk tier for a tool by name.
+pub fn tool_risk_tier(name: &str) -> ToolRiskTier {
+    match name {
+        // Safe: read-only, no side effects
+        "get_current_time" | "memory_recall" | "image_info" | "glob_search"
+        | "content_search" | "file_read" | "pdf_read" | "docx_read"
+        | "pptx_read" | "xlsx_read" | "cron_list" | "cron_runs"
+        | "check_logs" | "search_chat_log" | "bg_status"
+        | "subagent_list" | "delegate_coordination_status"
+        | "screenshot" | "cli_discovery" | "self_check" => ToolRiskTier::Safe,
+
+        // Sensitive: write operations, network access
+        "shell" | "process" | "file_write" | "file_edit" | "apply_patch"
+        | "git_operations" | "http_request" | "web_fetch" | "web_search"
+        | "browser" | "browser_open" | "send_email" | "send_telegram"
+        | "send_voice" | "cron_add" | "cron_remove" | "cron_update"
+        | "cron_run" | "source_sync" => ToolRiskTier::Sensitive,
+
+        // Restricted: security/config changes
+        "model_routing_config" | "proxy_config" | "web_access_config"
+        | "web_search_config" | "channel_ack_config" | "manage_auth_profile"
+        | "openclaw_migration" | "wasm_module" => ToolRiskTier::Restricted,
+
+        // Standard: everything else (memory writes, delegation, etc.)
+        _ => ToolRiskTier::Standard,
+    }
+}
 pub use wasm_module::WasmModuleTool;
 pub use web_access_config::WebAccessConfigTool;
 pub use web_fetch::WebFetchTool;

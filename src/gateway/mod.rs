@@ -701,6 +701,14 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/cron/{id}", delete(api::handle_api_cron_delete))
         .route("/api/integrations", get(api::handle_api_integrations))
         .route(
+            "/api/integrations/settings",
+            get(api::handle_api_integration_settings),
+        )
+        .route(
+            "/api/integrations/{id}/credentials",
+            put(api::handle_api_integration_credentials),
+        )
+        .route(
             "/api/doctor",
             get(api::handle_api_doctor).post(api::handle_api_doctor),
         )
