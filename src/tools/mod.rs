@@ -15,12 +15,15 @@
 //! To add a new tool, implement [`Tool`] in a new submodule and register it in
 //! [`all_tools_with_runtime`]. See `AGENTS.md` §7.3 for the full change playbook.
 
+pub mod agent_load_tracker;
+pub mod agent_selection;
 pub mod agents_ipc;
 pub mod apply_patch;
 pub mod auth_profile;
 pub mod bg_run;
 pub mod browser;
 pub mod browser_open;
+pub mod caller_context;
 pub mod channel_ack_config;
 pub mod check_logs;
 pub mod cli_discovery;
@@ -40,6 +43,7 @@ pub mod feishu_doc;
 pub mod file_edit;
 pub mod file_read;
 pub mod file_write;
+pub mod generate_pairing_code;
 pub mod get_time;
 pub mod git_operations;
 pub mod glob_search;
@@ -76,6 +80,8 @@ pub mod send_email;
 pub mod send_telegram;
 pub mod send_voice;
 pub mod shell;
+// elfClaw: Batch 2 upstream merge — orchestration settings loader
+pub mod orchestration_settings;
 pub mod source_sync;
 pub mod subagent_list;
 pub mod subagent_manage;
@@ -92,13 +98,19 @@ pub mod web_search_config;
 pub mod web_search_tool;
 pub mod xlsx_read;
 
+// elfClaw: public API re-exports; used by subagent_spawn and agent_selection via super::
+#[allow(unused_imports)]
+pub use agent_load_tracker::{AgentLoadLease, AgentLoadSnapshot, AgentLoadTracker};
 pub use apply_patch::ApplyPatchTool;
+#[allow(unused_imports)]
 pub use bg_run::{
     format_bg_result_for_injection, BgJob, BgJobStatus, BgJobStore, BgRunTool, BgStatusTool,
 };
 pub use browser::{BrowserTool, ComputerUseConfig};
 pub use browser_open::BrowserOpenTool;
 pub use channel_ack_config::ChannelAckConfigTool;
+#[allow(unused_imports)]
+pub use check_logs::CheckLogsTool;
 pub use composio::ComposioTool;
 pub use content_search::ContentSearchTool;
 pub use cron_add::CronAddTool;
@@ -115,6 +127,7 @@ pub use feishu_doc::FeishuDocTool;
 pub use file_edit::FileEditTool;
 pub use file_read::FileReadTool;
 pub use file_write::FileWriteTool;
+pub use generate_pairing_code::GeneratePairingCodeTool;
 pub use get_time::GetCurrentTimeTool;
 pub use git_operations::GitOperationsTool;
 pub use glob_search::GlobSearchTool;
@@ -141,7 +154,6 @@ pub use proxy_config::ProxyConfigTool;
 pub use pushover::PushoverTool;
 pub use schedule::ScheduleTool;
 #[allow(unused_imports)]
-pub use check_logs::CheckLogsTool;
 pub use schema::{CleaningStrategy, SchemaCleanr};
 pub use screenshot::ScreenshotTool;
 pub use search_chat_log::SearchChatLogTool;
@@ -159,16 +171,7 @@ pub use task_plan::TaskPlanTool;
 pub use traits::Tool;
 #[allow(unused_imports)]
 pub use traits::{ToolResult, ToolSpec};
-
-/// Risk tier for tool security classification (elfClaw)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ToolRiskTier {
-    Safe,
-    Standard,
-    Sensitive,
-    Restricted,
-}
+pub use traits::ToolRiskTier;
 
 /// Return the risk tier for a tool by name.
 pub fn tool_risk_tier(name: &str) -> ToolRiskTier {
@@ -215,6 +218,51 @@ use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+// elfClaw: centralized tool risk tier defaults (elfClaw original).
+// All tools not listed here default to Standard.
+// Config [autonomy.tool_overrides] can override these at deployment time.
+pub fn default_tool_risk_tiers() -> HashMap<&'static str, ToolRiskTier> {
+    use ToolRiskTier::*;
+    [
+        // Safe: read-only, information queries
+        ("file_read", Safe),
+        ("memory_recall", Safe),
+        ("get_current_time", Safe),
+        ("cron_list", Safe),
+        ("cron_runs", Safe),
+        ("search_chat_log", Safe),
+        // Sensitive: always require approval
+        ("generate_pairing_code", Sensitive),
+        // Restricted: hidden from non-CLI channels
+        ("shell", Restricted),
+        ("file_write", Restricted),
+        ("file_edit", Restricted),
+        ("git_operations", Restricted),
+        ("browser", Restricted),
+        ("browser_open", Restricted),
+        ("http_request", Restricted),
+        ("schedule", Restricted),
+        ("cron_add", Restricted),
+        ("cron_remove", Restricted),
+        ("cron_update", Restricted),
+        ("cron_run", Restricted),
+        ("memory_store", Restricted),
+        ("memory_forget", Restricted),
+        ("proxy_config", Restricted),
+        ("web_search_config", Restricted),
+        ("web_access_config", Restricted),
+        ("model_routing_config", Restricted),
+        ("channel_ack_config", Restricted),
+        ("pushover", Restricted),
+        ("composio", Restricted),
+        ("delegate", Restricted),
+        ("screenshot", Restricted),
+        ("image_info", Restricted),
+    ]
+    .into_iter()
+    .collect()
+}
 
 #[derive(Clone)]
 struct ArcDelegatingTool {
@@ -624,6 +672,16 @@ pub fn all_tools_with_runtime(
         }
     }
 
+    // elfClaw: remote pairing code generation tool (whitelist-gated)
+    if !root_config.gateway.pairing_tool_allowed_channels.is_empty()
+        && !root_config.gateway.pairing_tool_allowed_users.is_empty()
+    {
+        tool_arcs.push(Arc::new(GeneratePairingCodeTool::new(
+            root_config.gateway.pairing_tool_allowed_channels.clone(),
+            root_config.gateway.pairing_tool_allowed_users.clone(),
+        )));
+    }
+
     if let Some(key) = composio_key {
         if !key.is_empty() {
             tool_arcs.push(Arc::new(ComposioTool::new(
@@ -676,10 +734,7 @@ pub fn all_tools_with_runtime(
         )
         // elfClaw: workers without explicit provider/model inherit worker_model from config
         .with_worker_model_fallback(
-            root_config
-                .default_provider
-                .as_deref()
-                .unwrap_or("gemini"),
+            root_config.default_provider.as_deref().unwrap_or("gemini"),
             root_config
                 .worker_model
                 .as_deref()
@@ -734,6 +789,7 @@ pub fn all_tools_with_runtime(
         }
 
         let subagent_registry = Arc::new(SubAgentRegistry::new());
+        let load_tracker = Arc::new(agent_load_tracker::AgentLoadTracker::new());
         tool_arcs.push(Arc::new(SubAgentSpawnTool::new(
             delegate_agents,
             delegate_fallback_credential,
@@ -742,6 +798,8 @@ pub fn all_tools_with_runtime(
             subagent_registry.clone(),
             parent_tools,
             root_config.multimodal.clone(),
+            load_tracker,
+            root_config.agent.subagents.clone(),
         )));
         tool_arcs.push(Arc::new(SubAgentListTool::new(subagent_registry.clone())));
         tool_arcs.push(Arc::new(SubAgentManageTool::new(
@@ -1184,6 +1242,9 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                enabled: true,
+                capabilities: Vec::new(),
+                priority: 0,
             },
         );
 
@@ -1269,6 +1330,9 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                enabled: true,
+                capabilities: Vec::new(),
+                priority: 0,
             },
         );
 

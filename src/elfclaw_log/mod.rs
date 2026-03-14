@@ -17,8 +17,7 @@ use tokio::sync::broadcast;
 // ── Global singletons ────────────────────────────────────────────
 
 /// Global log store (initialised once on daemon startup).
-static LOGGER: LazyLock<RwLock<Option<Arc<store::LogStore>>>> =
-    LazyLock::new(|| RwLock::new(None));
+static LOGGER: LazyLock<RwLock<Option<Arc<store::LogStore>>>> = LazyLock::new(|| RwLock::new(None));
 
 /// Global SSE event bus shared by gateway, channels, and agent.
 static GLOBAL_EVENT_TX: LazyLock<broadcast::Sender<serde_json::Value>> =
@@ -46,9 +45,7 @@ pub fn global_event_tx() -> broadcast::Sender<serde_json::Value> {
 }
 
 /// Wrap a base `Observer` with elfClaw logging + SSE broadcast.
-pub fn wrap_observer(
-    base: Box<dyn crate::observability::Observer>,
-) -> ElfClawObserver {
+pub fn wrap_observer(base: Box<dyn crate::observability::Observer>) -> ElfClawObserver {
     ElfClawObserver::new(base, global_event_tx())
 }
 
@@ -100,7 +97,11 @@ pub fn log_tool_call(
     log(LogEntry {
         id: uuid::Uuid::new_v4().to_string(),
         timestamp: chrono::Utc::now().to_rfc3339(),
-        level: if success { LogLevel::Info } else { LogLevel::Warn },
+        level: if success {
+            LogLevel::Info
+        } else {
+            LogLevel::Warn
+        },
         category: LogCategory::ToolCall,
         component: "agent_loop".into(),
         message: format!(
@@ -121,12 +122,7 @@ pub fn log_tool_call(
 }
 
 /// Log a cron job lifecycle event.
-pub fn log_cron_event(
-    job_id: &str,
-    job_name: &str,
-    event: &str,
-    details: serde_json::Value,
-) {
+pub fn log_cron_event(job_id: &str, job_name: &str, event: &str, details: serde_json::Value) {
     let level = if event == "failed" {
         LogLevel::Error
     } else {
@@ -144,12 +140,7 @@ pub fn log_cron_event(
 }
 
 /// Log a channel message event (incoming or outgoing).
-pub fn log_channel_message(
-    channel: &str,
-    direction: &str,
-    sender: &str,
-    target: &str,
-) {
+pub fn log_channel_message(channel: &str, direction: &str, sender: &str, target: &str) {
     log(LogEntry {
         id: uuid::Uuid::new_v4().to_string(),
         timestamp: chrono::Utc::now().to_rfc3339(),
@@ -184,12 +175,7 @@ pub fn log_agent_start(provider: &str, model: &str, context: &str) {
 }
 
 /// Log agent session end.
-pub fn log_agent_end(
-    provider: &str,
-    model: &str,
-    duration_ms: u64,
-    tokens: Option<u64>,
-) {
+pub fn log_agent_end(provider: &str, model: &str, duration_ms: u64, tokens: Option<u64>) {
     log(LogEntry {
         id: uuid::Uuid::new_v4().to_string(),
         timestamp: chrono::Utc::now().to_rfc3339(),
@@ -207,11 +193,7 @@ pub fn log_agent_end(
 }
 
 /// Log an error from any component.
-pub fn log_error(
-    component: &str,
-    message: &str,
-    details: serde_json::Value,
-) {
+pub fn log_error(component: &str, message: &str, details: serde_json::Value) {
     log(LogEntry {
         id: uuid::Uuid::new_v4().to_string(),
         timestamp: chrono::Utc::now().to_rfc3339(),
@@ -227,9 +209,13 @@ pub fn log_error(
 pub fn format_chat_timestamp(rfc3339_ts: &str) -> String {
     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(rfc3339_ts) {
         let local = dt.with_timezone(&chrono::Local);
-        format!("[{:02}-{:02} {:02}:{:02}]",
-            local.format("%m"), local.format("%d"),
-            local.format("%H"), local.format("%M"))
+        format!(
+            "[{:02}-{:02} {:02}:{:02}]",
+            local.format("%m"),
+            local.format("%d"),
+            local.format("%H"),
+            local.format("%M")
+        )
     } else {
         String::new()
     }
@@ -239,9 +225,13 @@ pub fn format_chat_timestamp(rfc3339_ts: &str) -> String {
 pub fn format_unix_timestamp(unix_secs: u64) -> String {
     use chrono::TimeZone;
     if let Some(dt) = chrono::Local.timestamp_opt(unix_secs as i64, 0).single() {
-        format!("[{:02}-{:02} {:02}:{:02}]",
-            dt.format("%m"), dt.format("%d"),
-            dt.format("%H"), dt.format("%M"))
+        format!(
+            "[{:02}-{:02} {:02}:{:02}]",
+            dt.format("%m"),
+            dt.format("%d"),
+            dt.format("%H"),
+            dt.format("%M")
+        )
     } else {
         String::new()
     }

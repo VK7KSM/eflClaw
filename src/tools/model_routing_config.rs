@@ -682,6 +682,9 @@ impl ModelRoutingConfigTool {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: DEFAULT_AGENT_MAX_ITERATIONS,
+                enabled: true,
+                capabilities: Vec::new(),
+                priority: 0,
             });
 
         next_agent.provider = Some(provider);

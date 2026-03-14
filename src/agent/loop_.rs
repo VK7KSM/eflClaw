@@ -3,7 +3,7 @@ use crate::config::Config;
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::multimodal;
 use crate::observability::{self, runtime_trace, Observer, ObserverEvent};
-use crate::providers::{self, ChatMessage, ChatRequest, Provider};
+use crate::providers::{self, ChatMessage, ChatRequest, NormalizedStopReason, Provider};
 use crate::runtime;
 use crate::security::SecurityPolicy;
 use crate::tools::{self, Tool};
@@ -40,10 +40,128 @@ const MAX_TOOL_RESULT_IN_HISTORY_CHARS: usize = 8_000;
 /// Matches the channel-side constant in `channels/mod.rs`.
 const AUTOSAVE_MIN_MESSAGE_CHARS: usize = 20;
 
+// ── Safety Heartbeat ──────────────────────────────────────────────────
+
+/// Configuration for periodic safety-constraint re-injection (heartbeat).
+/// Built from `SecurityConfig.safety_heartbeat_interval` and
+/// `SecurityPolicy::summary_for_heartbeat()`.
+#[derive(Clone)]
+pub(crate) struct SafetyHeartbeatConfig {
+    /// Pre-rendered security policy summary text.
+    pub body: String,
+    /// Inject a heartbeat every `interval` tool iterations (0 = disabled).
+    pub interval: usize,
+}
+
+/// Returns `true` when a safety heartbeat should be injected at `counter`.
+/// Injection fires on every exact multiple of `interval`, skipping the
+/// initial iteration (counter == 0).
+fn should_inject_safety_heartbeat(counter: usize, interval: usize) -> bool {
+    interval > 0 && counter > 0 && counter % interval == 0
+}
+
+// ── Non-CLI Tool Approval ─────────────────────────────────────────────
+
+/// Timeout for waiting for non-CLI approval responses.
+const NON_CLI_APPROVAL_TIMEOUT_SECS: u64 = 300;
+/// Poll interval for checking non-CLI approval resolutions.
+const NON_CLI_APPROVAL_POLL_MS: u64 = 100;
+
+/// A prompt sent to the channel for non-CLI approval.
+pub(crate) struct NonCliApprovalPrompt {
+    pub request_id: String,
+    pub tool_name: String,
+    pub arguments: serde_json::Value,
+}
+
+/// Context for non-CLI approval flow, passed into the tool loop.
+pub(crate) struct NonCliApprovalContext {
+    pub sender: String,
+    pub reply_target: String,
+    pub prompt_tx: tokio::sync::mpsc::UnboundedSender<NonCliApprovalPrompt>,
+}
+
+/// Poll-wait for a non-CLI approval decision. Returns `No` on timeout,
+/// cancellation, or if the pending request disappears.
+async fn await_non_cli_approval_decision(
+    mgr: &ApprovalManager,
+    request_id: &str,
+    sender: &str,
+    channel_name: &str,
+    reply_target: &str,
+    cancellation_token: Option<&CancellationToken>,
+) -> ApprovalResponse {
+    let started = Instant::now();
+    loop {
+        if let Some(decision) = mgr.take_non_cli_pending_resolution(request_id) {
+            return decision;
+        }
+        if !mgr.has_non_cli_pending_request(request_id) {
+            return ApprovalResponse::No;
+        }
+        if cancellation_token.is_some_and(CancellationToken::is_cancelled) {
+            return ApprovalResponse::No;
+        }
+        if started.elapsed() >= Duration::from_secs(NON_CLI_APPROVAL_TIMEOUT_SECS) {
+            let _ =
+                mgr.reject_non_cli_pending_request(request_id, sender, channel_name, reply_target);
+            let _ = mgr.take_non_cli_pending_resolution(request_id);
+            return ApprovalResponse::No;
+        }
+        tokio::time::sleep(Duration::from_millis(NON_CLI_APPROVAL_POLL_MS)).await;
+    }
+}
+
+// ── MaxTokens Auto-Continuation ──────────────────────────────────────
+
+/// Maximum number of continuation attempts when output is truncated.
+const MAX_TOKENS_CONTINUATION_MAX_ATTEMPTS: usize = 3;
+/// Maximum total output characters across all continuations.
+const MAX_TOKENS_CONTINUATION_MAX_OUTPUT_CHARS: usize = 120_000;
+/// Prompt injected to request the model continues from where it left off.
+const MAX_TOKENS_CONTINUATION_PROMPT: &str = "Previous response was truncated by token limit.\n\
+    Continue exactly from where you left off.\n\
+    If you intended a tool call, emit one complete tool call payload only.\n\
+    Do not repeat already-sent text.";
+
+/// Smart text merging with overlap deduplication.
+fn merge_continuation_text(existing: &str, continuation: &str) -> String {
+    if continuation.is_empty() {
+        return existing.to_string();
+    }
+    if existing.is_empty() {
+        return continuation.to_string();
+    }
+    // Check if continuation is fully contained in existing
+    if existing.ends_with(continuation) {
+        return existing.to_string();
+    }
+    // Look for overlap: existing tail == continuation head
+    let max_overlap = existing.len().min(continuation.len());
+    for overlap_len in (1..=max_overlap).rev() {
+        if existing.ends_with(&continuation[..overlap_len]) {
+            return format!("{}{}", existing, &continuation[overlap_len..]);
+        }
+    }
+    // No overlap — simple concatenation
+    format!("{}{}", existing, continuation)
+}
+
+fn add_optional_u64(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x.saturating_add(y)),
+        (Some(x), None) | (None, Some(x)) => Some(x),
+        (None, None) => None,
+    }
+}
+
 /// Returns true if the provider should be treated as vision-capable.
 /// Includes a guardrail for anthropic routes that may report false negatives
 /// on capability probing even though Claude models accept image inputs.
-fn should_treat_provider_as_vision_capable(provider_name: &str, provider: &dyn crate::providers::Provider) -> bool {
+fn should_treat_provider_as_vision_capable(
+    provider_name: &str,
+    provider: &dyn crate::providers::Provider,
+) -> bool {
     if provider.supports_vision() {
         return true;
     }
@@ -111,7 +229,7 @@ pub(crate) fn scrub_credentials(input: &str) -> String {
 const DEFAULT_MAX_HISTORY_MESSAGES: usize = 50;
 
 mod context;
-mod detection;
+pub(crate) mod detection;
 mod execution;
 mod history;
 mod parsing;
@@ -291,6 +409,9 @@ pub(crate) async fn agent_turn(
         None,
         None,
         &[],
+        None,
+        None,
+        None,
     )
     .await
 }
@@ -327,6 +448,9 @@ pub(crate) async fn run_tool_call_loop(
     on_delta: Option<tokio::sync::mpsc::Sender<String>>,
     hooks: Option<&crate::hooks::HookRunner>,
     excluded_tools: &[String],
+    safety_heartbeat: Option<&SafetyHeartbeatConfig>,
+    non_cli_approval: Option<&NonCliApprovalContext>,
+    loop_detection_config: Option<LoopDetectionConfig>,
 ) -> Result<String> {
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
@@ -344,8 +468,8 @@ pub(crate) async fn run_tool_call_loop(
     let mut last_response_text = String::new();
     let mut missing_tool_call_retry_used = false;
     let mut missing_tool_call_retry_prompt: Option<String> = None;
-    // elfClaw: activate loop detection — detection.rs was dead code, now wired in
-    let mut loop_detector = LoopDetector::new(LoopDetectionConfig::default());
+    // elfClaw: activate loop detection — uses config when provided, otherwise defaults
+    let mut loop_detector = LoopDetector::new(loop_detection_config.unwrap_or_default());
     // When Some, signals a HardStop verdict; checked after inner tool-result loop
     let mut loop_hard_stop: Option<String> = None;
     // elfClaw: Fix 2 — action tools successfully invoked this turn; excluded from next LLM call
@@ -362,11 +486,24 @@ pub(crate) async fn run_tool_call_loop(
             return Err(ToolLoopCancelled.into());
         }
 
+        // ── Safety heartbeat: periodic security-constraint re-injection ──
+        if let Some(hb) = safety_heartbeat {
+            if should_inject_safety_heartbeat(iteration, hb.interval) {
+                history.push(ChatMessage::user(format!(
+                    "[Safety Heartbeat — round {}/{}]\n{}",
+                    iteration + 1,
+                    max_iterations,
+                    hb.body
+                )));
+            }
+        }
+
         // Early capability check: if the current history contains image markers but the
         // provider does not support vision input, return a structured capability error.
         // The channel layer catches ProviderCapabilityError and sends a user-friendly reply.
         let image_marker_count = crate::multimodal::count_image_markers(history);
-        let provider_supports_vision = should_treat_provider_as_vision_capable(provider_name, provider);
+        let provider_supports_vision =
+            should_treat_provider_as_vision_capable(provider_name, provider);
         if image_marker_count > 0 && !provider_supports_vision {
             return Err(crate::providers::ProviderCapabilityError {
                 provider: provider_name.to_string(),
@@ -393,7 +530,10 @@ pub(crate) async fn run_tool_call_loop(
                 clean.trim().len()
             })
             .unwrap_or(0);
-        tracing::debug!(caption_chars = caption_chars_before, "before multimodal prepare");
+        tracing::debug!(
+            caption_chars = caption_chars_before,
+            "before multimodal prepare"
+        );
 
         let prepared_messages =
             match multimodal::prepare_messages_for_provider(&stripped, multimodal_config).await {
@@ -418,8 +558,7 @@ pub(crate) async fn run_tool_call_loop(
                         error = %e,
                         "Multimodal image preparation failed; falling back to text-only"
                     );
-                    let text_only =
-                        crate::multimodal::strip_all_image_markers_with_note(&stripped);
+                    let text_only = crate::multimodal::strip_all_image_markers_with_note(&stripped);
                     multimodal::PreparedMessages {
                         messages: text_only,
                         contains_images: false,
@@ -474,17 +613,16 @@ pub(crate) async fn run_tool_call_loop(
         // (OpenAI/Anthropic/OpenRouter/compatible adapters) is honored.
         // elfClaw: Fix 2 — compute per-iteration tool list; exclude action tools already used this turn.
         // Gemini cannot call an action tool it cannot see in the tool_specs.
-        let turn_tool_specs: Vec<crate::tools::ToolSpec> = if !use_native_tools
-            || used_action_tools.is_empty()
-        {
-            tool_specs.clone()
-        } else {
-            tool_specs
-                .iter()
-                .filter(|s| !used_action_tools.contains(&s.name))
-                .cloned()
-                .collect()
-        };
+        let turn_tool_specs: Vec<crate::tools::ToolSpec> =
+            if !use_native_tools || used_action_tools.is_empty() {
+                tool_specs.clone()
+            } else {
+                tool_specs
+                    .iter()
+                    .filter(|s| !used_action_tools.contains(&s.name))
+                    .cloned()
+                    .collect()
+            };
         let request_tools = if use_native_tools && !turn_tool_specs.is_empty() {
             Some(turn_tool_specs.as_slice())
         } else {
@@ -507,6 +645,83 @@ pub(crate) async fn run_tool_call_loop(
             }
         } else {
             chat_future.await
+        };
+
+        // MaxTokens auto-continuation: when the response was truncated and has
+        // no tool calls, automatically request continuation up to the limit.
+        let chat_result = match chat_result {
+            Ok(mut resp)
+                if resp.stop_reason == Some(NormalizedStopReason::MaxTokens)
+                    && !resp.has_tool_calls() =>
+            {
+                let mut accumulated_text = resp.text_or_empty().to_string();
+                let mut total_chars = accumulated_text.chars().count();
+                let mut continuation_attempts = 0usize;
+                let mut cumulative_usage = resp.usage.clone();
+
+                while resp.stop_reason == Some(NormalizedStopReason::MaxTokens)
+                    && !resp.has_tool_calls()
+                    && continuation_attempts < MAX_TOKENS_CONTINUATION_MAX_ATTEMPTS
+                    && total_chars < MAX_TOKENS_CONTINUATION_MAX_OUTPUT_CHARS
+                {
+                    continuation_attempts += 1;
+                    tracing::info!(
+                        "MaxTokens continuation attempt {}/{} (chars so far: {})",
+                        continuation_attempts,
+                        MAX_TOKENS_CONTINUATION_MAX_ATTEMPTS,
+                        total_chars
+                    );
+                    // Build continuation messages: original history + assistant partial + continuation prompt
+                    let mut cont_messages = request_messages.clone();
+                    cont_messages.push(ChatMessage::assistant(&accumulated_text));
+                    cont_messages.push(ChatMessage::user(MAX_TOKENS_CONTINUATION_PROMPT));
+
+                    let cont_result = provider
+                        .chat(
+                            ChatRequest {
+                                messages: &cont_messages,
+                                tools: request_tools,
+                            },
+                            model,
+                            temperature,
+                        )
+                        .await;
+
+                    match cont_result {
+                        Ok(cont_resp) => {
+                            let cont_text = cont_resp.text_or_empty().to_string();
+                            accumulated_text =
+                                merge_continuation_text(&accumulated_text, &cont_text);
+                            total_chars = accumulated_text.chars().count();
+
+                            // Accumulate usage
+                            if let Some(ref cont_usage) = cont_resp.usage {
+                                cumulative_usage = Some(crate::providers::traits::TokenUsage {
+                                    input_tokens: add_optional_u64(
+                                        cumulative_usage.as_ref().and_then(|u| u.input_tokens),
+                                        cont_usage.input_tokens,
+                                    ),
+                                    output_tokens: add_optional_u64(
+                                        cumulative_usage.as_ref().and_then(|u| u.output_tokens),
+                                        cont_usage.output_tokens,
+                                    ),
+                                });
+                            }
+                            resp = cont_resp;
+                        }
+                        Err(e) => {
+                            tracing::warn!("MaxTokens continuation failed: {e}");
+                            break;
+                        }
+                    }
+                }
+
+                // Rebuild final response with accumulated text
+                resp.text = Some(accumulated_text);
+                resp.usage = cumulative_usage;
+                Ok(resp)
+            }
+            other => other,
         };
 
         let (response_text, parsed_text, tool_calls, assistant_history_content, native_tool_calls) =
@@ -822,17 +1037,53 @@ pub(crate) async fn run_tool_call_loop(
 
             // ── Approval hook ────────────────────────────────
             if let Some(mgr) = approval {
-                if mgr.needs_approval(&tool_name) {
+                // Check session-level bypass first (one-time token or session grant)
+                let non_cli_session_granted =
+                    channel_name != "cli" && mgr.is_non_cli_session_granted(&tool_name);
+                let bypass_non_cli = channel_name != "cli" && mgr.consume_non_cli_allow_all_once();
+
+                if bypass_non_cli || non_cli_session_granted {
+                    // Bypass: auto-approve and record
+                    mgr.record_decision(
+                        &tool_name,
+                        &tool_args,
+                        ApprovalResponse::Yes,
+                        channel_name,
+                    );
+                } else if mgr.needs_approval(&tool_name) {
                     let request = ApprovalRequest {
                         tool_name: tool_name.clone(),
                         arguments: tool_args.clone(),
                     };
 
-                    // Only prompt interactively on CLI; auto-approve on other channels.
                     let decision = if channel_name == "cli" {
                         mgr.prompt_cli(&request)
+                    } else if let Some(ctx) = non_cli_approval {
+                        // Non-CLI: create pending request and poll for resolution
+                        let pending = mgr.create_non_cli_pending_request(
+                            &tool_name,
+                            &ctx.sender,
+                            channel_name,
+                            &ctx.reply_target,
+                            Some(format!("Tool `{tool_name}` requires approval")),
+                        );
+                        let _ = ctx.prompt_tx.send(NonCliApprovalPrompt {
+                            request_id: pending.request_id.clone(),
+                            tool_name: tool_name.clone(),
+                            arguments: tool_args.clone(),
+                        });
+                        await_non_cli_approval_decision(
+                            mgr,
+                            &pending.request_id,
+                            &ctx.sender,
+                            channel_name,
+                            &ctx.reply_target,
+                            cancellation_token.as_ref(),
+                        )
+                        .await
                     } else {
-                        ApprovalResponse::Yes
+                        // No approval context available: fail closed
+                        ApprovalResponse::No
                     };
 
                     mgr.record_decision(&tool_name, &tool_args, decision, channel_name);
@@ -1039,10 +1290,11 @@ pub(crate) async fn run_tool_call_loop(
                 }
                 error_report.push('\n');
             }
-            error_report.push_str(
-                "教训: 上述工具在当前环境下不可用或参数有误，请勿重试相同操作。"
+            error_report.push_str("教训: 上述工具在当前环境下不可用或参数有误，请勿重试相同操作。");
+            tracing::info!(
+                "Loop detection hard stop — failure summary:\n{}",
+                error_report
             );
-            tracing::info!("Loop detection hard stop — failure summary:\n{}", error_report);
 
             last_response_text = format!(
                 "⚠️ [循环检测：已停止。原因：{}]\n\n📋 失败摘要：\n{}",
@@ -1344,7 +1596,8 @@ pub async fn run(
     let skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
 
     // elfClaw: register SKILL.toml tools (web_scrape, web_crawl, web_login, etc.)
-    let skill_tools = crate::skills::create_skill_tools(&skills, Arc::clone(&security), &config.workspace_dir);
+    let skill_tools =
+        crate::skills::create_skill_tools(&skills, Arc::clone(&security), &config.workspace_dir);
     if !skill_tools.is_empty() {
         tracing::info!(count = skill_tools.len(), "Skill tools registered");
         tools_registry.extend(skill_tools);
@@ -1548,6 +1801,15 @@ pub async fn run(
             ChatMessage::user(&enriched),
         ];
 
+        let safety_hb = if config.agent.safety_heartbeat_interval > 0 {
+            Some(SafetyHeartbeatConfig {
+                body: security.summary_for_heartbeat(),
+                interval: config.agent.safety_heartbeat_interval,
+            })
+        } else {
+            None
+        };
+
         let response = run_tool_call_loop(
             provider.as_ref(),
             &mut history,
@@ -1565,6 +1827,15 @@ pub async fn run(
             None,
             None,
             &[],
+            safety_hb.as_ref(),
+            None,
+            Some(LoopDetectionConfig {
+                no_progress_threshold: config.agent.loop_detection_no_progress_threshold,
+                ping_pong_cycles: config.agent.loop_detection_ping_pong_cycles,
+                failure_streak_threshold: config.agent.loop_detection_failure_streak,
+                total_failure_budget: config.agent.loop_detection_total_failure_budget,
+                ..Default::default()
+            }),
         )
         .await?;
         final_output = response.clone();
@@ -1577,6 +1848,17 @@ pub async fn run(
 
         // Persistent conversation history across turns
         let mut history = vec![ChatMessage::system(&system_prompt)];
+        let mut interactive_turn: usize = 0;
+
+        // Build safety heartbeat config once for the interactive session
+        let interactive_safety_hb = if config.agent.safety_heartbeat_interval > 0 {
+            Some(SafetyHeartbeatConfig {
+                body: security.summary_for_heartbeat(),
+                interval: config.agent.safety_heartbeat_interval,
+            })
+        } else {
+            None
+        };
 
         loop {
             print!("> ");
@@ -1670,6 +1952,19 @@ pub async fn run(
 
             history.push(ChatMessage::user(&enriched));
 
+            // Interactive safety heartbeat at configured turn intervals
+            interactive_turn += 1;
+            if should_inject_safety_heartbeat(
+                interactive_turn,
+                config.agent.safety_heartbeat_turn_interval,
+            ) {
+                history.push(ChatMessage::user(format!(
+                    "[Safety Heartbeat — turn {}]\n{}",
+                    interactive_turn,
+                    security.summary_for_heartbeat()
+                )));
+            }
+
             let response = match run_tool_call_loop(
                 provider.as_ref(),
                 &mut history,
@@ -1687,6 +1982,15 @@ pub async fn run(
                 None,
                 None,
                 &[],
+                interactive_safety_hb.as_ref(),
+                None,
+                Some(LoopDetectionConfig {
+                    no_progress_threshold: config.agent.loop_detection_no_progress_threshold,
+                    ping_pong_cycles: config.agent.loop_detection_ping_pong_cycles,
+                    failure_streak_threshold: config.agent.loop_detection_failure_streak,
+                    total_failure_budget: config.agent.loop_detection_total_failure_budget,
+                    ..Default::default()
+                }),
             )
             .await
             {
@@ -1742,8 +2046,9 @@ pub async fn run(
 /// Used by channels (Telegram, Discord, etc.) to enable hardware and tool use.
 pub async fn process_message(config: Config, message: &str) -> Result<String> {
     // elfClaw: wrap observer with ElfClawObserver for SQLite logging + SSE broadcast
-    let observer: Arc<dyn Observer> =
-        Arc::new(crate::elfclaw_log::wrap_observer(observability::create_observer(&config.observability)));
+    let observer: Arc<dyn Observer> = Arc::new(crate::elfclaw_log::wrap_observer(
+        observability::create_observer(&config.observability),
+    ));
     let runtime: Arc<dyn runtime::RuntimeAdapter> =
         Arc::from(runtime::create_runtime(&config.runtime)?);
     let security = Arc::new(SecurityPolicy::from_config(
@@ -1827,9 +2132,13 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     let skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
 
     // elfClaw: register SKILL.toml tools (web_scrape, web_crawl, web_login, etc.)
-    let skill_tools = crate::skills::create_skill_tools(&skills, Arc::clone(&security), &config.workspace_dir);
+    let skill_tools =
+        crate::skills::create_skill_tools(&skills, Arc::clone(&security), &config.workspace_dir);
     if !skill_tools.is_empty() {
-        tracing::info!(count = skill_tools.len(), "Skill tools registered in process_message");
+        tracing::info!(
+            count = skill_tools.len(),
+            "Skill tools registered in process_message"
+        );
         tools_registry.extend(skill_tools);
     }
 
@@ -2033,6 +2342,8 @@ mod tests {
                 usage: None,
                 reasoning_content: None,
                 quota_metadata: None,
+                stop_reason: None,
+                raw_stop_reason: None,
             })
         }
     }
@@ -2052,6 +2363,8 @@ mod tests {
                     usage: None,
                     reasoning_content: None,
                     quota_metadata: None,
+                    stop_reason: None,
+                    raw_stop_reason: None,
                 })
                 .collect();
             Self {
@@ -2246,6 +2559,9 @@ mod tests {
             None,
             None,
             &[],
+            None,
+            None,
+            None,
         )
         .await
         .expect_err("provider without vision support should fail");
@@ -2256,9 +2572,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_tool_call_loop_rejects_oversized_image_payload() {
+    async fn run_tool_call_loop_degrades_oversized_image_to_text() {
+        // VisionProvider bails when no image markers are present, but the
+        // fallback provider below tolerates text-only messages, allowing us to
+        // verify that the oversized image is stripped and the call succeeds.
+        struct FallbackProvider {
+            calls: Arc<AtomicUsize>,
+        }
+        #[async_trait]
+        impl Provider for FallbackProvider {
+            fn capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities {
+                    native_tool_calling: false,
+                    vision: true,
+                }
+            }
+            async fn chat_with_system(
+                &self,
+                _sys: Option<&str>,
+                _msg: &str,
+                _model: &str,
+                _temp: f64,
+            ) -> anyhow::Result<String> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok("fallback-ok".into())
+            }
+            async fn chat(
+                &self,
+                _request: ChatRequest<'_>,
+                _model: &str,
+                _temp: f64,
+            ) -> anyhow::Result<ChatResponse> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(ChatResponse {
+                    text: Some("fallback-ok".into()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                    quota_metadata: None,
+                    stop_reason: None,
+                    raw_stop_reason: None,
+                })
+            }
+        }
+
         let calls = Arc::new(AtomicUsize::new(0));
-        let provider = VisionProvider {
+        let provider = FallbackProvider {
             calls: Arc::clone(&calls),
         };
 
@@ -2275,7 +2634,8 @@ mod tests {
             allow_remote_fetch: false,
         };
 
-        let err = run_tool_call_loop(
+        // Oversized image should be gracefully degraded to text-only, not error.
+        let result = run_tool_call_loop(
             &provider,
             &mut history,
             &tools_registry,
@@ -2292,14 +2652,16 @@ mod tests {
             None,
             None,
             &[],
+            None,
+            None,
+            None,
         )
         .await
-        .expect_err("oversized payload must fail");
+        .expect("oversized image should degrade gracefully, not error");
 
-        assert!(err
-            .to_string()
-            .contains("multimodal image size limit exceeded"));
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(result, "fallback-ok");
+        // Provider was still called (with stripped text-only message).
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -2332,6 +2694,9 @@ mod tests {
             None,
             None,
             &[],
+            None,
+            None,
+            None,
         )
         .await
         .expect("valid multimodal payload should pass");
@@ -2458,6 +2823,9 @@ mod tests {
             None,
             None,
             &[],
+            None,
+            None,
+            None,
         )
         .await
         .expect("parallel execution should complete");
@@ -2527,6 +2895,9 @@ mod tests {
             None,
             None,
             &[],
+            None,
+            None,
+            None,
         )
         .await
         .expect("loop should finish after deduplicating repeated calls");
@@ -2583,6 +2954,9 @@ mod tests {
             None,
             None,
             &[],
+            None,
+            None,
+            None,
         )
         .await
         .expect("native fallback id flow should complete");
@@ -4237,12 +4611,172 @@ Let me check the result."#;
 
     #[test]
     fn resolve_model_no_config_uses_builtin_fallback() {
-        let result = resolve_model_for_context(
-            None,
-            None,
-            None,
-            crate::agent::RunContext::Interactive,
-        );
+        let result =
+            resolve_model_for_context(None, None, None, crate::agent::RunContext::Interactive);
         assert_eq!(result, "anthropic/claude-sonnet-4");
+    }
+
+    // ── Safety Heartbeat tests ────────────────────────────────────────────
+
+    #[test]
+    fn safety_heartbeat_interval_zero_disables_injection() {
+        for counter in 0..10 {
+            assert!(
+                !should_inject_safety_heartbeat(counter, 0),
+                "interval=0 should never inject at counter={counter}"
+            );
+        }
+    }
+
+    #[test]
+    fn safety_heartbeat_skips_initial_iteration() {
+        // counter=0 should never inject, regardless of interval
+        assert!(!should_inject_safety_heartbeat(0, 1));
+        assert!(!should_inject_safety_heartbeat(0, 5));
+        assert!(!should_inject_safety_heartbeat(0, 100));
+    }
+
+    #[test]
+    fn safety_heartbeat_fires_on_exact_multiples() {
+        let interval = 5;
+        let injected: Vec<usize> = (0..=20)
+            .filter(|c| should_inject_safety_heartbeat(*c, interval))
+            .collect();
+        assert_eq!(injected, vec![5, 10, 15, 20]);
+
+        // Also verify interval=1 fires every non-zero step
+        let injected_1: Vec<usize> = (0..=5)
+            .filter(|c| should_inject_safety_heartbeat(*c, 1))
+            .collect();
+        assert_eq!(injected_1, vec![1, 2, 3, 4, 5]);
+    }
+
+    // ── Non-CLI Approval tests ────────────────────────────────────────────
+
+    fn test_supervised_autonomy_config() -> crate::config::AutonomyConfig {
+        crate::config::AutonomyConfig {
+            level: crate::security::AutonomyLevel::Supervised,
+            auto_approve: vec!["file_read".into()],
+            always_ask: vec!["shell".into()],
+            ..crate::config::AutonomyConfig::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn await_approval_timeout_returns_no() {
+        let config = test_supervised_autonomy_config();
+        let mgr = ApprovalManager::from_config(&config);
+        let pending = mgr.create_non_cli_pending_request(
+            "shell",
+            "user1",
+            "telegram",
+            "12345",
+            Some("test".to_string()),
+        );
+        // Wrap in a short timeout to verify poll loop works
+        let result = tokio::time::timeout(
+            Duration::from_millis(200),
+            await_non_cli_approval_decision(
+                &mgr,
+                &pending.request_id,
+                "user1",
+                "telegram",
+                "12345",
+                None,
+            ),
+        )
+        .await;
+        // The inner function has a 300s timeout, so our 200ms wrapper should fire first
+        assert!(result.is_err(), "Should timeout waiting for resolution");
+    }
+
+    #[tokio::test]
+    async fn await_approval_receives_resolution() {
+        let config = test_supervised_autonomy_config();
+        let mgr = ApprovalManager::from_config(&config);
+        let pending = mgr.create_non_cli_pending_request(
+            "shell",
+            "user1",
+            "telegram",
+            "12345",
+            Some("test".to_string()),
+        );
+        // Resolve immediately via record
+        mgr.record_non_cli_pending_resolution(&pending.request_id, ApprovalResponse::Yes);
+        let result = await_non_cli_approval_decision(
+            &mgr,
+            &pending.request_id,
+            "user1",
+            "telegram",
+            "12345",
+            None,
+        )
+        .await;
+        assert_eq!(result, ApprovalResponse::Yes);
+    }
+
+    #[tokio::test]
+    async fn await_approval_cancellation_returns_no() {
+        let config = test_supervised_autonomy_config();
+        let mgr = ApprovalManager::from_config(&config);
+        let pending = mgr.create_non_cli_pending_request(
+            "shell",
+            "user1",
+            "telegram",
+            "12345",
+            Some("test".to_string()),
+        );
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let result = await_non_cli_approval_decision(
+            &mgr,
+            &pending.request_id,
+            "user1",
+            "telegram",
+            "12345",
+            Some(&cancel),
+        )
+        .await;
+        assert_eq!(result, ApprovalResponse::No);
+    }
+
+    // ── NormalizedStopReason / MaxTokens continuation tests ──────────────
+
+    #[test]
+    fn merge_continuation_detects_overlap() {
+        // Tail of existing == head of continuation
+        let merged =
+            merge_continuation_text("Hello, world! This is a te", "a test of continuation.");
+        assert_eq!(merged, "Hello, world! This is a test of continuation.");
+    }
+
+    #[test]
+    fn merge_continuation_simple_concat() {
+        // No overlap — simple concatenation
+        let merged = merge_continuation_text("Part one. ", "Part two.");
+        assert_eq!(merged, "Part one. Part two.");
+    }
+
+    #[test]
+    fn merge_continuation_empty_inputs() {
+        assert_eq!(merge_continuation_text("existing", ""), "existing");
+        assert_eq!(merge_continuation_text("", "continuation"), "continuation");
+        assert_eq!(merge_continuation_text("", ""), "");
+    }
+
+    #[test]
+    fn merge_continuation_full_duplicate() {
+        // Continuation is entirely contained in existing tail
+        let merged = merge_continuation_text("Hello, world!", "world!");
+        assert_eq!(merged, "Hello, world!");
+    }
+
+    #[test]
+    fn add_optional_u64_saturating_works() {
+        assert_eq!(add_optional_u64(Some(10), Some(20)), Some(30));
+        assert_eq!(add_optional_u64(Some(10), None), Some(10));
+        assert_eq!(add_optional_u64(None, Some(20)), Some(20));
+        assert_eq!(add_optional_u64(None, None), None);
+        assert_eq!(add_optional_u64(Some(u64::MAX), Some(1)), Some(u64::MAX));
     }
 }

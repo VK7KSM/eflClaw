@@ -276,7 +276,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
             false,
             Some(config.heartbeat.max_tool_iterations),
             crate::agent::RunContext::Background, // elfClaw: heartbeat uses worker_model
-            None, // elfClaw: no tool filtering for heartbeat
+            None,                                 // elfClaw: no tool filtering for heartbeat
         )
         .await
         {
@@ -310,7 +310,11 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                 crate::health::mark_component_error("heartbeat", e.to_string());
                 tracing::warn!("Heartbeat task failed: {e}");
                 // elfClaw: log heartbeat failure
-                crate::elfclaw_log::log_error("heartbeat", &format!("Heartbeat failed: {e}"), serde_json::json!({}));
+                crate::elfclaw_log::log_error(
+                    "heartbeat",
+                    &format!("Heartbeat failed: {e}"),
+                    serde_json::json!({}),
+                );
             }
         }
 

@@ -1,6 +1,6 @@
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    Provider, TokenUsage, ToolCall as ProviderToolCall,
+    NormalizedStopReason, Provider, TokenUsage, ToolCall as ProviderToolCall,
 };
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
@@ -145,6 +145,8 @@ struct UsageInfo {
 #[derive(Debug, Deserialize)]
 struct NativeChoice {
     message: NativeResponseMessage,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -303,6 +305,8 @@ impl OpenAiProvider {
             usage: None,
             reasoning_content,
             quota_metadata: None,
+            stop_reason: None,
+            raw_stop_reason: None,
         }
     }
 
@@ -408,15 +412,19 @@ impl Provider for OpenAiProvider {
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,
         });
-        let message = native_response
+        let choice = native_response
             .choices
             .into_iter()
             .next()
-            .map(|c| c.message)
             .ok_or_else(|| anyhow::anyhow!("No response from OpenAI"))?;
-        let mut result = Self::parse_native_response(message);
+        let raw_stop_reason = choice.finish_reason.clone();
+        let mut result = Self::parse_native_response(choice.message);
         result.usage = usage;
         result.quota_metadata = quota_metadata;
+        result.raw_stop_reason = raw_stop_reason.clone();
+        result.stop_reason = raw_stop_reason
+            .as_deref()
+            .map(NormalizedStopReason::from_openai_finish_reason);
         Ok(result)
     }
 
@@ -477,15 +485,19 @@ impl Provider for OpenAiProvider {
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,
         });
-        let message = native_response
+        let choice = native_response
             .choices
             .into_iter()
             .next()
-            .map(|c| c.message)
             .ok_or_else(|| anyhow::anyhow!("No response from OpenAI"))?;
-        let mut result = Self::parse_native_response(message);
+        let raw_stop_reason = choice.finish_reason.clone();
+        let mut result = Self::parse_native_response(choice.message);
         result.usage = usage;
         result.quota_metadata = quota_metadata;
+        result.raw_stop_reason = raw_stop_reason.clone();
+        result.stop_reason = raw_stop_reason
+            .as_deref()
+            .map(NormalizedStopReason::from_openai_finish_reason);
         Ok(result)
     }
 

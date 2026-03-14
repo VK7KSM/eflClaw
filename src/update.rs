@@ -5,6 +5,8 @@
 use anyhow::{bail, Context, Result};
 use std::env;
 use std::fs;
+// Used in #[cfg(unix)] code path for backup file cleanup
+#[allow(unused_imports)]
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::Command;

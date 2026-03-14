@@ -651,6 +651,8 @@ impl Provider for OllamaProvider {
                 usage,
                 reasoning_content: None,
                 quota_metadata: None,
+                stop_reason: None,
+                raw_stop_reason: None,
             });
         }
 
@@ -670,6 +672,8 @@ impl Provider for OllamaProvider {
             usage,
             reasoning_content: None,
             quota_metadata: None,
+            stop_reason: None,
+            raw_stop_reason: None,
         })
     }
 
@@ -718,6 +722,8 @@ impl Provider for OllamaProvider {
             usage: None,
             reasoning_content: None,
             quota_metadata: None,
+            stop_reason: None,
+            raw_stop_reason: None,
         })
     }
 }

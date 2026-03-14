@@ -168,9 +168,9 @@ impl OpenAiCodexProvider {
             gateway_api_key: gateway_api_key.map(ToString::to_string),
             reasoning_level: options.reasoning_level.and_then(|lvl| match lvl {
                 0 | 1 => Some("low".to_string()),
-                2     => Some("medium".to_string()),
+                2 => Some("medium".to_string()),
                 3 | 4 => Some("high".to_string()),
-                _     => None,
+                _ => None,
             }),
             client: Client::builder()
                 .timeout(std::time::Duration::from_secs(120))

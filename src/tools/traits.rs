@@ -1,5 +1,23 @@
 use async_trait::async_trait;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+
+// elfClaw: unified tool risk tier for permission management (elfClaw original).
+// Used by default_tool_risk_tiers() in mod.rs and AutonomyConfig.tool_overrides
+// in config/schema.rs. The Tool trait is NOT modified — risk tier is a deployment
+// policy concern, not a tool-intrinsic property.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolRiskTier {
+    /// No approval needed, visible on all channels.
+    Safe,
+    /// Approval needed in supervised mode, visible on all channels.
+    Standard,
+    /// Always requires approval (ignores session allowlist), visible on all channels.
+    Sensitive,
+    /// Hidden from non-CLI channels, approval needed in supervised mode.
+    Restricted,
+}
 
 /// Result of a tool execution
 #[derive(Debug, Clone, Serialize, Deserialize)]

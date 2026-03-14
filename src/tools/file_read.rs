@@ -936,6 +936,8 @@ mod tests {
                         usage: None,
                         reasoning_content: None,
                         quota_metadata: None,
+                        stop_reason: None,
+                        raw_stop_reason: None,
                     });
                 }
                 Ok(guard.remove(0))
@@ -998,6 +1000,8 @@ mod tests {
                 usage: None,
                 reasoning_content: None,
                 quota_metadata: None,
+                stop_reason: None,
+                raw_stop_reason: None,
             },
             // Turn 1 continued: provider sees tool result and answers
             ChatResponse {
@@ -1006,6 +1010,8 @@ mod tests {
                 usage: None,
                 reasoning_content: None,
                 quota_metadata: None,
+                stop_reason: None,
+                raw_stop_reason: None,
             },
         ]);
 
@@ -1094,6 +1100,8 @@ mod tests {
                 usage: None,
                 reasoning_content: None,
                 quota_metadata: None,
+                stop_reason: None,
+                raw_stop_reason: None,
             },
             ChatResponse {
                 text: Some("The file appears to be binary data.".into()),
@@ -1101,6 +1109,8 @@ mod tests {
                 usage: None,
                 reasoning_content: None,
                 quota_metadata: None,
+                stop_reason: None,
+                raw_stop_reason: None,
             },
         ]);
 

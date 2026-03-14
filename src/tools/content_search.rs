@@ -24,12 +24,20 @@ impl ContentSearchTool {
     pub fn new(security: Arc<SecurityPolicy>) -> Self {
         let has_rg = which::which("rg").is_ok();
         let has_grep = which::which("grep").is_ok();
-        Self { security, has_rg, has_grep }
+        Self {
+            security,
+            has_rg,
+            has_grep,
+        }
     }
 
     #[cfg(test)]
     fn new_with_backend(security: Arc<SecurityPolicy>, has_rg: bool) -> Self {
-        Self { security, has_rg, has_grep: false }
+        Self {
+            security,
+            has_rg,
+            has_grep: false,
+        }
     }
 }
 
@@ -277,9 +285,7 @@ impl Tool for ContentSearchTool {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some(
-                    "No search backend available (install ripgrep or grep).".into(),
-                ),
+                error: Some("No search backend available (install ripgrep or grep).".into()),
             });
         };
 
@@ -312,7 +318,11 @@ impl Tool for ContentSearchTool {
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
-                    error: Some(format!("Search timed out after {TIMEOUT_SECS} seconds.")),
+                    error: Some(format!(
+                        "Search timed out after {TIMEOUT_SECS} seconds. \
+                         Try narrowing the search: use a more specific pattern, \
+                         limit to a subdirectory (path parameter), or search for shorter keywords."
+                    )),
                 });
             }
         };

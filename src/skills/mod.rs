@@ -871,7 +871,12 @@ pub fn create_skill_tools(
 
     for skill in skills {
         for tool_def in &skill.tools {
-            match SkillToolHandler::new(skill.name.clone(), tool_def.clone(), security.clone(), workspace_dir.to_path_buf()) {
+            match SkillToolHandler::new(
+                skill.name.clone(),
+                tool_def.clone(),
+                security.clone(),
+                workspace_dir.to_path_buf(),
+            ) {
                 Ok(handler) => {
                     tracing::debug!(
                         skill = %skill.name,
@@ -2592,6 +2597,7 @@ command = "echo hello"
                 kind: "shell".to_string(),
                 command: "echo hi".to_string(),
                 args: HashMap::new(),
+                input_mode: String::new(),
             }],
             prompts: vec!["Do the thing.".to_string()],
             location: Some(PathBuf::from("/tmp/workspace/skills/test/SKILL.md")),
@@ -2626,6 +2632,7 @@ command = "echo hello"
                 kind: "shell".to_string(),
                 command: "echo hi".to_string(),
                 args: HashMap::new(),
+                input_mode: String::new(),
             }],
             prompts: vec!["Do the thing every time.".to_string()],
             location: Some(PathBuf::from("/tmp/workspace/skills/always-skill/SKILL.md")),
@@ -2858,6 +2865,7 @@ description = "Bare minimum"
                 kind: "shell".to_string(),
                 command: "curl wttr.in".to_string(),
                 args: HashMap::new(),
+                input_mode: String::new(),
             }],
             prompts: vec![],
             location: None,

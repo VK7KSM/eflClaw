@@ -34,6 +34,7 @@ impl Observer for LogObserver {
                 tool,
                 duration,
                 success,
+                ..
             } => {
                 let ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
                 info!(tool = %tool, duration_ms = ms, success = success, "tool.call");
@@ -166,6 +167,8 @@ mod tests {
             tool: "shell".into(),
             duration: Duration::from_millis(10),
             success: false,
+        args: None,
+        error: None,
         });
         obs.record_event(&ObserverEvent::ChannelMessage {
             channel: "telegram".into(),

@@ -145,7 +145,12 @@ async fn execute_and_persist_job(
 
     let job_name = job.name.clone().unwrap_or_else(|| job.id.clone());
     // elfClaw: log cron job start
-    crate::elfclaw_log::log_cron_event(&job.id, &job_name, "started", serde_json::json!({"model": &job.model}));
+    crate::elfclaw_log::log_cron_event(
+        &job.id,
+        &job_name,
+        "started",
+        serde_json::json!({"model": &job.model}),
+    );
 
     let started_at = Utc::now();
     let (success, output) = Box::pin(execute_job_with_retry(config, security, job)).await;
@@ -155,9 +160,19 @@ async fn execute_and_persist_job(
 
     // elfClaw: log cron job completion/failure
     if success {
-        crate::elfclaw_log::log_cron_event(&job.id, &job_name, "completed", serde_json::json!({"duration_ms": duration_ms, "output_len": output.len()}));
+        crate::elfclaw_log::log_cron_event(
+            &job.id,
+            &job_name,
+            "completed",
+            serde_json::json!({"duration_ms": duration_ms, "output_len": output.len()}),
+        );
     } else {
-        crate::elfclaw_log::log_cron_event(&job.id, &job_name, "failed", serde_json::json!({"duration_ms": duration_ms, "error": truncate_str_safe(&output, 200)}));
+        crate::elfclaw_log::log_cron_event(
+            &job.id,
+            &job_name,
+            "failed",
+            serde_json::json!({"duration_ms": duration_ms, "error": truncate_str_safe(&output, 200)}),
+        );
     }
 
     (job.id.clone(), success, output)
@@ -200,20 +215,23 @@ async fn run_agent_job(
     );
 
     // elfClaw: build prompt and resolve agent config for delegate_to (direct execution)
-    let (prefixed_prompt, effective_allowed_tools, effective_max_iterations) =
-        if let Some(ref agent_name) = job.delegate_to {
-            // elfClaw: run named agent directly — no intermediate Agent #1
-            // Previously this created a prompt asking Agent #1 to call delegate(agent=...),
-            // wasting ~55K tokens + 2 LLM calls. Now we resolve the agent config and pass
-            // allowed_tools directly to run().
-            let agent_cfg = config.agents.get(agent_name);
-            let allowed = agent_cfg
-                .map(|c| c.allowed_tools.clone())
-                .filter(|v| !v.is_empty());
-            let max_iter = agent_cfg
-                .map(|c| c.max_iterations)
-                .unwrap_or(config.scheduler.max_tool_iterations);
-            (
+    let (prefixed_prompt, effective_allowed_tools, effective_max_iterations) = if let Some(
+        ref agent_name,
+    ) =
+        job.delegate_to
+    {
+        // elfClaw: run named agent directly — no intermediate Agent #1
+        // Previously this created a prompt asking Agent #1 to call delegate(agent=...),
+        // wasting ~55K tokens + 2 LLM calls. Now we resolve the agent config and pass
+        // allowed_tools directly to run().
+        let agent_cfg = config.agents.get(agent_name);
+        let allowed = agent_cfg
+            .map(|c| c.allowed_tools.clone())
+            .filter(|v| !v.is_empty());
+        let max_iter = agent_cfg
+            .map(|c| c.max_iterations)
+            .unwrap_or(config.scheduler.max_tool_iterations);
+        (
                 format!(
                     "[cron:{id} {name}] IMPORTANT: You are a scheduled background task (agent: {agent_name}).\n\
                      \n\
@@ -234,11 +252,11 @@ async fn run_agent_job(
                 allowed,
                 max_iter,
             )
-        } else {
-            // elfClaw: strong behavioral guidance for cron agents.
-            // Fix 12b: explicitly instruct that final text IS the user-facing delivery,
-            // prohibit empty "task completed" responses and redundant send_telegram calls.
-            (
+    } else {
+        // elfClaw: strong behavioral guidance for cron agents.
+        // Fix 12b: explicitly instruct that final text IS the user-facing delivery,
+        // prohibit empty "task completed" responses and redundant send_telegram calls.
+        (
                 format!(
                     "[cron:{id} {name}] IMPORTANT: You are a scheduled background task.\n\
                      \n\
@@ -259,7 +277,7 @@ async fn run_agent_job(
                 None,
                 config.scheduler.max_tool_iterations,
             )
-        };
+    };
     // elfClaw: cron jobs always use worker_model from current config, not the
     // model snapshot stored at creation time — see RunContext::Background resolution
     let model_override: Option<String> = None;

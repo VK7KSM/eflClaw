@@ -124,12 +124,15 @@ pub fn discover_plugins(workspace_dir: Option<&Path>, extra_paths: &[PathBuf]) -
         seen.insert(plugin.manifest.id.clone(), i);
     }
     let mut deduped: Vec<DiscoveredPlugin> = Vec::with_capacity(seen.len());
-    // Collect in insertion order of the winning index
+    // elfClaw: fix dedup index corruption — sort descending so swap_remove(i) never
+    // invalidates smaller indices that haven't been processed yet; restore order at the end.
+    // Upstream fix: sort_unstable_by(|a, b| b.cmp(a)) + deduped.reverse()
     let mut indices: Vec<usize> = seen.values().copied().collect();
-    indices.sort_unstable();
+    indices.sort_unstable_by(|a, b| b.cmp(a));
     for i in indices {
         deduped.push(all_plugins.swap_remove(i));
     }
+    deduped.reverse();
 
     DiscoveryResult {
         plugins: deduped,
@@ -196,6 +199,24 @@ version = "0.1.0"
         let (plugins, _) = super::scan_dir(&ext_dir, PluginOrigin::Workspace);
         assert_eq!(plugins.len(), 1);
         assert_eq!(plugins[0].manifest.id, "visible-plugin");
+    }
+
+    #[test]
+    fn discover_handles_multiple_plugins_without_panicking() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ext_dir = tmp.path().join("custom-plugins");
+        fs::create_dir_all(&ext_dir).unwrap();
+        make_plugin_dir(&ext_dir, "custom-one");
+        make_plugin_dir(&ext_dir, "custom-two");
+
+        let result = discover_plugins(None, &[ext_dir]);
+        let ids: std::collections::HashSet<String> = result
+            .plugins
+            .iter()
+            .map(|p| p.manifest.id.clone())
+            .collect();
+        assert!(ids.contains("custom-one"));
+        assert!(ids.contains("custom-two"));
     }
 
     #[test]

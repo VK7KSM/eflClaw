@@ -405,6 +405,106 @@ fn find_matching_close(s: &str) -> Option<usize> {
     None
 }
 
+// elfClaw: human-readable Chinese descriptions for tool approval prompts
+fn tool_description_zh(tool_name: &str, args: &serde_json::Value) -> String {
+    match tool_name {
+        "generate_pairing_code" => {
+            "生成新的 Web 客户端配对码（6位数字），新码将替换之前未使用的旧码。".into()
+        }
+        "shell" => {
+            let cmd = args
+                .get("command")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(unknown)");
+            format!("在系统终端执行命令：\n`{cmd}`")
+        }
+        "file_write" => {
+            let path = args
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(unknown)");
+            format!("写入文件：{path}")
+        }
+        "file_edit" => {
+            let path = args
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(unknown)");
+            format!("编辑文件：{path}")
+        }
+        "http_request" => {
+            let url = args
+                .get("url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(unknown)");
+            let method = args
+                .get("method")
+                .and_then(|v| v.as_str())
+                .unwrap_or("GET");
+            format!("发送 HTTP 请求：{method} {url}")
+        }
+        "send_email" => {
+            let to = args
+                .get("to")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(unknown)");
+            let subject = args
+                .get("subject")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            format!("发送邮件到 {to}\n主题：{subject}")
+        }
+        "send_telegram" => {
+            let chat_id = args
+                .get("chat_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(unknown)");
+            format!("通过 Telegram 发送消息到 chat {chat_id}")
+        }
+        "cron_add" => {
+            let cmd = args
+                .get("command")
+                .and_then(|v| v.as_str())
+                .or_else(|| args.get("prompt").and_then(|v| v.as_str()))
+                .unwrap_or("(unknown)");
+            let schedule = args
+                .get("schedule")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            format!("创建定时任务：{schedule}\n内容：{cmd}")
+        }
+        "cron_run" => {
+            let job_id = args
+                .get("job_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(unknown)");
+            format!("立即执行定时任务：{job_id}")
+        }
+        "cron_remove" => {
+            let job_id = args
+                .get("job_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(unknown)");
+            format!("删除定时任务：{job_id}")
+        }
+        "cron_update" => {
+            let job_id = args
+                .get("job_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(unknown)");
+            format!("修改定时任务配置：{job_id}")
+        }
+        _ => {
+            let args_str = args.to_string();
+            if args_str.len() > 200 {
+                format!("执行工具 {tool_name}")
+            } else {
+                format!("执行工具 {tool_name}\n参数：{args_str}")
+            }
+        }
+    }
+}
+
 fn parse_attachment_markers(message: &str) -> (String, Vec<TelegramAttachment>) {
     let mut cleaned = String::with_capacity(message.len());
     let mut attachments = Vec::new();
@@ -3232,26 +3332,21 @@ impl Channel for TelegramChannel {
         let (chat_id, parsed_thread_id) = Self::parse_reply_target(recipient);
         let thread_id = parsed_thread_id.or(thread_ts);
 
-        let raw_args = arguments.to_string();
-        let args_preview = if raw_args.chars().count() > 260 {
-            crate::util::truncate_with_ellipsis(&raw_args, 260)
-        } else {
-            raw_args
-        };
+        let description = tool_description_zh(tool_name, arguments);
 
         let mut body = serde_json::json!({
             "chat_id": chat_id,
             "text": format!(
-                "Approval required for tool `{tool_name}`.\nRequest ID: `{request_id}`\nArgs: `{args_preview}`",
+                "🔐 请确认以下操作\n\n{description}\n\n工具：{tool_name}",
             ),
             "reply_markup": {
                 "inline_keyboard": [[
                     {
-                        "text": "Approve",
+                        "text": "✅ 允许",
                         "callback_data": format!("{TELEGRAM_APPROVAL_CALLBACK_APPROVE_PREFIX}{request_id}")
                     },
                     {
-                        "text": "Deny",
+                        "text": "❌ 拒绝",
                         "callback_data": format!("{TELEGRAM_APPROVAL_CALLBACK_DENY_PREFIX}{request_id}")
                     }
                 ]]

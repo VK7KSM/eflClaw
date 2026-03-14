@@ -69,8 +69,69 @@ pub struct TokenUsage {
     pub output_tokens: Option<u64>,
 }
 
+/// Provider-agnostic stop reason. Different LLMs return different strings
+/// (OpenAI `"stop"`/`"length"`, Anthropic `"end_turn"`/`"max_tokens"`,
+/// Gemini `"STOP"`/`"MAX_TOKENS"`); this enum normalizes them into 7 standard
+/// variants for uniform downstream handling.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NormalizedStopReason {
+    EndTurn,
+    ToolCall,
+    MaxTokens,
+    ContextWindowExceeded,
+    SafetyBlocked,
+    Cancelled,
+    Unknown(String),
+}
+
+impl NormalizedStopReason {
+    pub fn from_openai_finish_reason(reason: &str) -> Self {
+        match reason {
+            "stop" => Self::EndTurn,
+            "tool_calls" => Self::ToolCall,
+            "length" | "max_tokens" => Self::MaxTokens,
+            "content_filter" => Self::SafetyBlocked,
+            "cancelled" => Self::Cancelled,
+            other => Self::Unknown(other.to_string()),
+        }
+    }
+
+    pub fn from_anthropic_stop_reason(reason: &str) -> Self {
+        match reason {
+            "end_turn" | "stop_sequence" => Self::EndTurn,
+            "tool_use" => Self::ToolCall,
+            "max_tokens" => Self::MaxTokens,
+            "model_context_window_exceeded" => Self::ContextWindowExceeded,
+            "safety" => Self::SafetyBlocked,
+            other => Self::Unknown(other.to_string()),
+        }
+    }
+
+    pub fn from_bedrock_stop_reason(reason: &str) -> Self {
+        match reason {
+            "end_turn" => Self::EndTurn,
+            "tool_use" => Self::ToolCall,
+            "max_tokens" => Self::MaxTokens,
+            "guardrail_intervened" => Self::SafetyBlocked,
+            other => Self::Unknown(other.to_string()),
+        }
+    }
+
+    pub fn from_gemini_finish_reason(reason: &str) -> Self {
+        match reason {
+            "STOP" => Self::EndTurn,
+            "MAX_TOKENS" => Self::MaxTokens,
+            "MALFORMED_FUNCTION_CALL" | "UNEXPECTED_TOOL_CALL" | "TOO_MANY_TOOL_CALLS" => {
+                Self::ToolCall
+            }
+            "SAFETY" | "RECITATION" => Self::SafetyBlocked,
+            other => Self::Unknown(other.to_string()),
+        }
+    }
+}
+
 /// An LLM response that may contain text, tool calls, or both.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ChatResponse {
     /// Text content of the response (may be empty if only tool calls).
     pub text: Option<String>,
@@ -86,6 +147,10 @@ pub struct ChatResponse {
     /// Quota metadata extracted from response headers (if available).
     /// Populated by providers that support quota tracking.
     pub quota_metadata: Option<super::quota_types::QuotaMetadata>,
+    /// Normalized stop reason from the provider.
+    pub stop_reason: Option<NormalizedStopReason>,
+    /// Raw stop/finish reason string as returned by the provider API.
+    pub raw_stop_reason: Option<String>,
 }
 
 impl ChatResponse {
@@ -380,6 +445,8 @@ pub trait Provider: Send + Sync {
                     usage: None,
                     reasoning_content: None,
                     quota_metadata: None,
+                    stop_reason: None,
+                    raw_stop_reason: None,
                 });
             }
         }
@@ -393,6 +460,8 @@ pub trait Provider: Send + Sync {
             usage: None,
             reasoning_content: None,
             quota_metadata: None,
+            stop_reason: None,
+            raw_stop_reason: None,
         })
     }
 
@@ -429,6 +498,8 @@ pub trait Provider: Send + Sync {
             usage: None,
             reasoning_content: None,
             quota_metadata: None,
+            stop_reason: None,
+            raw_stop_reason: None,
         })
     }
 
@@ -559,6 +630,8 @@ mod tests {
             usage: None,
             reasoning_content: None,
             quota_metadata: None,
+            stop_reason: None,
+            raw_stop_reason: None,
         };
         assert!(!empty.has_tool_calls());
         assert_eq!(empty.text_or_empty(), "");
@@ -574,6 +647,8 @@ mod tests {
             usage: None,
             reasoning_content: None,
             quota_metadata: None,
+            stop_reason: None,
+            raw_stop_reason: None,
         };
         assert!(with_tools.has_tool_calls());
         assert_eq!(with_tools.text_or_empty(), "Let me check");
@@ -597,6 +672,8 @@ mod tests {
             }),
             reasoning_content: None,
             quota_metadata: None,
+            stop_reason: None,
+            raw_stop_reason: None,
         };
         assert_eq!(resp.usage.as_ref().unwrap().input_tokens, Some(100));
         assert_eq!(resp.usage.as_ref().unwrap().output_tokens, Some(50));
@@ -975,5 +1052,99 @@ mod tests {
         let message = err.to_string();
 
         assert!(message.contains("non-prompt-guided"));
+    }
+
+    // ── NormalizedStopReason mapping tests ───────────────────────────────
+
+    #[test]
+    fn openai_finish_reason_mapping() {
+        assert_eq!(
+            NormalizedStopReason::from_openai_finish_reason("stop"),
+            NormalizedStopReason::EndTurn
+        );
+        assert_eq!(
+            NormalizedStopReason::from_openai_finish_reason("tool_calls"),
+            NormalizedStopReason::ToolCall
+        );
+        assert_eq!(
+            NormalizedStopReason::from_openai_finish_reason("length"),
+            NormalizedStopReason::MaxTokens
+        );
+        assert_eq!(
+            NormalizedStopReason::from_openai_finish_reason("max_tokens"),
+            NormalizedStopReason::MaxTokens
+        );
+        assert_eq!(
+            NormalizedStopReason::from_openai_finish_reason("content_filter"),
+            NormalizedStopReason::SafetyBlocked
+        );
+    }
+
+    #[test]
+    fn anthropic_stop_reason_mapping() {
+        assert_eq!(
+            NormalizedStopReason::from_anthropic_stop_reason("end_turn"),
+            NormalizedStopReason::EndTurn
+        );
+        assert_eq!(
+            NormalizedStopReason::from_anthropic_stop_reason("stop_sequence"),
+            NormalizedStopReason::EndTurn
+        );
+        assert_eq!(
+            NormalizedStopReason::from_anthropic_stop_reason("tool_use"),
+            NormalizedStopReason::ToolCall
+        );
+        assert_eq!(
+            NormalizedStopReason::from_anthropic_stop_reason("max_tokens"),
+            NormalizedStopReason::MaxTokens
+        );
+        assert_eq!(
+            NormalizedStopReason::from_anthropic_stop_reason("model_context_window_exceeded"),
+            NormalizedStopReason::ContextWindowExceeded
+        );
+    }
+
+    #[test]
+    fn bedrock_stop_reason_mapping() {
+        assert_eq!(
+            NormalizedStopReason::from_bedrock_stop_reason("end_turn"),
+            NormalizedStopReason::EndTurn
+        );
+        assert_eq!(
+            NormalizedStopReason::from_bedrock_stop_reason("tool_use"),
+            NormalizedStopReason::ToolCall
+        );
+        assert_eq!(
+            NormalizedStopReason::from_bedrock_stop_reason("guardrail_intervened"),
+            NormalizedStopReason::SafetyBlocked
+        );
+    }
+
+    #[test]
+    fn gemini_finish_reason_mapping() {
+        assert_eq!(
+            NormalizedStopReason::from_gemini_finish_reason("STOP"),
+            NormalizedStopReason::EndTurn
+        );
+        assert_eq!(
+            NormalizedStopReason::from_gemini_finish_reason("MAX_TOKENS"),
+            NormalizedStopReason::MaxTokens
+        );
+        assert_eq!(
+            NormalizedStopReason::from_gemini_finish_reason("SAFETY"),
+            NormalizedStopReason::SafetyBlocked
+        );
+    }
+
+    #[test]
+    fn unknown_reason_preserved() {
+        assert_eq!(
+            NormalizedStopReason::from_openai_finish_reason("custom_reason"),
+            NormalizedStopReason::Unknown("custom_reason".to_string())
+        );
+        assert_eq!(
+            NormalizedStopReason::from_anthropic_stop_reason("new_reason"),
+            NormalizedStopReason::Unknown("new_reason".to_string())
+        );
     }
 }

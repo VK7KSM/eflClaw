@@ -46,6 +46,10 @@ pub enum ObserverEvent {
         tool: String,
         duration: Duration,
         success: bool,
+        /// elfClaw: tool call arguments summary (truncated to 200 chars).
+        args: Option<String>,
+        /// elfClaw: error message summary when `success == false` (truncated to 200 chars).
+        error: Option<String>,
     },
     /// The agent produced a final answer for the current user message.
     TurnComplete,
@@ -188,6 +192,8 @@ mod tests {
             tool: "shell".into(),
             duration: Duration::from_millis(10),
             success: true,
+            args: None,
+            error: None,
         };
         let metric = ObserverMetric::RequestLatency(Duration::from_millis(8));
 

@@ -492,6 +492,15 @@ pub struct DelegateAgentConfig {
     /// Maximum tool-call iterations in agentic mode.
     #[serde(default = "default_max_tool_iterations")]
     pub max_iterations: usize,
+    /// Whether this delegate profile is enabled for selection.
+    #[serde(default = "default_delegate_enabled")]
+    pub enabled: bool,
+    /// Capability tags used for automatic agent selection scoring.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    /// Priority weight for automatic selection tie-breaking. Higher = preferred.
+    #[serde(default)]
+    pub priority: i32,
 }
 
 fn default_max_depth() -> u32 {
@@ -500,6 +509,10 @@ fn default_max_depth() -> u32 {
 
 fn default_max_tool_iterations() -> usize {
     10
+}
+
+fn default_delegate_enabled() -> bool {
+    true
 }
 
 impl std::fmt::Debug for DelegateAgentConfig {
@@ -514,6 +527,9 @@ impl std::fmt::Debug for DelegateAgentConfig {
             .field("agentic", &self.agentic)
             .field("allowed_tools", &self.allowed_tools)
             .field("max_iterations", &self.max_iterations)
+            .field("enabled", &self.enabled)
+            .field("capabilities", &self.capabilities)
+            .field("priority", &self.priority)
             .finish()
     }
 }
@@ -927,6 +943,172 @@ impl Default for CoordinationConfig {
     }
 }
 
+// ── Agent Load Balancing & Orchestration ────────────────────────
+
+/// Runtime load-balancing strategy for team/subagent orchestration.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentLoadBalanceStrategy {
+    /// Preserve lexical/metadata scoring priority only.
+    Semantic,
+    /// Blend semantic score with runtime load and recent outcomes.
+    #[default]
+    Adaptive,
+    /// Prioritize least-loaded healthy agents before semantic tie-breakers.
+    LeastLoaded,
+}
+
+/// Agent-team orchestration controls (`[agent.teams]` section).
+///
+/// Governs synchronous delegation (`delegate`) and team-wide coordination.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AgentTeamsConfig {
+    /// Enable agent-team delegation tools.
+    #[serde(default = "default_agent_teams_enabled")]
+    pub enabled: bool,
+    /// Allow automatic team-agent selection when a specific agent is not given.
+    #[serde(default = "default_agent_teams_auto_activate")]
+    pub auto_activate: bool,
+    /// Maximum number of delegate profiles activated as team members.
+    #[serde(default = "default_agent_teams_max_agents")]
+    pub max_agents: usize,
+    /// Runtime strategy used for automatic team-agent selection.
+    #[serde(default)]
+    pub strategy: AgentLoadBalanceStrategy,
+    /// Sliding window (seconds) used to compute recent load/failure signals.
+    #[serde(default = "default_agent_teams_load_window_secs")]
+    pub load_window_secs: usize,
+    /// Penalty multiplier applied to each currently in-flight task.
+    #[serde(default = "default_agent_teams_inflight_penalty")]
+    pub inflight_penalty: usize,
+    /// Penalty multiplier applied to recent assignment count in load window.
+    #[serde(default = "default_agent_teams_recent_selection_penalty")]
+    pub recent_selection_penalty: usize,
+    /// Penalty multiplier applied to recent failure count in load window.
+    #[serde(default = "default_agent_teams_recent_failure_penalty")]
+    pub recent_failure_penalty: usize,
+}
+
+impl Default for AgentTeamsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_agent_teams_enabled(),
+            auto_activate: default_agent_teams_auto_activate(),
+            max_agents: default_agent_teams_max_agents(),
+            strategy: AgentLoadBalanceStrategy::default(),
+            load_window_secs: default_agent_teams_load_window_secs(),
+            inflight_penalty: default_agent_teams_inflight_penalty(),
+            recent_selection_penalty: default_agent_teams_recent_selection_penalty(),
+            recent_failure_penalty: default_agent_teams_recent_failure_penalty(),
+        }
+    }
+}
+
+fn default_agent_teams_enabled() -> bool {
+    true
+}
+fn default_agent_teams_auto_activate() -> bool {
+    true
+}
+fn default_agent_teams_max_agents() -> usize {
+    32
+}
+fn default_agent_teams_load_window_secs() -> usize {
+    120
+}
+fn default_agent_teams_inflight_penalty() -> usize {
+    8
+}
+fn default_agent_teams_recent_selection_penalty() -> usize {
+    2
+}
+fn default_agent_teams_recent_failure_penalty() -> usize {
+    12
+}
+
+/// Background sub-agent orchestration controls (`[agent.subagents]` section).
+///
+/// Governs asynchronous delegation (`subagent_spawn`, `subagent_list`, `subagent_manage`).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SubAgentsConfig {
+    /// Enable background sub-agent tools.
+    #[serde(default = "default_subagents_enabled")]
+    pub enabled: bool,
+    /// Allow automatic sub-agent selection when a specific agent is not given.
+    #[serde(default = "default_subagents_auto_activate")]
+    pub auto_activate: bool,
+    /// Maximum number of concurrently running background sub-agents.
+    #[serde(default = "default_subagents_max_concurrent")]
+    pub max_concurrent: usize,
+    /// Runtime strategy used for automatic sub-agent selection.
+    #[serde(default)]
+    pub strategy: AgentLoadBalanceStrategy,
+    /// Sliding window (seconds) used to compute recent load/failure signals.
+    #[serde(default = "default_subagents_load_window_secs")]
+    pub load_window_secs: usize,
+    /// Penalty multiplier applied to each currently in-flight task.
+    #[serde(default = "default_subagents_inflight_penalty")]
+    pub inflight_penalty: usize,
+    /// Penalty multiplier applied to recent assignment count in load window.
+    #[serde(default = "default_subagents_recent_selection_penalty")]
+    pub recent_selection_penalty: usize,
+    /// Penalty multiplier applied to recent failure count in load window.
+    #[serde(default = "default_subagents_recent_failure_penalty")]
+    pub recent_failure_penalty: usize,
+    /// When at concurrency limit, wait this long (ms) for a slot before failing.
+    /// Set to `0` for immediate fail-fast behavior.
+    #[serde(default = "default_subagents_queue_wait_ms")]
+    pub queue_wait_ms: usize,
+    /// Poll interval (ms) while waiting for a concurrency slot.
+    #[serde(default = "default_subagents_queue_poll_ms")]
+    pub queue_poll_ms: usize,
+}
+
+impl Default for SubAgentsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_subagents_enabled(),
+            auto_activate: default_subagents_auto_activate(),
+            max_concurrent: default_subagents_max_concurrent(),
+            strategy: AgentLoadBalanceStrategy::default(),
+            load_window_secs: default_subagents_load_window_secs(),
+            inflight_penalty: default_subagents_inflight_penalty(),
+            recent_selection_penalty: default_subagents_recent_selection_penalty(),
+            recent_failure_penalty: default_subagents_recent_failure_penalty(),
+            queue_wait_ms: default_subagents_queue_wait_ms(),
+            queue_poll_ms: default_subagents_queue_poll_ms(),
+        }
+    }
+}
+
+fn default_subagents_enabled() -> bool {
+    true
+}
+fn default_subagents_auto_activate() -> bool {
+    true
+}
+fn default_subagents_max_concurrent() -> usize {
+    10
+}
+fn default_subagents_load_window_secs() -> usize {
+    180
+}
+fn default_subagents_inflight_penalty() -> usize {
+    10
+}
+fn default_subagents_recent_selection_penalty() -> usize {
+    3
+}
+fn default_subagents_recent_failure_penalty() -> usize {
+    16
+}
+fn default_subagents_queue_wait_ms() -> usize {
+    15_000
+}
+fn default_subagents_queue_poll_ms() -> usize {
+    200
+}
+
 /// Agent orchestration configuration (`[agent]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AgentConfig {
@@ -948,6 +1130,12 @@ pub struct AgentConfig {
     /// Tool dispatch strategy (e.g. `"auto"`). Default: `"auto"`.
     #[serde(default = "default_agent_tool_dispatcher")]
     pub tool_dispatcher: String,
+    /// Agent-team runtime controls for synchronous delegation.
+    #[serde(default)]
+    pub teams: AgentTeamsConfig,
+    /// Sub-agent runtime controls for background delegation.
+    #[serde(default)]
+    pub subagents: SubAgentsConfig,
     /// Loop detection: no-progress repeat threshold.
     /// Triggers when the same tool+args produces identical output this many times.
     /// Set to `0` to disable. Default: `3`.
@@ -963,6 +1151,11 @@ pub struct AgentConfig {
     /// Set to `0` to disable. Default: `3`.
     #[serde(default = "default_loop_detection_failure_streak")]
     pub loop_detection_failure_streak: usize,
+    /// Loop detection: total failure budget across ALL tools per turn.
+    /// Triggers when cumulative failures (regardless of tool) reach this count.
+    /// Set to `0` to disable. Default: `8`.
+    #[serde(default = "default_loop_detection_total_failure_budget")]
+    pub loop_detection_total_failure_budget: usize,
     /// Safety heartbeat injection interval inside `run_tool_call_loop`.
     /// Injects a security-constraint reminder every N tool iterations.
     /// Set to `0` to disable. Default: `5`.
@@ -1060,6 +1253,10 @@ fn default_loop_detection_failure_streak() -> usize {
     3
 }
 
+fn default_loop_detection_total_failure_budget() -> usize {
+    8
+}
+
 fn default_safety_heartbeat_interval() -> usize {
     5
 }
@@ -1077,9 +1274,12 @@ impl Default for AgentConfig {
             max_history_messages: default_agent_max_history_messages(),
             parallel_tools: false,
             tool_dispatcher: default_agent_tool_dispatcher(),
+            teams: AgentTeamsConfig::default(),
+            subagents: SubAgentsConfig::default(),
             loop_detection_no_progress_threshold: default_loop_detection_no_progress_threshold(),
             loop_detection_ping_pong_cycles: default_loop_detection_ping_pong_cycles(),
             loop_detection_failure_streak: default_loop_detection_failure_streak(),
+            loop_detection_total_failure_budget: default_loop_detection_total_failure_budget(),
             safety_heartbeat_interval: default_safety_heartbeat_interval(),
             safety_heartbeat_turn_interval: default_safety_heartbeat_turn_interval(),
         }
@@ -1651,6 +1851,16 @@ pub struct GatewayConfig {
     /// Node-control protocol scaffold (`[gateway.node_control]`).
     #[serde(default)]
     pub node_control: NodeControlConfig,
+
+    /// Channels allowed to invoke the pairing code generation tool (e.g. ["telegram"]).
+    /// Empty = tool not registered.
+    #[serde(default)]
+    pub pairing_tool_allowed_channels: Vec<String>,
+
+    /// Users allowed to invoke the pairing code generation tool (e.g. ["e1vix"]).
+    /// Empty = tool not registered.
+    #[serde(default)]
+    pub pairing_tool_allowed_users: Vec<String>,
 }
 
 /// Node-control scaffold settings under `[gateway.node_control]`.
@@ -1718,6 +1928,8 @@ impl Default for GatewayConfig {
             idempotency_ttl_secs: default_idempotency_ttl_secs(),
             idempotency_max_keys: default_gateway_idempotency_max_keys(),
             node_control: NodeControlConfig::default(),
+            pairing_tool_allowed_channels: Vec::new(),
+            pairing_tool_allowed_users: Vec::new(),
         }
     }
 }
@@ -3341,6 +3553,21 @@ pub struct AutonomyConfig {
     #[serde(default)]
     pub non_cli_natural_language_approval_mode_by_channel:
         HashMap<String, NonCliNaturalLanguageApprovalMode>,
+
+    /// elfClaw: per-tool risk tier overrides (elfClaw original).
+    ///
+    /// Overrides code defaults in `default_tool_risk_tiers()`.
+    /// After config load, `apply_tool_overrides()` derives the correct
+    /// `auto_approve` / `always_ask` / `non_cli_excluded_tools` entries.
+    ///
+    /// Example in config.toml:
+    /// ```toml
+    /// [autonomy.tool_overrides]
+    /// cron_add = "safe"
+    /// shell = "standard"
+    /// ```
+    #[serde(default)]
+    pub tool_overrides: HashMap<String, crate::tools::ToolRiskTier>,
 }
 
 fn default_auto_approve() -> Vec<String> {
@@ -3348,7 +3575,7 @@ fn default_auto_approve() -> Vec<String> {
 }
 
 fn default_always_ask() -> Vec<String> {
-    vec![]
+    vec!["generate_pairing_code".to_string()]
 }
 
 fn default_non_cli_excluded_tools() -> Vec<String> {
@@ -3381,6 +3608,61 @@ fn default_non_cli_excluded_tools() -> Vec<String> {
     .into_iter()
     .map(std::string::ToString::to_string)
     .collect()
+}
+
+impl AutonomyConfig {
+    /// elfClaw: derive auto_approve / always_ask / non_cli_excluded_tools
+    /// from default_tool_risk_tiers() + config tool_overrides.
+    ///
+    /// This merges derived entries INTO the existing lists (union).
+    /// Existing entries in the old lists are preserved for backward compat.
+    /// tool_overrides entries take precedence: if a tool is overridden,
+    /// it is REMOVED from conflicting old lists and ADDED to the correct one.
+    pub fn apply_tool_overrides(&mut self) {
+        if self.tool_overrides.is_empty() {
+            return; // No overrides, keep existing config behavior
+        }
+
+        let defaults = crate::tools::default_tool_risk_tiers();
+
+        for (tool_name, tier) in &self.tool_overrides {
+            // Security: warn if downgrading a Restricted tool
+            if let Some(&code_tier) = defaults.get(tool_name.as_str()) {
+                if code_tier == crate::tools::ToolRiskTier::Restricted
+                    && (*tier == crate::tools::ToolRiskTier::Safe
+                        || *tier == crate::tools::ToolRiskTier::Standard)
+                {
+                    tracing::warn!(
+                        tool = %tool_name,
+                        from = ?code_tier,
+                        to = ?tier,
+                        "Tool risk tier downgraded via config override"
+                    );
+                }
+            }
+
+            // Remove from all old lists first (prevent conflicts)
+            self.auto_approve.retain(|t| t != tool_name);
+            self.always_ask.retain(|t| t != tool_name);
+            self.non_cli_excluded_tools.retain(|t| t != tool_name);
+
+            // Add to the correct list based on tier
+            match tier {
+                crate::tools::ToolRiskTier::Safe => {
+                    self.auto_approve.push(tool_name.clone());
+                }
+                crate::tools::ToolRiskTier::Standard => {
+                    // Standard = default supervised behavior, no list entry needed
+                }
+                crate::tools::ToolRiskTier::Sensitive => {
+                    self.always_ask.push(tool_name.clone());
+                }
+                crate::tools::ToolRiskTier::Restricted => {
+                    self.non_cli_excluded_tools.push(tool_name.clone());
+                }
+            }
+        }
+    }
 }
 
 fn is_valid_env_var_name(name: &str) -> bool {
@@ -3447,6 +3729,7 @@ impl Default for AutonomyConfig {
             non_cli_approval_approvers: Vec::new(),
             non_cli_natural_language_approval_mode: NonCliNaturalLanguageApprovalMode::default(),
             non_cli_natural_language_approval_mode_by_channel: HashMap::new(),
+            tool_overrides: HashMap::new(),
         }
     }
 }
@@ -7342,6 +7625,7 @@ impl Config {
 
             config.apply_env_overrides();
             config.validate()?;
+            config.autonomy.apply_tool_overrides(); // elfClaw: apply unified risk tier overrides
             tracing::info!(
                 path = %config.config_path.display(),
                 workspace = %config.workspace_dir.display(),
@@ -7365,6 +7649,7 @@ impl Config {
 
             config.apply_env_overrides();
             config.validate()?;
+            config.autonomy.apply_tool_overrides(); // elfClaw: apply unified risk tier overrides
             tracing::info!(
                 path = %config.config_path.display(),
                 workspace = %config.workspace_dir.display(),
@@ -7397,10 +7682,10 @@ impl Config {
         let normalized = value.to_ascii_lowercase().replace(['-', '_'], "");
         match normalized.as_str() {
             "minimal" => Some(0),
-            "low"     => Some(1),
-            "medium"  => Some(2),
-            "high"    => Some(3),
-            "xhigh"   => Some(4),
+            "low" => Some(1),
+            "medium" => Some(2),
+            "high" => Some(3),
+            "xhigh" => Some(4),
             _ => {
                 tracing::warn!(
                     reasoning_level = %value,
@@ -9281,6 +9566,9 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                enabled: true,
+                capabilities: Vec::new(),
+                priority: 0,
             },
         );
 
@@ -9658,6 +9946,7 @@ ws_url = "ws://127.0.0.1:3002"
                 non_cli_natural_language_approval_mode:
                     NonCliNaturalLanguageApprovalMode::RequestConfirm,
                 non_cli_natural_language_approval_mode_by_channel: HashMap::new(),
+                tool_overrides: HashMap::new(),
             },
             security: SecurityConfig::default(),
             runtime: RuntimeConfig {
@@ -9794,7 +10083,7 @@ default_temperature = 0.7
         let parsed: Config = toml::from_str(minimal).unwrap();
         assert!(parsed.api_key.is_none());
         assert!(parsed.default_provider.is_none());
-        assert_eq!(parsed.observability.backend, "none");
+        assert_eq!(parsed.observability.backend, "log");
         assert_eq!(parsed.observability.runtime_trace_mode, "none");
         assert_eq!(parsed.autonomy.level, AutonomyLevel::Supervised);
         assert_eq!(parsed.runtime.kind, "native");
@@ -9983,10 +10272,7 @@ reasoning_level = 3
 
         let parsed: Config = toml::from_str(raw).unwrap();
         assert_eq!(parsed.provider.reasoning_level, Some(3u8));
-        assert_eq!(
-            parsed.effective_provider_reasoning_level(),
-            Some(3u8)
-        );
+        assert_eq!(parsed.effective_provider_reasoning_level(), Some(3u8));
     }
 
     #[test]
@@ -10000,10 +10286,7 @@ reasoning_level = 4
 
         let parsed: Config = toml::from_str(raw).unwrap();
         assert_eq!(parsed.runtime.reasoning_level, Some(4u8));
-        assert_eq!(
-            parsed.effective_provider_reasoning_level(),
-            Some(4u8)
-        );
+        assert_eq!(parsed.effective_provider_reasoning_level(), Some(4u8));
     }
 
     #[test]
@@ -10019,10 +10302,7 @@ reasoning_level = 3
 "#;
 
         let parsed: Config = toml::from_str(raw).unwrap();
-        assert_eq!(
-            parsed.effective_provider_reasoning_level(),
-            Some(2u8)
-        );
+        assert_eq!(parsed.effective_provider_reasoning_level(), Some(2u8));
     }
 
     #[test]
@@ -10204,6 +10484,9 @@ tool_dispatcher = "xml"
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                enabled: true,
+                capabilities: Vec::new(),
+                priority: 0,
             },
         );
 
@@ -11138,6 +11421,8 @@ channel_id = "C123"
                 auth_token: Some("node-token".into()),
                 allowed_node_ids: vec!["node-1".into(), "node-2".into()],
             },
+            pairing_tool_allowed_channels: Vec::new(),
+            pairing_tool_allowed_users: Vec::new(),
         };
         let toml_str = toml::to_string(&g).unwrap();
         let parsed: GatewayConfig = toml::from_str(&toml_str).unwrap();
@@ -12656,10 +12941,7 @@ default_model = "legacy-model"
         std::env::set_var("ZEROCLAW_REASONING_LEVEL", "xhigh");
         config.apply_env_overrides();
         assert_eq!(config.runtime.reasoning_level, Some(4u8));
-        assert_eq!(
-            config.effective_provider_reasoning_level(),
-            Some(4u8)
-        );
+        assert_eq!(config.effective_provider_reasoning_level(), Some(4u8));
 
         std::env::remove_var("ZEROCLAW_REASONING_LEVEL");
     }
