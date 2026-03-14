@@ -104,12 +104,18 @@ impl Tool for SendTelegramTool {
             } else if i == 0 {
                 format!("{chunk}\n\n_(continues... {}/{total})_", i + 1)
             } else if i < total - 1 {
-                format!("_(continued {}/{total})_\n\n{chunk}\n\n_(continues...)_", i + 1)
+                format!(
+                    "_(continued {}/{total})_\n\n{chunk}\n\n_(continues...)_",
+                    i + 1
+                )
             } else {
                 format!("_(continued {}/{total})_\n\n{chunk}", i + 1)
             };
 
-            if let Err(e) = self.send_one_chunk(&client, &url, &chat_id, &text, i, total).await {
+            if let Err(e) = self
+                .send_one_chunk(&client, &url, &chat_id, &text, i, total)
+                .await
+            {
                 warn!(
                     chat_id = %chat_id,
                     chunk = i + 1,
@@ -183,9 +189,7 @@ impl SendTelegramTool {
                         total = total_chunks,
                         "send_telegram failed (plain text fallback)"
                     );
-                    anyhow::bail!(
-                        "Telegram API returned {retry_status} (plain text fallback)"
-                    );
+                    anyhow::bail!("Telegram API returned {retry_status} (plain text fallback)");
                 }
 
                 let message_id = Self::extract_message_id(&retry_body);

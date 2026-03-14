@@ -60,7 +60,9 @@ pub fn add_shell_job(
                 "Cron dedup: updating existing shell job instead of creating duplicate"
             );
             crate::elfclaw_log::log_cron_event(
-                &existing.id, job_name, "dedup_update",
+                &existing.id,
+                job_name,
+                "dedup_update",
                 serde_json::json!({"action": "updated existing shell job"}),
             );
             let patch = CronJobPatch {
@@ -105,7 +107,12 @@ pub fn add_shell_job(
 
     // elfClaw: log new job creation
     if let Some(ref job_name) = name {
-        crate::elfclaw_log::log_cron_event(&id, job_name, "created", serde_json::json!({"type": "shell"}));
+        crate::elfclaw_log::log_cron_event(
+            &id,
+            job_name,
+            "created",
+            serde_json::json!({"type": "shell"}),
+        );
     }
 
     get_job(config, &id)
@@ -132,7 +139,9 @@ pub fn add_agent_job(
                 "Cron dedup: updating existing agent job instead of creating duplicate"
             );
             crate::elfclaw_log::log_cron_event(
-                &existing.id, job_name, "dedup_update",
+                &existing.id,
+                job_name,
+                "dedup_update",
                 serde_json::json!({"action": "updated existing agent job"}),
             );
             let patch = CronJobPatch {
@@ -184,7 +193,12 @@ pub fn add_agent_job(
 
     // elfClaw: log new job creation
     if let Some(ref job_name) = name {
-        crate::elfclaw_log::log_cron_event(&id, job_name, "created", serde_json::json!({"type": "agent"}));
+        crate::elfclaw_log::log_cron_event(
+            &id,
+            job_name,
+            "created",
+            serde_json::json!({"type": "agent"}),
+        );
     }
 
     get_job(config, &id)

@@ -137,10 +137,7 @@ impl SourceSyncTool {
     }
 
     /// Run a git command with timeout. Returns (success, stdout, stderr).
-    async fn run_git(
-        args: &[&str],
-        cwd: &Path,
-    ) -> anyhow::Result<(bool, String, String)> {
+    async fn run_git(args: &[&str], cwd: &Path) -> anyhow::Result<(bool, String, String)> {
         let output = tokio::time::timeout(
             std::time::Duration::from_secs(GIT_TIMEOUT_SECS),
             tokio::process::Command::new(Self::find_git())
@@ -185,7 +182,11 @@ impl SourceSyncTool {
             .find(|(id, _, _)| *id == normalized)
             .ok_or_else(|| anyhow::anyhow!("No HTTP fallback for repo '{repo_id}'"))?;
 
-        let local_path = self.security.workspace_dir.join(SOURCE_DIR).join(&normalized);
+        let local_path = self
+            .security
+            .workspace_dir
+            .join(SOURCE_DIR)
+            .join(&normalized);
         let version_file = local_path.join(".elfclaw_sync_sha");
 
         // 1. Fetch latest commit SHA from GitHub API
@@ -273,11 +274,9 @@ impl SourceSyncTool {
         // Extract ZIP in blocking context (zip crate is sync)
         let local_path_clone = local_path.clone();
         let bytes_vec = bytes.to_vec();
-        tokio::task::spawn_blocking(move || {
-            extract_zip(&bytes_vec, &local_path_clone)
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("ZIP extraction task failed: {e}"))??;
+        tokio::task::spawn_blocking(move || extract_zip(&bytes_vec, &local_path_clone))
+            .await
+            .map_err(|e| anyhow::anyhow!("ZIP extraction task failed: {e}"))??;
 
         // 5. Write version marker for future skip-download check
         let commit_info = remote_sha.as_deref().unwrap_or("unknown");
@@ -410,8 +409,8 @@ fn extract_zip(zip_bytes: &[u8], target_dir: &Path) -> anyhow::Result<()> {
     use std::io::Read;
 
     let reader = std::io::Cursor::new(zip_bytes);
-    let mut archive = zip::ZipArchive::new(reader)
-        .map_err(|e| anyhow::anyhow!("Invalid ZIP archive: {e}"))?;
+    let mut archive =
+        zip::ZipArchive::new(reader).map_err(|e| anyhow::anyhow!("Invalid ZIP archive: {e}"))?;
 
     // Detect the top-level prefix to strip (e.g. "eflClaw-main/")
     let prefix = {
@@ -562,9 +561,7 @@ impl Tool for SourceSyncTool {
             other => Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some(format!(
-                    "Unknown action '{other}'. Use 'sync' or 'status'."
-                )),
+                error: Some(format!("Unknown action '{other}'. Use 'sync' or 'status'.")),
             }),
         }
     }

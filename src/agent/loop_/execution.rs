@@ -7,6 +7,11 @@ use anyhow::Result;
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
+/// Truncate a string to at most `max` characters (not bytes).
+fn truncate_str(s: &str, max: usize) -> String {
+    s.chars().take(max).collect()
+}
+
 fn find_tool<'a>(tools: &'a [Box<dyn Tool>], name: &str) -> Option<&'a dyn Tool> {
     tools.iter().find(|t| t.name() == name).map(|t| t.as_ref())
 }
@@ -21,6 +26,7 @@ async fn execute_one_tool(
         tool: call_name.to_string(),
     });
     let start = Instant::now();
+    let args_summary = Some(truncate_str(&call_arguments.to_string(), 200));
 
     let Some(tool) = find_tool(tools_registry, call_name) else {
         let reason = format!("Unknown tool: {call_name}");
@@ -29,6 +35,8 @@ async fn execute_one_tool(
             tool: call_name.to_string(),
             duration,
             success: false,
+            args: args_summary,
+            error: Some(reason.clone()),
         });
         return Ok(ToolExecutionOutcome {
             output: reason.clone(),
@@ -51,10 +59,20 @@ async fn execute_one_tool(
     match tool_result {
         Ok(r) => {
             let duration = start.elapsed();
+            let error_msg = if r.success {
+                None
+            } else {
+                Some(truncate_str(
+                    r.error.as_deref().unwrap_or(&r.output),
+                    200,
+                ))
+            };
             observer.record_event(&ObserverEvent::ToolCall {
                 tool: call_name.to_string(),
                 duration,
                 success: r.success,
+                args: args_summary,
+                error: error_msg,
             });
             if r.success {
                 Ok(ToolExecutionOutcome {
@@ -75,12 +93,14 @@ async fn execute_one_tool(
         }
         Err(e) => {
             let duration = start.elapsed();
+            let reason = format!("Error executing {call_name}: {e}");
             observer.record_event(&ObserverEvent::ToolCall {
                 tool: call_name.to_string(),
                 duration,
                 success: false,
+                args: args_summary,
+                error: Some(truncate_str(&reason, 200)),
             });
-            let reason = format!("Error executing {call_name}: {e}");
             Ok(ToolExecutionOutcome {
                 output: reason.clone(),
                 success: false,

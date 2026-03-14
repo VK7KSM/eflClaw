@@ -46,18 +46,22 @@ pub mod transcription;
 pub mod tts;
 pub mod wati;
 pub mod whatsapp;
-pub mod xiaozhi;
 #[cfg(feature = "whatsapp-web")]
 pub mod whatsapp_storage;
 #[cfg(feature = "whatsapp-web")]
 pub mod whatsapp_web;
+pub mod xiaozhi;
 
+// elfClaw: public API re-exports for all channel types; not all are consumed
+// internally (some channels are only loaded dynamically via config).
+#[allow(unused_imports)]
 pub use bluebubbles::BlueBubblesChannel;
 pub use clawdtalk::ClawdTalkChannel;
 pub use cli::CliChannel;
 pub use dingtalk::DingTalkChannel;
 pub use discord::DiscordChannel;
 pub use email_channel::EmailChannel;
+#[allow(unused_imports)]
 pub use github::GitHubChannel;
 pub use imessage::IMessageChannel;
 pub use irc::IrcChannel;
@@ -67,22 +71,24 @@ pub use linq::LinqChannel;
 #[cfg(feature = "channel-matrix")]
 pub use matrix::MatrixChannel;
 pub use mattermost::MattermostChannel;
+#[allow(unused_imports)]
 pub use napcat::NapcatChannel;
 pub use nextcloud_talk::NextcloudTalkChannel;
 pub use nostr::NostrChannel;
 pub use qq::QQChannel;
 pub use signal::SignalChannel;
 pub use slack::SlackChannel;
-pub use telegram::TelegramChannel;
 pub(crate) use telegram::split_message_for_telegram;
+pub use telegram::TelegramChannel;
 pub use traits::{Channel, SendMessage};
-pub use xiaozhi::XiaozhiChannel;
 pub use wati::WatiChannel;
 pub use whatsapp::WhatsAppChannel;
 #[cfg(feature = "whatsapp-web")]
 pub use whatsapp_web::WhatsAppWebChannel;
+pub use xiaozhi::XiaozhiChannel;
 
 use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop, scrub_credentials};
+use crate::agent::loop_::detection::LoopDetectionConfig;
 use crate::config::Config;
 use crate::identity;
 use crate::memory::{self, Memory};
@@ -275,6 +281,7 @@ struct ChannelRuntimeContext {
     chat_log_config: crate::config::ChatLogConfig,
     worker_model: Option<String>, // elfClaw: model for background tasks (email digest, etc.)
     config: Arc<crate::config::Config>, // elfClaw: full config for runtime status injection
+    approval_manager: Arc<crate::approval::ApprovalManager>, // elfClaw: non-CLI tool approval
 }
 
 #[derive(Clone)]
@@ -552,12 +559,7 @@ fn build_runtime_status_section(config: &crate::config::Config) -> String {
                     let _ = writeln!(
                         section,
                         "- id=`{}` name=\"{}\" enabled={} type={} delegate={} schedule={}",
-                        job.id,
-                        name,
-                        enabled,
-                        job_type,
-                        delegate,
-                        &job.expression
+                        job.id, name, enabled, job_type, delegate, &job.expression
                     );
                 }
             }
@@ -596,7 +598,7 @@ fn build_runtime_status_section(config: &crate::config::Config) -> String {
         "\nGitHub MCP 工具（如果已配置）：\
          当需要手动查阅源码时，可使用 github__search_code、\
          github__get_file_contents 等 MCP 工具直接查询 elfClaw/zeroclaw 仓库源码。\
-         这些工具通过 GitHub API 工作，不需要本地安装 git。\n"
+         这些工具通过 GitHub API 工作，不需要本地安装 git。\n",
     );
 
     // elfClaw: capability boundary declaration for deployed daemon
@@ -619,6 +621,7 @@ fn build_runtime_status_section(config: &crate::config::Config) -> String {
          If asked to modify config or code, explain that you are a deployed daemon \
          and these changes require the administrator to edit files and restart the service.\n"
     );
+
 
     section
 }
@@ -699,6 +702,199 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
         "/new" => Some(ChannelRuntimeCommand::NewSession),
         _ => None,
     }
+}
+
+// ── elfClaw: Non-CLI approval command routing ─────────────────────────
+
+/// Approval commands that can be issued from any non-CLI channel.
+enum ApprovalCommand {
+    /// /approve-allow {request_id} — resolve a pending request with Yes
+    AllowPending(String),
+    /// /approve-deny {request_id} — resolve a pending request with No
+    DenyPending(String),
+    /// /approve-pending — list pending approval requests
+    ListPending,
+    /// /approvals — show current approval status (auto_approve, session, always_ask)
+    ShowApprovals,
+    /// /approve-session {tool} — grant session-level approval for a tool
+    GrantSession(String),
+    /// /approve {tool} — grant persistent (permanent) approval for a tool
+    GrantPersistent(String),
+    /// /unapprove {tool} — revoke persistent approval for a tool
+    Revoke(String),
+}
+
+fn parse_approval_command(content: &str) -> Option<ApprovalCommand> {
+    let trimmed = content.trim();
+    if !trimmed.starts_with('/') {
+        return None;
+    }
+
+    let mut parts = trimmed.split_whitespace();
+    let command_token = parts.next()?;
+    // Strip @botname suffix (Telegram group commands)
+    let base_command = command_token
+        .split('@')
+        .next()
+        .unwrap_or(command_token)
+        .to_ascii_lowercase();
+
+    match base_command.as_str() {
+        "/approve-allow" => {
+            let id = parts.next()?.to_string();
+            Some(ApprovalCommand::AllowPending(id))
+        }
+        "/approve-deny" => {
+            let id = parts.next()?.to_string();
+            Some(ApprovalCommand::DenyPending(id))
+        }
+        "/approve-pending" => Some(ApprovalCommand::ListPending),
+        "/approvals" => Some(ApprovalCommand::ShowApprovals),
+        "/approve-session" => {
+            let tool = parts.next()?.to_string();
+            Some(ApprovalCommand::GrantSession(tool))
+        }
+        "/approve" => {
+            let tool = parts.next()?.to_string();
+            Some(ApprovalCommand::GrantPersistent(tool))
+        }
+        "/unapprove" => {
+            let tool = parts.next()?.to_string();
+            Some(ApprovalCommand::Revoke(tool))
+        }
+        _ => None,
+    }
+}
+
+/// Handle approval commands from any non-CLI channel.
+/// Returns `true` if the message was consumed as an approval command.
+async fn handle_approval_command_if_needed(
+    ctx: &ChannelRuntimeContext,
+    msg: &traits::ChannelMessage,
+    target_channel: Option<&Arc<dyn Channel>>,
+) -> bool {
+    // CLI doesn't use non-CLI approval
+    if msg.channel == "cli" {
+        return false;
+    }
+
+    let Some(command) = parse_approval_command(&msg.content) else {
+        return false;
+    };
+
+    let mgr = ctx.approval_manager.as_ref();
+
+    // elfClaw: identity check for write commands — only configured approval
+    // actors may approve/deny/grant/revoke. Read-only commands (list/show)
+    // are allowed for any user so they can inspect status.
+    let is_write_command = matches!(
+        command,
+        ApprovalCommand::AllowPending(_)
+            | ApprovalCommand::DenyPending(_)
+            | ApprovalCommand::GrantSession(_)
+            | ApprovalCommand::GrantPersistent(_)
+            | ApprovalCommand::Revoke(_)
+    );
+    if is_write_command && !mgr.is_non_cli_approval_actor_allowed(&msg.channel, &msg.sender) {
+        if let Some(channel) = target_channel {
+            let _ = channel
+                .send(
+                    &SendMessage::new(
+                        format!(
+                            "⛔ Permission denied: you are not an authorized approver on `{}`.",
+                            msg.channel
+                        ),
+                        &msg.reply_target,
+                    )
+                    .in_thread(msg.thread_ts.clone()),
+                )
+                .await;
+        }
+        return true;
+    }
+
+    let reply = match command {
+        ApprovalCommand::AllowPending(id) => {
+            mgr.record_non_cli_pending_resolution(&id, crate::approval::ApprovalResponse::Yes);
+            format!("✓ Approved request `{id}`")
+        }
+        ApprovalCommand::DenyPending(id) => {
+            mgr.record_non_cli_pending_resolution(&id, crate::approval::ApprovalResponse::No);
+            format!("✗ Denied request `{id}`")
+        }
+        ApprovalCommand::ListPending => {
+            let pending = mgr.list_non_cli_pending_requests(None, None, None);
+            if pending.is_empty() {
+                "No pending approval requests.".to_string()
+            } else {
+                let mut lines = vec!["Pending approval requests:".to_string()];
+                for req in &pending {
+                    lines.push(format!(
+                        "• `{}` — tool: `{}`, from: {}, channel: {}",
+                        req.request_id, req.tool_name, req.requested_by, req.requested_channel
+                    ));
+                }
+                lines.join("\n")
+            }
+        }
+        ApprovalCommand::ShowApprovals => {
+            let auto = mgr.auto_approve_tools();
+            let session = mgr.non_cli_session_allowlist();
+            let always = mgr.always_ask_tools();
+
+            let mut lines = vec!["Approval status:".to_string()];
+            if auto.is_empty() {
+                lines.push("• auto_approve: (none)".to_string());
+            } else {
+                let mut sorted: Vec<_> = auto.iter().cloned().collect();
+                sorted.sort();
+                lines.push(format!("• auto_approve: {}", sorted.join(", ")));
+            }
+            if session.is_empty() {
+                lines.push("• session grants: (none)".to_string());
+            } else {
+                let mut sorted: Vec<_> = session.iter().cloned().collect();
+                sorted.sort();
+                lines.push(format!("• session grants: {}", sorted.join(", ")));
+            }
+            if always.is_empty() {
+                lines.push("• always_ask: (none)".to_string());
+            } else {
+                let mut sorted: Vec<_> = always.iter().cloned().collect();
+                sorted.sort();
+                lines.push(format!("• always_ask: {}", sorted.join(", ")));
+            }
+            lines.join("\n")
+        }
+        ApprovalCommand::GrantSession(tool) => {
+            mgr.grant_non_cli_session(&tool);
+            format!("✓ Session-level approval granted for `{tool}` (resets on restart)")
+        }
+        ApprovalCommand::GrantPersistent(tool) => {
+            mgr.apply_persistent_runtime_grant(&tool);
+            format!("✓ Persistent approval granted for `{tool}`")
+        }
+        ApprovalCommand::Revoke(tool) => {
+            let removed = mgr.apply_persistent_runtime_revoke(&tool);
+            mgr.revoke_non_cli_session(&tool);
+            if removed {
+                format!("✓ Approval revoked for `{tool}`")
+            } else {
+                format!("Tool `{tool}` was not in auto_approve list (session grant also cleared)")
+            }
+        }
+    };
+
+    if let Some(channel) = target_channel {
+        let _ = channel
+            .send(
+                &SendMessage::new(reply, &msg.reply_target)
+                    .in_thread(msg.thread_ts.clone()),
+            )
+            .await;
+    }
+
+    true
 }
 
 fn resolve_provider_alias(name: &str) -> Option<String> {
@@ -1711,7 +1907,12 @@ async fn process_channel_message(
         truncate_with_ellipsis(&msg.content, 200)
     );
     // elfClaw: log incoming channel message
-    crate::elfclaw_log::log_channel_message(&msg.channel, "incoming", &msg.sender, &msg.reply_target);
+    crate::elfclaw_log::log_channel_message(
+        &msg.channel,
+        "incoming",
+        &msg.sender,
+        &msg.reply_target,
+    );
     runtime_trace::record_event(
         "channel_message_inbound",
         Some(msg.channel.as_str()),
@@ -1766,6 +1967,10 @@ async fn process_channel_message(
     if handle_runtime_command_if_needed(ctx.as_ref(), &msg, target_channel.as_ref()).await {
         return;
     }
+    // elfClaw: handle approval commands (/approve, /approve-session, /approvals, etc.)
+    if handle_approval_command_if_needed(ctx.as_ref(), &msg, target_channel.as_ref()).await {
+        return;
+    }
 
     let history_key = conversation_history_key(&msg);
     let mut route = get_route_selection(ctx.as_ref(), &history_key);
@@ -1797,7 +2002,8 @@ async fn process_channel_message(
     };
     if ctx.auto_save_memory
         && msg.content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
-        && !is_selfcheck_command // elfClaw: diagnostic data must not pollute memory
+        && !is_selfcheck_command
+    // elfClaw: diagnostic data must not pollute memory
     {
         let autosave_key = conversation_memory_key(&msg);
         let _ = ctx
@@ -1829,7 +2035,11 @@ async fn process_channel_message(
     } else {
         format!("{ts_prefix} {}", msg.content)
     };
-    append_sender_turn(ctx.as_ref(), &history_key, ChatMessage::user(&timestamped_content));
+    append_sender_turn(
+        ctx.as_ref(),
+        &history_key,
+        ChatMessage::user(&timestamped_content),
+    );
 
     // Persist user turn to local chat log
     if ctx.chat_log_config.enabled && msg.channel == "telegram" {
@@ -1932,7 +2142,9 @@ async fn process_channel_message(
     // elfClaw: watchdog recovery injection — if the LAST assistant message was a
     // hard stop from loop detection, inject recovery guidance so the LLM doesn't
     // repeat the same failing operations when the user says "continue".
-    let prior_watchdog_stop = prior_turns.iter().rev()
+    let prior_watchdog_stop = prior_turns
+        .iter()
+        .rev()
         .find(|m| m.role == "assistant")
         .map(|m| m.content.contains("⚠️ [循环检测：已停止"))
         .unwrap_or(false);
@@ -1944,7 +2156,8 @@ async fn process_channel_message(
              2. 禁止重复使用同一工具+相同参数的组合\n\
              3. 如果某个工具被安全策略拦截（0ms 失败），说明该工具在此环境不可用，切换到其他方法\n\
              4. 如果无法完成任务，向用户说明原因并建议替代方案\n\
-             5. 优先使用 file_read、content_search 等安全工具，避免 shell 命令".to_string();
+             5. 优先使用 file_read、content_search 等安全工具，避免 shell 命令"
+            .to_string();
         // Insert before the latest user message
         let insert_pos = prior_turns.len().saturating_sub(1);
         prior_turns.insert(insert_pos, ChatMessage::user(recovery_hint));
@@ -2104,6 +2317,56 @@ async fn process_channel_message(
         excluded
     };
 
+    // Build safety heartbeat config for this message processing
+    let channel_safety_hb = if ctx.config.agent.safety_heartbeat_interval > 0 {
+        let hb_security = crate::security::SecurityPolicy::from_config(
+            &ctx.config.autonomy,
+            &ctx.config.workspace_dir,
+        );
+        Some(crate::agent::loop_::SafetyHeartbeatConfig {
+            body: hb_security.summary_for_heartbeat(),
+            interval: ctx.config.agent.safety_heartbeat_interval,
+        })
+    } else {
+        None
+    };
+
+    // Build non-CLI approval context for channels that support interactive approval
+    let (approval_prompt_tx, mut approval_prompt_rx) =
+        tokio::sync::mpsc::unbounded_channel::<crate::agent::loop_::NonCliApprovalPrompt>();
+    let non_cli_approval_ctx = if msg.channel != "cli" {
+        Some(crate::agent::loop_::NonCliApprovalContext {
+            sender: msg.sender.clone(),
+            reply_target: msg.reply_target.clone(),
+            prompt_tx: approval_prompt_tx,
+        })
+    } else {
+        drop(approval_prompt_tx);
+        None
+    };
+
+    // Spawn approval prompt dispatcher: forwards approval requests to the channel
+    let approval_channel_ref = target_channel.clone();
+    let approval_reply_target = msg.reply_target.clone();
+    let approval_dispatcher = tokio::spawn(async move {
+        while let Some(prompt) = approval_prompt_rx.recv().await {
+            if let Some(ref ch) = approval_channel_ref {
+                if let Err(e) = ch
+                    .send_approval_prompt(
+                        &approval_reply_target,
+                        &prompt.request_id,
+                        &prompt.tool_name,
+                        &prompt.arguments,
+                        None,
+                    )
+                    .await
+                {
+                    tracing::warn!("Failed to send approval prompt: {e}");
+                }
+            }
+        }
+    });
+
     let timeout_budget_secs =
         channel_message_timeout_budget_secs(ctx.message_timeout_secs, ctx.max_tool_iterations);
     let llm_result = tokio::select! {
@@ -2119,7 +2382,7 @@ async fn process_channel_message(
                 route.model.as_str(),
                 runtime_defaults.temperature,
                 true,
-                None,
+                Some(ctx.approval_manager.as_ref()),
                 msg.channel.as_str(),
                 &ctx.multimodal,
                 ctx.max_tool_iterations,
@@ -2127,9 +2390,22 @@ async fn process_channel_message(
                 delta_tx,
                 ctx.hooks.as_deref(),
                 &effective_excluded_tools,
+                channel_safety_hb.as_ref(),
+                non_cli_approval_ctx.as_ref(),
+                Some(LoopDetectionConfig {
+                    no_progress_threshold: ctx.config.agent.loop_detection_no_progress_threshold,
+                    ping_pong_cycles: ctx.config.agent.loop_detection_ping_pong_cycles,
+                    failure_streak_threshold: ctx.config.agent.loop_detection_failure_streak,
+                    total_failure_budget: ctx.config.agent.loop_detection_total_failure_budget,
+                    ..Default::default()
+                }),
             ),
         ) => LlmExecutionResult::Completed(result),
     };
+
+    // Clean up approval dispatcher (drop sender side so receiver closes)
+    drop(non_cli_approval_ctx);
+    let _ = approval_dispatcher.await;
 
     // elfClaw: close self-check gate after processing, regardless of success/failure
     if is_selfcheck_command {
@@ -2461,6 +2737,15 @@ async fn process_channel_message(
                         None, // no streaming for retry
                         ctx.hooks.as_deref(),
                         excluded,
+                        channel_safety_hb.as_ref(),
+                        None,
+                        Some(LoopDetectionConfig {
+                            no_progress_threshold: ctx.config.agent.loop_detection_no_progress_threshold,
+                            ping_pong_cycles: ctx.config.agent.loop_detection_ping_pong_cycles,
+                            failure_streak_threshold: ctx.config.agent.loop_detection_failure_streak,
+                            total_failure_budget: ctx.config.agent.loop_detection_total_failure_budget,
+                            ..Default::default()
+                        }),
                     )
                     .await
                     {
@@ -2682,7 +2967,16 @@ async fn run_message_dispatch_loop(
                 }
             }
 
-            process_channel_message(worker_ctx, msg, cancellation_token).await;
+            // elfClaw: wrap in task_local scope so tools can discover caller identity
+            let caller = crate::tools::caller_context::CallerInfo {
+                channel: msg.channel.clone(),
+                sender: msg.sender.clone(),
+            };
+            crate::tools::caller_context::CALLER_INFO
+                .scope(caller, async {
+                    process_channel_message(worker_ctx, msg, cancellation_token).await;
+                })
+                .await;
 
             if interrupt_enabled {
                 let mut active = in_flight.lock().await;
@@ -3708,8 +4002,9 @@ pub async fn start_channels(config: Config) -> Result<()> {
     }
 
     // elfClaw: wrap observer with ElfClawObserver for SQLite logging + SSE broadcast
-    let observer: Arc<dyn Observer> =
-        Arc::new(crate::elfclaw_log::wrap_observer(observability::create_observer(&config.observability)));
+    let observer: Arc<dyn Observer> = Arc::new(crate::elfclaw_log::wrap_observer(
+        observability::create_observer(&config.observability),
+    ));
     let runtime: Arc<dyn runtime::RuntimeAdapter> =
         Arc::from(runtime::create_runtime(&config.runtime)?);
     let security = Arc::new(SecurityPolicy::from_config(
@@ -3789,7 +4084,10 @@ pub async fn start_channels(config: Config) -> Result<()> {
     let skills = crate::skills::load_skills_with_config(&workspace, &config);
     let skill_tools = crate::skills::create_skill_tools(&skills, Arc::clone(&security), &workspace);
     if !skill_tools.is_empty() {
-        tracing::info!(count = skill_tools.len(), "Skill tools registered in daemon");
+        tracing::info!(
+            count = skill_tools.len(),
+            "Skill tools registered in daemon"
+        );
         built_tools.extend(skill_tools);
     }
 
@@ -4056,6 +4354,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         chat_log_config: config.chat_log.clone(),
         worker_model: config.worker_model.clone(), // elfClaw
         config: Arc::new(config.clone()), // elfClaw: full config for runtime status injection
+        approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(&config.autonomy)), // elfClaw: non-CLI tool approval
     });
 
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
@@ -4273,6 +4572,7 @@ mod tests {
             chat_log_config: Default::default(),
             worker_model: None,
             config: Arc::new(crate::config::Config::default()), // elfClaw: test default
+            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(&crate::config::AutonomyConfig { level: crate::security::AutonomyLevel::Full, ..Default::default() })), // elfClaw: test default
         };
 
         assert!(compact_sender_history(&ctx, &sender));
@@ -4326,6 +4626,7 @@ mod tests {
             chat_log_config: Default::default(),
             worker_model: None,
             config: Arc::new(crate::config::Config::default()), // elfClaw: test default
+            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(&crate::config::AutonomyConfig { level: crate::security::AutonomyLevel::Full, ..Default::default() })), // elfClaw: test default
         };
 
         append_sender_turn(&ctx, &sender, ChatMessage::user("hello"));
@@ -4382,6 +4683,7 @@ mod tests {
             chat_log_config: Default::default(),
             worker_model: None,
             config: Arc::new(crate::config::Config::default()), // elfClaw: test default
+            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(&crate::config::AutonomyConfig { level: crate::security::AutonomyLevel::Full, ..Default::default() })), // elfClaw: test default
         };
 
         assert!(rollback_orphan_user_turn(&ctx, &sender, "pending"));
@@ -4861,6 +5163,7 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             worker_model: None,
             config: Arc::new(crate::config::Config::default()), // elfClaw: test default
+            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(&crate::config::AutonomyConfig { level: crate::security::AutonomyLevel::Full, ..Default::default() })), // elfClaw: test default
         });
 
         process_channel_message(
@@ -4924,6 +5227,7 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             worker_model: None,
             config: Arc::new(crate::config::Config::default()), // elfClaw: test default
+            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(&crate::config::AutonomyConfig { level: crate::security::AutonomyLevel::Full, ..Default::default() })), // elfClaw: test default
         });
 
         process_channel_message(
@@ -5001,6 +5305,7 @@ BTC is currently around $65,000 based on latest tool output."#
             chat_log_config: Default::default(),
             worker_model: None,
             config: Arc::new(crate::config::Config::default()), // elfClaw: test default
+            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(&crate::config::AutonomyConfig { level: crate::security::AutonomyLevel::Full, ..Default::default() })), // elfClaw: test default
         });
 
         process_channel_message(
@@ -5064,6 +5369,7 @@ BTC is currently around $65,000 based on latest tool output."#
             chat_log_config: Default::default(),
             worker_model: None,
             config: Arc::new(crate::config::Config::default()), // elfClaw: test default
+            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(&crate::config::AutonomyConfig { level: crate::security::AutonomyLevel::Full, ..Default::default() })), // elfClaw: test default
         });
 
         process_channel_message(
@@ -5136,6 +5442,7 @@ BTC is currently around $65,000 based on latest tool output."#
             chat_log_config: Default::default(),
             worker_model: None,
             config: Arc::new(crate::config::Config::default()), // elfClaw: test default
+            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(&crate::config::AutonomyConfig { level: crate::security::AutonomyLevel::Full, ..Default::default() })), // elfClaw: test default
         });
 
         process_channel_message(
@@ -5229,6 +5536,7 @@ BTC is currently around $65,000 based on latest tool output."#
             chat_log_config: Default::default(),
             worker_model: None,
             config: Arc::new(crate::config::Config::default()), // elfClaw: test default
+            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(&crate::config::AutonomyConfig { level: crate::security::AutonomyLevel::Full, ..Default::default() })), // elfClaw: test default
         });
 
         process_channel_message(
@@ -5304,6 +5612,7 @@ BTC is currently around $65,000 based on latest tool output."#
             chat_log_config: Default::default(),
             worker_model: None,
             config: Arc::new(crate::config::Config::default()), // elfClaw: test default
+            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(&crate::config::AutonomyConfig { level: crate::security::AutonomyLevel::Full, ..Default::default() })), // elfClaw: test default
         });
 
         process_channel_message(
@@ -5395,6 +5704,7 @@ BTC is currently around $65,000 based on latest tool output."#
             chat_log_config: Default::default(),
             worker_model: None,
             config: Arc::new(crate::config::Config::default()), // elfClaw: test default
+            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(&crate::config::AutonomyConfig { level: crate::security::AutonomyLevel::Full, ..Default::default() })), // elfClaw: test default
         });
 
         process_channel_message(
@@ -5441,7 +5751,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             provider: Arc::new(IterativeToolProvider {
-                required_tool_iterations: 11,
+                required_tool_iterations: 2,
             }),
             default_provider: Arc::new("test-provider".to_string()),
             memory: Arc::new(NoopMemory),
@@ -5470,6 +5780,7 @@ BTC is currently around $65,000 based on latest tool output."#
             chat_log_config: Default::default(),
             worker_model: None,
             config: Arc::new(crate::config::Config::default()), // elfClaw: test default
+            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(&crate::config::AutonomyConfig { level: crate::security::AutonomyLevel::Full, ..Default::default() })), // elfClaw: test default
         });
 
         process_channel_message(
@@ -5490,7 +5801,9 @@ BTC is currently around $65,000 based on latest tool output."#
         let sent_messages = channel_impl.sent_messages.lock().await;
         assert_eq!(sent_messages.len(), 1);
         assert!(sent_messages[0].starts_with("chat-iter-success:"));
-        assert!(sent_messages[0].contains("Completed after 11 tool iterations."));
+        // elfClaw: reduced from 11 to 2 because loop detection (no_progress_threshold=3)
+        // stops identical tool calls before reaching 11.
+        assert!(sent_messages[0].contains("Completed after 2 tool iterations."));
         assert!(!sent_messages[0].contains("⚠️ Error:"));
     }
 
@@ -5534,6 +5847,7 @@ BTC is currently around $65,000 based on latest tool output."#
             chat_log_config: Default::default(),
             worker_model: None,
             config: Arc::new(crate::config::Config::default()), // elfClaw: test default
+            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(&crate::config::AutonomyConfig { level: crate::security::AutonomyLevel::Full, ..Default::default() })), // elfClaw: test default
         });
 
         process_channel_message(
@@ -5717,6 +6031,7 @@ BTC is currently around $65,000 based on latest tool output."#
             chat_log_config: Default::default(),
             worker_model: None,
             config: Arc::new(crate::config::Config::default()), // elfClaw: test default
+            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(&crate::config::AutonomyConfig { level: crate::security::AutonomyLevel::Full, ..Default::default() })), // elfClaw: test default
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
@@ -5801,6 +6116,7 @@ BTC is currently around $65,000 based on latest tool output."#
             chat_log_config: Default::default(),
             worker_model: None,
             config: Arc::new(crate::config::Config::default()), // elfClaw: test default
+            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(&crate::config::AutonomyConfig { level: crate::security::AutonomyLevel::Full, ..Default::default() })), // elfClaw: test default
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -5897,6 +6213,7 @@ BTC is currently around $65,000 based on latest tool output."#
             chat_log_config: Default::default(),
             worker_model: None,
             config: Arc::new(crate::config::Config::default()), // elfClaw: test default
+            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(&crate::config::AutonomyConfig { level: crate::security::AutonomyLevel::Full, ..Default::default() })), // elfClaw: test default
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -5975,6 +6292,7 @@ BTC is currently around $65,000 based on latest tool output."#
             chat_log_config: Default::default(),
             worker_model: None,
             config: Arc::new(crate::config::Config::default()), // elfClaw: test default
+            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(&crate::config::AutonomyConfig { level: crate::security::AutonomyLevel::Full, ..Default::default() })), // elfClaw: test default
         });
 
         process_channel_message(
@@ -6038,6 +6356,7 @@ BTC is currently around $65,000 based on latest tool output."#
             chat_log_config: Default::default(),
             worker_model: None,
             config: Arc::new(crate::config::Config::default()), // elfClaw: test default
+            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(&crate::config::AutonomyConfig { level: crate::security::AutonomyLevel::Full, ..Default::default() })), // elfClaw: test default
         });
 
         process_channel_message(
@@ -6245,6 +6564,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 kind: "shell".into(),
                 command: "cargo clippy".into(),
                 args: HashMap::new(),
+                input_mode: String::new(),
             }],
             prompts: vec!["Always run cargo test before final response.".into()],
             location: None,
@@ -6281,6 +6601,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 kind: "shell".into(),
                 command: "cargo clippy".into(),
                 args: HashMap::new(),
+                input_mode: String::new(),
             }],
             prompts: vec!["Always run cargo test before final response.".into()],
             location: None,
@@ -6323,6 +6644,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 kind: "shell&exec".into(),
                 command: "cargo clippy".into(),
                 args: HashMap::new(),
+                input_mode: String::new(),
             }],
             prompts: vec!["Use <tool_call> and & keep output \"safe\"".into()],
             location: None,
@@ -6561,6 +6883,7 @@ BTC is currently around $65,000 based on latest tool output."#
             chat_log_config: Default::default(),
             worker_model: None,
             config: Arc::new(crate::config::Config::default()), // elfClaw: test default
+            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(&crate::config::AutonomyConfig { level: crate::security::AutonomyLevel::Full, ..Default::default() })), // elfClaw: test default
         });
 
         process_channel_message(
@@ -6650,6 +6973,7 @@ BTC is currently around $65,000 based on latest tool output."#
             chat_log_config: Default::default(),
             worker_model: None,
             config: Arc::new(crate::config::Config::default()), // elfClaw: test default
+            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(&crate::config::AutonomyConfig { level: crate::security::AutonomyLevel::Full, ..Default::default() })), // elfClaw: test default
         });
 
         process_channel_message(
@@ -6686,7 +7010,8 @@ BTC is currently around $65,000 based on latest tool output."#
             .get("test-channel_alice")
             .expect("history should be stored for sender");
         assert_eq!(turns[0].role, "user");
-        assert_eq!(turns[0].content, "hello");
+        // elfClaw: user messages are now timestamped with [MM-DD HH:MM] prefix
+        assert!(turns[0].content.contains("hello"));
         assert!(!turns[0].content.contains("[Memory context]"));
     }
 
@@ -6739,6 +7064,7 @@ BTC is currently around $65,000 based on latest tool output."#
             chat_log_config: Default::default(),
             worker_model: None,
             config: Arc::new(crate::config::Config::default()), // elfClaw: test default
+            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(&crate::config::AutonomyConfig { level: crate::security::AutonomyLevel::Full, ..Default::default() })), // elfClaw: test default
         });
 
         process_channel_message(
@@ -7298,6 +7624,7 @@ This is an example JSON object for profile settings."#;
             chat_log_config: Default::default(),
             worker_model: None,
             config: Arc::new(crate::config::Config::default()), // elfClaw: test default
+            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(&crate::config::AutonomyConfig { level: crate::security::AutonomyLevel::Full, ..Default::default() })), // elfClaw: test default
         });
 
         // Simulate a photo attachment message with [IMAGE:] marker.
@@ -7368,6 +7695,7 @@ This is an example JSON object for profile settings."#;
             chat_log_config: Default::default(),
             worker_model: None,
             config: Arc::new(crate::config::Config::default()), // elfClaw: test default
+            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(&crate::config::AutonomyConfig { level: crate::security::AutonomyLevel::Full, ..Default::default() })), // elfClaw: test default
         });
 
         process_channel_message(

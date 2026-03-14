@@ -196,10 +196,27 @@ impl Tool for ShellTool {
             Err(reason) => {
                 // elfClaw: log shell rejection so it's visible in terminal
                 tracing::warn!(command = %command, reason = %reason, "Shell command rejected by security policy");
+                // elfClaw: enrich error with actionable hints so the LLM can self-correct
+                let hint = if reason.contains("not allowed") && reason.contains("Allowed commands:") {
+                    // validate_command_execution already includes the allowed list
+                    String::new()
+                } else if reason.contains("not allowed") {
+                    format!(
+                        " Allowed commands: [{}].",
+                        self.security.allowed_commands_summary()
+                    )
+                } else {
+                    String::new()
+                };
+                let extra = if command.contains('$') || command.contains('`') {
+                    " Note: shell variable expansion ($VAR, $(cmd), `cmd`) is blocked for security. Use simpler commands without variables."
+                } else {
+                    ""
+                };
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
-                    error: Some(reason),
+                    error: Some(format!("{reason}{hint}{extra}")),
                 });
             }
         }
@@ -287,7 +304,8 @@ impl Tool for ShellTool {
 
                     // elfClaw: PATH diagnostic when command not found (helps debug env_clear issues)
                     if stderr.contains("CommandNotFoundException") || stderr.contains("not found") {
-                        let path_val = std::env::var("PATH").unwrap_or_else(|_| "(not set)".to_string());
+                        let path_val =
+                            std::env::var("PATH").unwrap_or_else(|_| "(not set)".to_string());
                         let preview_end = path_val.len().min(500);
                         let mut end = preview_end;
                         while end > 0 && !path_val.is_char_boundary(end) {
