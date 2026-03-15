@@ -2,6 +2,39 @@
 
 ---
 
+## 2026-03-15 — 修复 Windows 端口残留（TCP handle 继承 + Job Object）
+
+### 问题
+zeroclaw 被 `taskkill /F` 终止后，gateway 端口（42617）仍被占用，无法重启。
+根因：`TcpListener` socket handle 在 Windows 上默认可继承，子进程（agent-browser 等）继承该 handle，父进程被杀后子进程仍持有 → 端口无法释放。
+
+### 改动
+
+**第一层：Socket handle 不可继承**
+- **`src/gateway/mod.rs`**：新增 `mark_socket_non_inheritable()` 函数，在 `TcpListener::bind()` 后调用 `SetHandleInformation` 清除 `HANDLE_FLAG_INHERIT` 标志，仅 `#[cfg(windows)]` 编译。
+
+**第二层：Windows Job Object 自动清理子进程**
+- **`src/daemon/mod.rs`**：新增 `setup_job_object()` 函数，创建 Job Object 并设置 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`，将当前进程分配给它。效果：daemon 退出时（包括被强杀），所有子进程自动终止。在 `run()` 开头端口检查后调用。
+
+**unsafe_code lint 调整**
+- **`src/lib.rs`** + **`src/main.rs`**：`#![forbid(unsafe_code)]` → `#![deny(unsafe_code)]`，允许上述两个 `#[allow(unsafe_code)]` 标注的 Windows FFI 函数通过编译。`deny` 仍然默认禁止 unsafe，仅在显式 `#[allow]` 处放行。
+
+### 验证
+- `cargo build --release --features wasm-tools` 编译通过
+- 已 scp 到 K3 (`D:\ZeroClaw_Workspace\zeroclaw.exe`)
+
+---
+
+## 2026-03-15 — Telegram 截图默认发图片，用户要求时发原始文件
+
+### 改动
+- **`src/channels/mod.rs`**：`channel_delivery_instructions()` Telegram 规则新增一条：截图默认用 `[IMAGE:path]`（Telegram 会压缩），仅当用户明确要求原始/高清/不压缩版本时才用 `[FILE:path]` 或 `[DOCUMENT:path]` 发送同一文件。
+
+### 原理
+Telegram `sendPhoto` API 会自动压缩图片，`sendDocument` API 保留原始分辨率。通过 system prompt 引导 LLM 默认选择 IMAGE 标记，用户需要时切换到 FILE/DOCUMENT 标记。
+
+---
+
 ## 2026-03-15 — 修复浏览器截图无法通过 Telegram 发送
 
 ### 问题
