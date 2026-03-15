@@ -815,8 +815,14 @@ async fn handle_approval_command_if_needed(
 
     let reply = match command {
         ApprovalCommand::AllowPending(id) => {
-            mgr.record_non_cli_pending_resolution(&id, crate::approval::ApprovalResponse::Yes);
-            format!("✓ Approved request `{id}`")
+            if let Some(tool) = mgr.get_pending_tool_name(&id) {
+                mgr.grant_non_cli_session(&tool);
+                mgr.record_non_cli_pending_resolution(&id, crate::approval::ApprovalResponse::Yes);
+                format!("✓ Approved `{tool}` (session-level)")
+            } else {
+                mgr.record_non_cli_pending_resolution(&id, crate::approval::ApprovalResponse::Yes);
+                format!("✓ Approved request `{id}`")
+            }
         }
         ApprovalCommand::DenyPending(id) => {
             mgr.record_non_cli_pending_resolution(&id, crate::approval::ApprovalResponse::No);

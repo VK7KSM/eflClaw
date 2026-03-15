@@ -20,6 +20,19 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::process::Command;
+
+/// On Windows, `Command::new("foo")` only resolves `foo.exe` via CreateProcessW.
+/// npm global packages install as `.cmd` wrappers, so append `.cmd` when the
+/// command has no file extension.
+fn resolve_agent_browser_command(command: &str) -> std::borrow::Cow<'_, str> {
+    #[cfg(target_os = "windows")]
+    {
+        if std::path::Path::new(command).extension().is_none() {
+            return std::borrow::Cow::Owned(format!("{}.cmd", command));
+        }
+    }
+    std::borrow::Cow::Borrowed(command)
+}
 use tracing::debug;
 
 /// Computer-use sidecar settings.
@@ -203,6 +216,114 @@ pub enum BrowserAction {
         #[serde(default)]
         fill_value: Option<String>,
     },
+
+    // ── Navigation extensions ────────────────────────────────────
+    /// Navigate back in history
+    Back,
+    /// Navigate forward in history
+    Forward,
+    /// Reload current page
+    Reload,
+
+    // ── Interaction extensions ───────────────────────────────────
+    /// Double-click an element
+    DoubleClick { selector: String },
+    /// Select an option in a <select> element
+    Select { selector: String, value: String },
+    /// Check a checkbox
+    Check { selector: String },
+    /// Uncheck a checkbox
+    Uncheck { selector: String },
+    /// Focus an element
+    Focus { selector: String },
+    /// Drag element from source to target
+    Drag { source: String, target: String },
+    /// Upload file(s) to a file input
+    Upload {
+        selector: String,
+        files: Vec<String>,
+    },
+    /// Download a file by clicking an element
+    Download {
+        selector: String,
+        #[serde(default)]
+        path: Option<String>,
+    },
+
+    // ── JavaScript execution ─────────────────────────────────────
+    /// Execute JavaScript expression and return result
+    Eval { expression: String },
+
+    // ── Output ───────────────────────────────────────────────────
+    /// Export page as PDF
+    Pdf {
+        #[serde(default)]
+        path: Option<String>,
+    },
+
+    // ── View control ─────────────────────────────────────────────
+    /// Scroll element into view
+    ScrollIntoView { selector: String },
+    /// Set viewport size
+    SetViewport {
+        width: u32,
+        height: u32,
+        #[serde(default)]
+        scale: Option<f64>,
+    },
+    /// Emulate a device
+    SetDevice { name: String },
+
+    // ── Tab management ───────────────────────────────────────────
+    /// List open tabs
+    TabList,
+    /// Open a new tab
+    TabOpen {
+        #[serde(default)]
+        url: Option<String>,
+    },
+    /// Close a tab
+    TabClose {
+        #[serde(default)]
+        id: Option<String>,
+    },
+    /// Focus a specific tab
+    TabFocus { id: String },
+
+    // ── Clipboard ────────────────────────────────────────────────
+    /// Read clipboard content
+    ClipboardRead,
+    /// Write text to clipboard
+    ClipboardWrite { text: String },
+
+    // ── Debug / inspection ───────────────────────────────────────
+    /// Highlight an element visually
+    Highlight { selector: String },
+
+    // ── Extended data getters ────────────────────────────────────
+    /// Get inner HTML of an element
+    GetHtml { selector: String },
+    /// Get value of a form element
+    GetValue { selector: String },
+    /// Get attribute value of an element
+    GetAttribute { selector: String, name: String },
+    /// Get count of matching elements
+    GetCount { selector: String },
+
+    // ── Cookie management ────────────────────────────────────────
+    /// Get cookies
+    CookiesGet {
+        #[serde(default)]
+        url: Option<String>,
+    },
+    /// Set a cookie
+    CookiesSet {
+        name: String,
+        value: String,
+        domain: String,
+    },
+    /// Clear all cookies
+    CookiesClear,
 }
 
 impl BrowserTool {
@@ -297,7 +418,8 @@ impl BrowserTool {
 
     /// Check if agent-browser CLI is available.
     async fn is_agent_browser_available_with_command(command: &str) -> bool {
-        Command::new(command)
+        let resolved = resolve_agent_browser_command(command);
+        Command::new(resolved.as_ref())
             .arg("--version")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -541,7 +663,8 @@ impl BrowserTool {
             anyhow::bail!("browser.agent_browser_command cannot be empty");
         }
 
-        let mut cmd = Command::new(command);
+        let resolved = resolve_agent_browser_command(command);
+        let mut cmd = Command::new(resolved.as_ref());
 
         for extra in &self.agent_browser_extra_args {
             let trimmed = extra.trim();
@@ -554,6 +677,10 @@ impl BrowserTool {
         if let Some(ref session) = self.session_name {
             cmd.arg("--session").arg(session);
         }
+
+        // Ensure agent-browser cwd = workspace_dir so relative paths
+        // (e.g. screenshots) land where TelegramChannel expects them.
+        cmd.current_dir(&self.security.workspace_dir);
 
         // Add --json for machine-readable output
         cmd.args(args).arg("--json");
@@ -667,9 +794,21 @@ impl BrowserTool {
 
             BrowserAction::Screenshot { path, full_page } => {
                 let mut args = vec!["screenshot"];
-                if let Some(ref p) = path {
-                    args.push(p);
-                }
+                // elfClaw: default screenshot path to workspace/homework/
+                // so Telegram attachment security check passes.
+                let default_path;
+                let effective_path = match path.as_deref() {
+                    Some(p) => p,
+                    None => {
+                        let ts = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis();
+                        default_path = format!("homework/screenshot-{ts}.png");
+                        &default_path
+                    }
+                };
+                args.push(effective_path);
                 if full_page {
                     args.push("--full");
                 }
@@ -735,6 +874,208 @@ impl BrowserTool {
                     args.push(fv);
                 }
                 let resp = self.run_command(&args).await?;
+                self.to_result(resp)
+            }
+
+            // ── Navigation extensions ────────────────────────────
+            BrowserAction::Back => {
+                let resp = self.run_command(&["back"]).await?;
+                self.to_result(resp)
+            }
+
+            BrowserAction::Forward => {
+                let resp = self.run_command(&["forward"]).await?;
+                self.to_result(resp)
+            }
+
+            BrowserAction::Reload => {
+                let resp = self.run_command(&["reload"]).await?;
+                self.to_result(resp)
+            }
+
+            // ── Interaction extensions ───────────────────────────
+            BrowserAction::DoubleClick { selector } => {
+                let resp = self.run_command(&["dblclick", &selector]).await?;
+                self.to_result(resp)
+            }
+
+            BrowserAction::Select { selector, value } => {
+                let resp = self.run_command(&["select", &selector, &value]).await?;
+                self.to_result(resp)
+            }
+
+            BrowserAction::Check { selector } => {
+                let resp = self.run_command(&["check", &selector]).await?;
+                self.to_result(resp)
+            }
+
+            BrowserAction::Uncheck { selector } => {
+                let resp = self.run_command(&["uncheck", &selector]).await?;
+                self.to_result(resp)
+            }
+
+            BrowserAction::Focus { selector } => {
+                let resp = self.run_command(&["focus", &selector]).await?;
+                self.to_result(resp)
+            }
+
+            BrowserAction::Drag { source, target } => {
+                let resp = self.run_command(&["drag", &source, &target]).await?;
+                self.to_result(resp)
+            }
+
+            BrowserAction::Upload { selector, files } => {
+                let mut args = vec!["upload", &selector];
+                let file_refs: Vec<&str> = files.iter().map(String::as_str).collect();
+                args.extend(file_refs);
+                let resp = self.run_command(&args).await?;
+                self.to_result(resp)
+            }
+
+            BrowserAction::Download { selector, path } => {
+                let mut args = vec!["download", &selector];
+                if let Some(ref p) = path {
+                    args.push(p);
+                }
+                let resp = self.run_command(&args).await?;
+                self.to_result(resp)
+            }
+
+            // ── JavaScript execution ─────────────────────────────
+            BrowserAction::Eval { expression } => {
+                let resp = self.run_command(&["eval", &expression]).await?;
+                self.to_result(resp)
+            }
+
+            // ── Output ──────────────────────────────────────────
+            BrowserAction::Pdf { path } => {
+                let mut args = vec!["pdf"];
+                if let Some(ref p) = path {
+                    args.push(p);
+                }
+                let resp = self.run_command(&args).await?;
+                self.to_result(resp)
+            }
+
+            // ── View control ─────────────────────────────────────
+            BrowserAction::ScrollIntoView { selector } => {
+                let resp = self.run_command(&["scrollintoview", &selector]).await?;
+                self.to_result(resp)
+            }
+
+            BrowserAction::SetViewport {
+                width,
+                height,
+                scale,
+            } => {
+                let w_str = width.to_string();
+                let h_str = height.to_string();
+                let mut args = vec!["set", "viewport", &w_str, &h_str];
+                let scale_str;
+                if let Some(s) = scale {
+                    scale_str = s.to_string();
+                    args.push("--scale");
+                    args.push(&scale_str);
+                }
+                let resp = self.run_command(&args).await?;
+                self.to_result(resp)
+            }
+
+            BrowserAction::SetDevice { name } => {
+                let resp = self.run_command(&["set", "device", &name]).await?;
+                self.to_result(resp)
+            }
+
+            // ── Tab management ───────────────────────────────────
+            BrowserAction::TabList => {
+                let resp = self.run_command(&["tab", "list"]).await?;
+                self.to_result(resp)
+            }
+
+            BrowserAction::TabOpen { url } => {
+                let mut args = vec!["tab", "open"];
+                if let Some(ref u) = url {
+                    args.push(u);
+                }
+                let resp = self.run_command(&args).await?;
+                self.to_result(resp)
+            }
+
+            BrowserAction::TabClose { id } => {
+                let mut args = vec!["tab", "close"];
+                if let Some(ref i) = id {
+                    args.push(i);
+                }
+                let resp = self.run_command(&args).await?;
+                self.to_result(resp)
+            }
+
+            BrowserAction::TabFocus { id } => {
+                let resp = self.run_command(&["tab", "focus", &id]).await?;
+                self.to_result(resp)
+            }
+
+            // ── Clipboard ────────────────────────────────────────
+            BrowserAction::ClipboardRead => {
+                let resp = self.run_command(&["clipboard", "read"]).await?;
+                self.to_result(resp)
+            }
+
+            BrowserAction::ClipboardWrite { text } => {
+                let resp = self.run_command(&["clipboard", "write", &text]).await?;
+                self.to_result(resp)
+            }
+
+            // ── Debug ────────────────────────────────────────────
+            BrowserAction::Highlight { selector } => {
+                let resp = self.run_command(&["highlight", &selector]).await?;
+                self.to_result(resp)
+            }
+
+            // ── Extended data getters ────────────────────────────
+            BrowserAction::GetHtml { selector } => {
+                let resp = self.run_command(&["get", "html", &selector]).await?;
+                self.to_result(resp)
+            }
+
+            BrowserAction::GetValue { selector } => {
+                let resp = self.run_command(&["get", "value", &selector]).await?;
+                self.to_result(resp)
+            }
+
+            BrowserAction::GetAttribute { selector, name } => {
+                let resp = self.run_command(&["get", "attr", &selector, &name]).await?;
+                self.to_result(resp)
+            }
+
+            BrowserAction::GetCount { selector } => {
+                let resp = self.run_command(&["get", "count", &selector]).await?;
+                self.to_result(resp)
+            }
+
+            // ── Cookie management ────────────────────────────────
+            BrowserAction::CookiesGet { url } => {
+                let mut args = vec!["cookies", "get"];
+                if let Some(ref u) = url {
+                    args.push(u);
+                }
+                let resp = self.run_command(&args).await?;
+                self.to_result(resp)
+            }
+
+            BrowserAction::CookiesSet {
+                name,
+                value,
+                domain,
+            } => {
+                let resp = self
+                    .run_command(&["cookies", "set", &name, &value, &domain])
+                    .await?;
+                self.to_result(resp)
+            }
+
+            BrowserAction::CookiesClear => {
+                let resp = self.run_command(&["cookies", "clear"]).await?;
                 self.to_result(resp)
             }
         }
@@ -1136,13 +1477,23 @@ impl Tool for BrowserTool {
                     "enum": ["open", "snapshot", "click", "fill", "type", "get_text",
                              "get_title", "get_url", "screenshot", "wait", "press",
                              "hover", "scroll", "is_visible", "close", "find",
+                             "back", "forward", "reload",
+                             "double_click", "select", "check", "uncheck", "focus",
+                             "drag", "upload", "download",
+                             "eval", "pdf", "scroll_into_view",
+                             "set_viewport", "set_device",
+                             "tab_list", "tab_open", "tab_close", "tab_focus",
+                             "clipboard_read", "clipboard_write",
+                             "highlight",
+                             "get_html", "get_value", "get_attribute", "get_count",
+                             "cookies_get", "cookies_set", "cookies_clear",
                              "mouse_move", "mouse_click", "mouse_drag", "key_type",
                              "key_press", "screen_capture"],
                     "description": "Browser action to perform (OS-level actions require backend=computer_use)"
                 },
                 "url": {
                     "type": "string",
-                    "description": "URL to navigate to (for 'open' action)"
+                    "description": "URL to navigate to (for 'open', 'tab_open', 'cookies_get')"
                 },
                 "selector": {
                     "type": "string",
@@ -1150,15 +1501,56 @@ impl Tool for BrowserTool {
                 },
                 "value": {
                     "type": "string",
-                    "description": "Value to fill or type"
+                    "description": "Value to fill, type, or select"
                 },
                 "text": {
                     "type": "string",
-                    "description": "Text to type or wait for"
+                    "description": "Text to type, wait for, or write to clipboard"
                 },
                 "key": {
                     "type": "string",
                     "description": "Key to press (Enter, Tab, Escape, etc.)"
+                },
+                "expression": {
+                    "type": "string",
+                    "description": "JavaScript expression to evaluate (for 'eval')"
+                },
+                "source": {
+                    "type": "string",
+                    "description": "Source selector for drag action"
+                },
+                "target": {
+                    "type": "string",
+                    "description": "Target selector for drag action"
+                },
+                "files": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "File paths for upload action"
+                },
+                "name": {
+                    "type": "string",
+                    "description": "Attribute name (get_attribute) or cookie name (cookies_set)"
+                },
+                "domain": {
+                    "type": "string",
+                    "description": "Cookie domain (for cookies_set)"
+                },
+                "id": {
+                    "type": "string",
+                    "description": "Tab ID (for tab_close, tab_focus)"
+                },
+                "width": {
+                    "type": "integer",
+                    "description": "Viewport width (for set_viewport)"
+                },
+                "height": {
+                    "type": "integer",
+                    "description": "Viewport height (for set_viewport)"
+                },
+                "scale": {
+                    "type": "number",
+                    "description": "Device scale factor (for set_viewport)"
                 },
                 "x": {
                     "type": "integer",
@@ -1216,7 +1608,7 @@ impl Tool for BrowserTool {
                 },
                 "path": {
                     "type": "string",
-                    "description": "File path for screenshot"
+                    "description": "File path for screenshot, pdf, or download output"
                 },
                 "ms": {
                     "type": "integer",
@@ -1308,6 +1700,32 @@ impl Tool for BrowserTool {
         };
 
         if let BrowserAction::Screenshot {
+            path: Some(path), ..
+        } = &action
+        {
+            if let Err(err) = self.validate_output_path("path", path) {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(err.to_string()),
+                });
+            }
+        }
+
+        if let BrowserAction::Pdf {
+            path: Some(path), ..
+        } = &action
+        {
+            if let Err(err) = self.validate_output_path("path", path) {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(err.to_string()),
+                });
+            }
+        }
+
+        if let BrowserAction::Download {
             path: Some(path), ..
         } = &action
         {
@@ -1669,6 +2087,11 @@ mod native_backend {
                         "data": payload,
                     }))
                 }
+                // Extended actions only supported by agent-browser backend
+                _ => anyhow::bail!(
+                    "Action '{:?}' is not supported by the rust_native backend. Use agent_browser backend instead.",
+                    action
+                ),
             }
         }
 
@@ -2314,6 +2737,263 @@ fn parse_browser_action(action_str: &str, args: &Value) -> anyhow::Result<Browse
                     .map(String::from),
             })
         }
+
+        // ── Navigation extensions ────────────────────────────────
+        "back" => Ok(BrowserAction::Back),
+        "forward" => Ok(BrowserAction::Forward),
+        "reload" => Ok(BrowserAction::Reload),
+
+        // ── Interaction extensions ───────────────────────────────
+        "double_click" => {
+            let selector = args
+                .get("selector")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("Missing 'selector' for double_click"))?;
+            Ok(BrowserAction::DoubleClick {
+                selector: selector.into(),
+            })
+        }
+        "select" => {
+            let selector = args
+                .get("selector")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("Missing 'selector' for select"))?;
+            let value = args
+                .get("value")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("Missing 'value' for select"))?;
+            Ok(BrowserAction::Select {
+                selector: selector.into(),
+                value: value.into(),
+            })
+        }
+        "check" => {
+            let selector = args
+                .get("selector")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("Missing 'selector' for check"))?;
+            Ok(BrowserAction::Check {
+                selector: selector.into(),
+            })
+        }
+        "uncheck" => {
+            let selector = args
+                .get("selector")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("Missing 'selector' for uncheck"))?;
+            Ok(BrowserAction::Uncheck {
+                selector: selector.into(),
+            })
+        }
+        "focus" => {
+            let selector = args
+                .get("selector")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("Missing 'selector' for focus"))?;
+            Ok(BrowserAction::Focus {
+                selector: selector.into(),
+            })
+        }
+        "drag" => {
+            let source = args
+                .get("source")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("Missing 'source' for drag"))?;
+            let target = args
+                .get("target")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("Missing 'target' for drag"))?;
+            Ok(BrowserAction::Drag {
+                source: source.into(),
+                target: target.into(),
+            })
+        }
+        "upload" => {
+            let selector = args
+                .get("selector")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("Missing 'selector' for upload"))?;
+            let files = args
+                .get("files")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .ok_or_else(|| anyhow::anyhow!("Missing 'files' array for upload"))?;
+            Ok(BrowserAction::Upload {
+                selector: selector.into(),
+                files,
+            })
+        }
+        "download" => {
+            let selector = args
+                .get("selector")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("Missing 'selector' for download"))?;
+            Ok(BrowserAction::Download {
+                selector: selector.into(),
+                path: args.get("path").and_then(|v| v.as_str()).map(String::from),
+            })
+        }
+
+        // ── JavaScript execution ─────────────────────────────────
+        "eval" => {
+            let expression = args
+                .get("expression")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("Missing 'expression' for eval"))?;
+            Ok(BrowserAction::Eval {
+                expression: expression.into(),
+            })
+        }
+
+        // ── Output ──────────────────────────────────────────────
+        "pdf" => Ok(BrowserAction::Pdf {
+            path: args.get("path").and_then(|v| v.as_str()).map(String::from),
+        }),
+
+        // ── View control ─────────────────────────────────────────
+        "scroll_into_view" => {
+            let selector = args
+                .get("selector")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("Missing 'selector' for scroll_into_view"))?;
+            Ok(BrowserAction::ScrollIntoView {
+                selector: selector.into(),
+            })
+        }
+        "set_viewport" => {
+            let width = args
+                .get("width")
+                .and_then(|v| v.as_u64())
+                .map(|w| u32::try_from(w).unwrap_or(u32::MAX))
+                .ok_or_else(|| anyhow::anyhow!("Missing 'width' for set_viewport"))?;
+            let height = args
+                .get("height")
+                .and_then(|v| v.as_u64())
+                .map(|h| u32::try_from(h).unwrap_or(u32::MAX))
+                .ok_or_else(|| anyhow::anyhow!("Missing 'height' for set_viewport"))?;
+            Ok(BrowserAction::SetViewport {
+                width,
+                height,
+                scale: args.get("scale").and_then(|v| v.as_f64()),
+            })
+        }
+        "set_device" => {
+            let name = args
+                .get("name")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("Missing 'name' for set_device"))?;
+            Ok(BrowserAction::SetDevice { name: name.into() })
+        }
+
+        // ── Tab management ───────────────────────────────────────
+        "tab_list" => Ok(BrowserAction::TabList),
+        "tab_open" => Ok(BrowserAction::TabOpen {
+            url: args.get("url").and_then(|v| v.as_str()).map(String::from),
+        }),
+        "tab_close" => Ok(BrowserAction::TabClose {
+            id: args.get("id").and_then(|v| v.as_str()).map(String::from),
+        }),
+        "tab_focus" => {
+            let id = args
+                .get("id")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("Missing 'id' for tab_focus"))?;
+            Ok(BrowserAction::TabFocus { id: id.into() })
+        }
+
+        // ── Clipboard ────────────────────────────────────────────
+        "clipboard_read" => Ok(BrowserAction::ClipboardRead),
+        "clipboard_write" => {
+            let text = args
+                .get("text")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("Missing 'text' for clipboard_write"))?;
+            Ok(BrowserAction::ClipboardWrite { text: text.into() })
+        }
+
+        // ── Debug ────────────────────────────────────────────────
+        "highlight" => {
+            let selector = args
+                .get("selector")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("Missing 'selector' for highlight"))?;
+            Ok(BrowserAction::Highlight {
+                selector: selector.into(),
+            })
+        }
+
+        // ── Extended data getters ────────────────────────────────
+        "get_html" => {
+            let selector = args
+                .get("selector")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("Missing 'selector' for get_html"))?;
+            Ok(BrowserAction::GetHtml {
+                selector: selector.into(),
+            })
+        }
+        "get_value" => {
+            let selector = args
+                .get("selector")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("Missing 'selector' for get_value"))?;
+            Ok(BrowserAction::GetValue {
+                selector: selector.into(),
+            })
+        }
+        "get_attribute" => {
+            let selector = args
+                .get("selector")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("Missing 'selector' for get_attribute"))?;
+            let name = args
+                .get("name")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("Missing 'name' for get_attribute"))?;
+            Ok(BrowserAction::GetAttribute {
+                selector: selector.into(),
+                name: name.into(),
+            })
+        }
+        "get_count" => {
+            let selector = args
+                .get("selector")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("Missing 'selector' for get_count"))?;
+            Ok(BrowserAction::GetCount {
+                selector: selector.into(),
+            })
+        }
+
+        // ── Cookie management ────────────────────────────────────
+        "cookies_get" => Ok(BrowserAction::CookiesGet {
+            url: args.get("url").and_then(|v| v.as_str()).map(String::from),
+        }),
+        "cookies_set" => {
+            let name = args
+                .get("name")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("Missing 'name' for cookies_set"))?;
+            let value = args
+                .get("value")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("Missing 'value' for cookies_set"))?;
+            let domain = args
+                .get("domain")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("Missing 'domain' for cookies_set"))?;
+            Ok(BrowserAction::CookiesSet {
+                name: name.into(),
+                value: value.into(),
+                domain: domain.into(),
+            })
+        }
+        "cookies_clear" => Ok(BrowserAction::CookiesClear),
+
         other => anyhow::bail!("Unsupported browser action: {other}"),
     }
 }
@@ -2339,6 +3019,36 @@ fn is_supported_browser_action(action: &str) -> bool {
             | "is_visible"
             | "close"
             | "find"
+            | "back"
+            | "forward"
+            | "reload"
+            | "double_click"
+            | "select"
+            | "check"
+            | "uncheck"
+            | "focus"
+            | "drag"
+            | "upload"
+            | "download"
+            | "eval"
+            | "pdf"
+            | "scroll_into_view"
+            | "set_viewport"
+            | "set_device"
+            | "tab_list"
+            | "tab_open"
+            | "tab_close"
+            | "tab_focus"
+            | "clipboard_read"
+            | "clipboard_write"
+            | "highlight"
+            | "get_html"
+            | "get_value"
+            | "get_attribute"
+            | "get_count"
+            | "cookies_get"
+            | "cookies_set"
+            | "cookies_clear"
             | "mouse_move"
             | "mouse_click"
             | "mouse_drag"

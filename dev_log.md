@@ -2,6 +2,224 @@
 
 ---
 
+## 2026-03-15 — 修复浏览器截图无法通过 Telegram 发送
+
+### 问题
+Agent 调用 browser 工具截图后，截图无法发给 Telegram 用户。日志报错 `Telegram attachment path escapes workspace`。
+根因：LLM 调用 screenshot action 时未传 `path` 参数，导致 agent-browser CLI 将截图保存到 `~/.agent-browser/tmp/screenshots/`（workspace 外），Telegram channel 安全检查拒绝发送。
+
+### 改动
+- **`src/tools/browser.rs`**：Screenshot 分支增加默认路径逻辑。当 LLM 未传 `path` 参数时，自动填充 `homework/screenshot-{timestamp}.png`（相对路径）。`run_command()` 已设置 `current_dir(workspace_dir)`，相对路径自动解析到 workspace 内，通过安全检查。
+
+### 验证
+- `cargo check` 编译通过
+
+---
+
+## 2026-03-15 — 修复 agent-browser skill 安全审计误判
+
+### 问题
+elfClaw 启动时跳过 `agent-browser` skill，报 `markdown links to script files are blocked`。
+根因：`src/skills/audit.rs` 中 `audit_markdown_link_target()` 对 SKILL.md 内链接到 `.sh` 脚本的检查**不尊重** `allow_scripts` 配置选项，无条件阻止。
+
+### 修改文件
+- `src/skills/audit.rs` — 4 处改动：
+  1. `audit_markdown_file()` 签名加 `options: SkillAuditOptions` 参数
+  2. 内部调用 `audit_markdown_link_target()` 时传递 `options`
+  3. `audit_markdown_link_target()` 签名加 `options` 参数，核心修复：`if !options.allow_scripts && has_script_suffix(stripped)`
+  4. `audit_path()` 调用传递 `options`；`audit_open_skill_markdown()` 使用 `SkillAuditOptions::default()`（保持安全默认）
+
+### 验证
+- `cargo build --release --features wasm-tools` 编译通过（19MB）
+
+---
+
+## 2026-03-15 — K3 config.toml 完整配置恢复
+
+### 背景
+之前错误地将旧版 `资料/config.toml` 上传到 K3，覆盖了正确配置。上次 session 的 `/tmp/k3-config-fixed.toml` 修复了大部分问题，但 `[browser]` 段仍是 `enabled = false`，导致 agent 完全不知道浏览器工具存在。
+
+### 修改内容（基于 k3-config-fixed.toml 应用 3 处修改）
+
+1. **`[browser]` 段**：`enabled = true`，`allowed_domains = ["*"]`，`agent_browser_command = "agent-browser.cmd"`
+2. **`auto_approve`**：加入 `browser`、`browser_open`、`web_access_config`
+3. **`[memory]` embedding**：`embedding_provider = "gemini"`，`embedding_model = "gemini-embedding-001"`，`embedding_dimensions = 768`
+
+### 操作
+- 生成 `/tmp/k3-config-final.toml`
+- `scp` 上传到 K3 `D:/ZeroClaw_Workspace/config.toml`
+- 同步更新本地 `资料/config.toml`
+
+### 改动文件
+- `资料/config.toml` — 同步为最终正确版本
+
+---
+
+## 2026-03-15 — Browser 工具审批+截图路径修复
+
+### 问题 1：浏览器工具多次审批
+browser、browser_open、web_access_config 是独立工具名，每个都触发审批弹窗。
+
+**修复**：`资料/config.toml` 的 `auto_approve` 列表加入 `browser`、`browser_open`、`web_access_config`。零代码改动。
+
+### 问题 2：截图文件路径不匹配
+agent-browser 子进程继承 zeroclaw.exe 的 cwd（`D:\ZeroClaw_Workspace\`），截图保存到该目录。但 TelegramChannel 在 workspace_dir（`D:\ZeroClaw_Workspace\workspace\`）下查找，差了一级 `workspace/` 目录。
+
+**修复**：`src/tools/browser.rs` 的 `run_command()` 添加 `cmd.current_dir(&self.security.workspace_dir)`，确保 agent-browser cwd = workspace_dir。
+
+### 改动文件
+- `资料/config.toml` — auto_approve 加入 3 个浏览器工具
+- `src/tools/browser.rs` — run_command() 设置 current_dir
+
+---
+
+## 2026-03-15 — Browser 工具 Windows `.cmd` 解析修复
+
+### 背景
+browser 工具在 K3 上执行时 5ms 内失败，错误：`agent-browser CLI is unavailable`。
+根因：Rust `Command::new("agent-browser")` 在 Windows 上使用 `CreateProcessW`，只查找 `.exe`，不查找 `.cmd`。
+npm 全局安装在 Windows 上生成 `agent-browser.cmd` 包装器。
+
+### 修改内容
+
+**`src/tools/browser.rs`**
+- 新增 `resolve_agent_browser_command()` 辅助函数：在 Windows 上为无扩展名的命令追加 `.cmd`
+- `#[cfg(target_os = "windows")]` 隔离，不影响 Linux/macOS
+- 修改 `is_agent_browser_available_with_command()` 和 `run_command()` 两个调用点使用该函数
+
+**`资料/config.toml`**
+- `agent_browser_command = "agent-browser.cmd"`（belt-and-suspenders，即使没有代码修复也能工作）
+
+### 部署
+- `cargo build --release --features wasm-tools` 编译通过
+- 二进制文件（19.7MB）和 config.toml 已上传至 K3 `D:\ZeroClaw_Workspace\`
+
+---
+
+## 2026-03-14 — K3 config.toml browser.enabled 修复
+
+### 背景
+上次修复中从本地备份 `资料/config.toml` 恢复了 K3 配置文件，但该备份中 `browser.enabled = false`、`allowed_domains = []`，导致 browser 和 browser_open 工具根本未注册。LLM 在工具列表中看不到浏览器工具。
+
+### 修改内容
+
+#### 1. K3 `D:\ZeroClaw_Workspace\config.toml` — browser 段
+- `enabled = false` → `enabled = true`
+- `allowed_domains = []` → `allowed_domains = ["*"]`（通配符，允许所有域名）
+
+#### 2. 本地备份 `资料/config.toml` — 同步更新
+- 同上修改，保持本地备份与 K3 一致
+
+### 注意事项
+- 首次用 PowerShell `-replace` 修改时误将全文所有 `enabled = false` 改为 `true`，立即通过 scp 上传本地正确版本修复
+- K3 验证：browser 段 `enabled = true` + `allowed_domains = ["*"]`，其他 18 个 `enabled = false` 保持不变
+
+### 验证
+- 需用户手动重启 K3 elfClaw 进程
+- Telegram 测试："用浏览器打开 https://example.com 并截图"，预期 agent 调用 browser 工具
+
+---
+
+## 2026-03-14 — 浏览器工具调用失败修复 + 审批流程优化
+
+### 背景
+K3 上 agent 被 Telegram 要求"用浏览器打开 9news 并截图"时，`browser` 报 agent-browser CLI unavailable，`browser_open` 报 cmd start exit code 1（URL 被 `\` 包裹导致 Windows 找不到文件）。每个工具调用都需要单独确认，体验差。
+
+### 修改内容
+
+#### 1. `src/tools/browser_open.rs` — Windows URL 引号 bug 修复
+- 5 个 Windows 函数（open_in_brave/chrome/firefox/default/edge）中 `.arg(format!("\"{escaped}\""))` 改为 `.arg(&escaped)`
+- 原因：`format!` 产生含字面双引号的字符串，MSVC CRT 将内部 `"` 转义为 `\"`，cmd.exe 将 `\` 视为路径分隔符，导致 URL 变成 `\https://...\`
+- `escape_for_cmd_start()` 已对 `&`/`|`/`<`/`>` 等用 `^` 转义，无需额外引号包裹
+
+#### 2. `src/approval/mod.rs` — 新增 `get_pending_tool_name()` 方法
+- 从 `pending_non_cli_requests` 中查找指定 request_id 的 tool_name
+- 用于支持 `/approve-allow` 时自动获取工具名并提升为会话级审批
+
+#### 3. `src/channels/mod.rs` — `/approve-allow` 改为会话级审批
+- `AllowPending(id)` 处理逻辑：先查 pending request 的 tool_name → 调用 `grant_non_cli_session()` 加入会话 allowlist → 再 resolve
+- 效果：首次确认某工具后，该会话内同工具无需再次确认
+- 安全：会话级（重启重置），`always_ask` 仍优先
+
+#### 4. K3 运维操作
+- PowerShell 执行策略：`Set-ExecutionPolicy RemoteSigned -Scope CurrentUser`（解决 agent-browser.ps1 被阻止）
+- `config.toml` auto_approve 列表新增：web_scrape, web_crawl, web_login, web_health, web_help, agent_reach_ensure, web_fetch, web_search
+
+### 验证
+- cargo clippy：本次修改未引入新警告
+- cargo build --release --features wasm-tools：编译通过
+- K3 PowerShell 执行策略已确认为 RemoteSigned
+- K3 config.toml auto_approve 已更新确认
+
+---
+
+## 2026-03-14 — 部署 agent-browser Skill 到 K3
+
+### 背景
+agent 被要求"打开网站并截图"时，browser 工具调用失败后错误回退到 web_scrape/shell 等不相关工具。根本原因：agent 缺少 skill 指导，不知道 browser 工具的正确工作流。agent-browser 项目自带 SKILL.md（633 行完整指导），与 elfClaw skill 系统兼容。
+
+### 部署内容
+- **目标路径**：`D:\ZeroClaw_Workspace\workspace\skills\agent-browser\`
+- **源文件**：从 `C:\Dev\agent-browser\skills\agent-browser\` 复制
+  - `SKILL.md`（修改后 28580 字节）
+  - `references/`（7 个参考文档：commands, authentication, session-management 等）
+  - `templates/`（3 个模板脚本：form-automation, authenticated-session, capture-workflow）
+
+### SKILL.md 修改
+1. **Frontmatter 适配**：`allowed-tools: Bash(npx agent-browser:*)` → `always: true`（确保指导始终注入 system prompt）
+2. **追加 elfClaw 映射段**：
+   - 27 行映射表：agent-browser CLI 命令 → elfClaw browser 工具参数
+   - 3 个工作流示例：截图、表单填写、数据提取
+   - 重要提醒：ref 失效规则、优先用 snapshot、禁止用 web_scrape 替代
+
+### 其他 skill 分析
+agent-browser/skills/ 下的 dogfood、electron、slack、vercel-sandbox 四个 skill 均不适用于 K3 环境，未部署。
+
+### 验证
+需重启 elfClaw 后通过 Telegram 测试浏览器操作，确认 agent 使用 browser 工具而非 web_scrape。
+
+---
+
+## 2026-03-14 — 浏览器功能扩展 + K3 部署 agent-browser
+
+### 功能概述
+扩展 BrowserAction 枚举，新增 30+ 浏览器操作映射 agent-browser 0.20.0 的完整命令集。同时在 K3 上部署 agent-browser 运行时。
+
+### 修改文件
+
+#### `src/tools/browser.rs` — BrowserAction 枚举扩展
+- **BrowserAction 枚举**新增 30 个变体：
+  - 导航：Back, Forward, Reload
+  - 交互：DoubleClick, Select, Check, Uncheck, Focus, Drag, Upload, Download
+  - JS 执行：Eval
+  - 输出：Pdf
+  - 视图控制：ScrollIntoView, SetViewport, SetDevice
+  - 标签页：TabList, TabOpen, TabClose, TabFocus
+  - 剪贴板：ClipboardRead, ClipboardWrite
+  - 调试：Highlight
+  - 数据获取：GetHtml, GetValue, GetAttribute, GetCount
+  - Cookie：CookiesGet, CookiesSet, CookiesClear
+- **execute_agent_browser_action()** 新增对应 match 分支，每个变体映射到 agent-browser CLI 命令
+- **native_backend execute_action()** 添加通配符回退，不支持的扩展操作返回明确错误
+- **parameters_schema()** 扩展 action 枚举和参数定义
+- **parse_browser_action()** 新增所有新操作的参数解析
+- **is_supported_browser_action()** 扩展支持的操作列表
+- **execute()** 新增 Pdf/Download 的 validate_output_path() 安全校验
+
+### K3 部署
+- 通过 winget 安装 Node.js LTS (v24.14.0)
+- 通过 npm 全局安装 agent-browser 0.20.0
+- config.toml `[browser]` 段：`enabled = true`, `allowed_domains = ["*"]`
+- 上传新编译的 release 二进制文件（19.7MB）
+
+### 安全考虑
+- Eval：复用已有的 can_act() + record_action() 安全门
+- Upload/Download/Pdf：输出路径通过 validate_output_path() 校验
+- CookiesSet：受已有安全策略保护
+- 所有导航操作继续复用已有 URL 验证和 allowed_domains 检查
+
+---
+
 ## 2026-03-14 — Self-Improving 反思系统 + Gemini Embedding Provider
 
 ### 功能概述

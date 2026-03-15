@@ -518,6 +518,12 @@ impl ApprovalManager {
         pending.contains_key(request_id)
     }
 
+    /// Get the tool_name for a pending non-CLI request.
+    pub fn get_pending_tool_name(&self, request_id: &str) -> Option<String> {
+        let pending = self.pending_non_cli_requests.lock();
+        pending.get(request_id).map(|r| r.tool_name.clone())
+    }
+
     /// Record a yes/no resolution for a pending non-CLI request.
     pub fn record_non_cli_pending_resolution(&self, request_id: &str, decision: ApprovalResponse) {
         if !matches!(decision, ApprovalResponse::Yes | ApprovalResponse::No) {

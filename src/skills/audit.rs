@@ -101,7 +101,7 @@ pub fn audit_open_skill_markdown(path: &Path, repo_root: &Path) -> Result<SkillA
         files_scanned: 1,
         findings: Vec::new(),
     };
-    audit_markdown_file(&canonical_repo, &canonical_path, &mut report)?;
+    audit_markdown_file(&canonical_repo, &canonical_path, &mut report, SkillAuditOptions::default())?;
     Ok(report)
 }
 
@@ -314,7 +314,7 @@ fn audit_path(
     }
 
     if is_markdown_file(path) {
-        audit_markdown_file(root, path, report)?;
+        audit_markdown_file(root, path, report, options)?;
     } else if is_toml_file(path) {
         audit_manifest_file(root, path, report)?;
     }
@@ -322,7 +322,7 @@ fn audit_path(
     Ok(())
 }
 
-fn audit_markdown_file(root: &Path, path: &Path, report: &mut SkillAuditReport) -> Result<()> {
+fn audit_markdown_file(root: &Path, path: &Path, report: &mut SkillAuditReport, options: SkillAuditOptions) -> Result<()> {
     let content = fs::read_to_string(path)
         .with_context(|| format!("failed to read markdown file {}", path.display()))?;
     let rel = relative_display(root, path);
@@ -334,7 +334,7 @@ fn audit_markdown_file(root: &Path, path: &Path, report: &mut SkillAuditReport) 
     }
 
     for raw_target in extract_markdown_links(&content) {
-        audit_markdown_link_target(root, path, &raw_target, report);
+        audit_markdown_link_target(root, path, &raw_target, report, options);
     }
 
     Ok(())
@@ -409,6 +409,7 @@ fn audit_markdown_link_target(
     source: &Path,
     raw: &str,
     report: &mut SkillAuditReport,
+    options: SkillAuditOptions,
 ) {
     let normalized = normalize_markdown_target(raw);
     if normalized.is_empty() || normalized.starts_with('#') {
@@ -445,7 +446,7 @@ fn audit_markdown_link_target(
         return;
     }
 
-    if has_script_suffix(stripped) {
+    if !options.allow_scripts && has_script_suffix(stripped) {
         report.findings.push(format!(
             "{rel}: markdown links to script files are blocked ({normalized})."
         ));
