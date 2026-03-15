@@ -337,6 +337,17 @@ fn interruption_scope_key(msg: &traits::ChannelMessage) -> String {
     format!("{}_{}_{}", msg.channel, msg.reply_target, msg.sender)
 }
 
+/// Check if a message is a stop/pause command (hard-coded, bypasses LLM).
+fn is_stop_command(content: &str) -> bool {
+    let trimmed = content.trim();
+    if matches!(trimmed, "停" | "暂停" | "stop" | "pause") {
+        return true;
+    }
+    // Strip @bot_username suffix for group commands like "/pause@mybot"
+    let base = trimmed.split('@').next().unwrap_or(trimmed);
+    matches!(base, "/stop" | "/pause")
+}
+
 /// Strip tool-call XML tags from outgoing messages.
 ///
 /// LLM responses may contain `<function_calls>`, `<function_call>`,
@@ -2518,6 +2529,19 @@ async fn process_channel_message(
                     tracing::debug!("Failed to cancel draft on {}: {err}", channel.name());
                 }
             }
+            // elfClaw: persist partial history so the next message carries context
+            if history.len() > history_len_before_tools {
+                for turn in &history[history_len_before_tools..] {
+                    append_sender_turn(ctx.as_ref(), &history_key, turn.clone());
+                }
+                append_sender_turn(
+                    ctx.as_ref(),
+                    &history_key,
+                    ChatMessage::assistant(
+                        "[任务已暂停] 以上是暂停前的执行进度。用户将发送补充指令，请结合以上进度继续完成任务。",
+                    ),
+                );
+            }
         }
         LlmExecutionResult::Completed(Ok(Ok(response))) => {
             // ── Hook: on_message_sending (modifying) ─────────
@@ -2710,6 +2734,19 @@ async fn process_channel_message(
                     if let Err(err) = channel.cancel_draft(&msg.reply_target, draft_id).await {
                         tracing::debug!("Failed to cancel draft on {}: {err}", channel.name());
                     }
+                }
+                // elfClaw: persist partial history so the next message carries context
+                if history.len() > history_len_before_tools {
+                    for turn in &history[history_len_before_tools..] {
+                        append_sender_turn(ctx.as_ref(), &history_key, turn.clone());
+                    }
+                    append_sender_turn(
+                        ctx.as_ref(),
+                        &history_key,
+                        ChatMessage::assistant(
+                            "[任务已暂停] 以上是暂停前的执行进度。用户将发送补充指令，请结合以上进度继续完成任务。",
+                        ),
+                    );
                 }
             } else if is_context_window_overflow_error(&e) {
                 // Auto-retry with compacted/cleared history instead of asking user to resend.
@@ -2989,6 +3026,35 @@ async fn run_message_dispatch_loop(
     let task_sequence = Arc::new(AtomicU64::new(1));
 
     while let Some(msg) = rx.recv().await {
+        // elfClaw: intercept /pause and "停" commands before acquiring a worker slot.
+        // This is a hard-coded instant command that bypasses LLM processing entirely.
+        if msg.channel == "telegram" && is_stop_command(&msg.content) {
+            let sender_scope_key = interruption_scope_key(&msg);
+            let previous = {
+                let mut active = in_flight_by_sender.lock().await;
+                active.remove(&sender_scope_key)
+            };
+            if let Some(previous) = previous {
+                tracing::info!(
+                    channel = %msg.channel,
+                    sender = %msg.sender,
+                    "User issued pause command; cancelling in-flight task"
+                );
+                previous.cancellation.cancel();
+                previous.completion.wait().await;
+                if let Some(channel) = ctx.channels_by_name.get(&msg.channel) {
+                    let _ = channel
+                        .send(&SendMessage::new(
+                            "⏸ 已暂停当前任务。请发送补充信息，我会结合之前的进度继续执行。",
+                            &msg.reply_target,
+                        ))
+                        .await;
+                }
+            }
+            // No in-flight task → silently drop (fall through to next message)
+            continue;
+        }
+
         let permit = match Arc::clone(&semaphore).acquire_owned().await {
             Ok(permit) => permit,
             Err(_) => break,
@@ -2999,14 +3065,16 @@ async fn run_message_dispatch_loop(
         let task_sequence = Arc::clone(&task_sequence);
         workers.spawn(async move {
             let _permit = permit;
-            let interrupt_enabled =
-                worker_ctx.interrupt_on_new_message && msg.channel == "telegram";
+            let is_telegram = msg.channel == "telegram";
+            let auto_interrupt = worker_ctx.interrupt_on_new_message && is_telegram;
             let sender_scope_key = interruption_scope_key(&msg);
             let cancellation_token = CancellationToken::new();
             let completion = Arc::new(InFlightTaskCompletion::new());
             let task_id = task_sequence.fetch_add(1, Ordering::Relaxed);
 
-            if interrupt_enabled {
+            // Always register in-flight tasks for Telegram so /pause can find them,
+            // but only auto-cancel previous tasks when interrupt_on_new_message is enabled.
+            if is_telegram {
                 let previous = {
                     let mut active = in_flight.lock().await;
                     active.insert(
@@ -3019,14 +3087,16 @@ async fn run_message_dispatch_loop(
                     )
                 };
 
-                if let Some(previous) = previous {
-                    tracing::info!(
-                        channel = %msg.channel,
-                        sender = %msg.sender,
-                        "Interrupting previous in-flight request for sender"
-                    );
-                    previous.cancellation.cancel();
-                    previous.completion.wait().await;
+                if auto_interrupt {
+                    if let Some(previous) = previous {
+                        tracing::info!(
+                            channel = %msg.channel,
+                            sender = %msg.sender,
+                            "Interrupting previous in-flight request for sender"
+                        );
+                        previous.cancellation.cancel();
+                        previous.completion.wait().await;
+                    }
                 }
             }
 
@@ -3041,7 +3111,7 @@ async fn run_message_dispatch_loop(
                 })
                 .await;
 
-            if interrupt_enabled {
+            if is_telegram {
                 let mut active = in_flight.lock().await;
                 if active
                     .get(&sender_scope_key)
