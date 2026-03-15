@@ -314,6 +314,23 @@ pub struct AppState {
     pub event_tx: tokio::sync::broadcast::Sender<serde_json::Value>,
 }
 
+/// elfClaw: clear the HANDLE_FLAG_INHERIT bit on a TCP listener socket so that
+/// child processes (e.g. agent-browser) do not inherit the listening handle.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn mark_socket_non_inheritable(listener: &tokio::net::TcpListener) {
+    use std::os::windows::io::AsRawSocket;
+    extern "system" {
+        fn SetHandleInformation(handle: usize, mask: u32, flags: u32) -> i32;
+    }
+    let raw = listener.as_raw_socket() as usize;
+    // HANDLE_FLAG_INHERIT = 0x1 — clear it
+    let ok = unsafe { SetHandleInformation(raw, 1, 0) };
+    if ok == 0 {
+        tracing::warn!("Failed to clear HANDLE_FLAG_INHERIT on gateway socket");
+    }
+}
+
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
 #[allow(clippy::too_many_lines)]
 pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
@@ -337,6 +354,13 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
 
     let addr: SocketAddr = format!("{host}:{port}").parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
+
+    // elfClaw: prevent child processes from inheriting the gateway socket handle.
+    // Without this, `taskkill /F` on zeroclaw leaves the port occupied by orphan
+    // children (e.g. agent-browser) that inherited the listening socket.
+    #[cfg(windows)]
+    mark_socket_non_inheritable(&listener);
+
     let actual_port = listener.local_addr()?.port();
     let display_addr = format!("{host}:{actual_port}");
 

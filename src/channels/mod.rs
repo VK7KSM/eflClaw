@@ -466,6 +466,7 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - Be concise and direct. Skip filler phrases like 'Great question!' or 'Certainly!'\n\
              - Structure longer answers with bold headers, not raw markdown ## headers\n\
              - For media attachments use markers: [IMAGE:<path-or-url>], [DOCUMENT:<path-or-url>], [VIDEO:<path-or-url>], [AUDIO:<path-or-url>], or [VOICE:<path-or-url>]\n\
+             - Screenshots and photos: ALWAYS use [IMAGE:path] by default. Telegram compresses images sent this way. Only use [FILE:path] or [DOCUMENT:path] for the SAME file when the user explicitly asks for the original/uncompressed/full-resolution version.\n\
              - Keep normal text outside markers and never wrap markers in code fences.\n\
              - Use tool results silently: answer the latest user message directly, and do not narrate delayed/internal tool execution bookkeeping.",
         ),

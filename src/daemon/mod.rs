@@ -8,6 +8,87 @@ use tokio::time::Duration;
 
 const STATUS_FLUSH_SECONDS: u64 = 5;
 
+// elfClaw: Windows Job Object — ensures all child processes are killed when the
+// daemon exits (including `taskkill /F`).  The job handle is intentionally leaked
+// so it stays alive for the process lifetime; Windows closes it on exit and
+// terminates all associated children via JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn setup_job_object() {
+    extern "system" {
+        fn CreateJobObjectW(attrs: *mut u8, name: *const u16) -> usize;
+        fn SetInformationJobObject(
+            job: usize,
+            class: u32,
+            info: *const u8,
+            len: u32,
+        ) -> i32;
+        fn AssignProcessToJobObject(job: usize, process: usize) -> i32;
+        fn GetCurrentProcess() -> usize;
+    }
+
+    // JOBOBJECT_BASIC_LIMIT_INFORMATION (Windows x86_64 layout)
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct BasicLimitInfo {
+        per_process_user_time_limit: i64,
+        per_job_user_time_limit: i64,
+        limit_flags: u32,
+        minimum_working_set_size: usize,
+        maximum_working_set_size: usize,
+        active_process_limit: u32,
+        affinity: usize,
+        priority_class: u32,
+        scheduling_class: u32,
+    }
+
+    // JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct ExtendedLimitInfo {
+        basic: BasicLimitInfo,
+        io_info_reserved: [u64; 6],
+        process_memory_limit: usize,
+        job_memory_limit: usize,
+        peak_process_memory_used: usize,
+        peak_job_memory_used: usize,
+    }
+
+    unsafe {
+        let job = CreateJobObjectW(std::ptr::null_mut(), std::ptr::null());
+        if job == 0 {
+            tracing::warn!("Failed to create Windows Job Object — child cleanup on forced exit will not work");
+            return;
+        }
+
+        let mut info: ExtendedLimitInfo = std::mem::zeroed();
+        // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+        info.basic.limit_flags = 0x2000;
+
+        // JobObjectExtendedLimitInformation = 9
+        let ok = SetInformationJobObject(
+            job,
+            9,
+            &info as *const _ as *const u8,
+            std::mem::size_of::<ExtendedLimitInfo>() as u32,
+        );
+        if ok == 0 {
+            tracing::warn!("Failed to configure Windows Job Object limits");
+            return;
+        }
+
+        let ok = AssignProcessToJobObject(job, GetCurrentProcess());
+        if ok == 0 {
+            tracing::warn!("Failed to assign process to Windows Job Object");
+            return;
+        }
+
+        // Intentionally leak the job handle — it must outlive the process.
+        let _ = job;
+        tracing::debug!("Windows Job Object configured — children will be killed on daemon exit");
+    }
+}
+
 /// Check whether a TCP port on the given host is already in use.
 ///
 /// Attempts a non-blocking bind; returns `true` if the port is available,
@@ -28,6 +109,10 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
              To stop it: run `zeroclaw stop` or kill the process holding port {port}."
         );
     }
+
+    #[cfg(windows)]
+    setup_job_object();
+
     let initial_backoff = config.reliability.channel_initial_backoff_secs.max(1);
     let max_backoff = config
         .reliability
