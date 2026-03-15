@@ -2,6 +2,29 @@
 
 ---
 
+## 2026-03-15 — Telegram 暂停-恢复功能（/pause + "停"）
+
+### 功能
+用户在 Telegram 对话中发送 `/pause`、"停"、"暂停"、"stop"、"pause" 可即时中断正在执行的 agent 任务。中断后 agent 保存部分执行进度到会话历史，用户下一条消息自动携带上下文恢复。
+
+### 改动
+
+**`src/channels/telegram.rs`**
+- `register_commands()` 添加 `/pause` 到 Telegram Bot Menu
+
+**`src/channels/mod.rs`**
+- 新增 `is_stop_command()` 函数，匹配 "停"/"暂停"/"stop"/"pause"/"/stop"/"/pause"（含 @bot 后缀）
+- Dispatch loop 外层拦截：stop 命令不进入 worker，直接取消 in-flight 任务并发送确认消息
+- **解耦 in-flight tracking 与 auto-interrupt**：
+  - `is_telegram` 守护 tracking（始终注册），`auto_interrupt` 守护自动取消（仅 `interrupt_on_new_message=true` 时）
+  - 这样 `/pause` 无论 `interrupt_on_new_message` 配置如何都能找到并取消任务
+- 两条取消路径（`Cancelled` + `ToolLoopCancelled`）都保存部分历史 + "[任务已暂停]" 标记
+
+### 验证
+- `cargo build --release --features wasm-tools` 编译通过
+
+---
+
 ## 2026-03-15 — 修复 Windows 端口残留（TCP handle 继承 + Job Object）
 
 ### 问题

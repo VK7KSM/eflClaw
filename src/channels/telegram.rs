@@ -1080,6 +1080,7 @@ impl TelegramChannel {
                 { "command": "model", "description": "Show or switch the current model" },
                 { "command": "models", "description": "Show or switch the current provider" },
                 { "command": "selfcheck", "description": "Run system self-check diagnostics" },
+                { "command": "pause", "description": "Pause current task (⏸ 暂停当前任务)" },
             ]
         });
 
