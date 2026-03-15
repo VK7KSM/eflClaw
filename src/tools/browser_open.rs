@@ -396,7 +396,7 @@ async fn open_in_brave(url: &str) -> anyhow::Result<()> {
         .arg("start")
         .arg("")
         .arg("brave")
-        .arg(format!("\"{escaped}\""))
+        .arg(&escaped)
         .status()
         .await?;
 
@@ -415,7 +415,7 @@ async fn open_in_chrome(url: &str) -> anyhow::Result<()> {
         .arg("start")
         .arg("")
         .arg("chrome")
-        .arg(format!("\"{escaped}\""))
+        .arg(&escaped)
         .status()
         .await?;
 
@@ -434,7 +434,7 @@ async fn open_in_firefox(url: &str) -> anyhow::Result<()> {
         .arg("start")
         .arg("")
         .arg("firefox")
-        .arg(format!("\"{escaped}\""))
+        .arg(&escaped)
         .status()
         .await?;
 
@@ -452,7 +452,7 @@ async fn open_in_default(url: &str) -> anyhow::Result<()> {
         .arg("/C")
         .arg("start")
         .arg("")
-        .arg(format!("\"{escaped}\""))
+        .arg(&escaped)
         .status()
         .await?;
 
@@ -471,7 +471,7 @@ async fn open_in_edge(url: &str) -> anyhow::Result<()> {
         .arg("start")
         .arg("")
         .arg("msedge")
-        .arg(format!("\"{escaped}\""))
+        .arg(&escaped)
         .status()
         .await?;
 
