@@ -17,13 +17,20 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
 
-/// System-database filename suffixes that must never be written to by the agent.
-const SYSTEM_DBS: &[&str] = &[
-    "elfclaw-logs.db",
-    "brain.db",
-    "jobs.db",
-    "cron.db",
-];
+/// System-database filenames that must never be accessed by the agent.
+const SYSTEM_DBS: &[&str] = &["elfclaw-logs.db", "brain.db", "jobs.db", "cron.db"];
+
+/// Returns the matching system-database name if `path`'s final path component
+/// (case-insensitive) is one of `SYSTEM_DBS`.
+///
+/// Compares `file_name()`, not a string suffix — a suffix check (`"...db".ends_with(sys_db)`)
+/// both over-blocks legitimate files like `my_brain.db` and under-blocks a Windows 8.3
+/// short name alias (`ELFCLA~1.DB`), which does not end with `"elfclaw-logs.db"` as a
+/// string at all despite resolving to that exact file.
+fn system_db_match(path: &std::path::Path) -> Option<&'static str> {
+    let name = path.file_name()?.to_str()?.to_lowercase();
+    SYSTEM_DBS.iter().find(|&&sys_db| name == sys_db).copied()
+}
 
 /// SQL statement verbs that are allowed.
 const ALLOWED_VERBS: &[&str] = &["select", "insert", "update", "delete", "with"];
@@ -77,11 +84,7 @@ impl Tool for SqliteQueryTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        let db_path_raw = args["db_path"]
-            .as_str()
-            .unwrap_or("")
-            .trim()
-            .to_string();
+        let db_path_raw = args["db_path"].as_str().unwrap_or("").trim().to_string();
         let sql = args["sql"].as_str().unwrap_or("").trim().to_string();
 
         if db_path_raw.is_empty() {
@@ -100,11 +103,7 @@ impl Tool for SqliteQueryTool {
         }
 
         // --- Security check 1: SQL verb allowlist / blocklist ---
-        let first_word = sql
-            .split_whitespace()
-            .next()
-            .unwrap_or("")
-            .to_lowercase();
+        let first_word = sql.split_whitespace().next().unwrap_or("").to_lowercase();
 
         if BLOCKED_VERBS.contains(&first_word.as_str()) {
             return Ok(ToolResult {
@@ -127,19 +126,20 @@ impl Tool for SqliteQueryTool {
             });
         }
 
-        // --- Security check 2: system database protection ---
-        let db_lower = db_path_raw.to_lowercase().replace('\\', "/");
-        for sys_db in SYSTEM_DBS {
-            if db_lower.ends_with(sys_db) {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!(
-                        "Access to system database '{}' is not permitted.",
-                        sys_db
-                    )),
-                });
-            }
+        // --- Security check 2: system database protection (fast path) ---
+        // This is a cheap early rejection for the honest/common case; it is NOT
+        // the authoritative check because it runs on the raw, unresolved string.
+        // See the second `system_db_match` check below, which runs on the
+        // canonicalized path and is what actually closes the bypass.
+        if let Some(sys_db) = system_db_match(std::path::Path::new(&db_path_raw)) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "Access to system database '{}' is not permitted.",
+                    sys_db
+                )),
+            });
         }
 
         // --- Security check 3: path allowlist via SecurityPolicy ---
@@ -164,6 +164,25 @@ impl Tool for SqliteQueryTool {
             Ok(p) => p,
             Err(_) => abs_path.clone(),
         };
+
+        // --- Security check 2b: system database protection (authoritative) ---
+        // Re-check against the CANONICALIZED path. This is the check that actually
+        // matters: canonicalize() resolves the OS's real filesystem entity, so an
+        // alias for a system database — a Windows 8.3 short name (`ELFCLA~1.DB`
+        // for `elfclaw-logs.db`), a symlink, or a `./`-padded relative path — all
+        // resolve to the same real file here, even though the raw fast-path check
+        // above (which only sees the un-resolved string the caller supplied) can't
+        // see through any of those.
+        if let Some(sys_db) = system_db_match(&resolved) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "Access to system database '{}' is not permitted.",
+                    sys_db
+                )),
+            });
+        }
 
         if !self.security.is_resolved_path_allowed(&resolved) {
             return Ok(ToolResult {
@@ -298,5 +317,115 @@ fn run_query(
             output: format!("OK: {} rows affected", affected),
             error: None,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    fn test_security(workspace_dir: std::path::PathBuf) -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy {
+            workspace_dir,
+            ..SecurityPolicy::default()
+        })
+    }
+
+    #[test]
+    fn system_db_match_matches_case_insensitively() {
+        assert_eq!(system_db_match(Path::new("BRAIN.DB")), Some("brain.db"));
+        assert_eq!(
+            system_db_match(Path::new("skills/Elfclaw-Logs.db")),
+            Some("elfclaw-logs.db")
+        );
+    }
+
+    // elfClaw 2026-09-23 (elfclaw.md §11): the original check was a string
+    // suffix test (`"...".ends_with(sys_db)`), which blocks any filename that
+    // merely ENDS with a protected name — including unrelated, legitimate
+    // files like "my_brain.db" or "old_jobs.db". Comparing `file_name()`
+    // instead fixes this over-blocking without weakening the protection.
+    #[test]
+    fn system_db_match_does_not_over_block_similarly_named_files() {
+        assert_eq!(system_db_match(Path::new("my_brain.db")), None);
+        assert_eq!(system_db_match(Path::new("old_jobs.db")), None);
+        assert_eq!(system_db_match(Path::new("not-elfclaw-logs.db")), None);
+    }
+
+    #[test]
+    fn system_db_match_ignores_directory_prefix() {
+        assert_eq!(
+            system_db_match(Path::new("some/nested/dir/brain.db")),
+            Some("brain.db")
+        );
+    }
+
+    #[test]
+    fn system_db_match_requires_exact_filename_not_substring() {
+        // A file literally named "notbrain.db" (no separator) is a different
+        // file and must not be blocked.
+        assert_eq!(system_db_match(Path::new("notbrain.db")), None);
+    }
+
+    #[tokio::test]
+    async fn execute_blocks_protected_system_database_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = SqliteQueryTool::new(test_security(dir.path().to_path_buf()));
+        let result = tool
+            .execute(json!({"db_path": "brain.db", "sql": "SELECT 1"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("is not permitted"),
+            "{:?}",
+            result.error
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_blocks_protected_system_database_in_subdirectory() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("state")).unwrap();
+        let tool = SqliteQueryTool::new(test_security(dir.path().to_path_buf()));
+        let result = tool
+            .execute(json!({"db_path": "state/elfclaw-logs.db", "sql": "SELECT 1"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("is not permitted"),
+            "{:?}",
+            result.error
+        );
+    }
+
+    // elfClaw 2026-09-23: proves the over-blocking bug (system_db_match_does_not_
+    // over_block_similarly_named_files above) is also fixed end-to-end through
+    // execute() — a real query against a real "my_brain.db" file must NOT be
+    // rejected with the system-database error.
+    #[tokio::test]
+    async fn execute_does_not_block_similarly_named_non_system_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("my_brain.db");
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute("CREATE TABLE t (x INTEGER)", []).unwrap();
+        }
+        let tool = SqliteQueryTool::new(test_security(dir.path().to_path_buf()));
+        let result = tool
+            .execute(json!({"db_path": "my_brain.db", "sql": "SELECT * FROM t"}))
+            .await
+            .unwrap();
+        assert!(result.success, "{:?}", result.error);
     }
 }

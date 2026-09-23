@@ -2,6 +2,129 @@
 
 ---
 
+## 2026-09-23 — 补做第 11 节遗留安全问题：skill 审计漏报 + sqlite_query 路径绕过
+
+Step 1-6 提交完之后，用户要求重新检查开发计划里还有哪些工作和测试没做完。
+重新通读 `elfclaw.md`（不只是第 10 节"分步计划"，也包括第 3/5.4/6/11 节），
+用 `git log` 核实哪些条目是"写了要在 Step 5 修"但实际提交里没碰过的文件，
+发现 §11 列的四条安全问题里有两条（skill 审计 `find_map`、`sqlite_query`
+路径检查）明确标注"→ Step 5"但从未修过，还有一条（`cron_add`/`cron_update`
+的 `approved` 参数信任问题）标注"随 Step 5 自然消除"，但复核后发现这个判断
+是错的。本条目处理前两条；第三条的复核结论见下方"发现但判断为暂不修"。
+
+### 1. skill 审计：`find_map` 导致白名单"连带放过"未声明的危险模式
+
+**根因**：`src/skills/audit.rs` 的 `detect_high_risk_snippet(content) ->
+Option<&'static str>` 用 `.find_map()` 在一组高危正则里找**第一个**命中的
+就返回，不再继续检查剩下的。`audit_skill_md()` 里配合白名单使用的逻辑是：
+拿到这一个 pattern，检查它是否在作者声明的白名单里，在白名单就跳过、不
+报告。问题是：如果文件里同时存在两个真实的高危模式（比如
+`curl ... | bash` 和 `rm -rf /`），且作者只把 `curl-pipe-shell` 声明进白名单，
+`find_map` 会在检测到 `curl-pipe-shell` 这一个匹配后就停止——`rm -rf /`
+根本没被检查到，因为 `find_map` 找到第一个就短路了，不是"检测到所有匹配
+但只放行白名单里的那个"，而是"只检测了第一个，且这个第一个恰好被允许"。
+结果是整份报告里 `rm -rf /` 完全不出现，不是被豁免，是从未被看见。
+
+**改法**：`detect_high_risk_snippet` 改名 `detect_high_risk_snippets`，
+返回类型从 `Option<&'static str>` 改成 `Vec<&'static str>`（`.find_map()`
+→ `.filter_map().collect()`，扫描全部 8 个正则而不是找到第一个就停）。
+4 个调用点（zip 内容扫描、SKILL.md 白名单扫描、SKILL.toml 的
+`tools[idx].command`、`prompts[idx]`）相应从 `if let Some(pattern) = ...`
+改成 `for pattern in ...`，白名单调用点在循环内部对每个命中单独判断是否
+被豁免，不再是"拿到一个就整体放行"。
+
+**验证**（先证伪再证真）：新增测试
+`audit_allowlisting_one_real_pattern_does_not_hide_a_second_real_pattern`，
+构造一个 SKILL.md 同时含 `curl ... | bash` 和 `rm -rf /`，只把
+`curl-pipe-bash` 写进白名单声明。先临时把核心函数和 4 个调用点手动改回
+旧的 `find_map`/`Option` 形式（保留新测试不变），跑测试确认失败——findings
+列表是空的 `[]`，证明 `rm -rf /` 确实被漏报；再恢复修复后的版本，确认
+测试通过。仓库里已有的
+`audit_allowlist_does_not_bypass_different_pattern` 测试**不会**捕获这个
+bug（它的测试内容只含一个真实模式 `rm -rf /`，`find_map` 不管有没有 bug
+都会找到它，所以旧代码也能通过那个测试——这也是为什么这个 bug 在原来的
+测试覆盖下一直没被发现）。
+`cargo test --lib -- skills::audit::` 27 个测试全过。
+
+### 2. `sqlite_query`：受保护数据库路径检查是字符串后缀匹配，可被路径别名绕过
+
+**根因**：`src/tools/sqlite_query.rs` 的"Security check 2"在**原始、未解析
+的用户输入字符串**上做 `db_path_raw.to_lowercase().replace('\\', "/")` 然后
+`.ends_with(sys_db)`（`sys_db` 是 `"elfclaw-logs.db"`/`"brain.db"`/
+`"jobs.db"`/`"cron.db"` 之一）。这有两个问题：
+- **绕过（安全问题本身）**：Windows NTFS 对超过 8.3 格式的文件名会自动生成
+  短文件名别名（如 `elfclaw-logs.db` → `ELFCLA~1.DB`）。`"elfcla~1.db"` 不
+  以 `"elfclaw-logs.db"` 结尾，字符串检查完全看不出这是同一个文件——但
+  `tokio::fs::canonicalize()`（在这层检查**之后**才调用）会把短文件名解析
+  回真实的长文件名。也就是说，真正能识别出"这是系统数据库"的信息
+  （canonicalize 之后的路径）出现得比阻止访问的检查点**晚**，检查形同虚设。
+- **误拦截（连带发现的副作用 bug）**：反过来，纯字符串后缀匹配还会误伤
+  完全无关的文件——`"my_brain.db".ends_with("brain.db")` 也是 `true`，
+  一个叫 `my_brain.db` 的正常工作文件会被错误地当成受保护的系统数据库拒绝。
+
+**改法**：新增 `system_db_match(path: &Path) -> Option<&'static str>`，比较
+`path.file_name()`（大小写不敏感）而不是整条路径字符串的后缀——这同时
+修好了误拦截问题（`my_brain.db` 的 `file_name()` 是 `"my_brain.db"`，不
+等于 `"brain.db"`，不会被匹配）。检查点从一处改成两处：
+1. 原始字符串上的快速路径检查（在 `canonicalize()` 之前，对老实的调用
+   提前拒绝，避免不必要的文件系统调用）；
+2. `canonicalize()` **之后**、在真正打开数据库之前，对解析后的路径再做
+   一次权威检查——这一层才是真正堵住别名绕过的地方，无论调用方传的是
+   短文件名、符号链接还是别的路径变体，`canonicalize()` 之后大家都会
+   解析成同一个真实文件，第二层检查看到的是这个真实文件的文件名。
+
+**验证**：sqlite_query.rs 原来没有任何测试，本次新增 7 个：
+- `system_db_match` 直接单测（大小写不敏感匹配、含目录前缀、不误伤
+  `my_brain.db`/`old_jobs.db`/`not-elfclaw-logs.db`/`notbrain.db`）；
+- `execute()` 端到端测试：确认 `brain.db`（含子目录形式 `state/elfclaw-
+  logs.db`）仍被正确拦截，确认 `my_brain.db`（真实建表、真实查询）不再
+  被误拦截、能正常执行。
+- 先临时把 `system_db_match` 改回旧的整串 `ends_with` 逻辑，跑
+  `system_db_match_does_not_over_block_similarly_named_files` 和
+  `execute_does_not_block_similarly_named_non_system_database` 两个测试，
+  确认在旧逻辑下真的会失败（`my_brain.db` 被错误拦截，报错
+  `"Access to system database 'brain.db' is not permitted."`）；再恢复
+  修复后的版本确认通过。
+- Windows 8.3 短文件名绕过场景本身**无法**在可移植单测里可靠复现（依赖
+  NTFS 卷是否启用 8.3 别名生成；本机沙箱环境对符号链接/硬链接相关测试
+  也缺少对应权限——参见 `cargo test --lib` 里长期存在的 11 个预置失败）。
+  修复的正确性依据是 `canonicalize()`/Windows API 文档保证的标准行为
+  （短文件名和符号链接都会解析到规范长文件名），不是靠这个具体场景的
+  直接测试验证——如实记录这一点，不夸大测试覆盖范围。
+- `cargo test --lib -- sqlite_query::` 7 个测试全过。
+
+### 3. 发现但判断为暂不修：`cron_add`/`cron_update` 的 `approved` 参数信任问题
+
+`elfclaw.md` §11 原文写这条"随 Step 5 自然消除"，理由是"shell 命令生成
+不该由模型现编"。复核后发现这个判断站不住：Step 5 第一条只是把**独立的
+`shell` 工具**从非 CLI 渠道隐藏，`cron_add(job_type="shell", command="...",
+approved=true)` 是完全不同的代码路径——`cron_add` 工具本身是 Safe 级
+（免审批、对所有渠道可见），聊天 AI 现在仍然能调用它，在参数里自己传
+`approved: true`，`src/security/policy.rs::validate_command_execution`
+直接信任这个调用方自报的布尔值，等于聊天 AI 能给自己的 shell 定时任务
+自我批准，绕开真正的人工审批。
+
+**实际风险面复核后比最初设想的窄**：`validate_command_execution` 对
+`CommandRiskLevel::High` 的命令（`rm`/`mkfs`/`dd`/`chmod`/`curl`/`wget` 等）
+在 `block_high_risk_commands=true`（`资料/config.toml` 部署默认值）时**无
+条件硬拒绝，不看 `approved`**；`approved` 自报绕过只对 `CommandRiskLevel::
+Medium` 且已经在 `allowed_commands` 窄白名单内的命令有效——不是"任意 shell
+命令都能被聊天 AI 自我批准"那么严重，但仍然是真实、未修复的问题。
+
+**判断为暂不修的理由**：`Tool::execute()` 当前的签名只接收
+`args: serde_json::Value`，不带调用方渠道信息，`cron_add` 内部无法判断
+"这次调用是不是来自聊天渠道"。真正的修法要么改 `Tool` trait 签名（影响
+全部工具，改动面很大），要么复用某种全局状态判断当前渠道——本次会话刚
+删掉的 `SelfCheckGate`（`/selfcheck` 命令用的那个全局 `AtomicBool` gate）
+就是这一类反模式的例子，不该在这里照搬同样的设计。这本质上和 `elfclaw.md`
+§8 第 3 条"shell 只在用户明确对某个具体任务授权时才能执行"是**同一个
+尚未决定 UX 的设计问题**——今天早些时候已经问过用户该怎么设计这个机制，
+用户选择暂缓、先做 Step 6，所以这里不单独抢先设计一个局部方案，等以后
+和 §8 第 3 条一起处理。已把 `elfclaw.md` §11 的记录从"随 Step 5 自然消除"
+改成准确描述当前状态。
+
+---
+
 ## 2026-09-23 — 稳定化 Step 6：清理约束弱模型的旧 prompt
 
 按 `elfclaw.md` §10 Step 6。这是四步计划里最后一步——问用户"第 8 节第 3 条

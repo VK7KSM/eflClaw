@@ -242,9 +242,33 @@ gemini-3.5-flash: key A → key B → ...
 
 ## 11. 已发现、暂缓到对应 Step 修复的安全问题
 
-- skill 审计的高危模式检测用 `find_map`，只报告第一个命中的模式，白名单声明一个模式就可能连带放过同文件里的其他危险模式（如 `rm -rf`）。→ Step 5 一并修。
-- `cron_add`/`cron_update` 当前被设为免审批，但内部 `validate_command_execution` 信任的是**模型自己传的 `approved` 参数**，等于没有人工审批。→ Step 8 节原则实施后，shell 命令生成本身就不该由模型现编，此问题随 Step 5 自然消除。
-- `sqlite_query` 的受保护数据库路径检查是字符串后缀匹配，Windows 8.3 短文件名或路径变体可能绕过。→ Step 5。
+- skill 审计的高危模式检测用 `find_map`，只报告第一个命中的模式，白名单声明一个模式就可能连带放过同文件里的其他危险模式（如 `rm -rf`）。
+  **已修复，2026-09-23**：`detect_high_risk_snippet` 改名为 `detect_high_risk_snippets`，返回 `Vec<&str>`（全部命中）而不是
+  `Option<&str>`（只有第一个）；4 个调用点相应改成遍历全部命中；允许白名单场景下，只会豁免白名单显式声明的那个具体
+  pattern，不会连带放过同文件里其他未声明的 pattern。新增回归测试
+  `audit_allowlisting_one_real_pattern_does_not_hide_a_second_real_pattern`——先在旧代码上跑确认失败（真的会漏报
+  `rm -rf /`），再在新代码上确认通过。
+- `cron_add`/`cron_update` 当前被设为免审批，但内部 `validate_command_execution` 信任的是**模型自己传的 `approved` 参数**，等于没有人工审批。
+  **仍未修复，2026-09-23 复核后发现 elfclaw.md 原先的判断是错的**：原文写"此问题随 Step 5 自然消除"，理由是"shell 命令
+  生成不该由模型现编"——但 Step 5 第一条只是把**独立的 `shell` 工具**从聊天 AI 隐藏，`cron_add(job_type="shell", ...)`
+  是完全不同的代码路径，`cron_add` 工具本身仍是 Safe 级（免审批、对所有渠道可见），聊天 AI 现在仍能调用
+  `cron_add(job_type="shell", command="...", approved=true)` 自己给自己批准，创建一个稍后由 scheduler 直接执行的
+  shell 定时任务，完全绕开人工审批。**实际风险面比最初以为的窄**：`validate_command_execution` 对 High 风险命令
+  （`rm`/`mkfs`/`dd`/`chmod`/`curl`/`wget` 等）在 `block_high_risk_commands=true`（部署默认值）时无条件硬拒绝，不看
+  `approved`；只有 Medium 风险且已经在 `allowed_commands` 窄白名单内的命令，才会被这个自报 `approved` 绕过审批。
+  **判断为暂不修**：真正的修法需要让 `cron_add` 知道调用方是不是聊天渠道（当前 `Tool::execute()` 签名不带渠道信息，
+  要么改 trait 签名影响所有工具，要么复用某种全局状态——本会话刚删掉的 `SelfCheckGate` 就是这类反模式，不该照搬）；
+  这本质上和第 8 节第 3 条"shell 按任务临时授权机制"是同一个未决的设计问题，用户已经选择暂缓，这里不单独抢先做。
+- `sqlite_query` 的受保护数据库路径检查是字符串后缀匹配，Windows 8.3 短文件名或路径变体可能绕过。
+  **已修复，2026-09-23**：新增 `system_db_match()` 辅助函数，比较 `Path::file_name()` 而不是字符串后缀——顺带修了一个
+  过度拦截的副作用 bug（原来的 `"...".ends_with("brain.db")` 会把 `my_brain.db` 这种无关文件也误判为受保护数据库）。
+  检查点从"只在原始未解析字符串上做一次"改成两层：原始字符串上的快速路径（提前拒绝常见情况）+ **在 `canonicalize()`
+  之后的解析路径上再做一次权威检查**（这层才是真正堵住绕过的关键——8.3 短文件名、符号链接等各种别名，
+  `canonicalize()` 都会解析成同一个真实文件，但原始字符串检查看不穿）。新增 7 个测试，含端到端 `execute()` 测试证明
+  `my_brain.db` 不再被误拦、`brain.db`（含子目录形式）仍被正确拦截。**注**：Windows 8.3 短文件名场景本身无法在可移植的
+  单测里可靠复现（依赖 NTFS 卷是否启用 8.3 别名生成，这点因环境而异，本沙箱环境对符号链接/硬链接相关测试也缺相应权限
+  ——是已知的 11 个预置测试失败之一），修复的正确性基于 `tokio::fs::canonicalize()`/Windows API 文档保证的标准行为
+  （解析短文件名和符号链接到规范长文件名），不是靠这类场景的直接测试验证。
 - Telegram 相册在跨 `getUpdates` 长轮询批次时可能被拆成两条消息。**Step 4 未处理**——相册分组逻辑需要跨多次 poll 缓冲，改动面比离线消息那个大，且不是用户反馈过的实际痛点，往后放。
 
 ## 12. 密钥与账号管理
