@@ -1610,17 +1610,6 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         let message = update.get("message")?;
         let attachment = Self::parse_attachment_metadata(message)?;
 
-        // Check file size limit
-        if let Some(size) = attachment.file_size {
-            if size > TELEGRAM_MAX_FILE_DOWNLOAD_BYTES {
-                tracing::info!(
-                    "Skipping attachment: file size {size} bytes exceeds {} MB limit",
-                    TELEGRAM_MAX_FILE_DOWNLOAD_BYTES / (1024 * 1024)
-                );
-                return None;
-            }
-        }
-
         let (username, sender_id, sender_identity) = Self::extract_sender_info(message);
 
         let mut identities = vec![username.as_str()];
@@ -1662,56 +1651,9 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             chat_id.clone()
         };
 
-        // Ensure workspace directory is configured
-        let workspace = self.workspace_dir.as_ref().or_else(|| {
-            tracing::warn!("Cannot save attachment: workspace_dir not configured");
-            None
-        })?;
-
-        // Download file from Telegram
-        let tg_file_path = match self.get_file_path(&attachment.file_id).await {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::warn!("Failed to get attachment file path: {e}");
-                return None;
-            }
-        };
-
-        let file_data = match self.download_file(&tg_file_path).await {
-            Ok(d) => d,
-            Err(e) => {
-                tracing::warn!("Failed to download attachment: {e}");
-                return None;
-            }
-        };
-
-        // Determine local filename
-        let local_filename = match &attachment.file_name {
-            Some(name) => sanitize_attachment_filename(name)
-                .unwrap_or_else(|| format!("attachment_{chat_id}_{message_id}.bin")),
-            None => {
-                // For photos, derive extension from Telegram file path
-                let ext =
-                    sanitize_generated_extension(tg_file_path.rsplit('.').next().unwrap_or("jpg"));
-                format!("photo_{chat_id}_{message_id}.{ext}")
-            }
-        };
-
-        let local_path =
-            match resolve_workspace_attachment_output_path(workspace, &local_filename).await {
-                Ok(path) => path,
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to resolve attachment output path for {}: {e}",
-                        local_filename
-                    );
-                    return None;
-                }
-            };
-        if let Err(e) = tokio::fs::write(&local_path, &file_data).await {
-            tracing::warn!("Failed to save attachment to {}: {e}", local_path.display());
-            return None;
-        }
+        let (local_filename, local_path) = self
+            .download_attachment_to_workspace(&attachment, &chat_id, message_id)
+            .await?;
 
         // Build message content.
         // Photos with image extensions use [IMAGE:] marker so the multimodal
@@ -1737,6 +1679,185 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             content,
             channel: "telegram".to_string(),
             timestamp: Self::extract_message_timestamp(message), // elfClaw: use Telegram message.date
+            thread_ts: thread_id,
+        })
+    }
+
+    /// Download a single Telegram attachment, save to workspace.
+    /// Returns `(local_filename, local_path)` on success, `None` on size limit or I/O failure.
+    async fn download_attachment_to_workspace(
+        &self,
+        attachment: &IncomingAttachment,
+        chat_id: &str,
+        message_id: i64,
+    ) -> Option<(String, std::path::PathBuf)> {
+        if let Some(size) = attachment.file_size {
+            if size > TELEGRAM_MAX_FILE_DOWNLOAD_BYTES {
+                tracing::info!(
+                    "Skipping attachment: file size {size} bytes exceeds {} MB limit",
+                    TELEGRAM_MAX_FILE_DOWNLOAD_BYTES / (1024 * 1024)
+                );
+                return None;
+            }
+        }
+
+        let workspace = self.workspace_dir.as_ref().or_else(|| {
+            tracing::warn!("Cannot save attachment: workspace_dir not configured");
+            None
+        })?;
+
+        let tg_file_path = match self.get_file_path(&attachment.file_id).await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!("Failed to get attachment file path: {e}");
+                return None;
+            }
+        };
+
+        let file_data = match self.download_file(&tg_file_path).await {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!("Failed to download attachment: {e}");
+                return None;
+            }
+        };
+
+        let local_filename = match &attachment.file_name {
+            Some(name) => sanitize_attachment_filename(name)
+                .unwrap_or_else(|| format!("attachment_{chat_id}_{message_id}.bin")),
+            None => {
+                let ext =
+                    sanitize_generated_extension(tg_file_path.rsplit('.').next().unwrap_or("jpg"));
+                format!("photo_{chat_id}_{message_id}.{ext}")
+            }
+        };
+
+        let local_path =
+            match resolve_workspace_attachment_output_path(workspace, &local_filename).await {
+                Ok(path) => path,
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to resolve attachment output path for {}: {e}",
+                        local_filename
+                    );
+                    return None;
+                }
+            };
+
+        if let Err(e) = tokio::fs::write(&local_path, &file_data).await {
+            tracing::warn!("Failed to save attachment to {}: {e}", local_path.display());
+            return None;
+        }
+
+        Some((local_filename, local_path))
+    }
+
+    /// Parse multiple Telegram updates sharing a `media_group_id` into a single
+    /// `ChannelMessage` containing all attachment markers.
+    async fn try_parse_media_group(
+        &self,
+        group: &[&serde_json::Value],
+    ) -> Option<ChannelMessage> {
+        let first_update = group.first()?;
+        let first_message = first_update.get("message")?;
+
+        let (username, sender_id, sender_identity) = Self::extract_sender_info(first_message);
+
+        let mut identities = vec![username.as_str()];
+        if let Some(id) = sender_id.as_deref() {
+            identities.push(id);
+        }
+
+        if !self.is_any_user_allowed(identities.iter().copied()) {
+            return None;
+        }
+
+        // Use first non-empty caption from any update in the group.
+        let group_caption: Option<String> = group.iter().find_map(|update| {
+            update
+                .get("message")
+                .and_then(|m| m.get("caption"))
+                .and_then(serde_json::Value::as_str)
+                .filter(|c| !c.is_empty())
+                .map(String::from)
+        });
+
+        if !self.passes_mention_only_gate(
+            first_message,
+            sender_id.as_deref(),
+            group_caption.as_deref(),
+        ) {
+            return None;
+        }
+
+        let chat_id = first_message
+            .get("chat")
+            .and_then(|chat| chat.get("id"))
+            .and_then(serde_json::Value::as_i64)
+            .map(|id| id.to_string())?;
+
+        let first_message_id = first_message
+            .get("message_id")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0);
+
+        let thread_id = first_message
+            .get("message_thread_id")
+            .and_then(serde_json::Value::as_i64)
+            .map(|id| id.to_string());
+
+        let reply_target = if let Some(ref tid) = thread_id {
+            format!("{}:{}", chat_id, tid)
+        } else {
+            chat_id.clone()
+        };
+
+        // Download each attachment in the group; skip failures, collect markers.
+        let mut content_parts: Vec<String> = Vec::new();
+        for update in group {
+            let message = match update.get("message") {
+                Some(m) => m,
+                None => continue,
+            };
+            let attachment = match Self::parse_attachment_metadata(message) {
+                Some(a) => a,
+                None => continue,
+            };
+            let msg_id = message
+                .get("message_id")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(first_message_id);
+            if let Some((local_filename, local_path)) = self
+                .download_attachment_to_workspace(&attachment, &chat_id, msg_id)
+                .await
+            {
+                let marker =
+                    format_attachment_content(attachment.kind, &local_filename, &local_path);
+                content_parts.push(marker);
+            }
+        }
+
+        if content_parts.is_empty() {
+            return None;
+        }
+
+        let mut content = content_parts.join("\n");
+        if let Some(cap) = &group_caption {
+            use std::fmt::Write;
+            let _ = write!(content, "\n\n{cap}");
+        }
+
+        if let Some(quote) = self.extract_reply_context(first_message) {
+            content = format!("{quote}\n\n{content}");
+        }
+
+        Some(ChannelMessage {
+            id: format!("telegram_{chat_id}_{first_message_id}"),
+            sender: sender_identity,
+            reply_target,
+            content,
+            channel: "telegram".to_string(),
+            timestamp: Self::extract_message_timestamp(first_message),
             thread_ts: thread_id,
         })
     }
@@ -2930,6 +3051,35 @@ impl Channel for TelegramChannel {
             message.content.clone()
         };
 
+        // elfClaw: native streaming via sendMessageDraft (Bot API 9.5+)
+        if self.stream_mode == StreamMode::Native {
+            let mut body = serde_json::json!({
+                "chat_id": chat_id,
+                "text": initial_text,
+                "draft_id": 1,
+            });
+            if let Some(tid) = &thread_id {
+                body["message_thread_id"] = serde_json::Value::String(tid.to_string());
+            }
+            let resp = self
+                .client
+                .post(self.api_url("sendMessageDraft"))
+                .json(&body)
+                .send()
+                .await?;
+            if resp.status().is_success() {
+                self.last_draft_edit
+                    .lock()
+                    .insert(chat_id.to_string(), std::time::Instant::now());
+                return Ok(Some("native_draft".to_string()));
+            }
+            // sendMessageDraft failed (e.g. old Bot API) — fall back to non-streaming
+            let err = resp.text().await.unwrap_or_default();
+            let sanitized = Self::sanitize_telegram_error(&err);
+            tracing::warn!("sendMessageDraft failed ({sanitized}); falling back to non-streaming");
+            return Ok(None);
+        }
+
         let mut body = serde_json::json!({
             "chat_id": chat_id,
             "text": initial_text,
@@ -2971,7 +3121,7 @@ impl Channel for TelegramChannel {
         message_id: &str,
         text: &str,
     ) -> anyhow::Result<Option<String>> {
-        let (chat_id, _) = Self::parse_reply_target(recipient);
+        let (chat_id, thread_id) = Self::parse_reply_target(recipient);
 
         // Rate-limit edits per chat
         {
@@ -2998,6 +3148,35 @@ impl Channel for TelegramChannel {
         } else {
             text
         };
+
+        // elfClaw: native branch — must be before message_id.parse::<i64>() which fails for "native_draft"
+        if message_id == "native_draft" {
+            let mut body = serde_json::json!({
+                "chat_id": chat_id,
+                "text": display_text,
+                "draft_id": 1,
+            });
+            if let Some(tid) = &thread_id {
+                body["message_thread_id"] = serde_json::Value::String(tid.to_string());
+            }
+            let resp = self
+                .client
+                .post(self.api_url("sendMessageDraft"))
+                .json(&body)
+                .send()
+                .await?;
+            if resp.status().is_success() {
+                self.last_draft_edit
+                    .lock()
+                    .insert(chat_id.clone(), std::time::Instant::now());
+            } else {
+                let status = resp.status();
+                let err = resp.text().await.unwrap_or_default();
+                let sanitized = Self::sanitize_telegram_error(&err);
+                tracing::debug!("sendMessageDraft update failed ({status}): {sanitized}");
+            }
+            return Ok(None);
+        }
 
         let message_id_parsed = match message_id.parse::<i64>() {
             Ok(id) => id,
@@ -3237,8 +3416,27 @@ impl Channel for TelegramChannel {
     }
 
     async fn cancel_draft(&self, recipient: &str, message_id: &str) -> anyhow::Result<()> {
-        let (chat_id, _) = Self::parse_reply_target(recipient);
+        let (chat_id, thread_id) = Self::parse_reply_target(recipient);
         self.last_draft_edit.lock().remove(&chat_id);
+
+        // elfClaw: native draft — send empty text to clear the draft bubble
+        if message_id == "native_draft" {
+            let mut body = serde_json::json!({
+                "chat_id": chat_id,
+                "text": "",
+                "draft_id": 1,
+            });
+            if let Some(tid) = &thread_id {
+                body["message_thread_id"] = serde_json::Value::String(tid.to_string());
+            }
+            let _ = self
+                .client
+                .post(self.api_url("sendMessageDraft"))
+                .json(&body)
+                .send()
+                .await;
+            return Ok(());
+        }
 
         let message_id = match message_id.parse::<i64>() {
             Ok(id) => id,
@@ -3535,12 +3733,36 @@ Ensure only one `zeroclaw` process is using this bot token."
             }
 
             if let Some(results) = data.get("result").and_then(serde_json::Value::as_array) {
+                // Pre-pass: advance all offsets immediately, then split into standalone
+                // updates and media-group buckets.
+                let mut media_groups: std::collections::HashMap<
+                    String,
+                    Vec<&serde_json::Value>,
+                > = std::collections::HashMap::new();
+                let mut standalone: Vec<&serde_json::Value> = Vec::new();
+
                 for update in results {
-                    // Advance offset past this update
-                    if let Some(uid) = update.get("update_id").and_then(serde_json::Value::as_i64) {
+                    if let Some(uid) =
+                        update.get("update_id").and_then(serde_json::Value::as_i64)
+                    {
                         offset = uid + 1;
                     }
+                    if let Some(mgid) = update
+                        .get("message")
+                        .and_then(|m| m.get("media_group_id"))
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        media_groups
+                            .entry(mgid.to_string())
+                            .or_default()
+                            .push(update);
+                    } else {
+                        standalone.push(update);
+                    }
+                }
 
+                // Standalone updates: existing parse chain (behavior unchanged).
+                for update in standalone {
                     let msg = if let Some(m) = self.parse_update_message(update) {
                         m
                     } else if let Some(m) = self.try_parse_approval_callback_query(update) {
@@ -3585,6 +3807,59 @@ Ensure only one `zeroclaw` process is using this bot token."
                         .json(&typing_body)
                         .send()
                         .await; // Ignore errors for typing indicator
+
+                    if tx.send(msg).await.is_err() {
+                        return Ok(());
+                    }
+                }
+
+                // Media group updates: aggregate each group into a single ChannelMessage.
+                for (_mgid, group) in media_groups {
+                    let msg = if let Some(m) = self.try_parse_media_group(&group).await {
+                        m
+                    } else {
+                        if let Some(first_update) = group.first() {
+                            self.handle_unauthorized_message(first_update).await;
+                        }
+                        continue;
+                    };
+
+                    if let Some(first_update) = group.first() {
+                        if let Some((
+                            reaction_chat_id,
+                            reaction_message_id,
+                            chat_type,
+                            sender_id,
+                        )) = Self::extract_update_message_ack_target(first_update)
+                        {
+                            let reaction_ctx = AckReactionContext {
+                                text: &msg.content,
+                                sender_id: sender_id.as_deref(),
+                                chat_id: Some(&reaction_chat_id),
+                                chat_type,
+                                locale_hint: None,
+                            };
+                            if let Some(emoji) = select_ack_reaction(
+                                self.ack_reaction.as_ref(),
+                                TELEGRAM_ACK_REACTIONS,
+                                &reaction_ctx,
+                            ) {
+                                self.try_add_ack_reaction_nonblocking(
+                                    reaction_chat_id,
+                                    reaction_message_id,
+                                    emoji,
+                                );
+                            }
+                        }
+                    }
+
+                    let typing_body = Self::build_typing_action_body(&msg.reply_target);
+                    let _ = self
+                        .http_client()
+                        .post(self.api_url("sendChatAction"))
+                        .json(&typing_body)
+                        .send()
+                        .await;
 
                     if tx.send(msg).await.is_err() {
                         return Ok(());

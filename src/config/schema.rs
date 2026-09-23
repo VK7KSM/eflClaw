@@ -3619,11 +3619,23 @@ impl AutonomyConfig {
     /// tool_overrides entries take precedence: if a tool is overridden,
     /// it is REMOVED from conflicting old lists and ADDED to the correct one.
     pub fn apply_tool_overrides(&mut self) {
-        if self.tool_overrides.is_empty() {
-            return; // No overrides, keep existing config behavior
+        let defaults = crate::tools::default_tool_risk_tiers();
+
+        // elfClaw: always promote Safe-tier defaults into auto_approve so that
+        // default_tool_risk_tiers() has effect even when tool_overrides is empty.
+        // Union merge: skip tools already present in auto_approve or always_ask.
+        for (&tool_name, &tier) in &defaults {
+            if tier == crate::tools::ToolRiskTier::Safe
+                && !self.auto_approve.iter().any(|t| t == tool_name)
+                && !self.always_ask.iter().any(|t| t == tool_name)
+            {
+                self.auto_approve.push(tool_name.to_string());
+            }
         }
 
-        let defaults = crate::tools::default_tool_risk_tiers();
+        if self.tool_overrides.is_empty() {
+            return; // Safe defaults already applied; no per-tool overrides to process
+        }
 
         for (tool_name, tier) in &self.tool_overrides {
             // Security: warn if downgrading a Restricted tool
@@ -4787,8 +4799,10 @@ pub enum StreamMode {
     /// No streaming -- send the complete response as a single message (default).
     #[default]
     Off,
-    /// Update a draft message with every flush interval.
+    /// Update a draft message with every flush interval via editMessageText.
     Partial,
+    /// Use Telegram's native sendMessageDraft API (Bot API 9.5+).
+    Native,
 }
 
 /// Progress verbosity for channels that support draft streaming.

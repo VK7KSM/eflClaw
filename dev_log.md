@@ -2,6 +2,412 @@
 
 ---
 
+## 2026-05-11 — K6 新机部署：cf-crawler 运行环境恢复
+
+**背景**：elfclaw 从 K3（192.168.2.21）迁移到 K6（192.168.2.29），K6 上跑两个实例 `C:\dev\elfClaw\ZeroClaw_Skynet` 和 `C:\dev\elfClaw\ZeroClaw_Workspace`。两个实例的 cf-crawler 调用都不通。
+
+**根因**：
+1. K6 上 `CF_CRAWLER_ENDPOINT` 和 `CF_CRAWLER_TOKEN` 两个 User 级环境变量未设置 → EXE 不知道连哪个 Worker
+2. `ZeroClaw_Skynet\workspace\skills\cf-crawler\` 目录存在但 SKILL.md/SKILL.toml 缺失（Workspace 实例齐全）
+
+**修复**（无代码改动，纯运行时配置）：
+1. K6 上 setx 两个 env vars（值与 K3 一致）：`CF_CRAWLER_ENDPOINT=https://cf-crawler-worker.kangarooo-network.workers.dev`、`CF_CRAWLER_TOKEN=***REMOVED-CRAWLER-TOKEN***`
+2. 从本机 `C:\Dev\zeroclaw\资料\skills\cf-crawler\` 拷 `SKILL.md` + `SKILL.toml` 到 Skynet 实例的 `workspace\skills\cf-crawler\`
+3. 验证两个实例的 `config.toml` 已含 `shell_env_passthrough = ["CF_CRAWLER_ENDPOINT","CF_CRAWLER_TOKEN"]` 和 `cf-crawler-win-x64` 在 `allowed_commands`（确认 OK，无需改）
+
+**验证**：
+- 本地 curl `https://cf-crawler-worker.kangarooo-network.workers.dev/v1/health` → `ok:true, version:0.3.0`
+- K6 Skynet 实例 `cf-crawler-win-x64.exe health --pretty` → 126ms 通
+- K6 Workspace 实例 `scrape-page example.com` → success, edge_fetch, 1208ms
+
+**SSH 配置**：本次新增 K6 公私钥登录 `ssh k6`：本机生成 `~/.ssh/id_k6`（ed25519），pub key 写入 K6 的 `C:\ProgramData\ssh\administrators_authorized_keys`（elfRadio 是 admin，必须用这个路径），ACL 设为 SYSTEM:F + Administrators:F。`~/.ssh/config` 追加 `Host k6 / User elfRadio / IdentityFile ~/.ssh/id_k6`。
+
+**待用户操作**：两个 zeroclaw.exe 进程（PID 4228 Skynet、PID 4500 Workspace）已在运行，setx 不影响已运行进程，需要重启才能继承新 env。
+
+**待办（非本次范围，已发现的副作用）**：
+- 两个 config.toml 的 `[channels_config.xiaozhi].server_ip` 仍指向 `192.168.2.21`（K3），K6 上需要改成 `192.168.2.29` 或 `127.0.0.1`，看 Xiaozhi 客户端从哪里连。
+
+## 2026-05-11 — cf-crawler Worker 升级到 0.3.1
+
+**背景**：上一条 dev_log 提到 Worker 仍是 0.3.0、本地源码已到 0.3.1（含 `/v1/crawl` 第三道反爬防线 + screenshot 模式）。本次完成 Worker 端升级。
+
+**部署过程踩坑记录**：
+1. `npx wrangler login` OAuth 流程失败两次：
+   - 第一次：默认 callback 端口 8976 被 Windows winnat 服务（Hyper-V）动态预留段（8974-9073）锁住，bind 失败。`netsh int ipv4 show excludedportrange` 可看预留段。
+   - 加 `--callback-port=8888 --callback-host=127.0.0.1` 绕开 → 端口能 bind 但 CF 服务端 redirect_uri 写死 `localhost:8976`，浏览器回调走丢。
+   - 用 UAC 提权 `net stop winnat` 强行释放预留段 → 8976 bind 成功，但 **CF 的 OAuth consent 页面持续报 `There was an error fetching accounts`**，retry 十几次都同样错误（疑似 CF 服务端 bug 或风控）。
+2. **改走 API Token 路径成功**：dash.cloudflare.com → My Profile → API Tokens → "Edit Cloudflare Workers" 模板创建 token (`cfut_...`)，用 `CLOUDFLARE_API_TOKEN` 环境变量直接绕过 OAuth。
+
+**正式部署**：
+- `C:\Dev\cf-crawler\worker\wrangler.toml`：`CF_CRAWLER_VERSION = "0.3.0"` → `"0.3.1"`
+- `CLOUDFLARE_API_TOKEN=... CLOUDFLARE_ACCOUNT_ID=baf365a52956bb35cf34ff922f4e8298 npx wrangler deploy`
+- 设置 Worker secrets：`CF_API_TOKEN=<redacted, rotate before reuse>`（Browser Rendering），`CF_ACCOUNT_ID=baf365a52956bb35cf34ff922f4e8298`
+
+**验证**：
+- `curl /v1/health` → `{"ok":true,"version":"0.3.1",...}`
+- `curl /v1/crawl` (POST empty) → `{"ok":false,"error":"url is required"}`（路由已注册，token 鉴权通过）
+- K6 ZeroClaw_Workspace 实例 `cf-crawler-win-x64.exe health --pretty` → version 0.3.1，284ms
+- K6 上 scrape example.com → success, edge_fetch, 1301ms
+
+**新功能可用**：
+- `mode=screenshot`：调 Worker 内 Playwright 截图，返回 base64 PNG，CLI 自动保存到 `homework/screenshots/{domain}_{timestamp}.png`
+- `auto` 策略链补全：`edge_fetch → edge_browser → /v1/crawl`（第三道防线，走 CF Browser Rendering REST API）
+
+**Account 信息**（仅供后续运维参考，已存入 memory）：
+- CF Account ID: `baf365a52956bb35cf34ff922f4e8298` (Kangarooo Network)
+- Worker URL: `https://cf-crawler-worker.kangarooo-network.workers.dev`
+- 部署用的 API Token 默认 30 天过期，到期需重新生成
+
+## 2026-05-11 — K6 双实例 Groq STT 配置 + K3 残留清理
+
+**背景**：K6 两个实例 config.toml 的 `[transcription]` 缺 `api_key`（STT 不工作），多处文档仍写死 K3 路径 `D:\ZeroClaw_*` 和 K3 IP `192.168.2.21`，xiaozhi `server_ip` 也指向 K3。
+
+**改的文件**（每改前 `.bak-2026-05-11` 备份）：
+
+| 文件 | 改动 |
+|---|---|
+| `ZeroClaw_Skynet\config.toml` | `[transcription].api_key` 新增 Groq key；`allowed_roots` `D:\ZeroClaw_Skynet\homework` → `C:\dev\elfClaw\ZeroClaw_Skynet\homework`；xiaozhi `server_ip` `192.168.2.21` → `192.168.2.29` |
+| `ZeroClaw_Workspace\config.toml` | 同上三处 |
+| `ZeroClaw_Skynet\workspace\IDENTITY.md` | `D:\ZeroClaw_Skynet` → `C:\dev\elfClaw\ZeroClaw_Skynet` |
+| `ZeroClaw_Skynet\workspace\TOOLS.md` | 同上 |
+| `ZeroClaw_Workspace\workspace\IDENTITY.md` | `D:\ZeroClaw_Workspace\homework` → `C:\dev\elfClaw\ZeroClaw_Workspace\homework` |
+| `ZeroClaw_Workspace\workspace\MEMORY.md` | 同上 |
+| `ZeroClaw_Workspace\workspace\TOOLS.md` | 段落标题改成「本地环境（K6）」，路径同步更新 |
+| `ZeroClaw_Workspace\workspace\workers\news_fetcher.md` | CWD 路径 D:\ → C:\dev\elfClaw\ |
+| `ZeroClaw_Workspace\workspace\HEARTBEAT.md` | 415 & 432 行 `D:\ZeroClaw_Workspace\homework\news_sources.md` → `C:\dev\elfClaw\ZeroClaw_Workspace\homework\news_sources.md` |
+
+**也顺手**：创建 `C:\dev\elfClaw\ZeroClaw_Skynet\homework`（之前不存在）
+
+**验证**：
+- Groq key `gsk_0Ujj8PL9...` 通过 `/v1/models` 列表 16 个模型，含 `whisper-large-v3-turbo`
+- K6 → Groq `/v1/audio/transcriptions` 上传 DeepSpeech 测试 wav，转录返回 `"She had your duck suit in greasy wash water all year."` ✅
+- K6 → `speech.platform.bing.com:443` TCP 通；voice `zh-TW-HsiaoChenNeural` 在 Edge TTS voice list 中存在 → TTS 链路就绪（无需 key）
+- 最终扫描两个实例的 workspace（排除 `skills/`/`state/`/`sessions/`/`memory/`/`github/` clone）：**0 行 K3 残留**
+
+**没改的文件**（git clone 副本，git pull 会自动同步上游内容）：
+- `C:\dev\elfClaw\ZeroClaw_Workspace\workspace\github\elfclaw\CLAUDE.md`
+- `C:\dev\elfClaw\ZeroClaw_Workspace\workspace\github\elfclaw\dev_log.md`
+
+## 2026-05-11 — vbs 启动器修复 + WMI 启动法（cf-crawler 还是连不上根因）
+
+**症状**：上一轮把 CF_CRAWLER_* env vars setx 到 K6 User 注册表 + 把 skill + 配置都修好之后，agent 调用 `web_scrape` / `shell` 跑 cf-crawler 仍然失败。错误信息是 `connect ECONNREFUSED 127.0.0.1:8787`（cf-crawler EXE 拿不到 endpoint 时 fallback 到 wrangler dev 本地预览端口）。
+
+**真正的根因（两个隐藏问题叠加）**：
+
+1. **vbs 启动器路径写死 K3**：`start_bot.vbs` 还指向 `D:\ZeroClaw_*\zeroclaw.exe`（K6 上不存在）。用户根本不能用 vbs 启动，只能从 PowerShell 手动跑 `.\zeroclaw.exe daemon`。
+2. **手动启动的 PowerShell 比 setx 时间早**：那个 PowerShell 启动时已经把 User env 复制到自己进程环境块，之后注册表变了它不会重读。zeroclaw 继承的就是这个旧 env，进程环境块里完全没有 CF_CRAWLER_*。
+
+**诊断**：写了一段 psutil 脚本 dump zeroclaw 进程的 environ()，确认进程 env 块里既无 `CF_CRAWLER_ENDPOINT` 也无 `CF_CRAWLER_TOKEN`。
+
+**修复**（两个 vbs 都重写）：
+
+```vbs
+Set WshShell = CreateObject("WScript.Shell")
+Set userEnv = WshShell.Environment("USER")
+Set procEnv = WshShell.Environment("PROCESS")
+procEnv("CF_CRAWLER_ENDPOINT") = userEnv("CF_CRAWLER_ENDPOINT")
+procEnv("CF_CRAWLER_TOKEN")    = userEnv("CF_CRAWLER_TOKEN")
+WshShell.Run chr(34) & "C:\dev\elfClaw\ZeroClaw_<name>\zeroclaw.exe" & chr(34) & " daemon --config-dir " & chr(34) & "C:\dev\elfClaw\ZeroClaw_<name>" & chr(34), 0
+```
+
+关键点：`WshShell.Environment("USER")` 总是从 HKCU 注册表直接读最新值，再写到 `PROCESS` env 让子进程继承。这样无论 vbs 是怎么被启动的（Explorer 双击 / cmd / Task Scheduler），CF_CRAWLER 永远是最新的。
+
+**SSH 启动的 gotcha**：从 SSH session 跑 vbs（即使用 `Start-Process -WindowStyle Hidden`）启动的 zeroclaw 会被 SSH session 的 job object 收容，SSH 命令结束时 job 终止所有子进程。解决方法：用 `([wmiclass]"Win32_Process").Create("wscript.exe ...")` 让 WMI 服务孵化进程，自动跳出 SSH job。仅在远程运维场景需要，Explorer 双击 vbs 不受影响。
+
+**验证**（重启后）：
+- 两个 zeroclaw 进程稳定运行
+- psutil dump 进程 env：`CF_CRAWLER_ENDPOINT` 和 `CF_CRAWLER_TOKEN` 都已注入
+- 进程总 env 变量数从 39 涨到 40（多的就是我们注入的两个变量；另一个本来就有）
+
+**备份**：旧 vbs 已备份 `start_bot.vbs.bak-2026-05-11`
+
+## 2026-05-11 — Workspace 实例 SKILL.toml 是 v0.3.0 旧版本
+
+**症状**：上一步把 env + vbs 修好后，agent 在 Telegram 报「直接调用原生 `web_scrape` 工具时，系统内部路径拼接有个小 bug，但通过 shell 直接调用 `.\tools\cf-crawler-win-x64.exe scrape-page` 已经完美绕过了」。
+
+**根因**：之前部署 cf-crawler 的时候发现 Skynet 实例的 cf-crawler skill 目录是空的，所以从本地源拷了 SKILL.md + SKILL.toml 给 Skynet。但 Workspace 实例已经有 SKILL.md + SKILL.toml（K3 时代继承下来），**当时没动**。结果 Workspace 实例上一直在用 v0.3.0 的旧 SKILL.toml：
+
+旧版本（4515 字节）问题：
+- `web_scrape` 第 13 行：`command = "echo {json_input} | D:\\ZeroClaw_Workspace\\workspace\\tools\\cf-crawler-win-x64.exe scrape-page --pretty"` — D:\ 绝对路径写死 K3
+- `web_help` 第 57 行：同样 D:\ 绝对路径
+- 3 个工具（web_scrape/web_crawl/web_login）缺 `input_mode = "stdin_json"`，旧版用 `echo {json_input} | ...` 管道（PowerShell JSON 转义灾难）
+- `[tools.args]` 用单一 `json_input` 字符串字段，新版拆成 url/goal/mode/strategy/... 结构化字段
+- `version = "0.3.0"`
+
+新版本（4731 字节，本地 `资料/skills/cf-crawler/SKILL.toml`）：
+- 全部 6 个 command 用 `.\tools\cf-crawler-win-x64.exe`
+- stdin_json 模式（让 elfclaw 帮忙序列化 JSON 通过 stdin 传，跳过 PowerShell 引号灾难）
+- 结构化 args
+- `version = "0.3.1"`
+
+**修复**：scp 本地干净的 SKILL.toml 覆盖 Workspace 实例，重启 Workspace zeroclaw 重新加载 skill。Skynet 已经是干净版无需动。旧版本已备份 `SKILL.toml.bak-2026-05-11`。
+
+**SKILL.md 第 171 行的 `D:\...\\cf-crawler-win-x64.exe`** 是「常见错误」表格里的占位符示例（教学反例），不是真路径，保留不改。
+
+**教训**：以后只要碰到 K3→K6 这种环境迁移，所有 SKILL.* / *.md / config / vbs / 启动器都得"取本地权威版本统一覆盖"，不要因为目标"已存在"就跳过；新机器接管时 K3 时代的旧文件可能携带写死路径或老版本。
+
+## 2026-05-11 — SKILL.toml 反斜杠路径被 git-bash 转义吞掉
+
+**症状**：上一步把 Workspace 实例的 SKILL.toml 换成 v0.3.1 干净版后，agent 再调用 `web_scrape` 仍然报错：`/usr/bin/bash: line 1: .toolscf-crawler-win-x64.exe: command not found`。
+
+**根因**：
+- elfclaw 在 Windows 上的 shell 选择优先级（`src/runtime/native.rs:80-87`）是：**bash → sh → pwsh → powershell → cmd**
+- K6 上 elfRadio 用户通过 scoop 装了 git（`C:\Users\elfRadio\scoop\apps\git\2.54.0\usr\bin\bash.exe`），scoop shims 在 User PATH 里
+- 所以 elfclaw 选了 git-bash 来执行 shell 工具
+- git-bash 把 SKILL.toml 里的 `.\\tools\\cf-crawler-win-x64.exe`（双反斜杠）当 POSIX 转义：`\t` 当 tab，`\c` 不识别就吞掉，最终变成 `.toolscf-crawler-win-x64.exe` → command not found
+
+**本地实测**（用 K6 git-bash 直接验证）：
+- `bash -c ".\\tools\\cf-crawler-win-x64.exe health"` → `command not found`（复现 agent 错误）
+- `bash -c "./tools/cf-crawler-win-x64.exe health"` → 返回 `version: 0.3.1` 健康检查成功
+
+**修复**：把所有 6 个工具的 `command` 字段从 `".\\tools\\cf-crawler-win-x64.exe ..."` 改成 `"./tools/cf-crawler-win-x64.exe ..."`。正斜杠在 git-bash + PowerShell 都能识别（PowerShell 自 Windows 7+ 接受 forward slash 作路径分隔符；cmd.exe 不支持但 elfclaw 不会优先选 cmd）。
+
+改动：
+- 本地源 `C:\Dev\zeroclaw\资料\skills\cf-crawler\SKILL.toml`：6 处 command 字段 + prompts 段里的提示文本
+- K6 两个实例 `workspace\skills\cf-crawler\SKILL.toml`：scp 推送本地源
+- 备份：`SKILL.toml.bak2-2026-05-11`
+
+**附带把 prompts 段的说明文字也更新**了，提醒未来读者「elfclaw 在 Windows 上优先用 git-bash，反斜杠会被当转义符吞掉」。
+
+**重启**：两个 zeroclaw 实例都用 WMI `Win32_Process.Create` 重启加载新 SKILL.toml。
+
+## 2026-05-11 — K6 开机自启动 + 日志查看工具
+
+**自启动**：两个 elfclaw 实例注册到 Windows Task Scheduler：
+
+```powershell
+$action1 = New-ScheduledTaskAction -Execute "wscript.exe" -Argument "C:\dev\elfClaw\ZeroClaw_Skynet\start_bot.vbs"
+$action2 = New-ScheduledTaskAction -Execute "wscript.exe" -Argument "C:\dev\elfClaw\ZeroClaw_Workspace\start_bot.vbs"
+$trigger = New-ScheduledTaskTrigger -AtLogOn -User "K6\elfRadio"
+$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Days 9999)
+Register-ScheduledTask -TaskName "elfClaw_Skynet"    -Action $action1 -Trigger $trigger -Settings $settings -Force
+Register-ScheduledTask -TaskName "elfClaw_Workspace" -Action $action2 -Trigger $trigger -Settings $settings -Force
+```
+
+触发器：**At logon for K6\elfRadio**。
+- 优点：不需要存储密码、不需要 admin。Task 跑在 elfRadio 自己的上下文，能读 HKCU 注册表里的 CF_CRAWLER env。
+- 限制：仅在 elfRadio 登录 Windows 后才会触发。如果 K6 开机就跑 headless（不登录），需要改用 At startup + 凭据存储（要 admin）。
+
+验证：两个 task 手动 Start-ScheduledTask 触发后 LastTaskResult=0（success）。后续 elfRadio 每次登录自动起。
+
+**日志查看**：每个实例根目录加了 `tail_log.cmd`，**双击即可实时 tail** elfclaw-logs.jsonl，自动 JSON 解析 + 颜色区分（ERROR 红、WARN 黄、DEBUG 灰、INFO 白），按 Ctrl+C 退出。
+
+- `C:\dev\elfClaw\ZeroClaw_Skynet\tail_log.cmd`
+- `C:\dev\elfClaw\ZeroClaw_Workspace\tail_log.cmd`
+
+日志原始路径（如需直接 grep 或 SQL 查询）：
+- `<实例目录>\workspace\state\elfclaw-logs.jsonl`（追加式纯文本，可 `Get-Content -Tail -Wait` 或 grep）
+- `<实例目录>\workspace\state\elfclaw-logs.db`（SQLite，可结构化查询）
+
+---
+
+## 2026-03-16 — MaxTokens 续传 UTF-8 字节边界 Panic 修复
+
+**文件**：`src/agent/loop_.rs`，函数 `merge_continuation_text()`
+
+**问题**：Skynet sqlite_query 输出大段 CJK 文本触发 MaxTokens 续传逻辑，`merge_continuation_text()` 用字节偏移量（`overlap_len`）对含中文的字符串切片，当偏移量落在多字节字符（'以'，bytes 1070..1073）中间时 panic：`byte index 1072 is not a char boundary`。
+
+**根本原因**：`(1..=max_overlap).rev()` 逐字节迭代，`&continuation[..overlap_len]` 切片不检查 char boundary。
+
+**修复方式**（Option B，预收集合法边界）：用 `char_indices()` 收集所有合法 char end-boundary，只在合法边界处切片，跳过多字节字符内部的非法位置。语义完全不变，CJK 文本迭代次数降至约 1/3。
+
+**编译**：`cargo build --release --features wasm-tools` 通过（8m53s）。
+
+---
+
+## 2026-03-16 — Skills 按需加载（TOOLS.md 名称过滤，修复 Skynet 429）
+
+### 问题
+
+Skynet workspace 有 1,251 个社区 skill。`parse_front_matter()` 修复后首次全部成功加载，
+全量注入 system prompt → token 爆炸 → 429 错误。
+
+### 修改（仅 `src/skills/mod.rs`）
+
+1. **新增 `parse_allowed_from_tools_md()`**：读取 `workspace/TOOLS.md`，仅解析 `## 已安装 Skills` 区块的 Markdown 表格第一列（自动脱反引号、验证字符集），返回 `HashSet<String>`。到达第二个 `## ` 标题时停止。
+2. **`load_skills_from_directory()` 新增 `allowed_names: Option<&HashSet<String>>` 参数**：在读取 metadata / 运行审计之前，用目录名过滤非许可 skill，直接跳过。
+3. **`load_workspace_skills()` 应用过滤**：调用 `parse_allowed_from_tools_md()` 获取允许列表，传入 `load_skills_from_directory()`。
+4. **`load_open_skills()` 传 `None`**：open-skills 仓库不过滤，行为不变。
+
+### 向后兼容
+
+- 无 TOOLS.md → `parse_allowed_from_tools_md()` 返回 `None` → 加载全部（旧行为）
+- TOOLS.md 存在但解析 0 名 → `warn!` 日志 + 返回 `None` → 加载全部
+
+### 验证
+
+- `cargo build --release --features wasm-tools`：**编译成功（9m07s）**
+- 二进制输出：`target/release/zeroclaw.exe`
+
+---
+
+## 2026-03-16 — Skill 审计 `security-allowlist` 声明机制
+
+### 问题
+
+`audit_skill_md` 不识别 `<!-- security-allowlist: ... -->` 约定，导致 3 类误报：
+- `bun-development`：文件头注释中的 `irm-pipe-iex` 词语被 `\biex\b` 命中（纯误报）
+- `audit-skills`、`claude-code-expert`：审计示例中的 curl 命令，作者已有 allowlist 声明但未被识别
+- 总计 22 条警告中有至少 3 条是可消除的误报
+
+### 修改（仅 `src/skills/audit.rs`）
+
+1. **新增 `parse_security_allowlist()`**：从 SKILL.md 内容中提取 `<!-- security-allowlist: ... -->` 声明，返回小写 token 列表
+2. **新增 `is_pattern_allowlisted()`**：将 skill 作者的别名（`curl-pipe-bash`、`irm-pipe-iex` 等）映射到内部 pattern 名，支持封闭精确别名匹配
+3. **修改 `audit_skill_md()`**：扫描前先解析 allowlist，命中 pattern 后检查是否已被作者声明豁免
+4. **新增 5 个测试**：`audit_allows_allowlisted_curl_in_code_block`、`audit_allows_allowlisted_curl_in_plain_text`、`audit_rejects_non_allowlisted_pattern`、`audit_allows_irm_pipe_iex_alias`、`audit_allowlist_does_not_bypass_different_pattern`
+
+### 安全保证
+
+- allowlist 只对 SKILL.md 内容扫描（`detect_high_risk_snippet`）生效
+- SKILL.toml `tools[].command` 检查、链接安全检查、symlink 检查**完全不受影响**
+- 别名映射封闭，无模糊匹配，allowlist 只能豁免自身声明的具体 pattern
+
+### 验证
+
+- `cargo test skills::audit`：**26/26 全部通过**（+5 新测试）
+- `cargo build --release --features wasm-tools`：编译中
+
+## 2026-03-16 — Skill 审计误报修复（两级扫描 + 代码块剥离 + bug fix）
+
+### 问题
+
+Skynet 启动产生 40+ 条 `skipping insecure skill directory` 警告，绝大多数是系统设置过严的误报。
+
+### 根本原因
+
+1. `audit_markdown_file` 对所有 .md 文件执行完整扫描，包括 CHANGELOG.md、resources/、references/
+2. `detect_high_risk_snippet` 无代码块意识，文档示例代码（如 \`\`\`bash\ncurl | bash\n\`\`\`）触发告警
+3. Cross-skill reference 检查只在文件不存在（`Err`）分支，文件存在时反而被误报为"escapes skill root"
+4. `tg://` Telegram 深链接被当作未知危险 scheme
+
+### 修改（仅 `src/skills/audit.rs`）
+
+1. **新增 `strip_fenced_code_blocks()`**：扫描前剥离 fence 代码块，防止文档示例代码触发误报
+2. **`audit_path()` 两级扫描**：SKILL.md（执行契约）走严格全量扫描；其他 .md（参考文档）只做路径安全检查
+3. **`audit_markdown_file` 拆分为 `audit_skill_md` + `audit_reference_md`**：SKILL.md 扫描加代码块剥离；参考文档跳过内容扫描和远程链接检查
+4. **Cross-skill reference bug fix**：Ok 分支加入兄弟 skill 目录检查（canonical_target 在 root.parent() 的子目录中，不允许直接指向 parent 下文件）
+5. **允许 `tg://` scheme**：Telegram 深链接无害，elfClaw 不会自动发起网络请求
+6. **更新测试 `audit_allows_existing_cross_skill_reference`**：bug fix 后改为期望干净结果
+
+### 验证
+
+- `cargo test skills::audit`：**21/21 全部通过**
+- `cargo build --release --features wasm-tools`：**编译成功**（9m35s）
+
+### 预期效果
+
+启动警告从 40+ 条降至 ~16 条（12 个远程 .md 链接 + 4 个缺少 SKILL.md 的 skill，均属合理拦截）
+
+---
+
+## 2026-03-16 — UTF-8 字符边界 Panic 修复
+
+### 问题
+
+两个运行实例均因字节级切片踩入多字节 CJK 字符内部而 panic：
+
+1. **Bug 1**：`src/agent/loop_.rs:205`（`scrub_credentials()`）
+   `byte index 4 is not a char boundary; it is inside '的' ...`
+   原因：`&val[..4]` 按字节切片，CJK 字符 3 字节，字节 4 在 `的` 中间。
+
+2. **Bug 2**：`src/skills/mod.rs`（`parse_front_matter()`）
+   `byte index 309 is not a char boundary; it is inside '果' ...`
+   原因：`text.lines()` 剥离 `\r`，但 `end += line.len() + 1` 仅加 1 字节（假设 LF），CRLF 文件每行少算 1 字节，N 行后偏移漂移踩入 CJK 字符。
+
+### 修改
+
+**`src/agent/loop_.rs`**（第 205 行，1→2 行）：
+- 旧：`let prefix = if val.len() > 4 { &val[..4] } else { "" };`
+- 新：`val.chars().take(4).collect()` 按 Unicode 字符取前缀，消除字节切片。
+
+**`src/skills/mod.rs`**（`parse_front_matter()` 全函数重写，37 行）：
+- 旧：用 `text.lines()` 迭代 + 字节累加计算偏移。
+- 新：用 `remaining.find('\n')` 逐行定位——`\n` 是 ASCII，其字节位置天然是 UTF-8 字符边界，无需任何字节累加假设。
+- 同时修复 CRLF 处理：`trim_end_matches('\r')` 剥离 `\r`，`advance = nl + 1` 精确跳过 `\n`。
+- 所有切片操作均有安全性证明（见 CLAUDE.md §计划）。
+
+### 验证
+
+`cargo build --release --features wasm-tools` 编译成功（9m24s）。
+
+---
+
+## 2026-03-16 — Telegram media group 聚合修复（多图 album 支持）
+
+### 问题
+用户在 Telegram 发送多张图片（album）时，bot API 将每张图拆成独立 update，共享同一个 `media_group_id`。原代码对每个 update 独立处理，导致 agent 只收到 N 条各含 1 张图的分离消息，而非 1 条含 N 张图的消息。
+
+### 改动文件
+
+**`src/channels/telegram.rs`**（3 处改动）：
+
+1. **新增 `download_attachment_to_workspace()`**：从 `try_parse_attachment_message()` 提取文件下载+保存逻辑为独立方法，参数 `(attachment, chat_id, message_id)` → 返回 `Option<(local_filename, local_path)>`。内部含文件大小检查（≤20MB）、workspace 检查、get_file_path、download_file、文件名清理、路径解析、写入。
+
+2. **新增 `try_parse_media_group()`**：接收同一 `media_group_id` 的所有 update 切片，鉴权（在任何下载之前）、mention-only gate、遍历每个 update 调用 `download_attachment_to_workspace()`，收集 attachment markers，拼装为单条 `ChannelMessage`。
+
+3. **重构 `listen()` update 处理段**：在 `for update in results` 循环中先一次性推进所有 offset，然后按 `message.media_group_id` 是否存在分拣为 `standalone` 和 `media_groups`。standalone 路径行为完全不变；media_groups 路径调用 `try_parse_media_group()`。
+
+### 安全说明
+- 鉴权在任何下载之前（与单图路径一致）
+- 文件大小限制（20MB）在 `download_attachment_to_workspace()` 内检查
+- 路径遍历防护、文件名清理复用现有函数
+- offset 在 pre-pass 立即全部推进（与原行为一致）
+
+---
+
+## 2026-03-16 — 工具审批修复：cron 管理 + web_search 无需审批
+
+### 问题背景
+cron_add/remove/update 和 web_search 在 Telegram supervised 模式下每次都弹审批框。
+根本原因三层叠加：
+1. `default_tool_risk_tiers()` 将 cron_add/remove/update 错分为 Restricted
+2. `tool_risk_tier()` 将 web_search 分为 Sensitive、cron 分为 Sensitive
+3. `apply_tool_overrides()` 早返回导致 defaults 在无 tool_overrides 配置时永远不生效
+
+### 改动文件
+
+**`src/tools/mod.rs`**
+- `default_tool_risk_tiers()`：cron_add/remove/update → Safe（仅操作元数据，shell 命令另有独立校验）；新增 web_search → Safe（纯只读）；cron_run 保持 Restricted（立即触发命令执行）
+- `tool_risk_tier()`：同步上述变更，保持两函数一致
+
+**`src/config/schema.rs`**
+- `apply_tool_overrides()`：移除早返回逻辑，始终先将 Safe-tier defaults union 合并进 auto_approve；tool_overrides 为空时仅跳过 per-tool 覆盖处理，不影响 defaults 生效
+
+**K3 `D:\ZeroClaw_Workspace\config.toml`**
+- `autonomy.auto_approve` 追加 `cron_add`、`cron_remove`、`cron_update`（web_search 已存在）
+- 无需重新编译，重启实例即生效
+
+### 安全说明
+- `allowed_users` 已限制授权用户；`cron_add` 内部仍有独立 validate_command_execution()
+- `cron_run`（立即执行）保持高风险级别不变
+
+---
+
+## 2026-03-16 — Telegram 原生流式输出：sendMessageDraft (Bot API 9.5+)
+
+### 改动文件
+
+**`src/config/schema.rs`**
+- `StreamMode` 枚举新增 `Native` 变体（`#[serde(rename_all = "lowercase")]` → 配置写 `"native"`）
+
+**`src/channels/telegram.rs`**
+- `send_draft()`：在 Partial 逻辑前插入 Native 分支，调用 `sendMessageDraft(draft_id=1)`；API 失败时返回 `Ok(None)` 自动降级为非流式
+- `update_draft()`：
+  - `let (chat_id, _)` → `let (chat_id, thread_id)` 获取 thread_id
+  - 在 `message_id.parse::<i64>()` 之前插入 `message_id == "native_draft"` 分支，调用 `sendMessageDraft` 更新 draft 气泡
+- `cancel_draft()`：同样在 parse 前插入 native 分支，发空文本清除 draft 气泡
+- `finalize_draft()`：**无需修改**，`msg_id = None` fallback 已覆盖 native 模式（`send_text_chunks` 发送正式消息）
+
+### K3 配置更新
+- `D:\ZeroClaw_Workspace\config.toml`：`stream_mode = "off"` → `"native"`，`draft_update_interval_ms = 1000` → `200`
+- `D:\ZeroClaw_Skynet\config.toml`：同上
+
+### 构建结果
+- `cargo build --release --features wasm-tools` 编译通过（10m 23s）
+
+---
+
 ## 2026-03-15 — Telegram 暂停-恢复功能（/pause + "停"）
 
 ### 功能
@@ -4444,3 +4850,113 @@ K3 上 news_fetcher cron 任务两个工具反复失败（2026-03-11 全天统�
 
 `Cargo.toml` `0.3.0` → `0.4.0`（积累多天的功能性更新：TTS/语音、Email Monitor→Telegram 通知、
 聊天日志持久化、web_scrape 双重修复、heartbeat 可配置化、MCP 集成、自检改进等）
+
+## 2026-03-16 — 更新 K3 workspace AGENTS.md + BOOTSTRAP.md
+
+**目的**：让犇犇娃每次对话开始时主动读取 TOOLS.md（工具完整参考手册），解决 agent 不知道自己有哪些工具的问题。
+
+**修改文件（K3 D:\ZeroClaw_Workspace\workspace\）**：
+
+### AGENTS.md
+- `Every Session` 第 1 步仍为读 SOUL.md，新增第 2 步读 `TOOLS.md`，USER.md 移为第 3 步，memory_recall 移为第 4 步，MAIN SESSION 说明移为第 5 步
+- `Tools & Skills` 段：将 "Keep local notes in TOOLS.md" 改为 "Read TOOLS.md at session start for the full tool reference and skills list"
+
+### BOOTSTRAP.md
+- 启动清单第 1 步 IDENTITY.md 描述从"我是谁，我能做什么"改为"我是谁"
+- 新增第 2 步：读 TOOLS.md — 我能用哪些工具和 Skills（完整参考手册）
+- 原第 2-4 步顺延为第 3-5 步
+
+**背景**：TOOLS.md（6170 字节）已包含完整工具名+参数+用途+Skills 清单，是 agent 实际调用工具的权威参考；IDENTITY.md 是给人看的自我介绍，不适合作为工具查询入口。
+
+## 2026-03-16 — ZeroClaw_Skynet 人格重设（公司合伙人 CTO 兼首席科学家）
+
+**目的**：将 K3 上新建的 ZeroClaw_Skynet 实例人格从家庭成员（犇犇娃）改为公司合伙人 Skynet。
+
+**参考来源**：`C:\Dev\T880和Skynet核心指令集V4.1.txt`（V4.1）
+- 合并 T880（首席科学家，技术深度）+ Skynet（CFO/PR，务实验证）→ 单一 Skynet 角色
+- 保留 Skynet 名字，性别：女性，40 岁
+- Boss（Kasim @e1vix，ID: 495916105）按 CEO/合伙人设定
+
+**修改文件（K3: D:\ZeroClaw_Skynet\workspace\）**：
+- `SOUL.md` — 完全重写：Skynet 核心人格，铁律（7条），三档方案输出，说话风格
+- `IDENTITY.md` — 完全重写：Skynet 身份元数据（角色、能力、局限）
+- `USER.md` — 完全重写：Boss 档案 + elfRadio 项目完整设备清单（原文）
+- `BOOTSTRAP.md` — 重写：Skynet 视角启动脚本（保留5步清单结构）
+- `AGENTS.md` — 最小修改：仅改标题为"Skynet 工作协议"；Shell/Worker/Skill 规则全部保留
+
+**不修改**：TOOLS.md、HEARTBEAT.md（通用配置）
+
+## 2026-03-16 — ZeroClaw_Skynet AGENTS.md 命令修正 + HEARTBEAT.md 清空
+
+**HEARTBEAT.md**：清除全部犇犇娃定期任务内容，改为"（待配置）"占位。
+
+**AGENTS.md 命令表修正**：
+- `python` / `python3`（全平台）→ `uv run python` / `uv run <script>`（全平台），说明"必须通过 uv 运行"
+- `uv` Python包管理 → `uv` / `uv add` / `uv sync`，说明更完整
+- Worker 委派规则："通知爸爸更换" → "通知 Boss 更换"
+
+**其他命令分析结论（无需修改）**：
+- ls/cat/grep/find/pwd/wc/head/tail：已正确标注"Linux & Mac"，Windows 上不可用，标注无误
+- date：K3 在 Git Bash 环境下可用，暂不修改
+- echo/git/npm/cargo/shutdown/powercfg/cf-crawler：均适用于 Windows K3
+
+## 2026-03-16 — ZeroClaw_Skynet 部署 Antigravity Skills 库（1249 个）
+
+**操作**：
+- 从 https://github.com/sickn33/antigravity-awesome-skills 下载至 C:\Dev\antigravity-awesome-skills
+- 将 1249 个 skill（排除 agent-memory-systems）打包上传至 K3
+- 解压到 D:\ZeroClaw_Skynet\workspace\skills\（连同原有 10 个 elfClaw skills，共 1251 个目录）
+- 同步上传 skills_index.json（548KB，12591行，每条含 id/description/category/risk）
+
+**TOOLS.md 新增 Antigravity Skills 使用指南**：
+- 三步使用流程：content_search 搜索 skills_index.json → 取 id → file_read SKILL.md
+- 高价值速查表（rust-pro / architecture / brainstorming / systematic-debugging / api-security-best-practices / prompt-engineer / mcp-builder / tdd / git-pushing / 007）
+- 搜索示例和铁律（先读 SKILL.md，禁止猜测用法）
+
+---
+
+## 2026-03-16 — sqlite_query 工具 + Skills SQLite 索引库
+
+### 背景
+Skynet（K3 D:\ZeroClaw_Skynet）部署 1250+ Skill 目录，原用 content_search 搜索 548KB skills_index.json，浪费大量 token。
+
+### 新增文件
+
+**src/skills/index.rs**（新建）
+- `ensure_skills_db(workspace_dir)` — 幂等初始化 `workspace/skills/skills.db`
+- WAL 模式 + 普通 synchronous，schema: skills(name PK, description, category, risk)
+- 首次运行（表为空时）从 `skills_index.json` 批量导入，后续跳过
+- 若 skills 目录不存在则静默跳过，不阻断 daemon 启动
+
+**src/tools/sqlite_query.rs**（新建）
+- `SqliteQueryTool` — 通用 SQLite 查询工具，主要用途是搜索/维护 skills.db
+- 允许 SELECT / INSERT / UPDATE / DELETE（WITH 视为 SELECT）
+- 阻止 DDL (DROP/CREATE/ALTER/TRUNCATE)、ATTACH/DETACH、PRAGMA
+- 阻止系统 DB（elfclaw-logs.db、brain.db、jobs.db、cron.db）
+- SecurityPolicy 双重路径检查（is_path_allowed + is_resolved_path_allowed）
+- 只读路径用 SQLITE_OPEN_READ_ONLY；写操作用 READ_WRITE|CREATE
+- spawn_blocking 包裹 rusqlite 同步调用
+- SELECT 返回对齐文本表格；写操作返回 "OK: N rows affected"
+
+### 修改文件
+
+**src/skills/mod.rs**：添加 `pub mod index;`
+
+**src/tools/mod.rs**：
+- 添加 `pub mod sqlite_query;` 声明
+- 添加 `pub use sqlite_query::SqliteQueryTool;`
+- 在 has_filesystem_access 块内 content_search push 后注册 `SqliteQueryTool::new(security.clone())`
+
+**src/daemon/mod.rs**：ensure_heartbeat_file 调用之后追加 ensure_skills_db 调用（用 if let Err 包裹，失败只 warn 不阻断）
+
+### K3 远程更新
+- SCP 上传 `skills_index.json`（548KB，1259 条）到 K3 `workspace/skills/`
+- SCP 上传 `skill_lister.md` 到 K3 `workspace/workers/`（sqlite_query INSERT 方式，不依赖 shell）
+- 替换 TOOLS.md Antigravity 节 → 改用 sqlite_query 搜索示例
+- IDENTITY.md 核心能力追加技能库条目
+- HEARTBEAT.md 添加 02:00 skills.db 自动维护 cron
+
+### 风险 / 回滚
+- sqlite_query 不涉及 DDL，不会破坏现有 DB
+- skills.db 仅在表为空时导入，重启不重复写
+- K3 现有可执行文件不变；只在下次部署新版时生效

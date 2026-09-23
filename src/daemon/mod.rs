@@ -127,6 +127,11 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
                 .await;
     }
 
+    // elfClaw: ensure skills.db is initialized from skills_index.json on first run
+    if let Err(e) = crate::skills::index::ensure_skills_db(&config.workspace_dir) {
+        tracing::warn!("skills.db init skipped: {e}");
+    }
+
     let mut handles: Vec<JoinHandle<()>> = vec![spawn_state_writer(config.clone())];
 
     {

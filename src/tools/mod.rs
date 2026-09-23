@@ -83,6 +83,7 @@ pub mod shell;
 // elfClaw: Batch 2 upstream merge — orchestration settings loader
 pub mod orchestration_settings;
 pub mod source_sync;
+pub mod sqlite_query;
 pub mod subagent_list;
 pub mod subagent_manage;
 pub mod subagent_registry;
@@ -163,6 +164,7 @@ pub use send_telegram::SendTelegramTool;
 pub use send_voice::SendVoiceTool;
 pub use shell::ShellTool;
 pub use source_sync::SourceSyncTool;
+pub use sqlite_query::SqliteQueryTool;
 pub use subagent_list::SubAgentListTool;
 pub use subagent_manage::SubAgentManageTool;
 pub use subagent_registry::SubAgentRegistry;
@@ -176,20 +178,21 @@ pub use traits::ToolRiskTier;
 /// Return the risk tier for a tool by name.
 pub fn tool_risk_tier(name: &str) -> ToolRiskTier {
     match name {
-        // Safe: read-only, no side effects
+        // Safe: read-only, no side effects; low-risk scheduling management
         "get_current_time" | "memory_recall" | "image_info" | "glob_search"
         | "content_search" | "file_read" | "pdf_read" | "docx_read"
         | "pptx_read" | "xlsx_read" | "cron_list" | "cron_runs"
         | "check_logs" | "search_chat_log" | "bg_status"
         | "subagent_list" | "delegate_coordination_status"
-        | "screenshot" | "cli_discovery" | "self_check" => ToolRiskTier::Safe,
+        | "screenshot" | "cli_discovery" | "self_check"
+        | "web_search"                      // read-only search
+        | "cron_add" | "cron_remove" | "cron_update" => ToolRiskTier::Safe, // metadata only; shell cmds validated independently
 
         // Sensitive: write operations, network access
         "shell" | "process" | "file_write" | "file_edit" | "apply_patch"
-        | "git_operations" | "http_request" | "web_fetch" | "web_search"
+        | "git_operations" | "http_request" | "web_fetch"
         | "browser" | "browser_open" | "send_email" | "send_telegram"
-        | "send_voice" | "cron_add" | "cron_remove" | "cron_update"
-        | "cron_run" | "source_sync" => ToolRiskTier::Sensitive,
+        | "send_voice" | "cron_run" | "source_sync" => ToolRiskTier::Sensitive, // cron_run: immediate execution
 
         // Restricted: security/config changes
         "model_routing_config" | "proxy_config" | "web_access_config"
@@ -225,13 +228,17 @@ use std::sync::Arc;
 pub fn default_tool_risk_tiers() -> HashMap<&'static str, ToolRiskTier> {
     use ToolRiskTier::*;
     [
-        // Safe: read-only, information queries
+        // Safe: read-only, information queries, and low-risk management ops
         ("file_read", Safe),
         ("memory_recall", Safe),
         ("get_current_time", Safe),
         ("cron_list", Safe),
         ("cron_runs", Safe),
         ("search_chat_log", Safe),
+        ("web_search", Safe),    // read-only search, no side effects
+        ("cron_add", Safe),      // scheduling only; shell commands validated independently
+        ("cron_remove", Safe),   // metadata-only operation
+        ("cron_update", Safe),   // metadata-only operation
         // Sensitive: always require approval
         ("generate_pairing_code", Sensitive),
         // Restricted: hidden from non-CLI channels
@@ -243,10 +250,7 @@ pub fn default_tool_risk_tiers() -> HashMap<&'static str, ToolRiskTier> {
         ("browser_open", Restricted),
         ("http_request", Restricted),
         ("schedule", Restricted),
-        ("cron_add", Restricted),
-        ("cron_remove", Restricted),
-        ("cron_update", Restricted),
-        ("cron_run", Restricted),
+        ("cron_run", Restricted), // immediate command execution — keep Restricted
         ("memory_store", Restricted),
         ("memory_forget", Restricted),
         ("proxy_config", Restricted),
@@ -511,6 +515,7 @@ pub fn all_tools_with_runtime(
         tool_arcs.push(Arc::new(ApplyPatchTool::new()));
         tool_arcs.push(Arc::new(GlobSearchTool::new(security.clone())));
         tool_arcs.push(content_search_arc.clone());
+        tool_arcs.push(Arc::new(SqliteQueryTool::new(security.clone())));
 
         // elfClaw: self_check tool — programmatic source-level diagnostics
         tool_arcs.push(Arc::new(SelfCheckTool::new(

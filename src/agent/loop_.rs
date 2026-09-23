@@ -137,8 +137,14 @@ fn merge_continuation_text(existing: &str, continuation: &str) -> String {
         return existing.to_string();
     }
     // Look for overlap: existing tail == continuation head
+    // Use char-boundary-safe iteration to avoid panic on multi-byte (CJK) characters.
     let max_overlap = existing.len().min(continuation.len());
-    for overlap_len in (1..=max_overlap).rev() {
+    let boundaries: Vec<usize> = continuation
+        .char_indices()
+        .map(|(i, c)| i + c.len_utf8())
+        .take_while(|&end| end <= max_overlap)
+        .collect();
+    for &overlap_len in boundaries.iter().rev() {
         if existing.ends_with(&continuation[..overlap_len]) {
             return format!("{}{}", existing, &continuation[overlap_len..]);
         }
@@ -201,8 +207,10 @@ pub(crate) fn scrub_credentials(input: &str) -> String {
                 .map(|m| m.as_str())
                 .unwrap_or("");
 
-            // Preserve first 4 chars for context, then redact
-            let prefix = if val.len() > 4 { &val[..4] } else { "" };
+            // Preserve first 4 Unicode chars for context, then redact
+            // Use char-based slicing to avoid panicking on multi-byte CJK characters.
+            let prefix_s: String = val.chars().take(4).collect();
+            let prefix: &str = if prefix_s.len() < val.len() { &prefix_s } else { "" };
 
             if full_match.contains(':') {
                 if full_match.contains('"') {

@@ -7,6 +7,7 @@ use std::process::Command;
 use std::time::{Duration, SystemTime};
 
 mod audit;
+pub mod index;
 mod templates;
 mod tool_handler;
 
@@ -124,13 +125,77 @@ fn load_skills_with_open_skills_config(
     skills
 }
 
+/// Read `workspace/TOOLS.md` and extract skill directory names listed under the
+/// `## 已安装 Skills` (or `## Installed Skills`) section.
+///
+/// Returns `None` when TOOLS.md is absent (load everything — backwards-compatible)
+/// or when the section is found but contains no valid names (warn + load everything).
+fn parse_allowed_from_tools_md(workspace_dir: &Path) -> Option<HashSet<String>> {
+    let tools_md = workspace_dir.join("TOOLS.md");
+    let Ok(content) = std::fs::read_to_string(&tools_md) else {
+        return None;
+    };
+
+    let mut names: HashSet<String> = HashSet::new();
+    let mut in_installed_section = false;
+
+    for line in content.lines() {
+        let line = line.trim();
+
+        // Only match `##` level headings (not `#` or `###`)
+        if line.starts_with("## ") {
+            let was_in = in_installed_section;
+            in_installed_section = line.contains("已安装")
+                || line.to_ascii_lowercase().contains("installed skill");
+            // Stop as soon as we leave the installed-skills section
+            if was_in && !in_installed_section {
+                break;
+            }
+            continue;
+        }
+
+        if !in_installed_section || !line.starts_with('|') {
+            continue;
+        }
+
+        // Extract first table column; strip Markdown backtick formatting
+        let cell = line
+            .trim_start_matches('|')
+            .split('|')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .trim_matches('`')
+            .trim();
+
+        // Valid skill dir name: ASCII alphanumeric + `-` + `_`, at least one alphanumeric char
+        if !cell.is_empty()
+            && cell.len() <= 64
+            && cell.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            && cell.chars().any(|c| c.is_ascii_alphanumeric())
+        {
+            names.insert(cell.to_lowercase());
+        }
+    }
+
+    if names.is_empty() {
+        tracing::warn!(
+            "workspace/TOOLS.md found but no skill names parsed from installed section; loading all workspace skills"
+        );
+        None
+    } else {
+        Some(names)
+    }
+}
+
 fn load_workspace_skills(
     workspace_dir: &Path,
     allow_scripts: bool,
     trusted_skill_roots: &[PathBuf],
 ) -> Vec<Skill> {
     let skills_dir = workspace_dir.join("skills");
-    load_skills_from_directory(&skills_dir, allow_scripts, trusted_skill_roots)
+    let allowed = parse_allowed_from_tools_md(workspace_dir);
+    load_skills_from_directory(&skills_dir, allow_scripts, trusted_skill_roots, allowed.as_ref())
 }
 
 fn resolve_trusted_skill_roots(workspace_dir: &Path, raw_roots: &[String]) -> Vec<PathBuf> {
@@ -222,6 +287,7 @@ fn load_skills_from_directory(
     skills_dir: &Path,
     allow_scripts: bool,
     trusted_skill_roots: &[PathBuf],
+    allowed_names: Option<&HashSet<String>>,
 ) -> Vec<Skill> {
     if !skills_dir.exists() {
         return Vec::new();
@@ -235,6 +301,15 @@ fn load_skills_from_directory(
 
     for entry in entries.flatten() {
         let path = entry.path();
+
+        // Apply TOOLS.md allow-list filter before reading metadata or running audits
+        if let Some(allowed) = allowed_names {
+            let dir_name = entry.file_name().to_string_lossy().to_lowercase();
+            if !allowed.contains(dir_name.as_str()) {
+                continue;
+            }
+        }
+
         let metadata = match std::fs::symlink_metadata(&path) {
             Ok(meta) => meta,
             Err(err) => {
@@ -304,7 +379,7 @@ fn load_open_skills(repo_dir: &Path, allow_scripts: bool) -> Vec<Skill> {
     // as executable skills.
     let nested_skills_dir = repo_dir.join("skills");
     if nested_skills_dir.is_dir() {
-        return load_skills_from_directory(&nested_skills_dir, allow_scripts, &[]);
+        return load_skills_from_directory(&nested_skills_dir, allow_scripts, &[], None);
     }
 
     let mut skills = Vec::new();
@@ -671,38 +746,62 @@ fn strip_quotes(s: &str) -> &str {
 
 /// Parse optional YAML-like front matter from a SKILL.md body.
 /// Returns (front_matter_map, body_without_front_matter).
+///
+/// Uses `find('\n')` to locate line boundaries instead of accumulating byte
+/// lengths from `str::lines()` output.  `\n` is ASCII so its byte position is
+/// always a valid UTF-8 char boundary — this prevents panics when the content
+/// contains multi-byte CJK characters (e.g. in skill descriptions).
 fn parse_front_matter(content: &str) -> (HashMap<String, String>, &str) {
     let text = content.strip_prefix('\u{feff}').unwrap_or(content);
-    let mut lines = text.lines();
-    let Some(first) = lines.next() else {
-        return (HashMap::new(), content);
-    };
-    if first.trim() != "---" {
-        return (HashMap::new(), content);
-    }
 
-    let mut map = HashMap::new();
-    let start = first.len() + 1;
-    let mut end = start;
-    for line in lines {
+    // Must open with a '---' line (handles both LF and CRLF).
+    let after_open = match text
+        .strip_prefix("---\r\n")
+        .or_else(|| text.strip_prefix("---\n"))
+    {
+        Some(s) => s,
+        None => return (HashMap::new(), content),
+    };
+
+    // Scan for the closing '---' line.
+    // Using find('\n') guarantees we only slice at ASCII byte positions,
+    // which are always valid UTF-8 char boundaries — no byte accumulation.
+    let mut remaining = after_open;
+    let mut fm_byte_end = 0usize; // byte offset within after_open
+
+    loop {
+        let (line_bytes, advance) = match remaining.find('\n') {
+            Some(nl) => (nl, nl + 1),
+            None => (remaining.len(), remaining.len()), // last line, no newline
+        };
+
+        let line = remaining[..line_bytes].trim_end_matches('\r');
+
         if line.trim() == "---" {
-            let body_start = end + line.len() + 1;
-            let body = if body_start <= text.len() {
-                text[body_start..].trim_start_matches(['\n', '\r'])
+            let body_offset = fm_byte_end + advance;
+            let body = if body_offset <= after_open.len() {
+                after_open[body_offset..].trim_start_matches(['\n', '\r'])
             } else {
                 ""
             };
+            let mut map = HashMap::new();
+            for fm_line in after_open[..fm_byte_end].lines() {
+                if let Some((key, value)) = fm_line.split_once(':') {
+                    let key = key.trim().to_lowercase();
+                    let value = strip_quotes(value).to_string();
+                    if !key.is_empty() && !value.is_empty() {
+                        map.insert(key, value);
+                    }
+                }
+            }
             return (map, body);
         }
 
-        if let Some((key, value)) = line.split_once(':') {
-            let key = key.trim().to_lowercase();
-            let value = strip_quotes(value).to_string();
-            if !key.is_empty() && !value.is_empty() {
-                map.insert(key, value);
-            }
+        fm_byte_end += advance;
+        if advance >= remaining.len() {
+            break; // last line reached without finding closing '---'
         }
-        end += line.len() + 1;
+        remaining = &remaining[advance..];
     }
 
     // Unclosed block: ignore as plain markdown for safety/backward compatibility.
