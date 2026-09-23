@@ -2,6 +2,24 @@
 
 ---
 
+## 2026-09-23 — 稳定化 Step 0 + Step 1：密钥清理 + 死代码删除
+
+详细方案见 `elfclaw.md`。本次会话确定不迁移到 PicoClaw/Nanobot，改为稳定化现有 elfClaw。
+
+### Step 0：基线提交 + 密钥清理
+- 3 月 16 日之后的未提交改动（skills index、MaxTokens 续传修复、skill 审计、telegram 相册/流式草稿、cron 审批）整理成 baseline commit，提交前清掉其中一处泄露的 CF Worker secret。
+- 用 `git-filter-repo` 清理全部 git 历史里的 6 处真实密钥泄露（代理 key、Gmail 应用密码、`CF_CRAWLER_TOKEN`、Telegram bot token、CF Worker secret、gateway pairing token），强推 `origin/main`。
+- 删除 3 个仍携带旧历史的 dependabot 分支（会自动重建），GitHub 密钥扫描告警标记为已解决。
+- `CLAUDE.md` §0 补充中文输出规则，明确覆盖 commit message（之前有一条 commit message 整段写成英文，属违规）。
+
+### Step 1：删除死代码
+- 删除 `src/goals/`（932 行）、`src/economic/`（2529 行，含 `EconomicConfig`/`[economic]` 配置段）、`src/tools/agents_ipc.rs`（1023 行，含 `AgentsIpcConfig`/`[agents_ipc]` 配置段）、`src/heartbeat/engine.rs`（`ensure_heartbeat_file` 挪到 `daemon/mod.rs`）、`src/memory/decay.rs`、`src/cron/consolidation.rs`——均已逐一核实全代码库无生产调用方。
+- 清理仓库根目录垃圾文件（`tmp_check.zip`、`test_script*.sh` 等）。
+- 验证：`cargo check`/`cargo test --lib` 全过（4146 passed，11 个 pre-existing 失败与本次无关）；用真实部署的 `资料/config.toml` 跑了一次解析测试，确认删除 `[economic]`/`[agents_ipc]` 字段后旧配置文件依然能正常加载（`Config` 顶层无 `deny_unknown_fields`，残留字段被静默忽略）。
+
+### 下一步
+用户明确要求优先解决"多 Gemini key + 多模型轮询"（`elfclaw.md` 第 5 节），先于 Step 2（cron 重写）。
+
 ## 2026-05-11 — K6 新机部署：cf-crawler 运行环境恢复
 
 **背景**：elfclaw 从 K3（192.168.2.21）迁移到 K6（192.168.2.29），K6 上跑两个实例 `C:\dev\elfClaw\ZeroClaw_Skynet` 和 `C:\dev\elfClaw\ZeroClaw_Workspace`。两个实例的 cf-crawler 调用都不通。
