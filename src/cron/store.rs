@@ -1,7 +1,7 @@
 use crate::config::Config;
 use crate::cron::{
-    next_run_for_schedule, schedule_cron_expression, validate_schedule, CronJob, CronJobPatch,
-    CronRun, DeliveryConfig, JobType, Schedule, SessionTarget,
+    apply_default_tz, next_run_for_schedule, schedule_cron_expression, validate_schedule, CronJob,
+    CronJobPatch, CronRun, DeliveryConfig, JobType, Schedule, SessionTarget,
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -51,6 +51,12 @@ pub fn add_shell_job(
     schedule: Schedule,
     command: &str,
 ) -> Result<CronJob> {
+    // elfClaw 2026-09-23: resolve a missing tz to config.cron.default_tz
+    // before anything else touches `schedule` — the dedup-update branch
+    // below reuses this same value, so both the create and update paths get
+    // the default applied consistently.
+    let schedule = apply_default_tz(config, schedule);
+
     // elfClaw: idempotent dedup — if a job with the same name already exists, update it
     if let Some(ref job_name) = name {
         if let Ok(Some(existing)) = find_job_by_name(config, job_name) {
@@ -130,6 +136,9 @@ pub fn add_agent_job(
     delete_after_run: bool,
     delegate_to: Option<String>,
 ) -> Result<CronJob> {
+    // elfClaw 2026-09-23: see the matching comment in add_shell_job.
+    let schedule = apply_default_tz(config, schedule);
+
     // elfClaw: idempotent dedup — if a job with the same name already exists, update it
     if let Some(ref job_name) = name {
         if let Ok(Some(existing)) = find_job_by_name(config, job_name) {
@@ -198,6 +207,88 @@ pub fn add_agent_job(
             job_name,
             "created",
             serde_json::json!({"type": "agent"}),
+        );
+    }
+
+    get_job(config, &id)
+}
+
+/// elfClaw 2026-09-23: a `JobType::Message` job — plain text, delivered as-is
+/// at fire time with no LLM call (see the doc comment on `JobType::Message`).
+/// Deliberately narrower than `add_agent_job`: no `session_target`/`model`/
+/// `delegate_to`, none of which mean anything when nothing is going to run
+/// an agent loop.
+pub fn add_message_job(
+    config: &Config,
+    name: Option<String>,
+    schedule: Schedule,
+    message: &str,
+    delivery: Option<DeliveryConfig>,
+    delete_after_run: bool,
+) -> Result<CronJob> {
+    let schedule = apply_default_tz(config, schedule);
+
+    // elfClaw: idempotent dedup — if a job with the same name already exists, update it
+    if let Some(ref job_name) = name {
+        if let Ok(Some(existing)) = find_job_by_name(config, job_name) {
+            tracing::info!(
+                job_id = %existing.id,
+                name = %job_name,
+                "Cron dedup: updating existing message job instead of creating duplicate"
+            );
+            crate::elfclaw_log::log_cron_event(
+                &existing.id,
+                job_name,
+                "dedup_update",
+                serde_json::json!({"action": "updated existing message job"}),
+            );
+            let patch = CronJobPatch {
+                schedule: Some(schedule),
+                prompt: Some(message.to_string()),
+                delivery: delivery.clone(),
+                delete_after_run: Some(delete_after_run),
+                ..CronJobPatch::default()
+            };
+            return update_job(config, &existing.id, patch);
+        }
+    }
+
+    let now = Utc::now();
+    validate_schedule(&schedule, now)?;
+    let next_run = next_run_for_schedule(&schedule, now)?;
+    let id = Uuid::new_v4().to_string();
+    let expression = schedule_cron_expression(&schedule).unwrap_or_default();
+    let schedule_json = serde_json::to_string(&schedule)?;
+    let delivery = delivery.unwrap_or_default();
+
+    with_connection(config, |conn| {
+        conn.execute(
+            "INSERT INTO cron_jobs (
+                id, expression, command, schedule, job_type, prompt, name, session_target, model,
+                enabled, delivery, delete_after_run, created_at, next_run
+             ) VALUES (?1, ?2, '', ?3, 'message', ?4, ?5, 'isolated', NULL, 1, ?6, ?7, ?8, ?9)",
+            params![
+                id,
+                expression,
+                schedule_json,
+                message,
+                name,
+                serde_json::to_string(&delivery)?,
+                if delete_after_run { 1 } else { 0 },
+                now.to_rfc3339(),
+                next_run.to_rfc3339(),
+            ],
+        )
+        .context("Failed to insert cron message job")?;
+        Ok(())
+    })?;
+
+    if let Some(ref job_name) = name {
+        crate::elfclaw_log::log_cron_event(
+            &id,
+            job_name,
+            "created",
+            serde_json::json!({"type": "message"}),
         );
     }
 
@@ -284,6 +375,7 @@ pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<
     let mut schedule_changed = false;
 
     if let Some(schedule) = patch.schedule {
+        let schedule = apply_default_tz(config, schedule);
         validate_schedule(&schedule, Utc::now())?;
         job.schedule = schedule;
         job.expression = schedule_cron_expression(&job.schedule).unwrap_or_default();
@@ -701,6 +793,36 @@ mod tests {
         assert_eq!(job.expression, "*/5 * * * *");
         assert_eq!(job.command, "echo ok");
         assert!(matches!(job.schedule, Schedule::Cron { .. }));
+    }
+
+    #[test]
+    fn add_job_without_explicit_tz_defaults_to_sydney() {
+        // elfClaw 2026-09-23: a "daily 8am" job created without a tz used to
+        // silently run on the server's UTC clock — 18:00/19:00 Sydney time.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let job = add_job(&config, "0 8 * * *", "echo morning").unwrap();
+        match job.schedule {
+            Schedule::Cron { tz, .. } => assert_eq!(tz.as_deref(), Some("Australia/Sydney")),
+            other => panic!("expected Schedule::Cron, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn add_job_with_explicit_tz_is_not_overridden() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let schedule = Schedule::Cron {
+            expr: "0 8 * * *".into(),
+            tz: Some("America/Los_Angeles".into()),
+        };
+        let job = add_shell_job(&config, None, schedule, "echo morning").unwrap();
+        match job.schedule {
+            Schedule::Cron { tz, .. } => assert_eq!(tz.as_deref(), Some("America/Los_Angeles")),
+            other => panic!("expected Schedule::Cron, got {other:?}"),
+        }
     }
 
     #[test]

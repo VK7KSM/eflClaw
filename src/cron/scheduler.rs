@@ -1,7 +1,7 @@
 use crate::config::Config;
 use crate::cron::{
-    due_jobs, next_run_for_schedule, record_last_run, record_run, remove_job, reschedule_after_run,
-    update_job, CronJob, CronJobPatch, DeliveryConfig, JobType, Schedule, SessionTarget,
+    due_jobs, next_run_for_schedule, record_run, remove_job, reschedule_after_run, CronJob,
+    DeliveryConfig, JobType, Schedule, SessionTarget,
 };
 use crate::security::SecurityPolicy;
 use anyhow::Result;
@@ -79,6 +79,10 @@ async fn execute_job_with_retry(
         let (success, output) = match job.job_type {
             JobType::Shell => run_job_command(config, security, job).await,
             JobType::Agent => Box::pin(run_agent_job(config, security, job)).await,
+            // elfClaw 2026-09-23: no LLM call, so there is nothing here that
+            // can fail on a 429/503 — this always succeeds. `deliver_if_configured`
+            // (called by `persist_job_result`) is what actually sends it.
+            JobType::Message => (true, job.prompt.clone().unwrap_or_default()),
         };
         last_output = output;
 
@@ -324,7 +328,7 @@ async fn run_agent_job(
     }
 }
 
-async fn persist_job_result(
+pub(crate) async fn persist_job_result(
     config: &Config,
     job: &CronJob,
     mut success: bool,
@@ -356,23 +360,24 @@ async fn persist_job_result(
         tracing::warn!(job_id = %job.id, error = %e, "Failed to persist cron run result");
     }
 
-    if is_one_shot_auto_delete(job) {
-        if success {
-            if let Err(e) = remove_job(config, &job.id) {
-                tracing::warn!("Failed to remove one-shot cron job after success: {e}");
-            }
-        } else {
-            let _ = record_last_run(config, &job.id, finished_at, false, output);
-            if let Err(e) = update_job(
-                config,
-                &job.id,
-                CronJobPatch {
-                    enabled: Some(false),
-                    ..CronJobPatch::default()
-                },
-            ) {
-                tracing::warn!("Failed to disable failed one-shot cron job: {e}");
-            }
+    if is_one_shot(job) {
+        // elfClaw 2026-09-23: an `at` schedule always fires exactly once —
+        // whatever `delete_after_run` says. It used to gate this on that flag
+        // too, and a model calling cron_add could (and in production, did)
+        // pass `delete_after_run: false` for a one-time reminder; the job
+        // then fell through to `reschedule_after_run`, which recomputes
+        // `next_run` for `Schedule::At` as *the same past timestamp* —
+        // making it due again on the very next scheduler poll, forever.
+        // Failure is cleaned up the same as success (not just disabled and
+        // left in the list) for the same reason: a disabled one-shot with no
+        // next_run served no purpose but clutter — see elfclaw.md §6.3.
+        if let Err(e) = remove_job(config, &job.id) {
+            tracing::warn!(
+                job_id = %job.id,
+                success,
+                error = %e,
+                "Failed to remove one-shot cron job after it ran"
+            );
         }
         return success;
     }
@@ -384,8 +389,12 @@ async fn persist_job_result(
     success
 }
 
-fn is_one_shot_auto_delete(job: &CronJob) -> bool {
-    job.delete_after_run && matches!(job.schedule, Schedule::At { .. })
+/// A job scheduled with `Schedule::At` runs exactly once, by definition —
+/// independent of `delete_after_run`, which only still matters for
+/// `Cron`/`Every` schedules should a future feature want "run N more times
+/// then stop" semantics (nothing uses it that way today).
+fn is_one_shot(job: &CronJob) -> bool {
+    matches!(job.schedule, Schedule::At { .. })
 }
 
 fn warn_if_high_frequency_agent_job(job: &CronJob) {
@@ -631,6 +640,23 @@ mod tests {
 
     fn unique_component(prefix: &str) -> String {
         format!("{prefix}-{}", uuid::Uuid::new_v4())
+    }
+
+    #[tokio::test]
+    async fn message_job_delivers_stored_text_with_no_llm_call() {
+        // elfClaw 2026-09-23: the whole point of JobType::Message is that
+        // firing it can't fail on a 429/503 and doesn't touch the agent
+        // loop at all — this just returns the stored prompt text directly.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+        let mut job = test_job("");
+        job.job_type = JobType::Message;
+        job.prompt = Some("带孩子看牙医".into());
+
+        let (success, output) = execute_job_with_retry(&config, &security, &job).await;
+        assert!(success);
+        assert_eq!(output, "带孩子看牙医");
     }
 
     #[tokio::test]
@@ -966,7 +992,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn persist_job_result_failure_disables_one_shot() {
+    async fn persist_job_result_failure_also_deletes_one_shot() {
+        // elfClaw 2026-09-23: a failed one-shot used to be disabled and left
+        // in the job list forever — exactly the kind of zombie entry that
+        // piled up in production (see dev_log). It's now cleaned up the same
+        // as a successful run.
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
         let at = Utc::now() + ChronoDuration::minutes(10);
@@ -987,9 +1017,11 @@ mod tests {
 
         let success = persist_job_result(&config, &job, false, "boom", started, finished).await;
         assert!(!success);
-        let updated = cron::get_job(&config, &job.id).unwrap();
-        assert!(!updated.enabled);
-        assert_eq!(updated.last_status.as_deref(), Some("error"));
+        let lookup = cron::get_job(&config, &job.id);
+        assert!(
+            lookup.is_err(),
+            "failed one-shot should be removed, not left disabled"
+        );
     }
 
     #[tokio::test]
@@ -1009,7 +1041,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn persist_job_result_failure_disables_one_shot_shell_job() {
+    async fn persist_job_result_failure_also_deletes_one_shot_shell_job() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
         let at = Utc::now() + ChronoDuration::minutes(10);
@@ -1020,9 +1052,11 @@ mod tests {
 
         let success = persist_job_result(&config, &job, false, "boom", started, finished).await;
         assert!(!success);
-        let updated = cron::get_job(&config, &job.id).unwrap();
-        assert!(!updated.enabled);
-        assert_eq!(updated.last_status.as_deref(), Some("error"));
+        let lookup = cron::get_job(&config, &job.id);
+        assert!(
+            lookup.is_err(),
+            "failed one-shot should be removed, not left disabled"
+        );
     }
 
     #[tokio::test]
@@ -1104,13 +1138,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn persist_job_result_at_schedule_without_delete_after_run_is_not_deleted() {
+    async fn persist_job_result_at_schedule_is_deleted_even_with_delete_after_run_false() {
+        // elfClaw 2026-09-23: this pins the actual production bug. A model
+        // calling cron_add can pass `delete_after_run: false` for a one-time
+        // reminder (weak models default unfamiliar booleans to false); the
+        // old code trusted that flag and rescheduled the job instead of
+        // deleting it. `next_run_for_schedule(Schedule::At{at})` just returns
+        // the same past `at` again, so the job became due on every following
+        // scheduler poll forever — a reminder that never stops re-firing.
+        // `Schedule::At` must always mean "runs once," full stop, regardless
+        // of what the caller set `delete_after_run` to.
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
         let at = Utc::now() + ChronoDuration::minutes(10);
         let job = cron::add_agent_job(
             &config,
-            Some("at-no-autodelete".into()),
+            Some("at-explicit-false".into()),
             crate::cron::Schedule::At { at },
             "Hello",
             SessionTarget::Isolated,
@@ -1127,9 +1170,11 @@ mod tests {
         let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
         assert!(success);
 
-        let updated = cron::get_job(&config, &job.id).unwrap();
-        assert!(updated.enabled);
-        assert_eq!(updated.last_status.as_deref(), Some("ok"));
+        let lookup = cron::get_job(&config, &job.id);
+        assert!(
+            lookup.is_err(),
+            "an `at` job must be deleted after it runs even when delete_after_run=false"
+        );
     }
 
     #[tokio::test]

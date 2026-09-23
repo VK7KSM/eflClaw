@@ -38,6 +38,22 @@ pub fn next_run_for_schedule(schedule: &Schedule, from: DateTime<Utc>) -> Result
     }
 }
 
+/// elfClaw 2026-09-23: apply `config.cron.default_tz` to a `Schedule::Cron`
+/// that doesn't specify its own `tz`. Jobs created without an explicit
+/// timezone used to run on the server's UTC clock ("daily 8am" firing at
+/// 18:00/19:00 Sydney time) — see elfclaw.md §6. Call this once, as early as
+/// possible (job creation/update), so `next_run_for_schedule` itself never
+/// has to know about config.
+pub fn apply_default_tz(config: &crate::config::Config, schedule: Schedule) -> Schedule {
+    match schedule {
+        Schedule::Cron { expr, tz: None } if config.cron.default_tz.is_some() => Schedule::Cron {
+            expr,
+            tz: config.cron.default_tz.clone(),
+        },
+        other => other,
+    }
+}
+
 pub fn validate_schedule(schedule: &Schedule, now: DateTime<Utc>) -> Result<()> {
     match schedule {
         Schedule::Cron { expr, .. } => {
@@ -86,6 +102,64 @@ pub fn normalize_expression(expression: &str) -> Result<String> {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    #[test]
+    fn apply_default_tz_fills_in_sydney_by_default() {
+        let config = crate::config::Config::default();
+        assert_eq!(
+            config.cron.default_tz.as_deref(),
+            Some("Australia/Sydney"),
+            "precondition: default config should default to Sydney"
+        );
+
+        let schedule = Schedule::Cron {
+            expr: "0 8 * * *".into(),
+            tz: None,
+        };
+        let result = apply_default_tz(&config, schedule);
+        assert_eq!(
+            result,
+            Schedule::Cron {
+                expr: "0 8 * * *".into(),
+                tz: Some("Australia/Sydney".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn apply_default_tz_does_not_override_an_explicit_tz() {
+        let config = crate::config::Config::default();
+        let schedule = Schedule::Cron {
+            expr: "0 8 * * *".into(),
+            tz: Some("America/Los_Angeles".into()),
+        };
+        let result = apply_default_tz(&config, schedule.clone());
+        assert_eq!(result, schedule, "an explicit tz must win over the default");
+    }
+
+    #[test]
+    fn apply_default_tz_leaves_at_and_every_schedules_untouched() {
+        let config = crate::config::Config::default();
+        let at = Schedule::At { at: Utc::now() };
+        assert_eq!(apply_default_tz(&config, at.clone()), at);
+        let every = Schedule::Every { every_ms: 60_000 };
+        assert_eq!(apply_default_tz(&config, every.clone()), every);
+    }
+
+    #[test]
+    fn apply_default_tz_respects_none_meaning_keep_utc() {
+        let mut config = crate::config::Config::default();
+        config.cron.default_tz = None;
+        let schedule = Schedule::Cron {
+            expr: "0 8 * * *".into(),
+            tz: None,
+        };
+        let result = apply_default_tz(&config, schedule.clone());
+        assert_eq!(
+            result, schedule,
+            "default_tz=None should keep the old UTC behavior"
+        );
+    }
 
     #[test]
     fn next_run_for_schedule_supports_every_and_at() {

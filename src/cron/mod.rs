@@ -2,6 +2,7 @@ use crate::config::Config;
 use crate::security::SecurityPolicy;
 use anyhow::{bail, Result};
 
+pub mod heartbeat_decl;
 mod schedule;
 mod store;
 mod types;
@@ -10,12 +11,13 @@ pub mod scheduler;
 
 #[allow(unused_imports)]
 pub use schedule::{
-    next_run_for_schedule, normalize_expression, schedule_cron_expression, validate_schedule,
+    apply_default_tz, next_run_for_schedule, normalize_expression, schedule_cron_expression,
+    validate_schedule,
 };
 #[allow(unused_imports)]
 pub use store::{
-    add_agent_job, add_job, add_shell_job, due_jobs, get_job, list_jobs, list_runs,
-    record_last_run, record_run, remove_job, reschedule_after_run, update_job,
+    add_agent_job, add_job, add_message_job, add_shell_job, due_jobs, get_job, list_jobs,
+    list_runs, record_last_run, record_run, remove_job, reschedule_after_run, update_job,
 };
 pub use types::{CronJob, CronJobPatch, CronRun, DeliveryConfig, JobType, Schedule, SessionTarget};
 

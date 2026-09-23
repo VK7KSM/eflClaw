@@ -4332,10 +4332,22 @@ pub struct CronConfig {
     /// Maximum number of historical cron run records to retain. Default: `50`.
     #[serde(default = "default_max_run_history")]
     pub max_run_history: u32,
+    /// elfClaw 2026-09-23: IANA timezone applied to a `Schedule::Cron` job
+    /// that doesn't specify its own `tz` — jobs created via `cron_add`
+    /// without an explicit `tz`, or a `HEARTBEAT.md` task block that omits
+    /// one, used to silently run on the server's UTC clock instead of the
+    /// operator's local time. `None` keeps the old UTC-when-unset behavior.
+    /// Default: `"Australia/Sydney"`.
+    #[serde(default = "default_cron_tz")]
+    pub default_tz: Option<String>,
 }
 
 fn default_max_run_history() -> u32 {
     50
+}
+
+fn default_cron_tz() -> Option<String> {
+    Some("Australia/Sydney".to_string())
 }
 
 impl Default for CronConfig {
@@ -4343,6 +4355,7 @@ impl Default for CronConfig {
         Self {
             enabled: true,
             max_run_history: default_max_run_history(),
+            default_tz: default_cron_tz(),
         }
     }
 }
@@ -9697,6 +9710,7 @@ recipient = "42"
         let c = CronConfig::default();
         assert!(c.enabled);
         assert_eq!(c.max_run_history, 50);
+        assert_eq!(c.default_tz.as_deref(), Some("Australia/Sydney"));
     }
 
     #[test]
@@ -9704,11 +9718,22 @@ recipient = "42"
         let c = CronConfig {
             enabled: false,
             max_run_history: 100,
+            default_tz: Some("America/Los_Angeles".into()),
         };
         let json = serde_json::to_string(&c).unwrap();
         let parsed: CronConfig = serde_json::from_str(&json).unwrap();
         assert!(!parsed.enabled);
         assert_eq!(parsed.max_run_history, 100);
+        assert_eq!(parsed.default_tz.as_deref(), Some("America/Los_Angeles"));
+    }
+
+    #[test]
+    async fn cron_config_default_tz_omitted_in_toml_still_defaults_to_sydney() {
+        // elfClaw: a deployed config.toml with `[cron]` but no `default_tz`
+        // key must still get the Sydney default, not `None`/UTC.
+        let toml = "enabled = true\nmax_run_history = 50\n";
+        let parsed: CronConfig = toml::from_str(toml).unwrap();
+        assert_eq!(parsed.default_tz.as_deref(), Some("Australia/Sydney"));
     }
 
     #[test]

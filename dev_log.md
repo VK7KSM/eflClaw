@@ -2,6 +2,50 @@
 
 ---
 
+## 2026-09-23 — 稳定化 Step 2：Cron / 提醒重写
+
+用户明确要求"继续干，直到完成所有原计划的开发工作"，按 `elfclaw.md` 第 6 节推进。逐条核对了 K6 实测的 22 个重复任务和"一次性任务反复触发"问题的真实根因（有几处和最初的分析不完全一致，以代码为准）。
+
+### 6.1 一次性任务不再"失败后停用但留在库里"（严重 bug，已修复）
+
+根因不是"忘了删"，而是 `is_one_shot_auto_delete()` 同时要求 `delete_after_run == true` **和** `Schedule::At`——`cron_add` 工具允许模型自己传 `delete_after_run: false`，一旦传了，任务会走到 `reschedule_after_run()`，而 `next_run_for_schedule(Schedule::At{at})` 只会原样返回同一个（已经过去的）`at`，导致任务在下一次 scheduler 轮询（默认 15 秒一次）就又"到期"了，从此死循环重新触发，永不停止。
+
+`src/cron/scheduler.rs`：`is_one_shot_auto_delete` 改名 `is_one_shot`，判定只看 `Schedule::At`，不再看 `delete_after_run`；成功和失败都直接删除任务，不再有"失败后禁用但保留"的中间状态（这个中间状态本身就是 K6 上那些"停用但还在列表里"的僵尸任务的来源）。3 个相关测试重写，新增 1 个测试专门钉住"`delete_after_run=false` 显式传入也必须被删除"这条。
+
+### 6.2 同名任务改为更新，不再是空操作（严重 bug，已修复）
+
+`src/cron/store.rs` 的 `add_agent_job()` 本来就有正确的"同名 → 更新"逻辑（`find_job_by_name` + `update_job`），但 `src/tools/cron_add.rs` 的工具层在调用它之前，自己又加了一层"已存在就直接返回 `already_exists`，什么都不做"的检查，把下面那层正确逻辑彻底挡死、永远走不到。删掉这段挡路的代码，同名请求现在会真正落到 store 层的更新逻辑。新增回归测试：建两次同名任务、第二次改了时间和 prompt，断言只有一条记录且内容确实更新了。
+
+### 6.3 心跳不再让 LLM 同步 cron 任务（架构性根因，已修复）
+
+以前每次心跳（默认 30 分钟一次）都把整份 HEARTBEAT.md 塞给弱模型（worker_model），让它用 `cron_list` 对比、用 `cron_add` 补齐——生产环境里这套机制造出了 22 个重复/近似重复任务（光"新闻源搜索"一个逻辑任务就有 7 个不同名字的副本）。
+
+新增 `src/cron/heartbeat_decl.rs`：在 HEARTBEAT.md 里用 `<!-- heartbeat-task ... -->` HTML 注释块声明任务（内容是 TOML，复用现成的 `Schedule`/`DeliveryConfig` 类型），代码直接解析 + 对账（`reconcile()`），完全不经过 LLM。声明的任务统一加 `heartbeat:` 名字前缀，对账时只增/改/删这个前缀下的任务，绝不碰用户自己让 AI 建的临时提醒。`daemon/mod.rs` 的心跳循环里，原来那段"发送 HEARTBEAT.md 全文 + 严格规则"的 prompt 和 `crate::agent::run()` 调用整段删除，换成纯代码的 `reconcile()` 调用；另外在守护进程启动时也跑一次（不用等最多 30 分钟才生效）。对账结果（新建/更新/删除/出错）通过已有的 `deliver_announcement` 推送一条摘要，没有变化就不发消息。
+
+副作用：心跳每 30 分钟消耗一次 LLM 调用额度的情况也随之消失（这部分工作现在是纯 DB 操作）。
+
+11 个新测试覆盖：单/多任务块解析、无声明块时静默跳过、格式错误的块只报错不影响其他块、空名字/重名被拒绝或警告、对账的增/改/删/幂等性、绝不触碰非托管前缀的任务、`every_ms` 低于 5 分钟下限被拒绝。
+
+### 6.5 cron_list 输出限定大小
+
+`last_output` 最长可达 16KB、`prompt` 常见 1-1.5KB，`serde_json::to_string_pretty(&jobs)` 几个任务就能超过 agent loop 的 8000 字符工具结果截断上限——这正是心跳误判"任务不存在"的直接诱因之一（虽然心跳已经不再调用这个工具了，但聊天 agent 还会用）。改成精简视图：`prompt`/`last_output` 都截到 200 字符预览+总长度提示，其余字段原样保留。新增测试验证截断按字符边界（不会切碎中文）、且真实跑一个 5000 字符 prompt 的任务验证端到端输出确实变短。
+
+### 6.6 cron 时区默认改为悉尼
+
+新增配置 `[cron].default_tz`（默认 `"Australia/Sydney"`，设为空可恢复旧的 UTC-when-unset 行为）。在 `store.rs` 的 `add_shell_job`/`add_agent_job`/`update_job` 三处统一应用（`cron::apply_default_tz`），不用改 `next_run_for_schedule` 本身。之前"设了 tz=Australia/Sydney 才对，不设就是 UTC"的问题现在反过来：不设默认就是悉尼，要用 UTC 得显式声明。`资料/config.toml` 已加上这一项。
+
+### 还没做（下一步 Step 3 之前，可以随时单独补）
+
+- **Agent 类型定时任务失败重试会把已经执行过的工具重跑一遍**（`execute_job_with_retry` 整段重跑，包括已经发送过的消息/已经建过的 cron 任务）。没动这个，因为本轮 Gemini provider 修复（key 轮换 + 429/503 正确分类）已经大幅减少了"中途失败"的触发频率，根治需要 agent loop 暴露"跑到哪一步了"的状态，属于更大的改动，先记录不做。
+- `heartbeat.max_tool_iterations` 配置字段现在是孤儿字段（心跳不再跑 agent loop，这个字段没人读了），留着不影响正确性，后续和 `[economic]`/`[agents_ipc]` 一起做一轮 config 字段清理。
+- K6 上现有的 22 个重复任务还没清理——等新版本部署上去、心跳跑一轮 `reconcile()` 之后，需要把 HEARTBEAT.md 也换成新的 `<!-- heartbeat-task -->` 格式（当前 K6 上是纯 prose，没有声明块，reconcile 会认为"没有声明任务"而不会主动清理已有的旧任务——旧的重复任务需要手动 `cron_remove` 或等我们部署时一并处理）。
+
+### 验证
+
+`cargo check`/`cargo clippy`（改动文件无新增问题）/`cargo test --lib` 全过。用真实部署的 `资料/config.toml` 验证过时区默认值确实解析生效（临时测试，未提交）。
+
+---
+
 ## 2026-09-23 — 稳定化 Step 0 + Step 1：密钥清理 + 死代码删除
 
 详细方案见 `elfclaw.md`。本次会话确定不迁移到 PicoClaw/Nanobot，改为稳定化现有 elfClaw。

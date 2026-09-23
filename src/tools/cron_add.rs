@@ -56,12 +56,18 @@ impl Tool for CronAddTool {
     }
 
     fn description(&self) -> &str {
-        "Create a scheduled cron job (shell or agent) with cron/at/every schedules. \
-         Use job_type='agent' with a prompt to run the AI agent on schedule. \
+        "Create a scheduled cron job (shell, agent, or message) with cron/at/every schedules. \
+         Use job_type='message' with a fixed 'message' text for a plain reminder/scheduled \
+         send — it is delivered exactly as written with NO LLM call at fire time, so prefer \
+         it whenever the reminder doesn't need the model to look anything up or decide what \
+         to say. Use job_type='agent' with a 'prompt' only when the model actually needs to \
+         do something (e.g. fetch and summarize something) at fire time. \
          Use schedule.kind='at' for one-time reminders/delayed sends (recommended). \
-         Agent jobs with schedule.kind='cron' or schedule.kind='every' are recurring and require explicit recurring confirmation. \
+         Agent and message jobs with schedule.kind='cron' or schedule.kind='every' are recurring \
+         and require explicit recurring confirmation. \
          To deliver output to a channel (Discord, Telegram, Slack, Mattermost, QQ, Napcat, Lark, Feishu, Email), set \
-         delivery={\"mode\":\"announce\",\"channel\":\"discord\",\"to\":\"<channel_id_or_chat_id>\"}. \
+         delivery={\"mode\":\"announce\",\"channel\":\"discord\",\"to\":\"<channel_id_or_chat_id>\"} \
+         (required for job_type='message'). \
          This is the preferred tool for sending scheduled/delayed messages to users via channels."
     }
 
@@ -74,9 +80,13 @@ impl Tool for CronAddTool {
                     "type": "object",
                     "description": "Schedule object: {kind:'cron',expr,tz?} recurring | {kind:'at',at} one-time | {kind:'every',every_ms} recurring interval"
                 },
-                "job_type": { "type": "string", "enum": ["shell", "agent"] },
+                "job_type": { "type": "string", "enum": ["shell", "agent", "message"] },
                 "command": { "type": "string" },
                 "prompt": { "type": "string" },
+                "message": {
+                    "type": "string",
+                    "description": "For job_type='message': the exact text to deliver at fire time. No model call — sent as-is."
+                },
                 "session_target": { "type": "string", "enum": ["isolated", "main"] },
                 // elfClaw: removed model field — cron jobs must always use worker_model from config at runtime
                 "recurring_confirmed": {
@@ -146,6 +156,7 @@ impl Tool for CronAddTool {
         let job_type = match args.get("job_type").and_then(serde_json::Value::as_str) {
             Some("agent") => JobType::Agent,
             Some("shell") => JobType::Shell,
+            Some("message") => JobType::Message,
             Some(other) => {
                 return Ok(ToolResult {
                     success: false,
@@ -154,7 +165,9 @@ impl Tool for CronAddTool {
                 });
             }
             None => {
-                if args.get("prompt").is_some() {
+                if args.get("message").is_some() {
+                    JobType::Message
+                } else if args.get("prompt").is_some() {
                     JobType::Agent
                 } else {
                     JobType::Shell
@@ -210,32 +223,6 @@ impl Tool for CronAddTool {
                         });
                     }
                 };
-
-                // elfClaw: dedup — if an agent job with the same name already exists,
-                // return success immediately instead of failing on recurring_confirmed.
-                // This prevents weak models (gemini-flash-lite) from failing repeatedly
-                // when heartbeat tries to re-add existing cron jobs every hour.
-                if let Some(ref job_name) = name {
-                    if let Ok(jobs) = cron::list_jobs(&self.config) {
-                        if let Some(existing) = jobs
-                            .iter()
-                            .find(|j| j.name.as_deref() == Some(job_name.as_str()))
-                        {
-                            return Ok(ToolResult {
-                                success: true,
-                                output: serde_json::to_string_pretty(&json!({
-                                    "id": existing.id,
-                                    "name": &existing.name,
-                                    "action": "already_exists",
-                                    "message": format!("Job '{}' already exists, no action needed", job_name),
-                                    "schedule": &existing.schedule,
-                                    "next_run": &existing.next_run,
-                                }))?,
-                                error: None,
-                            });
-                        }
-                    }
-                }
 
                 let session_target = match args.get("session_target") {
                     Some(v) => match serde_json::from_value::<SessionTarget>(v.clone()) {
@@ -332,6 +319,86 @@ For one-time reminders, use schedule.kind='at' with an RFC3339 timestamp."
                     delegate_to,
                 )
             }
+            JobType::Message => {
+                let message = match args.get("message").and_then(serde_json::Value::as_str) {
+                    Some(message) if !message.trim().is_empty() => message,
+                    _ => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some("Missing 'message' for message job".to_string()),
+                        });
+                    }
+                };
+
+                let recurring_confirmed = args
+                    .get("recurring_confirmed")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                match &schedule {
+                    Schedule::Every { every_ms } if !recurring_confirmed => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some(
+                                "Message jobs with recurring schedules require recurring_confirmed=true. \
+For a one-time reminder, use schedule.kind='at' with an RFC3339 timestamp."
+                                    .to_string(),
+                            ),
+                        });
+                    }
+                    Schedule::Cron { .. } if !recurring_confirmed => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some(
+                                "Message jobs with recurring schedules require recurring_confirmed=true. \
+For a one-time reminder, use schedule.kind='at' with an RFC3339 timestamp."
+                                    .to_string(),
+                            ),
+                        });
+                    }
+                    _ => {}
+                }
+
+                let delivery = match args.get("delivery") {
+                    Some(v) => match serde_json::from_value::<DeliveryConfig>(v.clone()) {
+                        Ok(cfg) => cfg,
+                        Err(e) => {
+                            return Ok(ToolResult {
+                                success: false,
+                                output: String::new(),
+                                error: Some(format!("Invalid delivery config: {e}")),
+                            });
+                        }
+                    },
+                    None => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some(
+                                "'delivery' (mode='announce', channel, to) is required for \
+job_type='message' — a reminder with nowhere to go isn't useful. Use job_type='agent' \
+instead if you actually need the model to do something at fire time."
+                                    .to_string(),
+                            ),
+                        });
+                    }
+                };
+
+                if let Some(blocked) = self.enforce_mutation_allowed("cron_add") {
+                    return Ok(blocked);
+                }
+
+                cron::add_message_job(
+                    &self.config,
+                    name,
+                    schedule,
+                    message,
+                    Some(delivery),
+                    delete_after_run,
+                )
+            }
         };
 
         match result {
@@ -398,6 +465,90 @@ mod tests {
 
         assert!(result.success, "{:?}", result.error);
         assert!(result.output.contains("next_run"));
+    }
+
+    #[tokio::test]
+    async fn adds_message_job_with_delivery() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
+        let result = tool
+            .execute(json!({
+                "name": "reminder",
+                "schedule": { "kind": "at", "at": (chrono::Utc::now() + chrono::Duration::minutes(10)).to_rfc3339() },
+                "job_type": "message",
+                "message": "带孩子看牙医",
+                "delivery": { "mode": "announce", "channel": "telegram", "to": "123" }
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+        let jobs = cron::list_jobs(&cfg).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].job_type, JobType::Message);
+        assert_eq!(jobs[0].prompt.as_deref(), Some("带孩子看牙医"));
+    }
+
+    #[tokio::test]
+    async fn message_job_without_delivery_is_rejected() {
+        // A reminder with no delivery target would silently go nowhere at
+        // fire time — reject it up front instead of letting the user think
+        // it was scheduled.
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
+        let result = tool
+            .execute(json!({
+                "schedule": { "kind": "at", "at": (chrono::Utc::now() + chrono::Duration::minutes(10)).to_rfc3339() },
+                "job_type": "message",
+                "message": "no delivery"
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.error.unwrap_or_default().contains("delivery"));
+    }
+
+    #[tokio::test]
+    async fn message_job_requires_message_text() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
+        let result = tool
+            .execute(json!({
+                "schedule": { "kind": "at", "at": (chrono::Utc::now() + chrono::Duration::minutes(10)).to_rfc3339() },
+                "job_type": "message",
+                "delivery": { "mode": "announce", "channel": "telegram", "to": "123" }
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.error.unwrap_or_default().contains("message"));
+    }
+
+    #[tokio::test]
+    async fn recurring_message_job_requires_confirmation() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
+        let result = tool
+            .execute(json!({
+                "schedule": { "kind": "cron", "expr": "0 9 * * *" },
+                "job_type": "message",
+                "message": "daily reminder",
+                "delivery": { "mode": "announce", "channel": "telegram", "to": "123" }
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result
+            .error
+            .unwrap_or_default()
+            .contains("recurring_confirmed"));
     }
 
     #[tokio::test]
@@ -567,6 +718,66 @@ mod tests {
             .error
             .unwrap_or_default()
             .contains("Missing 'prompt'"));
+    }
+
+    #[tokio::test]
+    async fn agent_job_with_existing_name_updates_instead_of_no_op() {
+        // elfClaw 2026-09-23: pins the actual production bug. This tool used
+        // to have its own name-lookup that returned success/"already_exists"
+        // with NO changes applied, before the call ever reached
+        // `cron::add_agent_job` — which already had correct update-by-name
+        // logic that this early return made unreachable. A model correcting
+        // a reminder's time (or the heartbeat re-syncing HEARTBEAT.md) would
+        // get told "already exists, no action needed" and the job would
+        // silently keep its old, wrong schedule/prompt forever.
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
+
+        let first = tool
+            .execute(json!({
+                "name": "morning-news",
+                "schedule": { "kind": "cron", "expr": "30 6 * * *" },
+                "job_type": "agent",
+                "prompt": "Send the morning digest",
+                "recurring_confirmed": true
+            }))
+            .await
+            .unwrap();
+        assert!(first.success, "{:?}", first.error);
+
+        let second = tool
+            .execute(json!({
+                "name": "morning-news",
+                "schedule": { "kind": "cron", "expr": "0 7 * * *" },
+                "job_type": "agent",
+                "prompt": "Send the updated morning digest",
+                "recurring_confirmed": true
+            }))
+            .await
+            .unwrap();
+        assert!(second.success, "{:?}", second.error);
+        assert!(
+            !second.output.contains("already_exists"),
+            "same-name create should update the job, not report a no-op: {}",
+            second.output
+        );
+
+        let jobs = cron::list_jobs(&cfg).unwrap();
+        assert_eq!(
+            jobs.len(),
+            1,
+            "the second call must update the existing job, not create a duplicate"
+        );
+        assert_eq!(
+            jobs[0].expression, "0 7 * * *",
+            "schedule must reflect the update"
+        );
+        assert_eq!(
+            jobs[0].prompt.as_deref(),
+            Some("Send the updated morning digest"),
+            "prompt must reflect the update"
+        );
     }
 
     #[tokio::test]

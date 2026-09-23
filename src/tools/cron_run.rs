@@ -116,22 +116,30 @@ impl Tool for CronRunTool {
         }
 
         let started_at = Utc::now();
-        let (success, output) =
-            Box::pin(cron::scheduler::execute_job_now(&self.config, &job)).await;
+        let (ran_ok, output) = Box::pin(cron::scheduler::execute_job_now(&self.config, &job)).await;
         let finished_at = Utc::now();
         let duration_ms = (finished_at - started_at).num_milliseconds();
-        let status = if success { "ok" } else { "error" };
 
-        let _ = cron::record_run(
+        // elfClaw 2026-09-23: this used to call record_run/record_last_run
+        // directly and stop there — a manually-triggered run never actually
+        // delivered its output anywhere, and a one-shot job kept sitting in
+        // the list to fire again at its originally scheduled time later.
+        // persist_job_result is the same finish-the-lifecycle path the
+        // scheduler itself uses: it records the run AND delivers (if
+        // configured) AND cleans up a one-shot job. Its returned `success`
+        // can differ from `ran_ok` — e.g. the job itself succeeded but
+        // non-best-effort delivery failed — so recompute `status` from it
+        // rather than the pre-delivery value.
+        let success = cron::scheduler::persist_job_result(
             &self.config,
-            &job.id,
+            &job,
+            ran_ok,
+            &output,
             started_at,
             finished_at,
-            status,
-            Some(&output),
-            duration_ms,
-        );
-        let _ = cron::record_last_run(&self.config, &job.id, finished_at, success, &output);
+        )
+        .await;
+        let status = if success { "ok" } else { "error" };
 
         Ok(ToolResult {
             success,
@@ -188,6 +196,58 @@ mod tests {
 
         let runs = cron::list_runs(&cfg, &job.id, 10).unwrap();
         assert_eq!(runs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn manually_running_a_one_shot_job_deletes_it() {
+        // elfClaw 2026-09-23: this used to record the run and stop — the
+        // one-shot job stayed in the list and would still fire again later
+        // at its originally scheduled time.
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let job = crate::cron::add_message_job(
+            &cfg,
+            Some("manual-once".into()),
+            crate::cron::Schedule::At {
+                at: Utc::now() + chrono::Duration::minutes(10),
+            },
+            "reminder text",
+            None,
+            true,
+        )
+        .unwrap();
+        let tool = CronRunTool::new(cfg.clone(), test_security(&cfg));
+
+        let result = tool.execute(json!({ "job_id": job.id })).await.unwrap();
+        assert!(result.success, "{:?}", result.error);
+
+        assert!(
+            cron::get_job(&cfg, &job.id).is_err(),
+            "manually running a one-shot job should delete it, not leave it to fire again"
+        );
+    }
+
+    #[tokio::test]
+    async fn message_job_runs_with_no_delivery_configured_and_succeeds() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let job = crate::cron::add_message_job(
+            &cfg,
+            None,
+            crate::cron::Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "hello",
+            None, // no delivery configured — should still "succeed", just deliver nowhere
+            false,
+        )
+        .unwrap();
+        let tool = CronRunTool::new(cfg.clone(), test_security(&cfg));
+
+        let result = tool.execute(json!({ "job_id": job.id })).await.unwrap();
+        assert!(result.success, "{:?}", result.error);
+        assert!(result.output.contains("hello"));
     }
 
     #[tokio::test]

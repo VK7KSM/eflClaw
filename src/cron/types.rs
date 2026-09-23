@@ -7,6 +7,13 @@ pub enum JobType {
     #[default]
     Shell,
     Agent,
+    /// elfClaw 2026-09-23: a plain-text reminder with no LLM call at fire
+    /// time. The stored `prompt` is delivered as-is via `delivery` — no
+    /// model, so it can't fail on a 429/503 quota error, can't be silently
+    /// dropped by a "the model said something else instead" turn, and
+    /// doesn't cost any of the daily Gemini budget. This is what
+    /// `cron_add(job_type="message")` produces; see elfclaw.md §6.4.
+    Message,
 }
 
 impl From<JobType> for &'static str {
@@ -14,6 +21,7 @@ impl From<JobType> for &'static str {
         match value {
             JobType::Shell => "shell",
             JobType::Agent => "agent",
+            JobType::Message => "message",
         }
     }
 }
@@ -25,8 +33,9 @@ impl TryFrom<&str> for JobType {
         match value.to_lowercase().as_str() {
             "shell" => Ok(JobType::Shell),
             "agent" => Ok(JobType::Agent),
+            "message" => Ok(JobType::Message),
             _ => Err(format!(
-                "Invalid job type '{}'. Expected one of: 'shell', 'agent'",
+                "Invalid job type '{}'. Expected one of: 'shell', 'agent', 'message'",
                 value
             )),
         }
