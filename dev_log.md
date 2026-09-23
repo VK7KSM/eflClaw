@@ -2,6 +2,77 @@
 
 ---
 
+## 2026-09-23 — 稳定化 Step 6：清理约束弱模型的旧 prompt
+
+按 `elfclaw.md` §10 Step 6。这是四步计划里最后一步——问用户"第 8 节第 3 条
+（shell 按任务临时授权）应该怎么设计"，用户明确选择"暂不设计，先做 Step 6"，
+于是转做这一步。
+
+### 审计方式
+
+`elfclaw.md` 对 Step 6 的定义是"只删已经被对应代码保证覆盖的那部分"——即
+找本次会话（Step 1-5）改代码之后，在 prompt/文档里留下的、现在已经不成立
+的旧约束文字，而不是对整个 prompt 生态系统做无边界审计。
+
+先全局 `grep` 了 `资料/` 目录下对本次会话删除/改动过的东西的残留引用：
+`self_check`/`check_logs`/`economic`/`goals`/`agents_ipc`/`openai_compat`/
+`/v1/chat/completions`/`/v1/models`——全部干净，因为 Step 1（死代码删除）
+和 Step 5 第二部分（self_check 删除）当时就顺手清理了相关 prompt 文字。
+
+唯一找到的实质性遗留在 `资料/workers/news_fetcher.md`。
+
+### 改了什么
+
+`资料/workers/news_fetcher.md`（news_fetcher 子 agent 的工作手册，由 lead
+agent 在委派时 `file_read` 读取、作为子 agent 的任务 prompt 传入——不是
+Rust 代码硬编码加载的文件，纯内容编辑即可生效）：
+
+- 删除整节"## Shell 运行规则"（约 29 行）：CWD 约定、允许/禁止命令表、
+  复合命令拆分规则、"三次失败看门狗"。这套规则是 news_fetcher 还拥有
+  `shell` 工具权限时写的详细使用手册；Step 5 第三部分已经把 `"shell"`
+  从 `[agents.news_fetcher].allowed_tools` 移除（config.toml 变更本身,
+  代码层面结构性保证了这个子 agent 现在根本看不到 `shell` 工具），
+  这节文字描述的能力已经不存在，属于"约束一个已经不存在的工具"的典型
+  过时 prompt。
+- 删除"如果 shell 工具报错，不要调查，立刻改用 web_scrape 工具重试同一
+  URL"一行——同样的道理，拿不到 shell 工具就不会有"shell 工具报错"这回事。
+- 把 CRITICAL 节开头"**禁止用 `shell` 工具调用 cf-crawler.exe。** 必须
+  使用专用工具："改写成"用专用工具抓取，按场景选择："——不再需要先禁止
+  一个模型已经拿不到的工具，直接给正面指令。
+- 文件从 194 行降到 165 行。
+
+### 为什么不做更大范围的审计
+
+`资料/` 目录下还有 894 个 markdown 文件，绝大多数是第三方技能包的参考
+文档（如 `scientific-tools` 系列的 biomni/scientific-schematics 等），
+这些文档里出现的 `/v1/chat/completions` 之类字符串是 OpenAI API 格式的
+通用说明，和 elfClaw 自己删除的网关路由毫无关系（已用 `grep` 逐条确认
+是误报，不是残留引用）。对整个技能库做地毯式的"哪些约束已经被代码保证
+覆盖"审计是规模完全不同的另一项工作，不是"清理这次改动留下的旧约束文字"
+这个 Step 6 条目的本意，本次不做。
+
+### 验证
+
+- 纯 Markdown 内容编辑，没有代码改动，不涉及 `cargo check`/`test`/
+  `clippy`。
+- 手动通读整个文件确认章节结构完整（`## 工作流程`及之后的业务逻辑章节
+  未受影响），没有产生孤立标题或断裂的引用。
+- `资料/workers/news_fetcher.md` 和之前几步改的 `资料/config.toml`、
+  `资料/skills/cf-crawler/SKILL.toml` 一样，是 `.gitignore` 忽略的本地
+  部署参考镜像，**不会随 git push 同步到 K6**，需要连同前几步一起手动
+  同步到 K6 两个实例的真实路径（`workspace\workers\news_fetcher.md`
+  或对应位置）并重启才会真正生效。
+
+### elfclaw.md 四步计划完成情况小结
+
+Step 1-4 已在更早的会话/条目里完成。本次会话完成 Step 5（三部分：网关
+精简、self_check/check_logs 删除、shell 默认隐藏 + cf-crawler 原生化）
+和 Step 6。唯一还没做的是 `elfclaw.md` §8 第 3 条——shell 按任务临时
+授权的具体机制——用户已明确表示暂不设计，留给后续会话在有更清晰的 UX
+想法后再做。
+
+---
+
 ## 2026-09-23 — 稳定化 Step 5（第三部分）：Shell 默认隐藏 + cf-crawler 原生工具化
 
 按 `elfclaw.md` §8 第 1、2 条。这是全部四步计划里直接命中用户最初核心投诉

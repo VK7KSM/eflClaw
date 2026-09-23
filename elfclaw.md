@@ -186,9 +186,8 @@ gemini-3.5-flash: key A → key B → ...
    相当于把开关默认拨到"关"；第 3 条要的是"用户可以为某一次具体任务临时授权"的机制，目前代码里没有
    对应的、范围限定到单次任务的开关（`/selfcheck` 用过的那种全局 `AtomicBool` gate 模式已经在
    Step 5 第二部分随 self_check 一起删除，且那种设计本身也不是"限定到单次任务"，不适合直接照搬）。
-   需要先决定 UX（例如：一次性 slash 命令 + 用户在该命令后的第一条消息里描述任务，仅那一轮 agent 循环
-   放行 shell？还是要求每次 shell 调用单独走一次 `always_ask` 审批，而不是打开/关闭一个全局开关？）
-   再实现，避免草率设计出一个容易被绕过或误用的机制，与本节要解决的问题背道而驰。
+   需要先决定 UX——2026-09-23 问过用户，明确选择"暂不设计，先做 Step 6"，即优先级上排在
+   Step 6 之后，等有更明确的想法再回来做，不在本次会话里草率设计。
 4. 移除 `self_check`/`check_logs`（已在第 4 节列为删除项，这里重复强调原因：这类"自检"是 AI 自己诊断自己出的错，容易越检查越乱）。**已完成，2026-09-23（Step 5 第二部分）。**
 
 ## 9. 验证方式：不需要每次都烧 Gemini 额度
@@ -223,12 +222,23 @@ gemini-3.5-flash: key A → key B → ...
     要点：(a) 修复 `资料/config.toml` 里意外清空的 `non_cli_excluded_tools`，让聊天 AI 默认看不到 `shell`；
     (b) 新增 `src/tools/cf_crawler.rs` 四个原生工具替换 cf-crawler 的 shell 模板版本，用本机真实 exe
     做了手动验证（含特殊字符 argv 直传测试），同步精简 `SKILL.toml` 和 `news_fetcher.allowed_tools`。
-    第 8 节第 3 条（按任务临时授权 shell 的具体机制）尚未实现，原因见第 8 节第 3 条本身——UX 未定，
-    不贸然设计一个可能被绕过的授权机制。
+    第 8 节第 3 条（按任务临时授权 shell 的具体机制）尚未实现，问过用户后明确选择暂不设计、
+    优先级排到 Step 6 之后（见第 8 节第 3 条本身）。
   - **暂缓，原因是改动面比预期大，需要单独一步做**：
     1. `/webhook`、`/whatsapp`、`/linq`、`/wati`、`/nextcloud-talk` 路由删除——调查发现这些会级联到独立的 channel 实现文件（如 `src/channels/whatsapp.rs`/`whatsapp_web.rs`）和 `AppState` 里的多个专属字段，不是单文件自包含改动。
-  - 后续会话按这个顺序继续：Step 6（清理弱模型约束 prompt）；第 8 节第 3 条的 shell 按任务授权机制设计（需要先和用户确认 UX 取向）；webhook 系路由删除（如果精力允许）。
-- **Step 6**：清理约束弱模型的旧 prompt——只删已经被对应代码保证覆盖的那部分，不是一次性全删。
+  - 后续会话按这个顺序继续：第 8 节第 3 条的 shell 按任务授权机制设计（需要先和用户确认 UX 取向，2026-09-23 已问过、用户选择先做 Step 6，见下）；webhook 系路由删除（如果精力允许）。
+- **Step 6（已完成，2026-09-23）**：清理约束弱模型的旧 prompt——只删已经被对应代码保证覆盖的那部分，不是一次性全删。
+  审计范围：本次会话（Step 1-5）新增/移除的功能在 `资料/workers/*.md`、`资料/skills/**/SKILL.{toml,md}` 里留下的过时提示文字
+  （全局 `grep` 确认没有遗留对 self_check/check_logs/economic/goals/agents_ipc/openai_compat/`/v1/*` 的引用——这些在 Step
+  1/5 删除时已经顺手清理干净）。找到唯一一处实质性遗留：`资料/workers/news_fetcher.md` 的"## Shell 运行规则"整节
+  （CWD 约定、允许/禁止命令表、复合命令拆分规则、三次失败看门狗，约 29 行）——这套规则是在 news_fetcher 还拥有 `shell`
+  工具权限时写的详细使用手册；Step 5 第三部分已经把 `"shell"` 从 `[agents.news_fetcher].allowed_tools` 里移除，
+  该小节描述的能力对这个子 agent 已经不存在，整节删除（还删了 "如果 shell 工具报错" 一行、把 CRITICAL 节开头
+  "禁止用 shell 工具调用 cf-crawler.exe" 改写成纯正面指令，不再需要先禁止一个已经拿不到的工具）。194 行 → 165 行。
+  未做全量审计：`资料/` 下还有 894 个 markdown 文件（多是第三方技能包的参考文档，如 scientific-tools 系列），
+  本次只清理了这次会话自己造成的过时内容，没有对整个技能库做地毯式审计——那是规模完全不同的另一项工作，
+  不在"清理这次改动留下的旧约束"这个 Step 6 的原始意图范围内。同样是 `.gitignore` 忽略的本地文件，需要手动
+  同步到 K6 才生效（见 dev_log.md）。
 
 ## 11. 已发现、暂缓到对应 Step 修复的安全问题
 
