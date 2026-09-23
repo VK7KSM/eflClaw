@@ -155,9 +155,41 @@ gemini-3.5-flash: key A → key B → ...
 ## 8. Shell / 工具权限重新设计
 
 1. **聊天 AI 默认看不到 shell 工具。** 浏览文件用 `file_read`/`glob_search`，不用 `ls`/`dir`/`cat`。
+   **已完成，2026-09-23**：发现 `资料/config.toml` 的 `autonomy.non_cli_excluded_tools` 被显式写成空数组 `[]`，
+   而代码里 `default_non_cli_excluded_tools()`（`src/config/schema.rs`）本来就会把 `shell` 排除在非 CLI 渠道
+   （Telegram 等）之外——这个空数组把代码的安全默认值覆盖掉了，导致聊天 AI 一直能看到并调用 `shell` 工具，
+   这正是"shell 出错→AI 自作主张改 prompt→越改越坏"这条投诉链路的**根本起点**。修复：把
+   `non_cli_excluded_tools` 改成 `["shell"]`（只排除 shell，不动 browser/http_request/cron_*/memory_store
+   等聊天要用的常规工具）。CLI 渠道不受影响（`effective_excluded_tools` 对 `msg.channel == "cli"` 恒为空）。
+   ⚠️ `资料/config.toml` 是 `.gitignore` 忽略的本地部署参考镜像，这处改动**不会随 git push 同步到 K6**，
+   需要手动同步到 K6 两个实例的真实 `config.toml` 并重启才会真正生效（详见 dev_log.md 对应条目）。
 2. **cf-crawler、新闻抓取、skill 索引全部做成原生 typed 工具**，代码直接传参启动对应 exe，不经过 shell/bash/PowerShell 现拼命令行，彻底消除 bash 转义 vs PowerShell 语法不一致的问题。
+   **已完成（cf-crawler 部分），2026-09-23**：新增 `src/tools/cf_crawler.rs`，实现 `WebHealthTool`/
+   `WebScrapeTool`/`WebCrawlTool`/`WebLoginTool` 四个原生 Rust 工具，用 `tokio::process::Command` 直接
+   调用 `workspace/tools/cf-crawler-win-x64.exe`（带 `--json <payload>` 参数），完全不经过 shell/sh/
+   PowerShell。这条修复直接命中 dev_log.md 里记录的一长串历史 bug：旧的 `资料/skills/cf-crawler/
+   SKILL.toml`（`kind="shell"`，经 `src/skills/tool_handler.rs` 拼 `sh`/`powershell` 命令行）反复因为
+   bash 把 `\t`/`\c` 当转义符吞掉、双重 workspace 路径拼接等问题失败，多个会话花了大量时间修补。
+   用本机真实的 `cf-crawler-win-x64.exe`（`C:\Dev\cf-crawler\release\`）跑了两个手动验证测试
+   （`cf_crawler::tests::manual_*`，默认 `#[ignore]`，不进 CI）：(a) 无凭据时验证了 stdout 解析能正确跳过
+   cf-crawler 自己的 pino 错误日志行、取到最后一行真正的结果 JSON；(b) 传入含引号/反斜杠/tab/`&` 的
+   url/goal 参数，验证 argv 直传不需要任何转义（`tokio::process::Command` 走 Windows CreateProcess，
+   全程没有 shell 解释这一步，天然没有转义问题）。同步删除了 `SKILL.toml` 里 web_scrape/web_crawl/
+   web_login/web_health 四个旧的 shell 版本工具定义（保留 `agent_reach_ensure`/`web_help`，它们没有
+   复杂 JSON 参数，风险低，暂不迁移），移除 `[agents.news_fetcher].allowed_tools` 里的 `"shell"`
+   （之前作为 web_scrape 不稳定时的兜底，现在根因已消除）。**"新闻抓取"里 shell 依赖已随 cf-crawler
+   迁移一并解决**（news_fetcher 唯一用 shell 的地方就是调 cf-crawler）；**"skill 索引"**——审计后发现
+   `src/skills/index.rs`/`audit.rs` 本身不调用 shell，这条指的就是 SKILL.toml 的 `kind="shell"` 模板
+   机制本身，cf-crawler 是当前唯一使用该机制处理复杂 JSON 参数的技能，已随上述改动解决。
 3. **shell 只在用户明确对某个具体任务授权时才能执行**，授权范围限定在那次任务，不是全局打开一个"shell 权限开关"。
-4. 移除 `self_check`/`check_logs`（已在第 4 节列为删除项，这里重复强调原因：这类"自检"是 AI 自己诊断自己出的错，容易越检查越乱）。
+   **尚未实现**——这是本节剩下唯一没做的部分。第 1 条已经把 shell 从聊天 AI 默认可见工具里拿掉，
+   相当于把开关默认拨到"关"；第 3 条要的是"用户可以为某一次具体任务临时授权"的机制，目前代码里没有
+   对应的、范围限定到单次任务的开关（`/selfcheck` 用过的那种全局 `AtomicBool` gate 模式已经在
+   Step 5 第二部分随 self_check 一起删除，且那种设计本身也不是"限定到单次任务"，不适合直接照搬）。
+   需要先决定 UX（例如：一次性 slash 命令 + 用户在该命令后的第一条消息里描述任务，仅那一轮 agent 循环
+   放行 shell？还是要求每次 shell 调用单独走一次 `always_ask` 审批，而不是打开/关闭一个全局开关？）
+   再实现，避免草率设计出一个容易被绕过或误用的机制，与本节要解决的问题背道而驰。
+4. 移除 `self_check`/`check_logs`（已在第 4 节列为删除项，这里重复强调原因：这类"自检"是 AI 自己诊断自己出的错，容易越检查越乱）。**已完成，2026-09-23（Step 5 第二部分）。**
 
 ## 9. 验证方式：不需要每次都烧 Gemini 额度
 
@@ -187,10 +219,15 @@ gemini-3.5-flash: key A → key B → ...
 - **Step 5（进行中，2026-09-23）**：
   - **已完成（第一部分）**：网关精简——删除 OpenAI 兼容层（`/v1/chat/completions`、`/v1/models`）。`src/gateway/openai_compat.rs` 整个文件（720 行）确认无其他调用方后整体删除；`openclaw_compat.rs` 里专为该兼容层写的 `handle_v1_chat_completions_with_tools` handler、8 个 `Oai*` 请求/响应结构体、对应的 7 个单测一并删除，只保留 `/api/chat`（唯一需要保留的、被 `run_gateway_chat_with_tools` 走完整 agent 循环的入口）。纯删除，`cargo test --lib` 前后同为 11 个预置失败（Windows 符号链接权限相关，与本次改动无关），无新增失败；`cargo clippy` 在两个改动文件里零新增问题。
   - **已完成（第二部分）**：`self_check`/`check_logs` 自检模块删除。调查确认这是一套完整的 `/selfcheck` 用户命令功能（非死代码）：`SelfCheckGate`（开关状态机，仅 `/selfcheck` 命令能打开）→ `self_check(action="analyze")` 收集日志/源码 → 用 worker model 跑一次隔离的 `agent::loop_::run()` 分析 → 报告存到 `homework/`；`check_logs` 是配套的日志查询工具，两者都被硬编码为"未经 `/selfcheck` 打开就对聊天 AI 隐藏"。全部删除：`src/tools/self_check.rs`（888 行）、`src/tools/check_logs.rs`（129 行）整体删除；`channels/mod.rs` 里的 `/selfcheck` 命令解析、gate 开关调用、两段系统提示词说明、`effective_excluded_tools` 里的 gate 分支全部移除并简化；`channels/telegram.rs` 的 Telegram 命令菜单去掉 `selfcheck` 条目；`cron/scheduler.rs` 两处后台任务 prompt 里"禁止调用 self_check/check_logs"的规则连带删除（工具已不存在，规则本身变得多余）；`tools/mod.rs` 移除模块声明/`pub use`/风险分级/构造调用；`elfclaw_log/mod.rs`、`tools/source_sync.rs`、`agent/loop_.rs` 更新了引用这两个工具的过时注释。`query_recent()` 保留（`gateway/api.rs` 的仪表盘日志接口仍在用）；`source_sync` 工具本身保留（是独立注册的常驻工具，不是 self_check 专属）。验证：`cargo test --lib` 4181 passed，同样 11 个预置失败无新增（测试数从 4190 降到 4181，对应删掉的自检模块专属单测）；`cargo clippy` 在全部改动文件里零新增问题；`cargo fmt --all -- --check` 改动前后均为 154 处预置漂移，未引入新的格式问题；`资料/config.toml` 确认无字段引用这两个工具。
+  - **已完成（第三部分）**：Shell/工具权限收紧（第 8 节第 1、2 条，完整记录见第 8 节本身）。
+    要点：(a) 修复 `资料/config.toml` 里意外清空的 `non_cli_excluded_tools`，让聊天 AI 默认看不到 `shell`；
+    (b) 新增 `src/tools/cf_crawler.rs` 四个原生工具替换 cf-crawler 的 shell 模板版本，用本机真实 exe
+    做了手动验证（含特殊字符 argv 直传测试），同步精简 `SKILL.toml` 和 `news_fetcher.allowed_tools`。
+    第 8 节第 3 条（按任务临时授权 shell 的具体机制）尚未实现，原因见第 8 节第 3 条本身——UX 未定，
+    不贸然设计一个可能被绕过的授权机制。
   - **暂缓，原因是改动面比预期大，需要单独一步做**：
     1. `/webhook`、`/whatsapp`、`/linq`、`/wati`、`/nextcloud-talk` 路由删除——调查发现这些会级联到独立的 channel 实现文件（如 `src/channels/whatsapp.rs`/`whatsapp_web.rs`）和 `AppState` 里的多个专属字段，不是单文件自包含改动。
-    2. Shell/工具权限收紧本体（第 8 节：默认对聊天 AI 隐藏 shell、cf-crawler/新闻抓取/技能索引改成原生 Rust 类型化工具、按任务显式授权 shell）——尚未开始设计。
-  - 后续会话按这个顺序继续：先做第 8 节设计+实现，最后视情况处理 webhook 系路由删除（如果精力允许）。
+  - 后续会话按这个顺序继续：Step 6（清理弱模型约束 prompt）；第 8 节第 3 条的 shell 按任务授权机制设计（需要先和用户确认 UX 取向）；webhook 系路由删除（如果精力允许）。
 - **Step 6**：清理约束弱模型的旧 prompt——只删已经被对应代码保证覆盖的那部分，不是一次性全删。
 
 ## 11. 已发现、暂缓到对应 Step 修复的安全问题

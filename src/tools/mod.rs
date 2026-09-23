@@ -23,6 +23,7 @@ pub mod bg_run;
 pub mod browser;
 pub mod browser_open;
 pub mod caller_context;
+pub mod cf_crawler;
 pub mod channel_ack_config;
 pub mod cli_discovery;
 pub mod composio;
@@ -109,6 +110,7 @@ pub use bg_run::{
 };
 pub use browser::{BrowserTool, ComputerUseConfig};
 pub use browser_open::BrowserOpenTool;
+pub use cf_crawler::{WebCrawlTool, WebHealthTool, WebLoginTool, WebScrapeTool};
 pub use channel_ack_config::ChannelAckConfigTool;
 pub use composio::ComposioTool;
 pub use content_search::ContentSearchTool;
@@ -186,6 +188,7 @@ pub fn tool_risk_tier(name: &str) -> ToolRiskTier {
         | "subagent_list" | "delegate_coordination_status"
         | "screenshot" | "cli_discovery"
         | "web_search"                      // read-only search
+        | "web_health" | "web_scrape" | "web_crawl" // read-only cf-crawler calls
         | "cron_add" | "cron_remove" | "cron_update"
         | "note_add" | "note_list" | "note_done" => ToolRiskTier::Safe, // metadata only; shell cmds validated independently
 
@@ -237,6 +240,13 @@ pub fn default_tool_risk_tiers() -> HashMap<&'static str, ToolRiskTier> {
         ("cron_runs", Safe),
         ("search_chat_log", Safe),
         ("web_search", Safe),  // read-only search, no side effects
+        // elfClaw 2026-09-23: native cf-crawler tools (elfclaw.md §8 point 2).
+        // health/scrape/crawl are read-only network calls, same tier as web_search.
+        // web_login is deliberately left at Standard (default supervised approval)
+        // below — it submits credentials/steps to a real site, unlike the others.
+        ("web_health", Safe),
+        ("web_scrape", Safe),
+        ("web_crawl", Safe),
         ("cron_add", Safe),    // scheduling only; shell commands validated independently
         ("cron_remove", Safe), // metadata-only operation
         ("cron_update", Safe), // metadata-only operation
@@ -527,6 +537,13 @@ pub fn all_tools_with_runtime(
 
     // elfClaw: source_sync tool — clone/pull source repos for debug analysis
     let source_sync_arc: Arc<dyn Tool> = Arc::new(SourceSyncTool::new(security.clone()));
+
+    // elfClaw: native cf-crawler tools — direct process invocation, no shell
+    // (replaces the shell-templated SKILL.toml versions; see tools/cf_crawler.rs)
+    tool_arcs.push(Arc::new(WebHealthTool::new(security.clone())));
+    tool_arcs.push(Arc::new(WebScrapeTool::new(security.clone())));
+    tool_arcs.push(Arc::new(WebCrawlTool::new(security.clone())));
+    tool_arcs.push(Arc::new(WebLoginTool::new(security.clone())));
 
     if has_filesystem_access {
         tool_arcs.push(Arc::new(OpenClawMigrationTool::new(

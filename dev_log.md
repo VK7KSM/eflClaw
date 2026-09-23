@@ -2,6 +2,132 @@
 
 ---
 
+## 2026-09-23 — 稳定化 Step 5（第三部分）：Shell 默认隐藏 + cf-crawler 原生工具化
+
+按 `elfclaw.md` §8 第 1、2 条。这是全部四步计划里直接命中用户最初核心投诉
+（"shell 出错→AI 自作主张改 prompt→越改越坏"）的一条。
+
+### 发现的根因（第 1 条：聊天 AI 默认看不到 shell）
+
+`src/config/schema.rs` 的 `default_non_cli_excluded_tools()` 本来就会把
+`shell`（以及 `file_write`/`browser`/`memory_store` 等一长串）排除在非 CLI
+渠道（Telegram 等）之外——`AutonomyConfig` 字段有
+`#[serde(default = "default_non_cli_excluded_tools")]`，而且这个默认值早就
+有单测覆盖（`autonomy_config_serde_defaults_non_cli_excluded_tools` 断言
+`contains(&"shell")`）。但**实际部署的 `资料/config.toml` 显式写了
+`non_cli_excluded_tools = []`**——TOML 里显式出现的空数组会覆盖 serde 的
+default，等于把代码精心设计的安全默认值整个清空。结果是聊天 AI 从 Telegram
+一直能看到并调用 `shell` 工具，`always_ask = []` 也没有把它兜住。这正是
+用户最初那条"shell 出错→AI 自作主张改 prompt→越改越坏"投诉链路的**根本
+起点**——不是模型能力问题，是一处配置沉默地关掉了代码自带的安全网。
+
+### 改了什么（第 1 条）
+
+- `资料/config.toml`：`non_cli_excluded_tools = []` → `["shell"]`。只排除
+  shell，不动 browser/http_request/cron_*/memory_store 等聊天要用的常规
+  工具（`default_non_cli_excluded_tools()` 里其余的一长串暂不启用——那些
+  很多是"新闻推送""浏览器"等已保留功能实际依赖的工具，贸然全量恢复会
+  破坏这些功能，不在本次范围内）。CLI 渠道不受影响：
+  `channels/mod.rs` 的 `effective_excluded_tools` 对 `msg.channel == "cli"`
+  恒为空数组。
+
+### 发现的现状（第 2 条：cf-crawler 原生化）
+
+调查 `资料/skills/cf-crawler/SKILL.toml` 发现 `web_scrape`/`web_crawl`/
+`web_login`/`web_health` 早就以 `kind = "shell"` 的技能模板注册着——LLM 用
+命名参数调用，`src/skills/tool_handler.rs` 把参数序列化成 JSON，再经
+`Command::new("sh")`（失败则退回 `Command::new("powershell")`）执行
+`./tools/cf-crawler-win-x64.exe <子命令> --pretty`，JSON 通过 stdin 管道
+传入。`dev_log.md` 里能翻到至少 4 次独立会话在修这条路径的转义 bug：
+bash 把 SKILL.toml 命令模板里的 `\t`/`\c` 当 POSIX 转义符吞掉、
+`workspace/tools/...` 和 shell cwd 已经是 workspace 导致的双重路径拼接、
+Windows 反斜杠 vs 正斜杠分隔符不一致等——每次都是同一类"shell 转义地狱"
+在不同角落复发。
+
+### 改了什么（第 2 条）
+
+- 新增 `src/tools/cf_crawler.rs`：`WebHealthTool`/`WebScrapeTool`/
+  `WebCrawlTool`/`WebLoginTool` 四个原生 `Tool` trait 实现。共享的
+  `run_cf_crawler()` 用 `tokio::process::Command::new(exe).arg(subcommand)
+  .arg("--json").arg(payload.to_string())` 直接起进程——`Command` 在 Windows
+  上走 `CreateProcess`，参数按 argv 数组传递，中间完全没有 shell 解释这一
+  步，因此不存在"字符串被 shell 重新转义"的可能性。exe 路径固定解析为
+  `workspace_dir/tools/cf-crawler-win-x64.exe`（Windows-only，非 Windows
+  平台直接报错，不做无意义的跨平台适配）。`CF_CRAWLER_ENDPOINT`/
+  `CF_CRAWLER_TOKEN` 走进程环境变量默认继承（不再需要 `shell_env_passthrough`
+  那种针对"任意 shell 命令"设计的显式白名单——这里只跑一个硬编码的、
+  受信任的二进制，不存在任意命令执行的风险面）。
+- **解析逻辑的真实 bug 及修复**：本机跑 `cf-crawler-win-x64.exe health`
+  （无凭据、连不上 Worker）验证时发现，失败路径下 **stdout 本身有两行
+  JSON**——先是 pino 日志器写的一行 `{"level":50,...,"msg":"command failed"}`，
+  然后才是真正的结果 JSON `{"success":false,"error":...}`。第一版实现
+  直接 `serde_json::from_str(stdout.trim())` 解析整个 stdout，这样两行
+  JSON 拼在一起解析必然失败，会误判进入"非 JSON 输出"的错误分支。修复为
+  按行倒序扫描，取第一个带 `success`/`ok` 字段的行（pino 日志行没有这两个
+  字段，可以用来区分）。这是先跑真实二进制才发现的问题，没有真实验证的话
+  这个 bug 会一直隐藏在只用手写 JSON fixture 的单测背后。
+- 加了两个默认 `#[ignore]`（不进 CI，因为依赖本机 `C:\Dev\cf-crawler\
+  release\cf-crawler-win-x64.exe` 路径）的手动验证测试，本次会话里手动跑
+  过并确认通过：`manual_web_health_against_real_exe`（验证上面那个双行
+  JSON 解析修复）、`manual_web_scrape_special_chars_survive_argv_against_real_exe`
+  （url/goal 里塞引号、反斜杠、tab、`&`，验证 argv 直传不需要任何转义，
+  报错停在网络层 ECONNREFUSED 而不是 cf-crawler 自己的 JSON 解析错误——
+  证明参数确实完整无损地到达了目标进程）。
+- `tools/mod.rs`：注册四个新工具；`web_health`/`web_scrape`/`web_crawl`
+  标为 `Safe`（只读网络调用，与 `web_search` 同级）；`web_login` 刻意
+  不标 Safe，留在默认的 `Standard`（需要监督审批）——它会向目标网站提交
+  真实的登录步骤/凭据，和纯只读抓取的风险不是一回事，`资料/config.toml`
+  的 `auto_approve` 列表里原有的 `web_login` 沿用不动，不额外扩大范围。
+- `资料/skills/cf-crawler/SKILL.toml`：删除 web_scrape/web_crawl/web_login/
+  web_health 四个旧的 `kind="shell"` 工具定义，只保留 `agent_reach_ensure`
+  和 `web_help`（这两个没有复杂 JSON 参数、报错概率低，暂不迁移，留着继续
+  走技能系统的 shell 模板机制）。更新 `prompts` 说明，去掉过时的 bash 转义
+  注意事项。
+- `资料/config.toml` 的 `[agents.news_fetcher].allowed_tools`：移除
+  `"shell"`。这条是之前"web_scrape 不稳定时的兜底"（见更早的"三层防御"
+  会话记录），根因（shell 转义不稳定）已经随本次迁移消除，不再需要兜底。
+
+### 验证
+
+- `cargo check --quiet`：编译通过，零警告。
+- `cargo test --lib -- cf_crawler::`：10 个新增单测全过（不含 2 个
+  `#[ignore]` 手动测试）。
+- 手动运行 `cargo test --lib -- --ignored cf_crawler::tests::manual_*`：
+  2 个手动验证测试对本机真实 exe 全部通过（见上文"改了什么"部分的具体
+  验证内容）。
+- 临时验证测试（跑完即删，不进最终提交）：`资料/config.toml` 完整反序列化
+  为 `Config` 成功，`autonomy.non_cli_excluded_tools` 含 `"shell"`，
+  `agents["news_fetcher"].allowed_tools` 不含 `"shell"`、含 `"web_scrape"`；
+  `资料/skills/cf-crawler/SKILL.toml` 反序列化为 `Skill` 成功，`tools` 列表
+  含 `agent_reach_ensure`/`web_help`，不含 web_scrape/web_crawl/web_login/
+  web_health。
+- `cargo test --lib`（全量）、`cargo clippy --quiet --lib --tests
+  -- -D warnings`：与前序 Step 5 各部分一致的验证方式，结果见本条目下方
+  commit 记录（提交前会再跑一次全量确认无新增失败/警告）。
+
+### 未处理
+
+`elfclaw.md` §8 第 3 条——"shell 只在用户明确对某个具体任务授权时才能执行，
+授权范围限定在那次任务"——尚未实现。第 1 条已经把默认状态从"聊天 AI 能用
+shell"改成了"不能用"，相当于开关默认拨到"关"；第 3 条要的是一个"用户可以
+为单次具体任务临时开一道口子"的机制，目前代码里没有对应设计，UX 也没有
+定（一次性命令？单次工具调用走 always_ask 审批？）。这类"重新打开一个受限
+能力"的机制本身就是安全敏感设计，草率实现容易做出一个形同虚设或者容易被
+绕过的开关，和本节要解决的问题背道而驰，留给后续会话专门设计。
+
+**另外需要注意**：本条目改动的 `资料/config.toml`、`资料/skills/cf-crawler/
+SKILL.toml` 属于 `.gitignore` 忽略的本地部署参考镜像（不进 git，只用于
+`toml::from_str` 临时验证测试确认新代码兼容真实部署配置），**不会随
+`git push` 同步到 K6**。要让 K6 上两个实例（Skynet + Workspace，见
+`k6_deployment.md`）的聊天 AI 真正看不到 shell、真正用上原生 cf-crawler
+工具，还需要手动把这两个文件的改动同步到 K6 的
+`D:\ZeroClaw_Workspace\config.toml`、`workspace\skills\cf-crawler\
+SKILL.toml`（以及另一个实例的对应路径），并重启 elfclaw 进程。这一步本次
+会话没有做（没有 K6 的直接改动授权，且涉及重启生产进程，按规则需要用户
+确认）。
+
+---
+
 ## 2026-09-23 — 稳定化 Step 5（第二部分）：删除 self_check/check_logs 自检模块
 
 按 `elfclaw.md` §4"删除"列表、§10 Step 5。这是 Step 5 网关精简之后的下一块暂缓项，
