@@ -930,26 +930,17 @@ pub fn skills_to_prompt_with_mode(
 
         let inject_full =
             matches!(mode, crate::config::SkillsPromptInjectionMode::Full) || skill.always;
-        if inject_full {
-            if !skill.prompts.is_empty() {
-                let _ = writeln!(prompt, "    <instructions>");
-                for instruction in &skill.prompts {
-                    write_xml_text_element(&mut prompt, 6, "instruction", instruction);
-                }
-                let _ = writeln!(prompt, "    </instructions>");
+        // elfClaw 2026-09-24: SKILL.toml `[[tools]]` entries are no longer
+        // rendered. The only bridge that ever made them callable
+        // (src/skills/tool_handler.rs, kind="shell" only) was removed with the
+        // shell tool, so advertising them would send the model after tools
+        // that fail with "not found".
+        if inject_full && !skill.prompts.is_empty() {
+            let _ = writeln!(prompt, "    <instructions>");
+            for instruction in &skill.prompts {
+                write_xml_text_element(&mut prompt, 6, "instruction", instruction);
             }
-
-            if !skill.tools.is_empty() {
-                let _ = writeln!(prompt, "    <tools>");
-                for tool in &skill.tools {
-                    let _ = writeln!(prompt, "      <tool>");
-                    write_xml_text_element(&mut prompt, 8, "name", &tool.name);
-                    write_xml_text_element(&mut prompt, 8, "description", &tool.description);
-                    write_xml_text_element(&mut prompt, 8, "kind", &tool.kind);
-                    let _ = writeln!(prompt, "      </tool>");
-                }
-                let _ = writeln!(prompt, "    </tools>");
-            }
+            let _ = writeln!(prompt, "    </instructions>");
         }
 
         let _ = writeln!(prompt, "  </skill>");
@@ -2711,9 +2702,9 @@ command = "echo hello"
         assert!(prompt.contains("<available_skills>"));
         assert!(prompt.contains("<name>always-skill</name>"));
         assert!(prompt.contains("<instruction>Do the thing every time.</instruction>"));
-        assert!(prompt.contains("<tools>"));
-        assert!(prompt.contains("<name>run</name>"));
-        assert!(prompt.contains("<kind>shell</kind>"));
+        // SKILL.toml tools are never advertised (nothing can execute them).
+        assert!(!prompt.contains("<tools>"));
+        assert!(!prompt.contains("<name>run</name>"));
     }
 
     #[test]
@@ -2937,9 +2928,9 @@ description = "Bare minimum"
         }];
         let prompt = skills_to_prompt(&skills, Path::new("/tmp"));
         assert!(prompt.contains("weather"));
-        assert!(prompt.contains("<name>get_weather</name>"));
-        assert!(prompt.contains("<description>Fetch forecast</description>"));
-        assert!(prompt.contains("<kind>shell</kind>"));
+        // SKILL.toml tools are never advertised (nothing can execute them).
+        assert!(!prompt.contains("<name>get_weather</name>"));
+        assert!(!prompt.contains("<kind>shell</kind>"));
     }
 
     #[test]

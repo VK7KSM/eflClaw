@@ -6180,7 +6180,7 @@ async fn scaffold_workspace(
          - Memory is limited — if you want to remember something, WRITE IT TO A FILE\n\
          - \"Mental notes\" don't survive session restarts. Files do.\n\
          - When someone says \"remember this\" -> update daily file or MEMORY.md\n\
-         - When you learn a lesson -> update AGENTS.md, TOOLS.md, or the relevant skill\n"
+         - When you learn a lesson -> write it to MEMORY.md (core files like AGENTS.md/TOOLS.md are read-only to you; suggest changes to your human)\n"
             .to_string()
     } else if memory_disabled {
         "## Memory System\n\n\
@@ -6200,7 +6200,7 @@ async fn scaffold_workspace(
              - Memory is limited — if you want to remember something, STORE IT\n\
              - \"Mental notes\" don't survive session restarts. Stored memory does.\n\
              - When someone says \"remember this\" -> use memory_store\n\
-             - When you learn a lesson -> update AGENTS.md, TOOLS.md, or the relevant skill\n"
+             - When you learn a lesson -> use memory_store (core files like AGENTS.md/TOOLS.md are read-only to you; suggest changes to your human)\n"
         )
     };
 
@@ -6228,7 +6228,7 @@ async fn scaffold_workspace(
          - **Vibe:** Sharp, direct, resourceful. Not corporate. Not a chatbot.\n\
          - **Emoji:** \u{1f980}\n\n\
          ---\n\n\
-         Update this file as you evolve. Your identity is yours to shape.\n"
+         Your human maintains this file (it is read-only to you).\n"
     );
 
     let agents = format!(
@@ -6242,8 +6242,7 @@ async fn scaffold_workspace(
          {memory_system_block}\n\n\
          ## Safety\n\n\
          - Don't exfiltrate private data. Ever.\n\
-         - Don't run destructive commands without asking.\n\
-         - `trash` > `rm` (recoverable beats gone forever)\n\
+         - Don't take destructive actions without asking.\n\
          - When in doubt, ask.\n\n\
          ## External vs Internal\n\n\
          **Safe to do freely:** Read files, explore, organize, learn, search the web.\n\n\
@@ -6253,14 +6252,14 @@ async fn scaffold_workspace(
          Stay silent when it's casual banter or someone already answered.\n\n\
          ## Tools & Skills\n\n\
          Skills are listed in the system prompt. Use `read` on a skill's SKILL.md for details.\n\
-         Keep local notes (SSH hosts, device names, etc.) in `TOOLS.md`.\n\n\
+         Local notes (SSH hosts, device names, etc.) live in `TOOLS.md`, maintained by your human.\n\n\
          {crash_recovery_block}\n\n\
          ## Sub-task Scoping\n\n\
          - Break complex work into focused sub-tasks with clear success criteria.\n\
          - Keep sub-tasks small, verify each output, then merge results.\n\
          - Prefer one clear objective per sub-task over broad \"do everything\" asks.\n\n\
-         ## Make It Yours\n\n\
-         This is a starting point. Add your own conventions, style, and rules.\n"
+         ## Ownership\n\n\
+         Your human maintains this file; it is read-only to you. Suggest changes instead of editing it.\n"
     );
 
     let heartbeat = format!(
@@ -6340,9 +6339,6 @@ async fn scaffold_workspace(
          - Preferred voices for TTS\n\
          - Anything environment-specific\n\n\
          ## Built-in Tools\n\n\
-         - **shell** — Execute terminal commands\n\
-           - Use when: running local checks, build/test commands, or diagnostics.\n\
-           - Don't use when: a safer dedicated tool exists, or command is destructive without approval.\n\
          - **file_read** — Read file contents\n\
            - Use when: inspecting project files, configs, or logs.\n\
            - Don't use when: you only need a quick string search (prefer targeted search first).\n\
@@ -6359,7 +6355,7 @@ async fn scaffold_workspace(
            - Use when: memory is incorrect, stale, or explicitly requested to be removed.\n\
            - Don't use when: uncertain about impact; verify before deleting.\n\n\
          ---\n\
-         *Add whatever helps you do your job. This is your cheat sheet.*\n";
+         *Maintained by your human — this file is read-only to you.*\n";
 
     let bootstrap = format!(
         "# BOOTSTRAP.md — Hello, World\n\n\
@@ -6370,12 +6366,12 @@ async fn scaffold_workspace(
          Don't interrogate. Don't be robotic. Just... talk.\n\
          Introduce yourself as {agent} and get to know each other.\n\n\
          ## After You Know Each Other\n\n\
-         Update these files with what you learned:\n\
+         Tell your human what you learned so they can update these files (they are read-only to you):\n\
          - `IDENTITY.md` — your name, vibe, emoji\n\
          - `USER.md` — their preferences, work context\n\
          - `SOUL.md` — boundaries and behavior\n\n\
          ## When You're Done\n\n\
-         Delete this file. You don't need a bootstrap script anymore —\n\
+         Ask your human to delete this file. You don't need a bootstrap script anymore —\n\
          you're you now.\n"
     );
 
@@ -7643,7 +7639,6 @@ mod tests {
             .await
             .unwrap();
         for tool in &[
-            "shell",
             "file_read",
             "file_write",
             "memory_store",
@@ -7655,6 +7650,10 @@ mod tests {
                 "TOOLS.md should list built-in tool: {tool}"
             );
         }
+        assert!(
+            !tools.contains("**shell**"),
+            "TOOLS.md must not advertise the removed shell tool"
+        );
         assert!(
             tools.contains("Use when:"),
             "TOOLS.md should include 'Use when' guidance"

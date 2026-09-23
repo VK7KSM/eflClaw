@@ -257,7 +257,7 @@ use history::{apply_compaction_summary, build_compaction_transcript};
 use history::{auto_compact_history, trim_history};
 #[allow(unused_imports)]
 use parsing::{
-    build_assistant_history_with_tool_calls, build_curl_command, build_native_assistant_history,
+    build_assistant_history_with_tool_calls, build_native_assistant_history,
     build_native_assistant_history_from_parsed_calls, default_param_for_tool,
     detect_tool_call_parse_issue, extract_json_values, extract_xml_pairs, find_first_tag,
     find_json_end, is_xml_meta_tag, map_tool_name_alias, matching_tool_call_close_tag,
@@ -4339,23 +4339,23 @@ Let me check the result."#;
 
     #[test]
     fn parse_tool_calls_cross_alias_close_tag_with_glm_shortened() {
-        // <tool_call>shell>uname -a</invoke> — GLM shortened inside cross-alias tags
-        let input = "<tool_call>shell>uname -a</invoke>";
+        // <tool_call>memory_recall>project notes</invoke> — GLM shortened inside cross-alias tags
+        let input = "<tool_call>memory_recall>project notes</invoke>";
         let (text, calls) = parse_tool_calls(input);
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "shell");
-        assert_eq!(calls[0].arguments["command"], "uname -a");
+        assert_eq!(calls[0].name, "memory_recall");
+        assert_eq!(calls[0].arguments["query"], "project notes");
         assert!(text.is_empty());
     }
 
     #[test]
     fn parse_tool_calls_glm_shortened_body_in_matched_tags() {
-        // <tool_call>shell>pwd</tool_call> — GLM shortened in matched tags
-        let input = "<tool_call>shell>pwd</tool_call>";
+        // <tool_call>file_read>notes.md</tool_call> — GLM shortened in matched tags
+        let input = "<tool_call>file_read>notes.md</tool_call>";
         let (text, calls) = parse_tool_calls(input);
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "shell");
-        assert_eq!(calls[0].arguments["command"], "pwd");
+        assert_eq!(calls[0].name, "file_read");
+        assert_eq!(calls[0].arguments["path"], "notes.md");
         assert!(text.is_empty());
     }
 
@@ -4395,35 +4395,36 @@ Let me check the result."#;
 
     #[test]
     fn parse_tool_calls_unclosed_glm_shortened_no_close_tag() {
-        // <tool_call>shell>ls -la (no close tag at all)
-        let input = "<tool_call>shell>ls -la";
+        // <tool_call>file_read>notes.md (no close tag at all)
+        let input = "<tool_call>file_read>notes.md";
         let (text, calls) = parse_tool_calls(input);
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "shell");
-        assert_eq!(calls[0].arguments["command"], "ls -la");
+        assert_eq!(calls[0].name, "file_read");
+        assert_eq!(calls[0].arguments["path"], "notes.md");
         assert!(text.is_empty());
     }
 
     #[test]
     fn parse_tool_calls_text_before_cross_alias() {
         // Text before and after cross-alias tool call
-        let input = "Let me check that.\n<tool_call>shell>uname -a</invoke>\nDone.";
+        let input = "Let me check that.\n<tool_call>memory_recall>project notes</invoke>\nDone.";
         let (text, calls) = parse_tool_calls(input);
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "shell");
-        assert_eq!(calls[0].arguments["command"], "uname -a");
+        assert_eq!(calls[0].name, "memory_recall");
+        assert_eq!(calls[0].arguments["query"], "project notes");
         assert!(text.contains("Let me check that."));
         assert!(text.contains("Done."));
     }
 
     #[test]
-    fn parse_glm_shortened_body_url_to_curl() {
-        // URL values for shell should be wrapped in curl
+    fn parse_glm_shortened_body_never_synthesizes_curl_command() {
+        // elfClaw 2026-09-24: URLs passed to a "shell" call used to be
+        // rewritten into `curl -s '<url>'`. The shell tool no longer exists,
+        // so the value is passed through untouched and dispatch fails cleanly.
         let call = parse_glm_shortened_body("shell>https://example.com/api").unwrap();
         assert_eq!(call.name, "shell");
-        let cmd = call.arguments["command"].as_str().unwrap();
-        assert!(cmd.contains("curl"));
-        assert!(cmd.contains("example.com"));
+        assert!(!call.arguments.to_string().contains("curl"));
+        assert_eq!(call.arguments["input"], "https://example.com/api");
     }
 
     #[test]
@@ -4471,16 +4472,19 @@ Let me check the result."#;
     #[test]
     fn map_tool_name_alias_preserves_browser_and_web_search() {
         // elfClaw 2026-09-23: regression test for a pre-existing bug where
-        // these three real tools were incorrectly aliased to "shell".
+        // these names were incorrectly aliased to "shell". The search tool
+        // registers as "web_search_tool" (fixed 2026-09-24).
         assert_eq!(map_tool_name_alias("browser_open"), "browser_open");
         assert_eq!(map_tool_name_alias("browser"), "browser");
-        assert_eq!(map_tool_name_alias("web_search"), "web_search");
+        assert_eq!(map_tool_name_alias("web_search"), "web_search_tool");
+        assert_eq!(map_tool_name_alias("web_search_tool"), "web_search_tool");
     }
 
     #[test]
     fn default_param_for_tool_coverage() {
-        assert_eq!(default_param_for_tool("shell"), "command");
-        assert_eq!(default_param_for_tool("bash"), "command");
+        assert_eq!(default_param_for_tool("shell"), "input");
+        assert_eq!(default_param_for_tool("web_search"), "query");
+        assert_eq!(default_param_for_tool("web_search_tool"), "query");
         assert_eq!(default_param_for_tool("file_read"), "path");
         assert_eq!(default_param_for_tool("memory_recall"), "query");
         assert_eq!(default_param_for_tool("memory_store"), "content");

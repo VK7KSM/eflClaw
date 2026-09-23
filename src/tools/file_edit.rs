@@ -1,5 +1,8 @@
 use super::traits::{Tool, ToolResult};
 use crate::security::file_link_guard::has_multiple_hard_links;
+use crate::security::protected_identity_files::{
+    is_protected_identity_file, protected_identity_file_block_message,
+};
 use crate::security::sensitive_paths::is_sensitive_file_path;
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
@@ -129,6 +132,14 @@ impl Tool for FileEditTool {
             });
         }
 
+        if is_protected_identity_file(Path::new(path)) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(protected_identity_file_block_message(path)),
+            });
+        }
+
         let full_path = self.security.workspace_dir.join(path);
 
         // ── 5. Canonicalize parent ─────────────────────────────────
@@ -178,6 +189,16 @@ impl Tool for FileEditTool {
                 success: false,
                 output: String::new(),
                 error: Some(sensitive_file_edit_block_message(
+                    &resolved_target.display().to_string(),
+                )),
+            });
+        }
+
+        if is_protected_identity_file(&resolved_target) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(protected_identity_file_block_message(
                     &resolved_target.display().to_string(),
                 )),
             });
@@ -511,6 +532,68 @@ mod tests {
 
         let content = tokio::fs::read_to_string(dir.join(".env")).await.unwrap();
         assert_eq!(content, "API_KEY=new");
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn file_edit_blocks_protected_identity_file() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_edit_identity_blocked");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("HEARTBEAT.md"), "original")
+            .await
+            .unwrap();
+
+        let tool = FileEditTool::new(test_security(dir.clone()));
+        let result = tool
+            .execute(json!({
+                "path": "HEARTBEAT.md",
+                "old_string": "original",
+                "new_string": "hijacked"
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("protected core identity"));
+
+        let content = tokio::fs::read_to_string(dir.join("HEARTBEAT.md"))
+            .await
+            .unwrap();
+        assert_eq!(content, "original");
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn file_edit_allows_heartbeat_data_file() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_edit_heartbeat_data_allowed");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("HEARTBEAT_DATA.md"), "original")
+            .await
+            .unwrap();
+
+        let tool = FileEditTool::new(test_security(dir.clone()));
+        let result = tool
+            .execute(json!({
+                "path": "HEARTBEAT_DATA.md",
+                "old_string": "original",
+                "new_string": "updated"
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+        let content = tokio::fs::read_to_string(dir.join("HEARTBEAT_DATA.md"))
+            .await
+            .unwrap();
+        assert_eq!(content, "updated");
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }

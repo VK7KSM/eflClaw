@@ -596,8 +596,9 @@ fn build_runtime_status_section(config: &crate::config::Config) -> String {
          - Restarting or stopping your own process\n\
          - Installing packages or system dependencies\n\n\
          ALLOWED actions:\n\
-         - Reading and writing files in your workspace directory\n\
-         - Using shell commands for information gathering\n\
+         - Reading files, and writing non-core files, in your workspace directory \
+           (AGENTS.md/SOUL.md/TOOLS.md/HEARTBEAT.md/IDENTITY.md/USER.md/BOOTSTRAP.md/config.toml are read-only; \
+           put data you need to keep in HEARTBEAT_DATA.md or other non-core files)\n\
          - Using all registered tools (within their permission gates)\n\
          - Memory operations (recall, store, search)\n\
          - Sending messages via configured channels\n\
@@ -2209,7 +2210,7 @@ async fn process_channel_message(
              2. 禁止重复使用同一工具+相同参数的组合\n\
              3. 如果某个工具被安全策略拦截（0ms 失败），说明该工具在此环境不可用，切换到其他方法\n\
              4. 如果无法完成任务，向用户说明原因并建议替代方案\n\
-             5. 优先使用 file_read、content_search 等安全工具，避免 shell 命令"
+             5. 优先使用 file_read、content_search 等只读工具"
             .to_string();
         // Insert before the latest user message
         let insert_pos = prior_turns.len().saturating_sub(1);
@@ -3311,19 +3312,12 @@ pub fn build_system_prompt_with_mode(
     let host =
         hostname::get().map_or_else(|_| "unknown".into(), |h| h.to_string_lossy().to_string());
 
-    // elfClaw: inject platform details so LLM adapts shell commands to current OS
-    #[cfg(windows)]
-    let platform_hint = "Shell: PowerShell. Use `python` (not `python3`). Use PowerShell syntax.";
-    #[cfg(target_os = "macos")]
-    let platform_hint = "Shell: sh (macOS). Use `python3` for Python.";
-    #[cfg(target_os = "linux")]
-    let platform_hint = "Shell: sh (Linux). Use `python3` for Python.";
-    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
-    let platform_hint = "Shell: sh.";
-
+    // elfClaw 2026-09-24: the per-OS "Shell: PowerShell / use python" hint was
+    // removed with the shell tool — it only nudged the model toward a tool
+    // that no longer exists.
     let _ = writeln!(
         prompt,
-        "## Runtime\n\nHost: {host} | OS: {} | Model: {model_name}\n{platform_hint}\n",
+        "## Runtime\n\nHost: {host} | OS: {} | Model: {model_name}\n",
         std::env::consts::OS,
     );
 
@@ -6771,7 +6765,7 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[test]
-    fn prompt_skills_include_instructions_and_tools() {
+    fn prompt_skills_include_instructions_but_not_uncallable_tools() {
         let ws = make_workspace();
         let skills = vec![crate::skills::Skill {
             name: "code-review".into(),
@@ -6801,9 +6795,10 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(prompt.contains("<instructions>"));
         assert!(prompt
             .contains("<instruction>Always run cargo test before final response.</instruction>"));
-        assert!(prompt.contains("<tools>"));
-        assert!(prompt.contains("<name>lint</name>"));
-        assert!(prompt.contains("<kind>shell</kind>"));
+        // elfClaw 2026-09-24: SKILL.toml tools are no longer advertised —
+        // nothing can execute them since the shell bridge was removed.
+        assert!(!prompt.contains("<tools>"));
+        assert!(!prompt.contains("<name>lint</name>"));
         assert!(!prompt.contains("loaded on demand"));
     }
 
@@ -6878,9 +6873,6 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(prompt.contains(
             "<description>Review &quot;unsafe&quot; and &apos;risky&apos; bits</description>"
         ));
-        assert!(prompt.contains("<name>run&quot;linter&quot;</name>"));
-        assert!(prompt.contains("<description>Run &lt;lint&gt; &amp; report</description>"));
-        assert!(prompt.contains("<kind>shell&amp;exec</kind>"));
         assert!(prompt.contains(
             "<instruction>Use &lt;tool_call&gt; and &amp; keep output &quot;safe&quot;</instruction>"
         ));

@@ -1,3 +1,6 @@
+use crate::security::protected_identity_files::{
+    is_protected_identity_file, protected_identity_file_block_message,
+};
 use crate::tools::traits::{Tool, ToolResult};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -6,6 +9,26 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use tempfile::NamedTempFile;
 use tokio::process::Command;
+
+/// elfClaw 2026-09-24: a unified diff's target paths are its `--- a/<path>`
+/// and `+++ b/<path>` header lines. Returns the first one whose file name
+/// matches a protected identity file (elfclaw.md §3 point 4) — apply_patch
+/// has no `path` argument to check up front like file_write/file_edit do,
+/// so the patch body itself has to be scanned before `git apply` ever runs.
+fn first_protected_identity_target(patch: &str) -> Option<String> {
+    for line in patch.lines() {
+        let Some(candidate) = line
+            .strip_prefix("--- a/")
+            .or_else(|| line.strip_prefix("+++ b/"))
+        else {
+            continue;
+        };
+        if is_protected_identity_file(Path::new(candidate)) {
+            return Some(candidate.to_string());
+        }
+    }
+    None
+}
 
 /// ApplyPatchTool
 ///
@@ -94,6 +117,14 @@ impl Tool for ApplyPatchTool {
                     patch.len(),
                     MAX_PATCH_BYTES
                 )),
+            });
+        }
+
+        if let Some(target) = first_protected_identity_target(&patch) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(protected_identity_file_block_message(&target)),
             });
         }
 
@@ -327,5 +358,59 @@ mod tests {
         assert_eq!(s["type"], "object");
         assert!(s["properties"].is_object());
         assert!(s["properties"]["patch"].is_object());
+    }
+
+    #[test]
+    fn detects_protected_identity_file_in_patch_target() {
+        let patch = "\
+diff --git a/HEARTBEAT.md b/HEARTBEAT.md
+index 0000000..1111111 100644
+--- a/HEARTBEAT.md
++++ b/HEARTBEAT.md
+@@ -1 +1 @@
+-old
++new
+";
+        assert_eq!(
+            first_protected_identity_target(patch).as_deref(),
+            Some("HEARTBEAT.md")
+        );
+    }
+
+    #[test]
+    fn allows_patch_targeting_unrelated_files() {
+        let patch = "\
+diff --git a/src/main.rs b/src/main.rs
+index 0000000..1111111 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1 +1 @@
+-old
++new
+";
+        assert!(first_protected_identity_target(patch).is_none());
+    }
+
+    #[tokio::test]
+    async fn execute_rejects_patch_targeting_protected_identity_file() {
+        let tool = ApplyPatchTool::new();
+        let patch = "\
+diff --git a/AGENTS.md b/AGENTS.md
+index 0000000..1111111 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -1 +1 @@
+-old
++new
+";
+        let result = tool
+            .execute(json!({ "patch": patch, "dry_run": true }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result
+            .error
+            .unwrap_or_default()
+            .contains("protected core identity"));
     }
 }

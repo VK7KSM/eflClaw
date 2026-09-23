@@ -1,5 +1,8 @@
 use super::traits::{Tool, ToolResult};
 use crate::security::file_link_guard::has_multiple_hard_links;
+use crate::security::protected_identity_files::{
+    is_protected_identity_file, protected_identity_file_block_message,
+};
 use crate::security::sensitive_paths::is_sensitive_file_path;
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
@@ -93,6 +96,14 @@ impl Tool for FileWriteTool {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Path not allowed by security policy: {path}")),
+            });
+        }
+
+        if is_protected_identity_file(Path::new(path)) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(protected_identity_file_block_message(path)),
             });
         }
 
@@ -428,6 +439,93 @@ mod tests {
         );
         let content = tokio::fs::read_to_string(dir.join(".env")).await.unwrap();
         assert_eq!(content, "API_KEY=123");
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn file_write_blocks_protected_identity_file() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_write_identity_blocked");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        let tool = FileWriteTool::new(test_security(dir.clone()));
+        let result = tool
+            .execute(json!({"path": "HEARTBEAT.md", "content": "hijacked"}))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("protected core identity"));
+        assert!(!dir.join("HEARTBEAT.md").exists());
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn file_write_blocks_real_config_toml_outside_workspace() {
+        // Deployed layout: <root>/config.toml next to <root>/workspace/, with
+        // workspace_only = false. The resolved-path check only vets the parent
+        // directory, so without the name-based protection this write succeeds.
+        let root = std::env::temp_dir().join("zeroclaw_test_file_write_config_toml");
+        let _ = tokio::fs::remove_dir_all(&root).await;
+        let workspace = root.join("workspace");
+        tokio::fs::create_dir_all(&workspace).await.unwrap();
+        tokio::fs::write(root.join("config.toml"), "original")
+            .await
+            .unwrap();
+
+        let tool = FileWriteTool::new(Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: workspace,
+            workspace_only: false,
+            forbidden_paths: vec![],
+            ..SecurityPolicy::default()
+        }));
+
+        let control = root.join("other.toml");
+        let result = tool
+            .execute(json!({"path": control.to_string_lossy(), "content": "x"}))
+            .await
+            .unwrap();
+        assert!(
+            result.success,
+            "control write outside workspace should be reachable: {:?}",
+            result.error
+        );
+
+        let target = root.join("config.toml");
+        let result = tool
+            .execute(json!({"path": target.to_string_lossy(), "content": "hijacked"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert_eq!(
+            tokio::fs::read_to_string(&target).await.unwrap(),
+            "original"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    #[tokio::test]
+    async fn file_write_allows_heartbeat_data_file() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_write_heartbeat_data_allowed");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        let tool = FileWriteTool::new(test_security(dir.clone()));
+        let result = tool
+            .execute(json!({"path": "HEARTBEAT_DATA.md", "content": "- source: example.com"}))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+        assert!(dir.join("HEARTBEAT_DATA.md").exists());
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }

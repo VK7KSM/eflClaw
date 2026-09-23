@@ -38,6 +38,7 @@ pub mod pairing;
 pub mod perplexity;
 pub mod policy;
 pub mod prompt_guard;
+pub mod protected_identity_files;
 pub mod roles;
 pub mod secrets;
 pub mod sensitive_paths;

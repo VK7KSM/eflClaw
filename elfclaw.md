@@ -29,7 +29,9 @@ elfClaw 最大的优势——**运行几乎不占系统资源**——是三者�
 
 1. **能用代码实现的确定性行为，一律用代码实现，不让 LLM 参与。** 提醒到点直接发文字、cron 去重清理、新闻抓取流水线、skill 索引——这些都不该由 LLM 现编 shell 命令去做。
 2. **LLM 只做两件事：理解/整理文字、和用户聊天。** 工具调用应该是简单的开关式动作（带类型参数），不是让模型拼命令行。
-3. **shell 保留，但默认对聊天 AI 不可见。** 只有用户明确对某个具体任务授权时，才能执行 shell 命令；不再是"全局打开、靠审批拦"。
+3. ~~**shell 保留，但默认对聊天 AI 不可见。** 只有用户明确对某个具体任务授权时，才能执行 shell 命令；不再是"全局打开、靠审批拦"。~~
+   **2026-09-23 被更彻底的方案取代（Step 7）**：确认爬虫/邮件等功能都已不依赖 shell 后，用户指示"彻底移除shell"——
+   `shell`/`process`/`schedule` 三个工具和 `SKILL.toml` `kind="shell"` 桥接层已从代码中整体删除，不存在"授权"问题了。
 4. **AI 不能改自己的配置和 prompt 文件。** `AGENTS.md`/`SOUL.md`/`TOOLS.md`/`HEARTBEAT.md`/`IDENTITY.md`/`config.toml`/`skills/` 对写文件工具设为只读，代码层拒绝，不是靠 prompt 里写"不要改"。
    **2026-09-23 复查发现**：这条原则从未被拆成具体 Step，`file_write.rs`/`file_edit.rs` 代码里目前完全没有这层保护
    （已有的 `is_sensitive_file_path` 只管 `.env`/SSH key 等凭据文件，跟这条原则是两回事）。深入设计时发现一个真实的
@@ -42,6 +44,17 @@ elfClaw 最大的优势——**运行几乎不占系统资源**——是三者�
    安装工具，全面禁止 AI 写 `skills/` 目录会不会连带堵死"用户让 AI 帮忙写一个新技能"这条本来就存在的用法，也没有
    确认清楚。**问过用户后决定：暂不实现，留待后续**——这条原则的实现范围本身还需要更明确的设计（至少要先想清楚
    HEARTBEAT.md 和 `skills/` 这两块的写入边界该怎么划），不在本轮仓促拍板。
+   **2026-09-24 用户拍板并实现骨架（Step 8）**：用户的方案是"HEARTBEAT.md 这类核心文件 AI 不能改，另给 AI 一个
+   可以改的非核心辅助文件，辅助文件能改什么由 HEARTBEAT.md 规定死"。辅助文件定名 `HEARTBEAT_DATA.md`；核心文件
+   "全部锁上"。已实现：新增 `src/security/protected_identity_files.rs`（名单：`IDENTITY.md`/`AGENTS.md`/
+   `HEARTBEAT.md`/`SOUL.md`/`USER.md`/`TOOLS.md`/`BOOTSTRAP.md`/`config.toml`，按文件名匹配、大小写不敏感、
+   不论目录层级），接入所有能写文件的工具：`file_write`、`file_edit`（原始路径和解析后路径两层）、`apply_patch`
+   （扫描 diff 的目标文件）、`browser` 截图/PDF 输出、`screenshot`。`HEARTBEAT_DATA.md` 不在名单内，天然可写。
+   **尚未做**（用户选择"先搭骨架"）：① 真实 `资料/HEARTBEAT.md` 迁移到 `<!-- heartbeat-task -->` 声明式格式、把
+   RSS 源清单/死源记录挪进 `HEARTBEAT_DATA.md`；② HEARTBEAT.md 里声明"辅助文件契约"+ tick 时代码校验；
+   ③ `skills/` 目录是否也要锁（与"让 AI 帮忙写技能"用法冲突，仍待用户决定）；④ 五个 `*_config` 工具
+   （`model_routing_config`/`proxy_config`/`web_access_config`/`web_search_config`/`channel_ack_config`）是结构化
+   地改 `config.toml` 的，不受文件名单约束——是否保留给聊天 AI 用待用户决定（见第 11 节）。
 5. **审批不是安全边界，能力收窄才是。** 把危险能力从模型手里拿掉之后，大部分工具可以免审批；只留 `send_email` 这类真正对外的动作需要确认。
 6. **约束弱模型的 prompt，只在对应代码保证做好之后才删。** 不是先删 prompt 再补代码，是反过来。
 7. **不要教 AI"应该做什么"，而要让它做不了不该做的事。** 这条是前 6 条的总纲。
@@ -155,7 +168,7 @@ gemini-3.5-flash: key A → key B → ...
 3. **一次性任务（`at`）无论成功失败都清理**，不再"失败后停用但留在库里"。✅ 已实现（`is_one_shot` 判定不再看 `delete_after_run`）。
 4. **新增"直接发文字"的提醒类型**：到期由代码直接推送，不经过 LLM，不会因为 429/503 而失败，也不会被误判为"已完成"从而消失。✅ 已实现：`JobType::Message`，`cron_add(job_type="message", message="...", delivery=...)`，`delivery` 必填（没地方投递的提醒没意义）。
 5. `cron_list` 只输出精简字段，不把 `last_output`（最长 16KB）整段塞进去。✅ 已实现：`prompt`/`last_output` 截到 200 字符预览+总长度。
-6. 时区默认悉尼，不再是裸 UTC。✅ 已实现：新增 `[cron].default_tz`（默认 `"Australia/Sydney"`），在 `add_shell_job`/`add_agent_job`/`update_job` 三处统一应用。
+6. 时区默认悉尼，不再是裸 UTC。✅ 已实现：新增 `[cron].default_tz`（默认 `"Australia/Sydney"`），在 `add_shell_job`/`add_agent_job`/`update_job` 三处统一应用（`add_shell_job` 已随 Step 7 删除）。
 7. Agent 类型的定时任务失败重试时，不能把已经执行过的工具（发消息、写文件、建任务）重跑一遍。**未实现**——需要 agent loop 暴露"跑到哪一步了"的状态才能根治，属于更大的改动。本轮的 Gemini provider 修复（key 轮换 + 429/503 正确分类，见 §5.4）已经大幅减少了触发这个问题的中途失败次数，作为缓解措施先够用；根治留到后续。
 8. **附带修复**：`cron_run`（手动立即执行）以前只记录运行结果，不投递、不清理一次性任务——手动跑一个提醒之后它还会在原定时间再触发一次。已改为复用 `persist_job_result`，和 scheduler 自动触发走同一条收尾逻辑。
 
@@ -184,6 +197,7 @@ gemini-3.5-flash: key A → key B → ...
    等聊天要用的常规工具）。CLI 渠道不受影响（`effective_excluded_tools` 对 `msg.channel == "cli"` 恒为空）。
    ⚠️ `资料/config.toml` 是 `.gitignore` 忽略的本地部署参考镜像，这处改动**不会随 git push 同步到 K6**，
    需要手动同步到 K6 两个实例的真实 `config.toml` 并重启才会真正生效（详见 dev_log.md 对应条目）。
+   **后续（Step 7）**：shell 整体删除后，`non_cli_excluded_tools` 又改回 `[]`（没有 shell 可隐藏了）。
 2. **cf-crawler、新闻抓取、skill 索引全部做成原生 typed 工具**，代码直接传参启动对应 exe，不经过 shell/bash/PowerShell 现拼命令行，彻底消除 bash 转义 vs PowerShell 语法不一致的问题。
    **已完成（cf-crawler 部分），2026-09-23**：新增 `src/tools/cf_crawler.rs`，实现 `WebHealthTool`/
    `WebScrapeTool`/`WebCrawlTool`/`WebLoginTool` 四个原生 Rust 工具，用 `tokio::process::Command` 直接
@@ -197,7 +211,8 @@ gemini-3.5-flash: key A → key B → ...
    url/goal 参数，验证 argv 直传不需要任何转义（`tokio::process::Command` 走 Windows CreateProcess，
    全程没有 shell 解释这一步，天然没有转义问题）。同步删除了 `SKILL.toml` 里 web_scrape/web_crawl/
    web_login/web_health 四个旧的 shell 版本工具定义（保留 `agent_reach_ensure`/`web_help`，它们没有
-   复杂 JSON 参数，风险低，暂不迁移），移除 `[agents.news_fetcher].allowed_tools` 里的 `"shell"`
+   复杂 JSON 参数，风险低，暂不迁移——**Step 7 删除 shell 桥接层后这两个也一并移除**，SKILL.toml 现为 v0.5.0，
+   只剩提示文字），移除 `[agents.news_fetcher].allowed_tools` 里的 `"shell"`
    （之前作为 web_scrape 不稳定时的兜底，现在根因已消除）。**"新闻抓取"里 shell 依赖已随 cf-crawler
    迁移一并解决**（news_fetcher 唯一用 shell 的地方就是调 cf-crawler）；**"skill 索引"**——审计后发现
    `src/skills/index.rs`/`audit.rs` 本身不调用 shell，这条指的就是 SKILL.toml 的 `kind="shell"` 模板
@@ -247,10 +262,10 @@ gemini-3.5-flash: key A → key B → ...
     (b) 新增 `src/tools/cf_crawler.rs` 四个原生工具替换 cf-crawler 的 shell 模板版本，用本机真实 exe
     做了手动验证（含特殊字符 argv 直传测试），同步精简 `SKILL.toml` 和 `news_fetcher.allowed_tools`。
     第 8 节第 3 条（按任务临时授权 shell 的具体机制）尚未实现，问过用户后明确选择暂不设计、
-    优先级排到 Step 6 之后（见第 8 节第 3 条本身）。
+    优先级排到 Step 6 之后（见第 8 节第 3 条本身）。——**已被 Step 7"彻底移除 shell"取代，不再需要。**
   - **暂缓，原因是改动面比预期大，需要单独一步做**：
     1. `/webhook`、`/whatsapp`、`/linq`、`/wati`、`/nextcloud-talk` 路由删除——调查发现这些会级联到独立的 channel 实现文件（如 `src/channels/whatsapp.rs`/`whatsapp_web.rs`）和 `AppState` 里的多个专属字段，不是单文件自包含改动。
-  - 后续会话按这个顺序继续：第 8 节第 3 条的 shell 按任务授权机制设计（需要先和用户确认 UX 取向，2026-09-23 已问过、用户选择先做 Step 6，见下）；webhook 系路由删除（如果精力允许）。
+  - ~~后续会话按这个顺序继续：第 8 节第 3 条的 shell 按任务授权机制设计……~~（已被 Step 7 取代）；webhook 系路由删除仍暂缓。
 - **Step 6（已完成，2026-09-23）**：清理约束弱模型的旧 prompt——只删已经被对应代码保证覆盖的那部分，不是一次性全删。
   审计范围：本次会话（Step 1-5）新增/移除的功能在 `资料/workers/*.md`、`资料/skills/**/SKILL.{toml,md}` 里留下的过时提示文字
   （全局 `grep` 确认没有遗留对 self_check/check_logs/economic/goals/agents_ipc/openai_compat/`/v1/*` 的引用——这些在 Step
@@ -266,7 +281,8 @@ gemini-3.5-flash: key A → key B → ...
 - **Step 7（已完成，2026-09-23）**：`shell`/`process`/`schedule` 工具彻底移除（第 8 节第 3 条，问题被
   用户"彻底移除shell"的指示直接取代，不再需要按任务授权设计）。同时修了一个借此机会才发现的独立预置
   bug：`agent/loop_/parsing.rs` 的 `map_tool_name_alias()` 把真实存在的 `browser_open`/`browser`/
-  `web_search` 三个工具错误地别名到 `"shell"`（历史遗留，与本次改动无关），导致 LLM 以 GLM 简写格式调用
+  `web_search` 三个工具错误地别名到 `"shell"`（历史遗留，与本次改动无关；**更正（Step 8 复查）**：
+  `web_search` 并不是真实工具名，搜索工具注册名是 `web_search_tool`，现已改为把 `web_search` 别名到它），导致 LLM 以 GLM 简写格式调用
   `browser_open/url>...` 时会被静默改写成裸 `curl` shell 命令执行，完全绕过 `browser_open` 工具自己的
   域名白名单/URL 校验（`validate_url`）——这是本次改动之前就存在的、真实可复现的安全问题（用测试直接
   证明：修复前 `map_tool_name_alias("browser_open")` 返回 `"shell"`），移除 shell 后这个错误映射的后果
@@ -278,6 +294,37 @@ gemini-3.5-flash: key A → key B → ...
   `scientific-tools`/`self-improving`/`skill-evolution-manager`）里假设 shell 可用但现已失效的提示文字
   （这些是 prose-only skill，只影响系统提示词文本，不是可调用工具，未删除，留给后续会话按需处理），
   见 dev_log.md 对应条目。
+- **Step 8（已完成，2026-09-24）**：核心文件写保护骨架（第 3 节第 4 条，详见该条）+ 对 Step 0-7 的整体复查。
+  复查发现并修复的问题：
+  1. **AI 能直接改真实 `config.toml`**：部署配置 `workspace_only = false`，而解析后路径检查只看父目录；
+     `forbidden_paths` 里的 `"config.toml"` 是相对路径，永远匹配不上 `C:\dev\...\config.toml` 这个绝对路径。
+     把 `config.toml` 加进保护名单，回归测试先在去掉保护时确认失败（写入成功），再确认修复后被拦截。
+  2. **截图可以覆盖核心文件**：`screenshot` 工具把文件名直接拼到 workspace 根目录，`browser` 截图/PDF 输出
+     同理——`filename: "HEARTBEAT.md"` 会用 PNG 覆盖它。两处唯一出口都加了保护检查。
+  3. **`web_search_tool` 风险分级一直没生效**：两张分级表写的都是不存在的 `"web_search"`，真实工具
+     `web_search_tool` 于是落到默认 Standard 级，每次搜索都要审批（跟 `AGENTS.md` 要求"不确定就先搜索"直接冲突）。
+     改名 + 新增测试把分级表和工具真实注册名绑定。同时别名表 `web_search` → `web_search_tool`，默认参数改为
+     `query`（原来错配成 `url`）。
+  4. **Shell 残留的提示词**（Step 6 审计漏掉了根目录的核心文件）：每条消息都注入的
+     `Shell: PowerShell. Use python…` 平台提示、系统提示词"允许用 shell 收集信息"、循环中断恢复提示里的
+     "避免 shell 命令"、默认 AIEOS 身份里声明的 `shell` 能力、新工作区脚手架 `TOOLS.md` 里的 shell 条目——全部删除。
+     部署版 `资料/AGENTS.md` 删掉整节"Shell 运行规则"和"Worker Shell 规则管理"（后者**明文要求主 agent 发现
+     worker shell 失败时用 `file_write` 改写 worker 工作手册**，正是"AI 自作主张改 prompt"链路），`资料/TOOLS.md`
+     删掉 shell 条目。
+  5. **提示词里让 AI 改核心文件的指令**（现在会被代码拦截、白白失败）：部署版 `AGENTS.md`/`SOUL.md`/`TOOLS.md`
+     和脚手架模板里的"学到教训就更新 AGENTS.md/TOOLS.md""把学到的写回 USER.md/SOUL.md/IDENTITY.md""删除
+     BOOTSTRAP.md"等全部改为：记到 `MEMORY.md` / 用 `note_add` 记事 / 告诉爸爸由他改。
+  6. **技能提示词还在宣传调不了的工具**：`SKILL.toml` 的 `[[tools]]` 以前会被渲染进系统提示词，但唯一能执行
+     它们的桥接层（仅支持 `kind="shell"`）已随 Step 7 删除——新装的技能会让模型去调"不存在的工具"。不再渲染。
+  7. **解析器里残留的 curl 命令拼接**：`build_curl_command` 和两处 `"shell"` 分支（把 URL 改写成
+     `curl -s '<url>'`）只服务于已删除的 shell 工具，删除。
+  8. **验证了升级安全**：K6 上还没同步的旧 `config.toml`（仍含 `allowed_commands` 等已删字段、工具列表里还有
+     `"shell"`）照样能加载和通过校验，只打"Unknown config key ignored"警告——用临时测试确认后删除。
+  9. **文档更正**：Step 7 的 dev_log 条目误写"本次未改动 `资料/`、无新增同步需求"，实际改了 `资料/config.toml`
+     和 `资料/skills/cf-crawler/SKILL.toml`；K6 手动同步完整清单见 dev_log.md 2026-09-24 条目。
+  **本轮所有步骤此前只跑了 `cargo test --lib`，集成测试（`tests/` 下 24 个）一直没跑过**。这次补跑：230 通过，
+  3 个失败（`agent_loop_robustness` 的循环检测测试，期望旧版的报错行为，而 2026-03 起 elfClaw 改成返回友好提示
+  文字——早于本轮、与本轮无关，未修）。
 
 ## 11. 已发现、暂缓到对应 Step 修复的安全问题
 
@@ -304,6 +351,13 @@ gemini-3.5-flash: key A → key B → ...
   单测里可靠复现（依赖 NTFS 卷是否启用 8.3 别名生成，这点因环境而异，本沙箱环境对符号链接/硬链接相关测试也缺相应权限
   ——是已知的 11 个预置测试失败之一），修复的正确性基于 `tokio::fs::canonicalize()`/Windows API 文档保证的标准行为
   （解析短文件名和符号链接到规范长文件名），不是靠这类场景的直接测试验证。
+- **五个 `*_config` 工具让聊天 AI 能改自己的 `config.toml`（2026-09-24 复查发现，待用户决定）**：
+  `model_routing_config`/`proxy_config`/`web_access_config`/`web_search_config`/`channel_ack_config` 都会直接写回
+  `config.toml`。代码里它们被标为 Restricted（注释写"对非 CLI 渠道隐藏"），但**默认分级只在 `tool_overrides`
+  里点名时才生效**，部署配置又是 `non_cli_excluded_tools = []`，所以 Telegram 上的聊天 AI 实际上能看到并调用它们；
+  部署配置还把 `web_access_config` 放进了 `auto_approve`——意味着 AI 可以免审批地放宽自己的网址白名单。
+  这和第 3 节第 4 条"AI 不能改自己的配置"直接冲突，但删掉它们也会失去"聊天里让 AI 帮忙换模型"之类的用法，
+  属于产品取舍，没有擅自处理。
 - Telegram 相册在跨 `getUpdates` 长轮询批次时可能被拆成两条消息。**Step 4 未处理**——相册分组逻辑需要跨多次 poll 缓冲，改动面比离线消息那个大，且不是用户反馈过的实际痛点，往后放。
 
 ## 12. 密钥与账号管理

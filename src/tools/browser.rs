@@ -1172,6 +1172,15 @@ impl BrowserTool {
         if !self.security.is_path_allowed(trimmed) {
             anyhow::bail!("'{key}' path blocked by security policy: {trimmed}");
         }
+        if crate::security::protected_identity_files::is_protected_identity_file(Path::new(trimmed))
+        {
+            anyhow::bail!(
+                "{}",
+                crate::security::protected_identity_files::protected_identity_file_block_message(
+                    trimmed
+                )
+            );
+        }
         Ok(())
     }
 
@@ -3618,6 +3627,17 @@ mod tests {
         assert!(tool.validate_output_path("path", "../outside.png").is_err());
         assert!(tool
             .validate_output_path("path", "captures/page.png")
+            .is_ok());
+    }
+
+    #[test]
+    fn screenshot_path_validation_blocks_protected_identity_files() {
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = BrowserTool::new(security, vec!["example.com".into()], None);
+        assert!(tool.validate_output_path("path", "HEARTBEAT.md").is_err());
+        assert!(tool.validate_output_path("path", "config.toml").is_err());
+        assert!(tool
+            .validate_output_path("path", "HEARTBEAT_DATA.md")
             .is_ok());
     }
 

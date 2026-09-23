@@ -703,12 +703,13 @@ pub(super) fn map_tool_name_alias(tool_name: &str) -> &str {
         // elfClaw 2026-09-23: shell/bash/sh/exec/command/cmd used to alias to
         // "shell", which no longer exists as a tool (removed entirely —
         // elfclaw.md §8). That old arm also incorrectly caught
-        // "browser_open" | "browser" | "web_search" — three real, still-
-        // existing tools — and rewrote them to "shell" too, silently
-        // misdirecting any LLM call to them into shell execution. Dropping
-        // the whole arm lets all of these fall through to `_ => tool_name`:
-        // shell-ish names now cleanly fail as "tool not found", and the
-        // three real tools resolve to themselves as they should.
+        // "browser_open" | "browser" (real tools) and "web_search" and
+        // rewrote them to "shell", silently misdirecting those calls into
+        // shell execution. Shell-ish names now fall through and cleanly fail
+        // as "tool not found"; browser_open/browser resolve to themselves.
+        // The search tool registers as "web_search_tool", so the common
+        // shorter spelling maps there.
+        "web_search" | "websearch" => "web_search_tool",
         // Messaging variations
         "send_message" | "sendmessage" => "message_send",
         // File tool variations
@@ -723,19 +724,6 @@ pub(super) fn map_tool_name_alias(tool_name: &str) -> &str {
         "http_request" | "http" | "fetch" | "curl" | "wget" => "http_request",
         _ => tool_name,
     }
-}
-
-pub(super) fn build_curl_command(url: &str) -> Option<String> {
-    if !(url.starts_with("http://") || url.starts_with("https://")) {
-        return None;
-    }
-
-    if url.chars().any(char::is_whitespace) {
-        return None;
-    }
-
-    let escaped = url.replace('\'', r#"'\\''"#);
-    Some(format!("curl -s '{}'", escaped))
 }
 
 pub(super) fn parse_glm_style_tool_calls(
@@ -762,23 +750,6 @@ pub(super) fn parse_glm_style_tool_calls(
                     let value = rest[gt_pos + 1..].trim();
 
                     let arguments = match tool_name {
-                        "shell" => {
-                            if param_name == "url" {
-                                let Some(command) = build_curl_command(value) else {
-                                    continue;
-                                };
-                                serde_json::json!({ "command": command })
-                            } else if value.starts_with("http://") || value.starts_with("https://")
-                            {
-                                if let Some(command) = build_curl_command(value) {
-                                    serde_json::json!({ "command": command })
-                                } else {
-                                    serde_json::json!({ "command": value })
-                                }
-                            } else {
-                                serde_json::json!({ "command": value })
-                            }
-                        }
                         "http_request" => {
                             serde_json::json!({"url": value, "method": "GET"})
                         }
@@ -812,18 +783,17 @@ pub(super) fn parse_glm_style_tool_calls(
 /// to. This function encodes the mapping for known ZeroClaw tools.
 pub(super) fn default_param_for_tool(tool: &str) -> &'static str {
     match tool {
-        "shell" | "bash" | "sh" | "exec" | "command" | "cmd" => "command",
         // All file tools default to "path"
         "file_read" | "fileread" | "readfile" | "read_file" | "file" | "file_write"
         | "filewrite" | "writefile" | "write_file" | "file_edit" | "fileedit" | "editfile"
         | "edit_file" | "file_list" | "filelist" | "listfiles" | "list_files" => "path",
-        // Memory recall and forget both default to "query"
+        // Memory recall/forget and web search all default to "query"
         "memory_recall" | "memoryrecall" | "recall" | "memrecall" | "memory_forget"
-        | "memoryforget" | "forget" | "memforget" => "query",
+        | "memoryforget" | "forget" | "memforget" | "web_search" | "websearch"
+        | "web_search_tool" => "query",
         "memory_store" | "memorystore" | "store" | "memstore" => "content",
         // HTTP and browser tools default to "url"
-        "http_request" | "http" | "fetch" | "curl" | "wget" | "browser_open" | "browser"
-        | "web_search" => "url",
+        "http_request" | "http" | "fetch" | "curl" | "wget" | "browser_open" | "browser" => "url",
         _ => "input",
     }
 }
@@ -959,17 +929,6 @@ pub(super) fn parse_glm_shortened_body(body: &str) -> Option<ParsedToolCall> {
     if !value_part.is_empty() {
         let param = default_param_for_tool(tool_raw);
         let arguments = match tool_name {
-            "shell" => {
-                if value_part.starts_with("http://") || value_part.starts_with("https://") {
-                    if let Some(cmd) = build_curl_command(value_part) {
-                        serde_json::json!({ "command": cmd })
-                    } else {
-                        serde_json::json!({ "command": value_part })
-                    }
-                } else {
-                    serde_json::json!({ "command": value_part })
-                }
-            }
             "http_request" => serde_json::json!({"url": value_part, "method": "GET"}),
             _ => serde_json::json!({ param: value_part }),
         };

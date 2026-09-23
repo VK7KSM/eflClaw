@@ -44,6 +44,17 @@ impl ScreenshotTool {
 
     /// Resolve screenshot output path and block writes through symlink targets.
     async fn resolve_output_path_for_write(&self, filename: &str) -> anyhow::Result<PathBuf> {
+        if crate::security::protected_identity_files::is_protected_identity_file(Path::new(
+            filename,
+        )) {
+            anyhow::bail!(
+                "{}",
+                crate::security::protected_identity_files::protected_identity_file_block_message(
+                    filename
+                )
+            );
+        }
+
         tokio::fs::create_dir_all(&self.security.workspace_dir).await?;
 
         let workspace_root = tokio::fs::canonicalize(&self.security.workspace_dir)
@@ -422,6 +433,16 @@ mod tests {
             .unwrap();
         assert!(!result.success);
         assert!(result.error.unwrap().contains("unsafe for shell execution"));
+    }
+
+    #[tokio::test]
+    async fn screenshot_refuses_protected_identity_filename() {
+        let tool = ScreenshotTool::new(test_security());
+        let err = tool
+            .resolve_output_path_for_write("HEARTBEAT.md")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("protected core identity"));
     }
 
     #[test]

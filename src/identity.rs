@@ -81,7 +81,6 @@ pub fn generate_default_aieos_json(agent_name: &str, user_name: &str) -> String 
                 "documentation"
             ],
             "tools": [
-                "shell",
                 "file_read",
                 "file_write"
             ]
@@ -1592,6 +1591,11 @@ mod tests {
             payload["motivations"]["core_drive"],
             "Help Argenis ship high-quality work."
         );
-        assert_eq!(payload["capabilities"]["tools"][0], "shell");
+        assert_eq!(payload["capabilities"]["tools"][0], "file_read");
+        let tools = payload["capabilities"]["tools"].as_array().unwrap();
+        assert!(
+            !tools.iter().any(|t| t == "shell"),
+            "shell tool was removed; the default identity must not advertise it"
+        );
     }
 }

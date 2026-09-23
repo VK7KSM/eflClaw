@@ -5752,7 +5752,7 @@ Skynet（K3 D:\ZeroClaw_Skynet）部署 1250+ Skill 目录，原用 content_sear
 
 ### 顺带修复的独立预置 bug（非本次改动引入，借机发现）
 
-src/agent/loop_/parsing.rs 的 map_tool_name_alias()：曾把 "shell" | "bash" | "sh" | "exec" | "command" | "cmd" | "browser_open" | "browser" | "web_search" 全部映射到 "shell"。这行代码把三个**真实存在、彼此独立**的工具（browser_open——打开经域名白名单校验的 URL；browser——浏览器自动化/抓取；web_search——只读搜索）全部错误地别名成 "shell"。移除 shell 之前，这意味着 LLM 用 GLM 简写格式调用 `browser_open/url>https://...` 时，会被 parse_glm_style_tool_calls/parse_glm_shortened_body 静默改写成 `{"command": "curl -s '...'"}` 并路由给 shell 工具执行——**完全绕过了 browser_open 工具自己的域名白名单和 validate_url 校验**，属于独立于本次改动的真实安全问题（用回归测试直接证明：修复前 map_tool_name_alias("browser_open") 返回 "shell"）。移除 shell 之后，这个错误映射的后果从"静默绕过安全校验去执行任意 curl"变成"报 tool not found: shell 错误"，但连带后果是 browser_open/browser/web_search 三个真实工具本身也被写坏了（调用即失败）。一并修：删除整个别名分支，让这三个名字落回 `_ => tool_name` 兜底分支解析为自身；同时因为 "shell" 已不存在为任何工具的真实名字，bash/sh/exec/command/cmd 这组别名也没有再映射到 "shell" 的意义，一并从别名表移除（现在会干净地报"工具不存在"而不是被误导向一个不存在的目标）。
+src/agent/loop_/parsing.rs 的 map_tool_name_alias()：曾把 "shell" | "bash" | "sh" | "exec" | "command" | "cmd" | "browser_open" | "browser" | "web_search" 全部映射到 "shell"。这行代码把三个**真实存在、彼此独立**的工具（browser_open——打开经域名白名单校验的 URL；browser——浏览器自动化/抓取；web_search——只读搜索）全部错误地别名成 "shell"。（**更正（2026-09-24 复查）**：`web_search` 不是真实工具名，搜索工具注册名是 `web_search_tool`；已改为 `web_search` → `web_search_tool`，见下一条。）移除 shell 之前，这意味着 LLM 用 GLM 简写格式调用 `browser_open/url>https://...` 时，会被 parse_glm_style_tool_calls/parse_glm_shortened_body 静默改写成 `{"command": "curl -s '...'"}` 并路由给 shell 工具执行——**完全绕过了 browser_open 工具自己的域名白名单和 validate_url 校验**，属于独立于本次改动的真实安全问题（用回归测试直接证明：修复前 map_tool_name_alias("browser_open") 返回 "shell"）。移除 shell 之后，这个错误映射的后果从"静默绕过安全校验去执行任意 curl"变成"报 tool not found: shell 错误"，但连带后果是 browser_open/browser/web_search 三个真实工具本身也被写坏了（调用即失败）。一并修：删除整个别名分支，让这三个名字落回 `_ => tool_name` 兜底分支解析为自身；同时因为 "shell" 已不存在为任何工具的真实名字，bash/sh/exec/command/cmd 这组别名也没有再映射到 "shell" 的意义，一并从别名表移除（现在会干净地报"工具不存在"而不是被误导向一个不存在的目标）。
 
 受影响并修复的测试（src/agent/loop_.rs）：map_tool_name_alias_direct_coverage（新增 map_tool_name_alias_preserves_browser_and_web_search 专项回归测试）、parse_glm_style_browser_open_url、parse_glm_style_rejects_non_http_url_param（改名为 parse_glm_style_passes_non_http_url_param_through_for_tool_to_reject，断言从"应生成空调用列表"改为"应生成 browser_open 调用、把 URL 校验交给工具自己做"）、parse_glm_style_tool_call_integration、parse_glm_shortened_body_browser_open_maps_to_shell_command（改名为 parse_glm_shortened_body_browser_open_resolves_to_browser_open_tool）。
 
@@ -5779,4 +5779,76 @@ src/agent/loop_/parsing.rs 的 map_tool_name_alias()：曾把 "shell" | "bash" |
 
 - 纯删除 + 收窄枚举，无新增行为；回滚只需 git revert 本次 commit。
 - SQLite 迁移（job_type='shell' → 'agent'）是幂等的 UPDATE，重复执行无副作用；K6 生产库首次启动新版本时会自动跑这条迁移，之后不再需要手动干预。
-- 资料/config.toml/资料/skills/** 本次会话未改动（上一轮会话已完成对应部分），本条无新增的手动同步需求。
+- ~~资料/config.toml/资料/skills/** 本次会话未改动（上一轮会话已完成对应部分），本条无新增的手动同步需求。~~
+  **更正（2026-09-24 复查）**：这句是错的。Step 7 实际改了 `资料/config.toml`（删 `allowed_commands`/
+  `require_approval_for_medium_risk`/`block_high_risk_commands`/`shell_env_passthrough`，`non_cli_excluded_tools`
+  改回 `[]`，`[security.otp].gated_actions` 去掉 `"shell"`）和 `资料/skills/cf-crawler/SKILL.toml`（v0.5.0，删掉
+  最后两个 `kind="shell"` 工具）。两者都需要手动同步到 K6，完整清单见下一条。
+
+---
+
+## 2026-09-24 — Step 8：核心文件写保护骨架 + Step 0-7 整体复查修复
+
+### 背景
+
+用户对 elfclaw.md §3 第 4 条"AI 不能改自己的配置文件"给出方案：HEARTBEAT.md 这类核心文件 AI 不能改，另给一个 AI 可以改的非核心辅助文件（定名 `HEARTBEAT_DATA.md`），辅助文件能改什么由 HEARTBEAT.md 规定死；核心文件"全部锁上"，"先搭骨架"。随后用户要求"把该做的都做完，然后回顾开发文档，认真检查本次开发是否按计划高质量完成，发现问题就改正"。
+
+### 一、核心文件写保护（骨架）
+
+- 新增 `src/security/protected_identity_files.rs`：名单 `IDENTITY.md`/`AGENTS.md`/`HEARTBEAT.md`/`SOUL.md`/`USER.md`/`TOOLS.md`/`BOOTSTRAP.md`（`src/onboard/wizard.rs` 脚手架用的 OpenClaw 标准名单）+ `config.toml`。按文件名匹配，大小写不敏感，不论目录层级（与既有的 `sensitive_paths.rs` 同一套路）。`HEARTBEAT_DATA.md` 不在名单里，天然可写。
+- 接入所有能写文件的工具（先 grep 了 `src/tools/` 全部生产代码里的 `fs::write`/`File::create` 等写入点逐个核对）：
+  - `file_write`：路径预检查处。
+  - `file_edit`：原始路径 + 符号链接解析后路径两层（与它原有的敏感文件检查同一位置）。
+  - `apply_patch`：这个工具没有 `path` 参数、此前**完全没有任何路径保护**；新增扫描 diff 里 `--- a/`、`+++ b/` 目标文件名，命中就在跑 `git apply` 之前拒绝。
+  - `browser` 截图/PDF 输出（唯一出口 `validate_output_path`）、`screenshot`（唯一出口 `resolve_output_path_for_write`）：两者都能把文件写到 workspace 根目录，`filename: "HEARTBEAT.md"` 会用 PNG 覆盖真文件。
+  - 核对后无需处理：`source_sync`（只把固定白名单仓库解压进自己的沙箱子目录，内容不受模型控制）、`git_operations`（`checkout` 只切分支，且 K6 workspace 不是 git 仓库）。`heartbeat_decl.rs` 的 reconcile 是代码直接读文件，不经过这些工具，不受影响。
+- **`config.toml` 为什么按文件名保护**：部署配置 `workspace_only = false`，而 `is_resolved_path_allowed` 只检查父目录；`forbidden_paths` 里的 `"config.toml"` 是相对路径，永远匹配不上 `C:\dev\elfClaw\...\config.toml` 这个绝对路径——**聊天 AI 此前可以直接 `file_write` 真实的 `config.toml`**。回归测试 `file_write_blocks_real_config_toml_outside_workspace` 模拟部署目录结构，先写一个同目录的 `other.toml` 证明该目录本来可达，再证明 `config.toml` 被拦截；并在临时去掉名单里的 `config.toml` 时确认测试失败（写入成功），恢复后通过。
+
+### 二、复查发现并修复的问题
+
+1. **`web_search_tool` 的风险分级从来没生效**：`tool_risk_tier()` 和 `default_tool_risk_tiers()` 写的都是 `"web_search"`，但工具实际注册名是 `"web_search_tool"`——Safe 级没套上，落到 Standard，每次搜索都要审批（与 AGENTS.md"不确定就先用 web_search_tool 搜"直接冲突）。两处改名；新增测试 `web_search_risk_tier_matches_registered_tool_name` 直接从注册出来的工具取名字去查分级表，以后改名会立刻被抓到。另用脚本把两张分级表的全部条目和全部工具真实名字做了对照，只有这一处错（`cli_discovery` 只在展示用的表里、不是注册工具，无害）。
+2. **我在 Step 7 犯的错**：修 `map_tool_name_alias()` 时把 `web_search` 当成真实工具、映射到自己（其实是不存在的名字）。改为 `web_search`/`websearch` → `web_search_tool`；`default_param_for_tool` 里搜索工具的默认参数从 `url` 改为 `query`（`web_search_tool` 的 schema 只有 `query`）。别名表另有 `file_list`/`message_send` 两个不存在的目标（上游遗留），只会得到"找不到工具"、不会误导到别的工具，也没有参数对得上的等价工具可映射，未改。
+3. **Shell 残留的提示词和代码**（Step 6 只审计了 `workers/*.md` 和 skills，漏了根目录核心文件和代码内置提示词）：
+   - `channels/mod.rs`：每条消息都注入的 `Shell: PowerShell. Use python (not python3)…` 平台提示删除；部署模式提示里"ALLOWED: Using shell commands for information gathering"删除，改为说明哪些核心文件只读、数据写 `HEARTBEAT_DATA.md`；循环中断恢复提示"避免 shell 命令"改为"优先使用只读工具"。
+   - `identity.rs`：默认 AIEOS 身份 JSON 的 `capabilities.tools` 去掉 `shell`。
+   - `onboard/wizard.rs`：新工作区 `TOOLS.md` 模板去掉 shell 条目；`AGENTS.md` 模板去掉 `trash > rm`。
+   - `agent/loop_/parsing.rs`：删除 `build_curl_command()` 和两处 `"shell"` 分支（把 URL 改写成 `curl -s '<url>'` 命令字符串），`default_param_for_tool` 去掉 shell 组。4 个只是拿 `shell>…` 当解析格式示例的测试改用真实工具（`memory_recall`/`file_read`）；`parse_glm_shortened_body_url_to_curl` 改为 `…_never_synthesizes_curl_command`，锁定"不再拼 curl"。
+   - `tools/mod.rs`：分级表里两处"shell cmds validated independently"、`cron_run` 的"command execution"过时注释更正。
+4. **技能提示词宣传调不了的工具**：`skills/mod.rs` 把 `SKILL.toml` 的 `[[tools]]` 渲染进系统提示词（`<tools><tool><kind>shell</kind>…`），但唯一能执行它们的 `tool_handler.rs`（且只支持 `kind="shell"`）已在 Step 7 删除——新装的技能会让模型去调"不存在的工具"。不再渲染；5 个断言渲染内容的测试改为断言"不渲染"。（部署版技能目前都没有 `[[tools]]`，属防患于未然。）
+5. **让 AI 改核心文件的指令**（代码层已拦截，留着只会让 AI 白白撞墙）：`wizard.rs` 脚手架模板里"学到教训就更新 AGENTS.md/TOOLS.md""Update this file as you evolve""Update these files with what you learned""Delete this file""Make It Yours: Add your own conventions"等，全部改为"核心文件由用户维护、对你只读、有建议告诉用户"，教训记到 `MEMORY.md` 或 `memory_store`。
+6. **升级安全验证**：K6 上还没手动同步的旧 `config.toml` 仍含已删字段（`allowed_commands` 原先是**必填**字段，所以每份真实配置里都有）和工具列表里的 `"shell"`。确认 `AutonomyConfig` 没有 `deny_unknown_fields`，未知键只经 `serde_ignored` 打警告；`validate()` 对 `gated_actions`/`allowed_tools` 只做语法检查。写了临时集成测试（含全部已删字段 + `"shell"` 出现在三处列表）确认能反序列化且通过 `validate()`，已删除。
+7. **集成测试补跑**：本轮 Step 0-7 一直只跑 `cargo test --lib`，`tests/` 下的 24 个集成测试从没编译过。补跑：全部能编译；230 通过，3 失败——`agent_loop_robustness` 的 `loop_detection_*` 三个测试期望 `turn()` 返回含 "detected loop pattern" 的错误，而 elfClaw 自 2026-03（`290ad87ca`/`ea884ed5d`）起改成返回"⚠️ [循环检测：已停止…"友好文字、源码里已无该字符串——早于本轮、与本轮无关，未修，记录在案。
+8. **clippy 核对方法本身有 bug**：之前用路径 grep 筛"改动文件里的 clippy 错误"，但 clippy 在 Windows 输出反斜杠路径，正则转义写错时会**静默返回空**（看起来像"零新增"）。这次改成两种可靠方法：① 逐文件统计错误数与改动前对比；② 对每个 clippy 报错行跑 `git blame`，看是否落在 Step 7 提交或未提交改动上（先用已知的一行新代码、一行 Step 7 代码做正例验证方法有效）。结果：本轮一开始确实新增了 2 个（`parsing.rs` 的 `match_same_arms`、`skills/mod.rs` 的 `collapsible_if`），已修；Step 7 提交经 blame 核对确实零新增。
+
+### 三、部署文件（`资料/`，`.gitignore` 忽略，不随 push 同步）
+
+- `资料/AGENTS.md`：删除整节"### Shell 运行规则"和"### Worker Shell 规则管理"（173 → 114 行）。后者**明文要求主 agent 发现 worker shell 失败时用 `file_write` 改写 `workers/<name>.md`**——正是"AI 自作主张改 prompt"的投诉链路写成了制度。"学到教训更新 AGENTS.md/TOOLS.md"改为写 `MEMORY.md`；删掉 `trash > rm`、"Keep local notes in TOOLS.md"；"Make It Yours"改为"文件归属：本文件由爸爸维护，对你只读"。
+- `资料/TOOLS.md`：删 shell 条目；结尾"This is your cheat sheet"改为"本文件由爸爸维护，对你只读"。
+- `资料/SOUL.md`："持续进化"一节原本要求把学到的东西写回 `USER.md`/本文件/`IDENTITY.md`，改为：偏好记 `MEMORY.md`，日程提醒用 `note_add`（Step 3 的代码驱动提醒），身份/风格调整告诉爸爸。
+- `资料/config.toml`：`auto_approve` 删掉两个已不存在的工具 `web_help`/`agent_reach_ensure`，`"web_search"` 改成真实名字 `"web_search_tool"`。
+
+### ⚠️ K6 手动同步清单（本轮 Step 5-8 全部 `资料/` 改动汇总，两个实例都要核对）
+
+| 本地文件 | 同步到 K6 | 来自 |
+|---|---|---|
+| `资料/config.toml` | 两个实例各自的 `config.toml`（**按字段合并，不要整文件覆盖**——两个实例配置不同，且含密钥） | Step 5/7/8 |
+| `资料/skills/cf-crawler/SKILL.toml` | 两个实例 `workspace\skills\cf-crawler\` | Step 5/7 |
+| `资料/workers/news_fetcher.md` | 两个实例 `workspace\workers\` | Step 6 |
+| `资料/AGENTS.md`、`资料/TOOLS.md`、`资料/SOUL.md` | 两个实例 `workspace\` 根目录 | Step 8 |
+
+同步后重启两个实例；首次启动新版本会自动跑 `cron_jobs.job_type 'shell' → 'agent'` 迁移（Step 7）。
+
+### 验证
+
+- `cargo test --lib`：4055 passed，10 failed（与本轮基线完全相同的 10 个：5 个 Windows 符号链接/硬链接权限、`security::policy` 两个 Unix 路径语义、`runtime::wasm`、`tools::screenshot::screenshot_command_contains_output_path`、`channels::tests::e2e_failed_vision_turn_*`，均在本次未触碰或无关区域）。
+- `cargo test --no-fail-fast --test '*'`：230 passed，3 failed（上述预置的循环检测测试）。
+- 偶发失败：`channels::tests::message_dispatch_processes_messages_in_parallel` 是墙钟计时断言（两个 250ms 任务须在 430ms 内并行完成），全量跑时机器负载高会超时。单独跑 10/10 通过；把本轮改动 stash 掉、在 HEAD 上同样全量跑 5 次也失败 1 次——确认是预置的计时脆弱测试，与本轮无关，未改。
+- `cargo clippy`：与改动前逐文件错误数一致；`git blame` 核对无报错行落在 Step 7 或本轮改动上。
+- `cargo fmt --all`：跑后撤销无关文件的历史格式漂移，只保留本次改动文件。
+
+### 未做，留待用户决定
+
+1. 真实 `HEARTBEAT.md` 迁移到 `<!-- heartbeat-task -->` 格式，RSS 源清单/死源记录挪到 `HEARTBEAT_DATA.md`；HEARTBEAT.md 声明"辅助文件契约"+ 代码校验（用户选择先搭骨架）。
+2. `skills/` 目录是否也锁（与"让 AI 帮忙写技能"冲突）；`workers/*.md`（子 agent 工作手册，本质也是 prompt）是否也锁——不在 §3 第 4 条原始名单里。
+3. 五个 `*_config` 工具能结构化地改 `config.toml`，不受文件名单约束，且 Restricted 默认分级实际没生效、`web_access_config` 在部署配置里免审批（见 elfclaw.md §11）。
+4. `src/security/syscall_anomaly.rs`（678 行）生产代码已无调用方（Step 7 遗留）。

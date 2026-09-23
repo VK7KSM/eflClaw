@@ -181,10 +181,10 @@ pub fn tool_risk_tier(name: &str) -> ToolRiskTier {
         | "search_chat_log" | "bg_status"
         | "subagent_list" | "delegate_coordination_status"
         | "screenshot" | "cli_discovery"
-        | "web_search"                      // read-only search
+        | "web_search_tool"                 // read-only search
         | "web_health" | "web_scrape" | "web_crawl" // read-only cf-crawler calls
         | "cron_add" | "cron_remove" | "cron_update"
-        | "note_add" | "note_list" | "note_done" => ToolRiskTier::Safe, // metadata only; shell cmds validated independently
+        | "note_add" | "note_list" | "note_done" => ToolRiskTier::Safe, // metadata only
 
         // Sensitive: write operations, network access
         "file_write" | "file_edit" | "apply_patch"
@@ -233,7 +233,7 @@ pub fn default_tool_risk_tiers() -> HashMap<&'static str, ToolRiskTier> {
         ("cron_list", Safe),
         ("cron_runs", Safe),
         ("search_chat_log", Safe),
-        ("web_search", Safe), // read-only search, no side effects
+        ("web_search_tool", Safe), // read-only search, no side effects
         // elfClaw 2026-09-23: native cf-crawler tools (elfclaw.md §8 point 2).
         // health/scrape/crawl are read-only network calls, same tier as web_search.
         // web_login is deliberately left at Standard (default supervised approval)
@@ -241,7 +241,7 @@ pub fn default_tool_risk_tiers() -> HashMap<&'static str, ToolRiskTier> {
         ("web_health", Safe),
         ("web_scrape", Safe),
         ("web_crawl", Safe),
-        ("cron_add", Safe), // scheduling only; shell commands validated independently
+        ("cron_add", Safe), // scheduling only (agent/message jobs; shell jobs no longer exist)
         ("cron_remove", Safe), // metadata-only operation
         ("cron_update", Safe), // metadata-only operation
         // elfClaw 2026-09-23: notes are purely local, no side effects outside
@@ -262,7 +262,7 @@ pub fn default_tool_risk_tiers() -> HashMap<&'static str, ToolRiskTier> {
         ("browser", Restricted),
         ("browser_open", Restricted),
         ("http_request", Restricted),
-        ("cron_run", Restricted), // immediate command execution — keep Restricted
+        ("cron_run", Restricted), // immediate agent-job execution — keep Restricted
         ("memory_store", Restricted),
         ("memory_forget", Restricted),
         ("proxy_config", Restricted),
@@ -954,6 +954,49 @@ mod tests {
         assert!(names.contains(&"web_access_config"));
         assert!(names.contains(&"web_search_config"));
         assert!(names.contains(&"openclaw_migration"));
+    }
+
+    #[test]
+    fn web_search_risk_tier_matches_registered_tool_name() {
+        // elfClaw 2026-09-24: both tier tables used to say "web_search", but
+        // the tool registers as "web_search_tool" — so its intended Safe tier
+        // never applied and every search needed approval.
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(crate::memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+        let mut cfg = test_config(&tmp);
+        cfg.web_search.enabled = true;
+
+        let tools = all_tools(
+            Arc::new(Config::default()),
+            &security,
+            mem,
+            None,
+            None,
+            &BrowserConfig::default(),
+            &crate::config::HttpRequestConfig::default(),
+            &crate::config::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+        );
+        let search_name = tools
+            .iter()
+            .map(|t| t.name())
+            .find(|n| n.starts_with("web_search") && *n != "web_search_config")
+            .expect("web search tool should be registered when enabled");
+
+        assert_eq!(
+            default_tool_risk_tiers().get(search_name),
+            Some(&ToolRiskTier::Safe)
+        );
+        assert_eq!(tool_risk_tier(search_name), ToolRiskTier::Safe);
     }
 
     #[test]
