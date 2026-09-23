@@ -134,7 +134,17 @@ gemini-3.5-flash: key A → key B → ...
 **还没做**（按影响排序，后续步骤补）：
 
 1. **503（模型过载）目前还是会把一个模型的所有 key 都试一遍才换模型**，没有做"503 直接跳过剩余 key、换模型"的优化。不是正确性问题（迟早会换到下一个模型），只是慢——每个耗尽的 key 上还要等一次退避。
-2. **"整条池子都耗尽"目前只会抛一个聚合错误**，还没有在 `channels/mod.rs` 接一层"识别到全部是配额/频率错误 → 回复用户'今天额度用完了'"的转换。现在用户看到的还是原始错误堆栈。
+2. ~~"整条池子都耗尽"目前只会抛一个聚合错误~~ **已修复，2026-09-23**：`src/providers/traits.rs` 新增结构化错误
+   `AllProvidersRateLimitedError`（`thiserror` 派生，和已有的 `ProviderCapabilityError` 同一模式）。
+   `src/providers/reliable.rs` 新增共享的 `finalize_all_failed(failures, all_rate_limited)`：`chat_with_system`/
+   `chat_with_history`/`chat_with_tools`/`chat` 四个方法都在失败循环里额外用一个 `all_rate_limited` 布尔做 AND
+   累积（每次失败调用已有的 `is_rate_limited()` 分类结果），链路耗尽时统一走这个函数——**全部**尝试都是 429
+   （日额度耗尽或每分钟限流，不管是哪种）才返回结构化错误，混了任何一个非限流的真实失败（bug/鉴权/网络问题）都
+   仍然走原来的原始聚合错误，不会被误判成"只是配额问题"而掩盖真正的故障。`channels/mod.rs` 新增
+   `user_facing_llm_error_message()`，对这个结构化错误显示"今天的额度用完了，明天再试"，其他情况显示已脱敏的
+   `safe_error`（顺带修了一个相邻 bug：原来这里已经算出 `safe_error` 却没用上，直接把未脱敏的原始 `{e}` 显示给
+   用户）。新增测试：`reliable.rs` 2 个（全部限流 → 结构化错误；限流+真实错误混合 → 不构造结构化错误）、
+   `channels/mod.rs` 2 个（消息选择逻辑的直接单测，不依赖完整 e2e 管道）。
 3. **额度耗尽状态没有持久化**：现在完全靠"live 请求时判定 429/503，当场跳过"，不需要单独的计数器就能正确工作（耗尽的 key 每次被试到都会很快拿到同样的 429 并跳过，不会重试），但每轮对话仍然会为每个已耗尽的 key/模型多花一次请求去确认"确实还没恢复"。加一个磁盘持久化的"跳过到什么时候"状态是优化项，不是必须项。
 4. `资料/config.toml` 已经按上面的方案更新（`default_model`/`summary_model`/`worker_model` 换成新模型池，`[reliability.model_fallbacks]` 填好两条链），但 `api_keys = []` 还是空的——等用户建好额外的 Google 项目和 key 再填进去。
 

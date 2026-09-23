@@ -1,5 +1,6 @@
 use super::traits::{
-    ChatMessage, ChatRequest, ChatResponse, StreamChunk, StreamOptions, StreamResult,
+    AllProvidersRateLimitedError, ChatMessage, ChatRequest, ChatResponse, StreamChunk,
+    StreamOptions, StreamResult,
 };
 use super::Provider;
 use async_trait::async_trait;
@@ -248,6 +249,26 @@ fn compact_error_detail(err: &anyhow::Error) -> String {
         .join(" ")
 }
 
+/// elfClaw 2026-09-23 (elfclaw.md §5.4 item 2): build the final error once the
+/// whole model/provider/key fallback chain is exhausted. Returns a structured
+/// `AllProvidersRateLimitedError` when every attempt failed with a 429 —
+/// letting the channel layer show a clean "今天额度用完了" message — or the
+/// original raw aggregated-attempts error otherwise (a genuine bug, auth
+/// failure, or network error must never be disguised as "just rate limited").
+fn finalize_all_failed(failures: Vec<String>, all_rate_limited: bool) -> anyhow::Error {
+    if all_rate_limited && !failures.is_empty() {
+        return AllProvidersRateLimitedError {
+            attempt_count: failures.len(),
+            details: failures.join("\n"),
+        }
+        .into();
+    }
+    anyhow::anyhow!(
+        "All providers/models failed. Attempts:\n{}",
+        failures.join("\n")
+    )
+}
+
 fn push_failure(
     failures: &mut Vec<String>,
     provider_name: &str,
@@ -411,6 +432,7 @@ impl Provider for ReliableProvider {
     ) -> anyhow::Result<String> {
         let models = self.model_chain(model);
         let mut failures = Vec::new();
+        let mut all_rate_limited = true;
 
         // Outer: model fallback chain. Middle: provider priority. Inner: retries.
         // Each iteration: attempt one (provider, model) call. On success, return
@@ -445,6 +467,7 @@ impl Provider for ReliableProvider {
                                 let non_retryable =
                                     is_non_retryable(&e) || non_retryable_rate_limit;
                                 let rate_limited = is_rate_limited(&e);
+                                all_rate_limited = all_rate_limited && rate_limited;
                                 let failure_reason = failure_reason(rate_limited, non_retryable);
                                 let error_detail = compact_error_detail(&e);
 
@@ -511,10 +534,7 @@ impl Provider for ReliableProvider {
             }
         }
 
-        anyhow::bail!(
-            "All providers/models failed. Attempts:\n{}",
-            failures.join("\n")
-        )
+        Err(finalize_all_failed(failures, all_rate_limited))
     }
 
     async fn chat_with_history(
@@ -525,6 +545,7 @@ impl Provider for ReliableProvider {
     ) -> anyhow::Result<String> {
         let models = self.model_chain(model);
         let mut failures = Vec::new();
+        let mut all_rate_limited = true;
 
         for current_model in &models {
             for (provider_index, (provider_name, provider)) in self.providers.iter().enumerate() {
@@ -555,6 +576,7 @@ impl Provider for ReliableProvider {
                                 let non_retryable =
                                     is_non_retryable(&e) || non_retryable_rate_limit;
                                 let rate_limited = is_rate_limited(&e);
+                                all_rate_limited = all_rate_limited && rate_limited;
                                 let failure_reason = failure_reason(rate_limited, non_retryable);
                                 let error_detail = compact_error_detail(&e);
 
@@ -613,10 +635,7 @@ impl Provider for ReliableProvider {
             }
         }
 
-        anyhow::bail!(
-            "All providers/models failed. Attempts:\n{}",
-            failures.join("\n")
-        )
+        Err(finalize_all_failed(failures, all_rate_limited))
     }
 
     fn supports_native_tools(&self) -> bool {
@@ -643,6 +662,7 @@ impl Provider for ReliableProvider {
     ) -> anyhow::Result<ChatResponse> {
         let models = self.model_chain(model);
         let mut failures = Vec::new();
+        let mut all_rate_limited = true;
 
         for current_model in &models {
             for (provider_index, (provider_name, provider)) in self.providers.iter().enumerate() {
@@ -673,6 +693,7 @@ impl Provider for ReliableProvider {
                                 let non_retryable =
                                     is_non_retryable(&e) || non_retryable_rate_limit;
                                 let rate_limited = is_rate_limited(&e);
+                                all_rate_limited = all_rate_limited && rate_limited;
                                 let failure_reason = failure_reason(rate_limited, non_retryable);
                                 let error_detail = compact_error_detail(&e);
 
@@ -731,10 +752,7 @@ impl Provider for ReliableProvider {
             }
         }
 
-        anyhow::bail!(
-            "All providers/models failed. Attempts:\n{}",
-            failures.join("\n")
-        )
+        Err(finalize_all_failed(failures, all_rate_limited))
     }
 
     async fn chat(
@@ -745,6 +763,7 @@ impl Provider for ReliableProvider {
     ) -> anyhow::Result<ChatResponse> {
         let models = self.model_chain(model);
         let mut failures = Vec::new();
+        let mut all_rate_limited = true;
 
         for current_model in &models {
             for (provider_index, (provider_name, provider)) in self.providers.iter().enumerate() {
@@ -776,6 +795,7 @@ impl Provider for ReliableProvider {
                                 let non_retryable =
                                     is_non_retryable(&e) || non_retryable_rate_limit;
                                 let rate_limited = is_rate_limited(&e);
+                                all_rate_limited = all_rate_limited && rate_limited;
                                 let failure_reason = failure_reason(rate_limited, non_retryable);
                                 let error_detail = compact_error_detail(&e);
 
@@ -842,10 +862,7 @@ impl Provider for ReliableProvider {
             }
         }
 
-        anyhow::bail!(
-            "All providers/models failed. Attempts:\n{}",
-            failures.join("\n")
-        )
+        Err(finalize_all_failed(failures, all_rate_limited))
     }
 
     fn supports_streaming(&self) -> bool {
@@ -1116,6 +1133,90 @@ mod tests {
         assert!(msg.contains("error=p1 error"));
         assert!(msg.contains("error=p2 error"));
         assert!(msg.contains("retryable"));
+    }
+
+    // elfClaw 2026-09-23 (elfclaw.md §5.4 item 2): when every attempt across
+    // the whole fallback chain fails with a 429, the caller (channels/mod.rs)
+    // should be able to detect that cleanly via downcast rather than having
+    // to string-match the aggregated error text.
+    #[tokio::test]
+    async fn all_providers_rate_limited_produces_structured_error() {
+        let provider = ReliableProvider::new(
+            vec![
+                (
+                    "p1".into(),
+                    Box::new(MockProvider {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        fail_until_attempt: usize::MAX,
+                        response: "never",
+                        error: "429 Too Many Requests: rate limit exceeded",
+                    }),
+                ),
+                (
+                    "p2".into(),
+                    Box::new(MockProvider {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        fail_until_attempt: usize::MAX,
+                        response: "never",
+                        error: "429 rate limit exceeded",
+                    }),
+                ),
+            ],
+            0,
+            1,
+        );
+
+        let err = provider
+            .simple_chat("hello", "test", 0.0)
+            .await
+            .expect_err("all providers should fail");
+        let quota_err = err
+            .downcast_ref::<AllProvidersRateLimitedError>()
+            .expect("error should downcast to AllProvidersRateLimitedError");
+        assert_eq!(quota_err.attempt_count, 2);
+        assert!(quota_err.details.contains("provider=p1"));
+        assert!(quota_err.details.contains("provider=p2"));
+    }
+
+    // A genuine failure mixed in with rate-limited ones must NOT be reported
+    // as "just quota" — that would hide a real bug/outage behind a misleading
+    // "today's quota is used up" message.
+    #[tokio::test]
+    async fn mixed_rate_limited_and_genuine_error_does_not_produce_structured_error() {
+        let provider = ReliableProvider::new(
+            vec![
+                (
+                    "p1".into(),
+                    Box::new(MockProvider {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        fail_until_attempt: usize::MAX,
+                        response: "never",
+                        error: "429 rate limit exceeded",
+                    }),
+                ),
+                (
+                    "p2".into(),
+                    Box::new(MockProvider {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        fail_until_attempt: usize::MAX,
+                        response: "never",
+                        error: "500 internal server error",
+                    }),
+                ),
+            ],
+            0,
+            1,
+        );
+
+        let err = provider
+            .simple_chat("hello", "test", 0.0)
+            .await
+            .expect_err("all providers should fail");
+        assert!(
+            err.downcast_ref::<AllProvidersRateLimitedError>().is_none(),
+            "a genuine non-rate-limit failure must not be disguised as quota-exhausted"
+        );
+        assert!(err.to_string().contains("All providers/models failed"));
     }
 
     #[test]

@@ -87,8 +87,8 @@ pub use whatsapp::WhatsAppChannel;
 pub use whatsapp_web::WhatsAppWebChannel;
 pub use xiaozhi::XiaozhiChannel;
 
-use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop, scrub_credentials};
 use crate::agent::loop_::detection::LoopDetectionConfig;
+use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop, scrub_credentials};
 use crate::config::Config;
 use crate::identity;
 use crate::memory::{self, Memory};
@@ -611,7 +611,6 @@ fn build_runtime_status_section(config: &crate::config::Config) -> String {
          and these changes require the administrator to edit files and restart the service.\n"
     );
 
-
     section
 }
 
@@ -882,10 +881,7 @@ async fn handle_approval_command_if_needed(
 
     if let Some(channel) = target_channel {
         let _ = channel
-            .send(
-                &SendMessage::new(reply, &msg.reply_target)
-                    .in_thread(msg.thread_ts.clone()),
-            )
+            .send(&SendMessage::new(reply, &msg.reply_target).in_thread(msg.thread_ts.clone()))
             .await;
     }
 
@@ -1161,6 +1157,23 @@ fn append_sender_turn(ctx: &ChannelRuntimeContext, sender_key: &str, turn: ChatM
     turns.push(turn);
     while turns.len() > MAX_CHANNEL_HISTORY {
         turns.remove(0);
+    }
+}
+
+/// elfClaw 2026-09-23 (elfclaw.md §5.4 item 2): pick the text shown to the
+/// user for a failed LLM call. When `e` is an `AllProvidersRateLimitedError`
+/// (every provider/model/key in the fallback chain hit a 429), show a clean
+/// Chinese "quota used up" message instead of the raw multi-attempt failure
+/// dump. Any other failure (a real bug, auth error, network error) shows
+/// `safe_error` — the already-sanitized text — never the raw `e`, which may
+/// embed unsanitized upstream text.
+fn user_facing_llm_error_message(e: &anyhow::Error, safe_error: &str) -> String {
+    if e.downcast_ref::<providers::AllProvidersRateLimitedError>()
+        .is_some()
+    {
+        "⚠️ 今天的额度用完了，明天再试，或者检查一下 API key 配置。".to_string()
+    } else {
+        format!("⚠️ Error: {safe_error}")
     }
 }
 
@@ -2124,8 +2137,7 @@ async fn process_channel_message(
             use std::collections::HashSet;
             let mut seen = HashSet::new();
             system_prompt.push_str("\n\n## 已学习的纠错规则\n\n");
-            system_prompt
-                .push_str("以下是从过往对话中学到的纠错。遇到相关场景时必须遵守：\n\n");
+            system_prompt.push_str("以下是从过往对话中学到的纠错。遇到相关场景时必须遵守：\n\n");
             let mut count = 0;
             for entry in &corrections {
                 let normalized = entry.content.trim().to_lowercase();
@@ -2795,10 +2807,19 @@ async fn process_channel_message(
                         channel_safety_hb.as_ref(),
                         None,
                         Some(LoopDetectionConfig {
-                            no_progress_threshold: ctx.config.agent.loop_detection_no_progress_threshold,
+                            no_progress_threshold: ctx
+                                .config
+                                .agent
+                                .loop_detection_no_progress_threshold,
                             ping_pong_cycles: ctx.config.agent.loop_detection_ping_pong_cycles,
-                            failure_streak_threshold: ctx.config.agent.loop_detection_failure_streak,
-                            total_failure_budget: ctx.config.agent.loop_detection_total_failure_budget,
+                            failure_streak_threshold: ctx
+                                .config
+                                .agent
+                                .loop_detection_failure_streak,
+                            total_failure_budget: ctx
+                                .config
+                                .agent
+                                .loop_detection_total_failure_budget,
                             ..Default::default()
                         }),
                     )
@@ -2891,15 +2912,16 @@ async fn process_channel_message(
                         ChatMessage::assistant("[Task failed — not continuing this request]"),
                     );
                 }
+                let user_facing_error = user_facing_llm_error_message(&e, &safe_error);
                 if let Some(channel) = target_channel.as_ref() {
                     if let Some(ref draft_id) = draft_message_id {
                         let _ = channel
-                            .finalize_draft(&msg.reply_target, draft_id, &format!("⚠️ Error: {e}"))
+                            .finalize_draft(&msg.reply_target, draft_id, &user_facing_error)
                             .await;
                     } else {
                         let _ = channel
                             .send(
-                                &SendMessage::new(format!("⚠️ Error: {e}"), &msg.reply_target)
+                                &SendMessage::new(user_facing_error, &msg.reply_target)
                                     .in_thread(msg.thread_ts.clone()),
                             )
                             .await;
@@ -4443,7 +4465,9 @@ pub async fn start_channels(config: Config) -> Result<()> {
         chat_log_config: config.chat_log.clone(),
         worker_model: config.worker_model.clone(), // elfClaw
         config: Arc::new(config.clone()), // elfClaw: full config for runtime status injection
-        approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(&config.autonomy)), // elfClaw: non-CLI tool approval
+        approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(
+            &config.autonomy,
+        )), // elfClaw: non-CLI tool approval
     });
 
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
@@ -4467,6 +4491,28 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use tempfile::TempDir;
+
+    #[test]
+    fn user_facing_llm_error_message_shows_friendly_text_for_quota_exhaustion() {
+        let err: anyhow::Error = providers::AllProvidersRateLimitedError {
+            attempt_count: 4,
+            details: "provider=p1 model=m attempt 1/1: rate_limited; error=429 rate limit"
+                .to_string(),
+        }
+        .into();
+        let shown = user_facing_llm_error_message(&err, "should not appear");
+        assert!(shown.contains("今天的额度用完了"));
+        // The raw attempt log must not leak into the friendly message.
+        assert!(!shown.contains("provider=p1"));
+    }
+
+    #[test]
+    fn user_facing_llm_error_message_shows_sanitized_text_for_other_errors() {
+        let err = anyhow::anyhow!("connection reset by peer");
+        let shown = user_facing_llm_error_message(&err, "connection reset by peer");
+        assert!(shown.contains("connection reset by peer"));
+        assert!(!shown.contains("今天的额度用完了"));
+    }
 
     fn make_workspace() -> TempDir {
         let tmp = TempDir::new().unwrap();
@@ -4661,7 +4707,12 @@ mod tests {
             chat_log_config: Default::default(),
             worker_model: None,
             config: Arc::new(crate::config::Config::default()), // elfClaw: test default
-            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(&crate::config::AutonomyConfig { level: crate::security::AutonomyLevel::Full, ..Default::default() })), // elfClaw: test default
+            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(
+                &crate::config::AutonomyConfig {
+                    level: crate::security::AutonomyLevel::Full,
+                    ..Default::default()
+                },
+            )), // elfClaw: test default
         };
 
         assert!(compact_sender_history(&ctx, &sender));
@@ -4715,7 +4766,12 @@ mod tests {
             chat_log_config: Default::default(),
             worker_model: None,
             config: Arc::new(crate::config::Config::default()), // elfClaw: test default
-            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(&crate::config::AutonomyConfig { level: crate::security::AutonomyLevel::Full, ..Default::default() })), // elfClaw: test default
+            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(
+                &crate::config::AutonomyConfig {
+                    level: crate::security::AutonomyLevel::Full,
+                    ..Default::default()
+                },
+            )), // elfClaw: test default
         };
 
         append_sender_turn(&ctx, &sender, ChatMessage::user("hello"));
@@ -4772,7 +4828,12 @@ mod tests {
             chat_log_config: Default::default(),
             worker_model: None,
             config: Arc::new(crate::config::Config::default()), // elfClaw: test default
-            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(&crate::config::AutonomyConfig { level: crate::security::AutonomyLevel::Full, ..Default::default() })), // elfClaw: test default
+            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(
+                &crate::config::AutonomyConfig {
+                    level: crate::security::AutonomyLevel::Full,
+                    ..Default::default()
+                },
+            )), // elfClaw: test default
         };
 
         assert!(rollback_orphan_user_turn(&ctx, &sender, "pending"));
@@ -5252,7 +5313,12 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             worker_model: None,
             config: Arc::new(crate::config::Config::default()), // elfClaw: test default
-            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(&crate::config::AutonomyConfig { level: crate::security::AutonomyLevel::Full, ..Default::default() })), // elfClaw: test default
+            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(
+                &crate::config::AutonomyConfig {
+                    level: crate::security::AutonomyLevel::Full,
+                    ..Default::default()
+                },
+            )), // elfClaw: test default
         });
 
         process_channel_message(
@@ -5316,7 +5382,12 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             worker_model: None,
             config: Arc::new(crate::config::Config::default()), // elfClaw: test default
-            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(&crate::config::AutonomyConfig { level: crate::security::AutonomyLevel::Full, ..Default::default() })), // elfClaw: test default
+            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(
+                &crate::config::AutonomyConfig {
+                    level: crate::security::AutonomyLevel::Full,
+                    ..Default::default()
+                },
+            )), // elfClaw: test default
         });
 
         process_channel_message(
@@ -5394,7 +5465,12 @@ BTC is currently around $65,000 based on latest tool output."#
             chat_log_config: Default::default(),
             worker_model: None,
             config: Arc::new(crate::config::Config::default()), // elfClaw: test default
-            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(&crate::config::AutonomyConfig { level: crate::security::AutonomyLevel::Full, ..Default::default() })), // elfClaw: test default
+            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(
+                &crate::config::AutonomyConfig {
+                    level: crate::security::AutonomyLevel::Full,
+                    ..Default::default()
+                },
+            )), // elfClaw: test default
         });
 
         process_channel_message(
@@ -5458,7 +5534,12 @@ BTC is currently around $65,000 based on latest tool output."#
             chat_log_config: Default::default(),
             worker_model: None,
             config: Arc::new(crate::config::Config::default()), // elfClaw: test default
-            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(&crate::config::AutonomyConfig { level: crate::security::AutonomyLevel::Full, ..Default::default() })), // elfClaw: test default
+            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(
+                &crate::config::AutonomyConfig {
+                    level: crate::security::AutonomyLevel::Full,
+                    ..Default::default()
+                },
+            )), // elfClaw: test default
         });
 
         process_channel_message(
@@ -5531,7 +5612,12 @@ BTC is currently around $65,000 based on latest tool output."#
             chat_log_config: Default::default(),
             worker_model: None,
             config: Arc::new(crate::config::Config::default()), // elfClaw: test default
-            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(&crate::config::AutonomyConfig { level: crate::security::AutonomyLevel::Full, ..Default::default() })), // elfClaw: test default
+            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(
+                &crate::config::AutonomyConfig {
+                    level: crate::security::AutonomyLevel::Full,
+                    ..Default::default()
+                },
+            )), // elfClaw: test default
         });
 
         process_channel_message(
@@ -5625,7 +5711,12 @@ BTC is currently around $65,000 based on latest tool output."#
             chat_log_config: Default::default(),
             worker_model: None,
             config: Arc::new(crate::config::Config::default()), // elfClaw: test default
-            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(&crate::config::AutonomyConfig { level: crate::security::AutonomyLevel::Full, ..Default::default() })), // elfClaw: test default
+            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(
+                &crate::config::AutonomyConfig {
+                    level: crate::security::AutonomyLevel::Full,
+                    ..Default::default()
+                },
+            )), // elfClaw: test default
         });
 
         process_channel_message(
@@ -5701,7 +5792,12 @@ BTC is currently around $65,000 based on latest tool output."#
             chat_log_config: Default::default(),
             worker_model: None,
             config: Arc::new(crate::config::Config::default()), // elfClaw: test default
-            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(&crate::config::AutonomyConfig { level: crate::security::AutonomyLevel::Full, ..Default::default() })), // elfClaw: test default
+            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(
+                &crate::config::AutonomyConfig {
+                    level: crate::security::AutonomyLevel::Full,
+                    ..Default::default()
+                },
+            )), // elfClaw: test default
         });
 
         process_channel_message(
@@ -5793,7 +5889,12 @@ BTC is currently around $65,000 based on latest tool output."#
             chat_log_config: Default::default(),
             worker_model: None,
             config: Arc::new(crate::config::Config::default()), // elfClaw: test default
-            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(&crate::config::AutonomyConfig { level: crate::security::AutonomyLevel::Full, ..Default::default() })), // elfClaw: test default
+            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(
+                &crate::config::AutonomyConfig {
+                    level: crate::security::AutonomyLevel::Full,
+                    ..Default::default()
+                },
+            )), // elfClaw: test default
         });
 
         process_channel_message(
@@ -5869,7 +5970,12 @@ BTC is currently around $65,000 based on latest tool output."#
             chat_log_config: Default::default(),
             worker_model: None,
             config: Arc::new(crate::config::Config::default()), // elfClaw: test default
-            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(&crate::config::AutonomyConfig { level: crate::security::AutonomyLevel::Full, ..Default::default() })), // elfClaw: test default
+            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(
+                &crate::config::AutonomyConfig {
+                    level: crate::security::AutonomyLevel::Full,
+                    ..Default::default()
+                },
+            )), // elfClaw: test default
         });
 
         process_channel_message(
@@ -5936,7 +6042,12 @@ BTC is currently around $65,000 based on latest tool output."#
             chat_log_config: Default::default(),
             worker_model: None,
             config: Arc::new(crate::config::Config::default()), // elfClaw: test default
-            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(&crate::config::AutonomyConfig { level: crate::security::AutonomyLevel::Full, ..Default::default() })), // elfClaw: test default
+            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(
+                &crate::config::AutonomyConfig {
+                    level: crate::security::AutonomyLevel::Full,
+                    ..Default::default()
+                },
+            )), // elfClaw: test default
         });
 
         process_channel_message(
@@ -6120,7 +6231,12 @@ BTC is currently around $65,000 based on latest tool output."#
             chat_log_config: Default::default(),
             worker_model: None,
             config: Arc::new(crate::config::Config::default()), // elfClaw: test default
-            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(&crate::config::AutonomyConfig { level: crate::security::AutonomyLevel::Full, ..Default::default() })), // elfClaw: test default
+            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(
+                &crate::config::AutonomyConfig {
+                    level: crate::security::AutonomyLevel::Full,
+                    ..Default::default()
+                },
+            )), // elfClaw: test default
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
@@ -6205,7 +6321,12 @@ BTC is currently around $65,000 based on latest tool output."#
             chat_log_config: Default::default(),
             worker_model: None,
             config: Arc::new(crate::config::Config::default()), // elfClaw: test default
-            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(&crate::config::AutonomyConfig { level: crate::security::AutonomyLevel::Full, ..Default::default() })), // elfClaw: test default
+            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(
+                &crate::config::AutonomyConfig {
+                    level: crate::security::AutonomyLevel::Full,
+                    ..Default::default()
+                },
+            )), // elfClaw: test default
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -6302,7 +6423,12 @@ BTC is currently around $65,000 based on latest tool output."#
             chat_log_config: Default::default(),
             worker_model: None,
             config: Arc::new(crate::config::Config::default()), // elfClaw: test default
-            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(&crate::config::AutonomyConfig { level: crate::security::AutonomyLevel::Full, ..Default::default() })), // elfClaw: test default
+            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(
+                &crate::config::AutonomyConfig {
+                    level: crate::security::AutonomyLevel::Full,
+                    ..Default::default()
+                },
+            )), // elfClaw: test default
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -6381,7 +6507,12 @@ BTC is currently around $65,000 based on latest tool output."#
             chat_log_config: Default::default(),
             worker_model: None,
             config: Arc::new(crate::config::Config::default()), // elfClaw: test default
-            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(&crate::config::AutonomyConfig { level: crate::security::AutonomyLevel::Full, ..Default::default() })), // elfClaw: test default
+            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(
+                &crate::config::AutonomyConfig {
+                    level: crate::security::AutonomyLevel::Full,
+                    ..Default::default()
+                },
+            )), // elfClaw: test default
         });
 
         process_channel_message(
@@ -6445,7 +6576,12 @@ BTC is currently around $65,000 based on latest tool output."#
             chat_log_config: Default::default(),
             worker_model: None,
             config: Arc::new(crate::config::Config::default()), // elfClaw: test default
-            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(&crate::config::AutonomyConfig { level: crate::security::AutonomyLevel::Full, ..Default::default() })), // elfClaw: test default
+            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(
+                &crate::config::AutonomyConfig {
+                    level: crate::security::AutonomyLevel::Full,
+                    ..Default::default()
+                },
+            )), // elfClaw: test default
         });
 
         process_channel_message(
@@ -6988,7 +7124,12 @@ BTC is currently around $65,000 based on latest tool output."#
             chat_log_config: Default::default(),
             worker_model: None,
             config: Arc::new(crate::config::Config::default()), // elfClaw: test default
-            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(&crate::config::AutonomyConfig { level: crate::security::AutonomyLevel::Full, ..Default::default() })), // elfClaw: test default
+            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(
+                &crate::config::AutonomyConfig {
+                    level: crate::security::AutonomyLevel::Full,
+                    ..Default::default()
+                },
+            )), // elfClaw: test default
         });
 
         process_channel_message(
@@ -7078,7 +7219,12 @@ BTC is currently around $65,000 based on latest tool output."#
             chat_log_config: Default::default(),
             worker_model: None,
             config: Arc::new(crate::config::Config::default()), // elfClaw: test default
-            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(&crate::config::AutonomyConfig { level: crate::security::AutonomyLevel::Full, ..Default::default() })), // elfClaw: test default
+            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(
+                &crate::config::AutonomyConfig {
+                    level: crate::security::AutonomyLevel::Full,
+                    ..Default::default()
+                },
+            )), // elfClaw: test default
         });
 
         process_channel_message(
@@ -7169,7 +7315,12 @@ BTC is currently around $65,000 based on latest tool output."#
             chat_log_config: Default::default(),
             worker_model: None,
             config: Arc::new(crate::config::Config::default()), // elfClaw: test default
-            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(&crate::config::AutonomyConfig { level: crate::security::AutonomyLevel::Full, ..Default::default() })), // elfClaw: test default
+            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(
+                &crate::config::AutonomyConfig {
+                    level: crate::security::AutonomyLevel::Full,
+                    ..Default::default()
+                },
+            )), // elfClaw: test default
         });
 
         process_channel_message(
@@ -7729,7 +7880,12 @@ This is an example JSON object for profile settings."#;
             chat_log_config: Default::default(),
             worker_model: None,
             config: Arc::new(crate::config::Config::default()), // elfClaw: test default
-            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(&crate::config::AutonomyConfig { level: crate::security::AutonomyLevel::Full, ..Default::default() })), // elfClaw: test default
+            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(
+                &crate::config::AutonomyConfig {
+                    level: crate::security::AutonomyLevel::Full,
+                    ..Default::default()
+                },
+            )), // elfClaw: test default
         });
 
         // Simulate a photo attachment message with [IMAGE:] marker.
@@ -7800,7 +7956,12 @@ This is an example JSON object for profile settings."#;
             chat_log_config: Default::default(),
             worker_model: None,
             config: Arc::new(crate::config::Config::default()), // elfClaw: test default
-            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(&crate::config::AutonomyConfig { level: crate::security::AutonomyLevel::Full, ..Default::default() })), // elfClaw: test default
+            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(
+                &crate::config::AutonomyConfig {
+                    level: crate::security::AutonomyLevel::Full,
+                    ..Default::default()
+                },
+            )), // elfClaw: test default
         });
 
         process_channel_message(

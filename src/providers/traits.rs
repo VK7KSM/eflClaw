@@ -299,6 +299,21 @@ pub struct ProviderCapabilityError {
     pub message: String,
 }
 
+/// elfClaw 2026-09-23 (elfclaw.md §5.4 item 2): structured error returned by
+/// `ReliableProvider` when the entire model/key/provider fallback chain was
+/// exhausted and *every single attempt* failed with a 429 rate-limit response
+/// (daily quota or per-minute throttling) — never mixed with a genuine bug,
+/// auth failure, or network error. Lets the channel layer show the user a
+/// clean "今天额度用完了" message instead of dumping the raw multi-attempt
+/// failure log, without losing that log (it's still attached as `details`
+/// for logging/debugging).
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("all_providers_rate_limited attempts={attempt_count}")]
+pub struct AllProvidersRateLimitedError {
+    pub attempt_count: usize,
+    pub details: String,
+}
+
 /// Provider capabilities declaration.
 ///
 /// Describes what features a provider supports, enabling intelligent

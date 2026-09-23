@@ -2,6 +2,69 @@
 
 ---
 
+## 2026-09-23 — 补做 §5.4 第 2 项：额度整体耗尽时给用户友好提示
+
+继续复查 `elfclaw.md`，处理 §5.4"还没做"列表里第 2 项——"整条池子都耗尽
+时只会抛一个聚合错误，用户看到的是原始错误堆栈"。这条范围明确、风险低，
+直接对应用户最初的实际痛点（Gemini 免费额度用完时的体验），本条目做完。
+
+### 改了什么
+
+- `src/providers/traits.rs`：新增 `AllProvidersRateLimitedError`（`thiserror`
+  派生结构化错误，和已有的 `ProviderCapabilityError` 同一模式），带
+  `attempt_count`（尝试次数）和 `details`（完整的按次失败日志，供调试用，
+  不直接展示给用户）。`src/providers/mod.rs` 加入重导出。
+- `src/providers/reliable.rs`：新增共享的 `finalize_all_failed(failures,
+  all_rate_limited) -> anyhow::Error`——`all_rate_limited` 为真且有失败记录时
+  返回结构化的 `AllProvidersRateLimitedError`，否则返回原来的原始聚合错误
+  （"All providers/models failed. Attempts:\n..."）。`chat_with_system`/
+  `chat_with_history`/`chat_with_tools`/`chat` 四个方法结构完全一致（三层
+  嵌套循环：模型链→provider链→重试），都在各自的失败循环里加一行
+  `all_rate_limited = all_rate_limited && rate_limited;`（`rate_limited` 是
+  已有的 `is_rate_limited()` 判定，检测 429），链路彻底耗尽时统一改用
+  `Err(finalize_all_failed(failures, all_rate_limited))` 收尾。
+- `src/channels/mod.rs`：新增 `user_facing_llm_error_message(e, safe_error)`
+  纯函数——`e` 能 downcast 成 `AllProvidersRateLimitedError` 时返回"⚠️ 今天
+  的额度用完了，明天再试，或者检查一下 API key 配置。"，否则返回
+  `"⚠️ Error: {safe_error}"`。原来这个位置已经算出了 `safe_error`（脱敏后的
+  错误文本）却没有用上，直接把未脱敏的原始 `{e}` 显示给用户——顺带修了
+  这个相邻的小 bug（属于"发现即顺手修"，不是本条目的主线，但值得记录）。
+
+### 为什么"全部限流才转换"这个判断很重要
+
+`AllProvidersRateLimitedError` 只在**每一次**尝试（跨全部模型/provider/key/
+重试）都被 `is_rate_limited()` 判定为 429 时才构造。只要有一次是别的原因
+失败（真实 bug、鉴权错误、网络问题），就还是走原来的聚合错误。这是刻意
+设计——把一个真实故障误判成"只是配额用完了"会掩盖真正的问题，比原始
+错误堆栈更有害。
+
+### 验证
+
+- `cargo test --lib -- providers::reliable::` 51 个测试全过，新增 2 个：
+  - `all_providers_rate_limited_produces_structured_error`：两个 mock
+    provider 都返回 429 类错误，断言最终错误能 downcast 成
+    `AllProvidersRateLimitedError`，`attempt_count` 和 `details` 内容正确。
+  - `mixed_rate_limited_and_genuine_error_does_not_produce_structured_error`：
+    一个 429、一个 500，断言**不会**构造结构化错误，仍是原始聚合错误——
+    证明"混合失败不会被误判成纯配额问题"这条设计意图。
+- `channels/mod.rs` 新增 2 个直接测试 `user_facing_llm_error_message` 的
+  单测（不需要搭建完整的 channel/agent-loop e2e 管道就能验证选择逻辑）：
+  一个验证 `AllProvidersRateLimitedError` 输入得到友好中文文案且不泄漏
+  原始 `details` 内容，一个验证普通错误显示脱敏后的错误文本。
+- `cargo test --lib`（全量）4203 passed，同样 11 个预置失败无新增（测试数
+  从 4199 增至 4203，对应新增的 4 个测试）。
+- `cargo clippy --quiet --lib --tests -- -D warnings`：全仓库 244 个预置
+  历史错误（与本次改动无关），`grep` 精确匹配 `--> src\...` 定位行确认
+  本次改动的 4 个文件里零命中。
+- `cargo fmt --all -- --check`：本次改动的 4 个文件本身格式干净。
+  **附带说明**：格式化过程中意外触发了 `src/channels/telegram.rs`、
+  `chat_index.rs`、`chat_summarizer.rs` 三个未被本条目改动的文件的
+  预置格式漂移被顺带格式化——这三个文件不在本次改动范围内，已用
+  `git checkout --` 撤销，保持提交范围精确（只包含本条目实际改的 4 个
+  文件）。
+
+---
+
 ## 2026-09-23 — 复查发现：§3 第 4 条"AI 不能改自己的配置文件"从未拆成 Step，且和 Step 2 有架构冲突
 
 继续复查 `elfclaw.md` 时，发现 §3 设计原则第 4 条（"AI 不能改自己的配置和
