@@ -69,10 +69,8 @@ mod daemon;
 mod doctor;
 mod elfclaw_log; // elfClaw: structured logging + SSE event bus
 mod gateway;
-mod goals;
 mod hardware;
 mod health;
-mod heartbeat;
 mod hooks;
 mod identity;
 mod integrations;

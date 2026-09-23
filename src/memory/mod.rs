@@ -2,7 +2,6 @@ pub mod backend;
 pub mod chunker;
 pub mod cli;
 pub mod cortex;
-pub mod decay;
 pub mod embeddings;
 pub mod hybrid;
 pub mod hygiene;
@@ -24,9 +23,6 @@ pub use backend::{
     selectable_memory_backends, MemoryBackendKind, MemoryBackendProfile,
 };
 pub use cortex::CortexMemMemory;
-// elfClaw: public API for memory time-decay; callable by external integrations
-#[allow(unused_imports)]
-pub use decay::apply_time_decay;
 pub use hybrid::SqliteQdrantHybridMemory;
 pub use lucid::LucidMemory;
 pub use markdown::MarkdownMemory;

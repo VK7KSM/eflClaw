@@ -49,13 +49,10 @@ pub(crate) mod cost;
 pub(crate) mod cron;
 pub(crate) mod daemon;
 pub(crate) mod doctor;
-pub mod economic;
 pub mod elfclaw_log; // elfClaw: structured logging + SSE event bus
 pub mod gateway;
-pub mod goals;
 pub(crate) mod hardware;
 pub(crate) mod health;
-pub(crate) mod heartbeat;
 pub mod hooks;
 pub(crate) mod identity;
 // Intentionally unused re-export — public API surface for plugin authors.

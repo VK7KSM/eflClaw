@@ -8,6 +8,28 @@ use tokio::time::Duration;
 
 const STATUS_FLUSH_SECONDS: u64 = 5;
 
+/// Create a default HEARTBEAT.md if it doesn't exist yet.
+///
+/// elfClaw: moved here from the now-deleted `src/heartbeat/engine.rs` — that
+/// module's `HeartbeatEngine::run()`/`tick()`/`collect_tasks()`/`parse_tasks()`
+/// were dead code (superseded by `run_heartbeat_worker()` below); this was the
+/// only production-reachable method in it.
+async fn ensure_heartbeat_file(workspace_dir: &std::path::Path) -> Result<()> {
+    let path = workspace_dir.join("HEARTBEAT.md");
+    if !path.exists() {
+        let default = "# Periodic Tasks\n\n\
+                       # Add tasks below (one per line, starting with `- `)\n\
+                       # The agent will check this file on each heartbeat tick.\n\
+                       #\n\
+                       # Examples:\n\
+                       # - Check my email for important messages\n\
+                       # - Review my calendar for upcoming events\n\
+                       # - Check the weather forecast\n";
+        tokio::fs::write(&path, default).await?;
+    }
+    Ok(())
+}
+
 // elfClaw: Windows Job Object — ensures all child processes are killed when the
 // daemon exits (including `taskkill /F`).  The job handle is intentionally leaked
 // so it stays alive for the process lifetime; Windows closes it on exit and
@@ -17,12 +39,7 @@ const STATUS_FLUSH_SECONDS: u64 = 5;
 fn setup_job_object() {
     extern "system" {
         fn CreateJobObjectW(attrs: *mut u8, name: *const u16) -> usize;
-        fn SetInformationJobObject(
-            job: usize,
-            class: u32,
-            info: *const u8,
-            len: u32,
-        ) -> i32;
+        fn SetInformationJobObject(job: usize, class: u32, info: *const u8, len: u32) -> i32;
         fn AssignProcessToJobObject(job: usize, process: usize) -> i32;
         fn GetCurrentProcess() -> usize;
     }
@@ -57,7 +74,9 @@ fn setup_job_object() {
     unsafe {
         let job = CreateJobObjectW(std::ptr::null_mut(), std::ptr::null());
         if job == 0 {
-            tracing::warn!("Failed to create Windows Job Object — child cleanup on forced exit will not work");
+            tracing::warn!(
+                "Failed to create Windows Job Object — child cleanup on forced exit will not work"
+            );
             return;
         }
 
@@ -122,9 +141,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
     crate::health::mark_component_ok("daemon");
 
     if config.heartbeat.enabled {
-        let _ =
-            crate::heartbeat::engine::HeartbeatEngine::ensure_heartbeat_file(&config.workspace_dir)
-                .await;
+        let _ = ensure_heartbeat_file(&config.workspace_dir).await;
     }
 
     // elfClaw: ensure skills.db is initialized from skills_index.json on first run
@@ -564,6 +581,29 @@ mod tests {
         };
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
         config
+    }
+
+    #[tokio::test]
+    async fn ensure_heartbeat_file_creates_expected_file() {
+        let tmp = TempDir::new().unwrap();
+        ensure_heartbeat_file(tmp.path()).await.unwrap();
+
+        let path = tmp.path().join("HEARTBEAT.md");
+        assert!(path.exists());
+        let content = tokio::fs::read_to_string(&path).await.unwrap();
+        assert!(content.contains("Periodic Tasks"));
+    }
+
+    #[tokio::test]
+    async fn ensure_heartbeat_file_does_not_overwrite_existing() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("HEARTBEAT.md");
+        tokio::fs::write(&path, "- My custom task").await.unwrap();
+
+        ensure_heartbeat_file(tmp.path()).await.unwrap();
+
+        let content = tokio::fs::read_to_string(&path).await.unwrap();
+        assert_eq!(content, "- My custom task");
     }
 
     #[test]

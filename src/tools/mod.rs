@@ -17,7 +17,6 @@
 
 pub mod agent_load_tracker;
 pub mod agent_selection;
-pub mod agents_ipc;
 pub mod apply_patch;
 pub mod auth_profile;
 pub mod bg_run;
@@ -171,9 +170,9 @@ pub use subagent_registry::SubAgentRegistry;
 pub use subagent_spawn::SubAgentSpawnTool;
 pub use task_plan::TaskPlanTool;
 pub use traits::Tool;
+pub use traits::ToolRiskTier;
 #[allow(unused_imports)]
 pub use traits::{ToolResult, ToolSpec};
-pub use traits::ToolRiskTier;
 
 /// Return the risk tier for a tool by name.
 pub fn tool_risk_tier(name: &str) -> ToolRiskTier {
@@ -235,10 +234,10 @@ pub fn default_tool_risk_tiers() -> HashMap<&'static str, ToolRiskTier> {
         ("cron_list", Safe),
         ("cron_runs", Safe),
         ("search_chat_log", Safe),
-        ("web_search", Safe),    // read-only search, no side effects
-        ("cron_add", Safe),      // scheduling only; shell commands validated independently
-        ("cron_remove", Safe),   // metadata-only operation
-        ("cron_update", Safe),   // metadata-only operation
+        ("web_search", Safe),  // read-only search, no side effects
+        ("cron_add", Safe),    // scheduling only; shell commands validated independently
+        ("cron_remove", Safe), // metadata-only operation
+        ("cron_update", Safe), // metadata-only operation
         // Sensitive: always require approval
         ("generate_pairing_code", Sensitive),
         // Restricted: hidden from non-CLI channels
