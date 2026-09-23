@@ -173,9 +173,17 @@ impl SqliteMemory {
             CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(category);
             CREATE INDEX IF NOT EXISTS idx_memories_key ON memories(key);
 
-            -- FTS5 full-text search (BM25 scoring)
+            -- FTS5 full-text search (BM25 scoring). elfClaw 2026-09-23:
+            -- trigram tokenizer instead of the fts5 default (unicode61) —
+            -- unicode61 lumps a whole run of CJK characters into a single
+            -- token (it has no Chinese word-segmentation), so searching for
+            -- a substring like \"牙医\" inside a stored \"...看牙医\" entry
+            -- matched zero rows. Trigram indexes every 3-character window
+            -- regardless of script, so a 3+-character Chinese query works
+            -- the same way it always did for English. See elfclaw.md §7.6.
             CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
-                key, content, content=memories, content_rowid=rowid
+                key, content, content=memories, content_rowid=rowid,
+                tokenize='trigram case_sensitive 0'
             );
 
             -- FTS5 triggers: keep in sync with memories table
@@ -214,6 +222,35 @@ impl SqliteMemory {
                 "ALTER TABLE memories ADD COLUMN session_id TEXT;
                  CREATE INDEX IF NOT EXISTS idx_memories_session ON memories(session_id);",
             )?;
+        }
+
+        // elfClaw 2026-09-23: migrate an existing memories_fts table created
+        // before the trigram tokenizer change — `CREATE VIRTUAL TABLE IF NOT
+        // EXISTS` above is a no-op once the table already exists, so an old
+        // brain.db would otherwise keep the unicode61 default forever. FTS5
+        // doesn't support ALTERing a table's tokenizer in place, so this
+        // drops and rebuilds the index from `memories` (the `content=`
+        // source table) — the triggers stay valid since they're unrelated
+        // to the tokenizer, and `memories` itself is untouched.
+        let fts_sql: Option<String> = conn
+            .prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='memories_fts'")?
+            .query_row([], |row| row.get::<_, String>(0))
+            .ok();
+        if let Some(sql) = fts_sql {
+            if !sql.contains("trigram") {
+                conn.execute_batch(
+                    "DROP TABLE memories_fts;
+                     CREATE VIRTUAL TABLE memories_fts USING fts5(
+                         key, content, content=memories, content_rowid=rowid,
+                         tokenize='trigram case_sensitive 0'
+                     );
+                     INSERT INTO memories_fts(memories_fts) VALUES('rebuild');",
+                )
+                .context("migrating memories_fts to the trigram tokenizer")?;
+                tracing::info!(
+                    "Migrated memories_fts to the trigram tokenizer (Chinese-language search)"
+                );
+            }
         }
 
         Ok(())
@@ -476,11 +513,25 @@ impl Memory for SqliteMemory {
         category: MemoryCategory,
         session_id: Option<&str>,
     ) -> anyhow::Result<()> {
-        // Compute embedding (async, before blocking work)
-        let embedding_bytes = self
-            .get_or_compute_embedding(content)
-            .await?
-            .map(|emb| vector::vec_to_bytes(&emb));
+        // elfClaw 2026-09-23: an embedding failure (network error, 429,
+        // timeout) used to propagate via `?` and abort the whole store()
+        // call — the content was never written anywhere, silently, with
+        // auto_save swallowing the error too (`let _ = ... .await;`). Now it
+        // degrades to a keyword-only row (`embedding = NULL`) instead of
+        // losing the write outright; `recall()`'s keyword/FTS path still
+        // finds it, only vector similarity ranking is unavailable for this
+        // one entry. See elfclaw.md §7.5.
+        let embedding_bytes = match self.get_or_compute_embedding(content).await {
+            Ok(Some(emb)) => Some(vector::vec_to_bytes(&emb)),
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!(
+                    "Embedding computation failed for memory key '{key}', storing without a \
+                     vector (keyword search will still find it): {e}"
+                );
+                None
+            }
+        };
 
         let conn = self.conn.clone();
         let key = key.to_string();
@@ -882,6 +933,59 @@ mod tests {
         (tmp, mem)
     }
 
+    /// elfClaw 2026-09-23: a real embedding provider with `dimensions() > 0`
+    /// (unlike `NoopEmbedding`, whose `dimensions()==0` short-circuits
+    /// `get_or_compute_embedding` before it ever calls `embed()`) that
+    /// always fails — simulates a network error/429/timeout hitting the
+    /// real Gemini embedding endpoint.
+    struct FailingEmbedding;
+
+    #[async_trait::async_trait]
+    impl super::super::embeddings::EmbeddingProvider for FailingEmbedding {
+        fn name(&self) -> &str {
+            "failing-test-double"
+        }
+        fn dimensions(&self) -> usize {
+            768
+        }
+        async fn embed(&self, _texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+            anyhow::bail!("simulated embedding provider failure (e.g. 429)")
+        }
+    }
+
+    #[tokio::test]
+    async fn store_survives_embedding_failure_instead_of_losing_the_write() {
+        // elfClaw 2026-09-23: this is the actual production bug — store()
+        // used to propagate the embedding error via `?` and never write
+        // anything, and auto_save's caller ignored the error
+        // (`let _ = ctx.memory.store(...).await;`), so the note vanished
+        // with no trace. Now it degrades to embedding=NULL and the row is
+        // still written and still findable by keyword.
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::with_embedder(
+            tmp.path(),
+            Arc::new(FailingEmbedding),
+            0.7,
+            0.3,
+            1000,
+            None,
+        )
+        .unwrap();
+
+        let result = mem
+            .store("reminder_key", "带孩子看牙医", MemoryCategory::Core, None)
+            .await;
+        assert!(
+            result.is_ok(),
+            "store() must not fail just because the embedding call failed: {:?}",
+            result.err()
+        );
+
+        let entry = mem.get("reminder_key").await.unwrap();
+        assert!(entry.is_some(), "the content must still be persisted");
+        assert_eq!(entry.unwrap().content, "带孩子看牙医");
+    }
+
     #[tokio::test]
     async fn sqlite_name() {
         let (_tmp, mem) = temp_sqlite();
@@ -892,6 +996,40 @@ mod tests {
     async fn sqlite_health() {
         let (_tmp, mem) = temp_sqlite();
         assert!(mem.health_check().await);
+    }
+
+    #[tokio::test]
+    async fn chinese_substring_search_finds_multi_character_query() {
+        // elfClaw 2026-09-23: reproduces the production bug (see
+        // elfclaw.md §7.6) — the default unicode61 tokenizer lumps a whole
+        // run of CJK characters into one token, so searching for a
+        // substring of a longer Chinese phrase matched nothing. A
+        // 3+-character query works with the trigram tokenizer the same way
+        // it always worked for English.
+        let (_tmp, mem) = temp_sqlite();
+        mem.store(
+            "reminder_1",
+            "周五下午三点带孩子去看牙医",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let results = mem.recall("看牙医", 10, None).await.unwrap();
+        assert!(
+            results.iter().any(|e| e.key == "reminder_1"),
+            "expected to find the stored note via a 3-character Chinese substring, got: {results:?}"
+        );
+
+        // A query shorter than one trigram (2 characters) also works —
+        // confirmed empirically; the hybrid search's keyword-fallback path
+        // (or FTS5's own short-pattern handling) picks it up either way.
+        let short_results = mem.recall("牙医", 10, None).await.unwrap();
+        assert!(
+            short_results.iter().any(|e| e.key == "reminder_1"),
+            "expected a 2-character Chinese query to also find the note, got: {short_results:?}"
+        );
     }
 
     #[tokio::test]

@@ -2,6 +2,81 @@
 
 ---
 
+## 2026-09-23 — 稳定化 Step 3：记忆重新设计
+
+按 `elfclaw.md` §7 逐条实现（7 条全部完成）。
+
+### 7.1-7.3 记事系统（新增，独立于原有 embedding 记忆）
+
+新增 `src/memory/notes.rs`：`Note { id, content, created_at, due_at: Option, done }`，
+独立的小 SQLite 文件 `workspace/memory/notes.db`（和 `cron::store` 自己那份
+`jobs.db` 同一个模式，不混进 `brain.db` 的 embedding 表结构）。`open_notes_for_prompt()`
+只返回未完成的记事、每条带创建日期、上限 30 条，渲染成一段 `## 未完成的记事`。
+
+新增三个工具 `note_add`/`note_list`/`note_done`（`src/tools/note_*.rs`），风险等级
+Safe（免审批——记事是纯本地写入，没有对外副作用，不该被拦审批，见 elfclaw.md §8）。
+`note_add` 支持可选 `due_at`（RFC3339），带了 `due_at` 的记事就是一个提醒，到点由
+Step 2 新增的 `JobType::Message` cron 任务直接发送，不经过 LLM。
+
+在 `channels/mod.rs` 的 `process_channel_message` 里，每条消息都重新打开一次
+`NoteStore`（本地小文件，开销可忽略）读取未完成记事、注入系统提示词——没有给
+`ChannelRuntimeContext` 加字段（这个结构体已经有约 24 处构造点，大多是测试，
+加必填字段的改动面太大，划不来）。
+
+### 7.4 关掉聊天原文自动存成记忆
+
+`[memory].auto_save` 默认值从 `true` 改成 `false`（`config/schema.rs` 新增
+`default_memory_auto_save()`，`资料/config.toml` 显式设为 `false`）。原来每句超过
+长度阈值的用户消息都会被存成 `Conversation` 分类的 embedding 记忆，把真正该记的
+事挤出语义检索前几名；聊天记录本身已经由 `[chat_log]` 单独持久化，不需要再进
+embedding 记忆库。
+
+### 7.5 embedding 失败不再丢写入
+
+`src/memory/sqlite.rs` 的 `store()`：以前 `get_or_compute_embedding(...).await?`
+用 `?` 直接把整次写入连同错误一起扔掉——遇到一次 429/网络错误，这条记忆就彻底没了，
+连原文都没留下（`auto_save` 那边调用方还 `let _ = ...` 吞掉了错误，用户毫无感知）。
+改成 embedding 失败就降级成 `embedding = NULL`（关键词检索还能找到，只是不参与
+向量排序），原文本身永远会写进去。新增测试：一个总是失败的 `FailingEmbedding`
+测试替身，验证 `store()` 不再报错、内容确实落库。
+
+### 7.6 中文全文检索改用 trigram 分词
+
+`memories_fts` 虚拟表的分词器从 FTS5 默认的 `unicode61` 改成
+`tokenize='trigram case_sensitive 0'`。`unicode61` 会把一整段连续的中文字符
+当成一个 token，导致"周五下午三点带孩子去看牙医"存进去后，搜"看牙医"或"牙医"
+一个都搜不到（旧问题分析里验证过这个现象）。加了迁移逻辑：检测已存在的
+`memories_fts` 表定义里有没有 "trigram" 字样，没有就 DROP + 用新分词器重建 +
+从 `memories` 表 `rebuild` 回填索引。新增测试直接验证：3 字和 2 字的中文子串
+查询现在都能命中（2 字的比预期还好，命中了 hybrid 检索的关键词兜底路径）。
+
+### 7.7 系统提示词的"当前时间"合并为一处
+
+以前有两处：`build_system_prompt_with_mode`（daemon 启动时构建一次、缓存进
+`ChannelRuntimeContext`，可能几天不变）和 `build_channel_system_prompt`（每条
+消息都重新注入一次）——模型每次看到的 prompt 里其实有两个不同的"当前时间"，
+一个是启动时那一刻的、早就过期了。删掉启动时那次注入，只留每条消息都刷新的
+那一处。
+
+### 验证
+
+`cargo check` / `cargo clippy`（改动文件无新增问题）/ `cargo test --lib` 全过
+（4205 passed，11 个 pre-existing 失败与本次无关）。新增约 35 个测试覆盖记事
+增删查、系统提示词注入、embedding 失败降级、中文 trigram 检索、时间注入去重。
+用真实部署的 `资料/config.toml` 验证过 `auto_save=false` 确实生效（临时测试，
+未提交）。
+
+### 还没做
+
+- §7 之外的项：`memory_store`/`memory_forget` 目前仍是 Restricted（需要审批）——
+  这两个是 embedding 记忆的写入口，暂时保留原样；elfclaw.md 的设计意图是"记事"
+  走新的 `note_add`（已免审批），embedding 记忆作为辅助系统继续保留原有审批级别，
+  不在本轮改动范围。
+- Skynet/Workspace 两个实例部署后需要各自初始化一次 `notes.db`（首次运行时
+  `NoteStore::open()` 自动建表，不需要手动迁移）。
+
+---
+
 ## 2026-09-23 — 稳定化 Step 2：Cron / 提醒重写
 
 用户明确要求"继续干，直到完成所有原计划的开发工作"，按 `elfclaw.md` 第 6 节推进。逐条核对了 K6 实测的 22 个重复任务和"一次性任务反复触发"问题的真实根因（有几处和最初的分析不完全一致，以代码为准）。

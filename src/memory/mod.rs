@@ -8,6 +8,7 @@ pub mod hygiene;
 pub mod lucid;
 pub mod markdown;
 pub mod none;
+pub mod notes;
 #[cfg(feature = "memory-postgres")]
 pub mod postgres;
 pub mod qdrant;

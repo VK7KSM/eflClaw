@@ -2133,6 +2133,18 @@ async fn process_channel_message(
     let mut system_prompt =
         build_channel_system_prompt(ctx.system_prompt.as_str(), &msg.channel, &msg.reply_target);
 
+    // elfClaw 2026-09-23: inject open notes/reminders fresh on every message
+    // (not baked into the cached startup prompt — a note can be added or
+    // marked done between messages). See src/memory/notes.rs and
+    // elfclaw.md §7. Opening a small local SQLite file per message is
+    // deliberately simple rather than threading a shared handle through
+    // ChannelRuntimeContext, which has ~24 construction sites (mostly
+    // tests) that a new required field would touch.
+    match crate::memory::notes::NoteStore::open(&ctx.workspace_dir) {
+        Ok(store) => system_prompt.push_str(&crate::memory::notes::open_notes_for_prompt(&store)),
+        Err(e) => tracing::warn!("Notes unavailable for this turn (failed to open notes.db): {e}"),
+    }
+
     // elfClaw: inject dynamic runtime status (cron jobs, autonomy, agents) so agent
     // knows its current environment and can self-diagnose tool/config issues
     system_prompt.push_str(&build_runtime_status_section(&ctx.config));
@@ -3326,13 +3338,14 @@ pub fn build_system_prompt_with_mode(
     }
 
     // ── 6. Date & Time ──────────────────────────────────────────
-    let now = chrono::Local::now();
-    let _ = writeln!(
-        prompt,
-        "## Current Date & Time\n\n{} ({})\n",
-        now.format("%Y-%m-%d %H:%M:%S"),
-        now.format("%Z")
-    );
+    // elfClaw 2026-09-23: removed. This function builds the system prompt
+    // ONCE at daemon startup and it's cached in ChannelRuntimeContext for the
+    // whole process lifetime (which can run for days) — a timestamp baked in
+    // here goes stale immediately and just sits there. The model was
+    // literally shown two different "current time" values on every message:
+    // this stale one from startup, plus a second, correct one that
+    // build_channel_system_prompt appends fresh per-message (see its own
+    // comment). That's the single injection point now; see elfclaw.md §7.7.
 
     // ── 7. Runtime ──────────────────────────────────────────────
     let host =
@@ -6539,11 +6552,27 @@ BTC is currently around $65,000 based on latest tool output."#
             prompt.contains("## Project Context"),
             "missing Project Context"
         );
-        assert!(
-            prompt.contains("## Current Date & Time"),
-            "missing Date/Time"
-        );
         assert!(prompt.contains("## Runtime"), "missing Runtime section");
+    }
+
+    #[test]
+    fn build_channel_system_prompt_injects_fresh_current_time() {
+        // The one real-time injection point now (see the removed test above).
+        let prompt = build_channel_system_prompt("base", "telegram", "12345");
+        assert!(prompt.contains("## Current Date & Time"));
+        let this_year = chrono::Local::now().format("%Y").to_string();
+        assert!(prompt.contains(&this_year));
+    }
+
+    #[test]
+    fn build_system_prompt_no_longer_bakes_in_a_startup_timestamp() {
+        // elfClaw 2026-09-23: this prompt is built once at daemon startup and
+        // cached for the process lifetime — a "## Current Date & Time" here
+        // would go stale immediately. build_channel_system_prompt (see its
+        // own test above) is the one real-time injection point now.
+        let ws = make_workspace();
+        let prompt = build_system_prompt(ws.path(), "test-model", &[], &[], None, None);
+        assert!(!prompt.contains("## Current Date & Time"));
     }
 
     #[test]

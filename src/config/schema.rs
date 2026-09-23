@@ -2961,7 +2961,18 @@ pub struct MemoryConfig {
     /// `postgres` requires `[storage.provider.config]` with `db_url` (`dbURL` alias supported).
     /// `qdrant` and `sqlite_qdrant_hybrid` use `[memory.qdrant]` config or `QDRANT_URL` env var.
     pub backend: String,
-    /// Auto-save user-stated conversation input to memory (assistant output is excluded)
+    /// Auto-save user-stated conversation input to memory (assistant output is excluded).
+    ///
+    /// elfClaw 2026-09-23: defaults to `false` now (see elfclaw.md §7.4).
+    /// Every message over `AUTOSAVE_MIN_MESSAGE_CHARS` used to get written
+    /// into embedding memory as a `Conversation`-category entry — in
+    /// production this drowned out the handful of real facts/notes a user
+    /// actually asked to be remembered, since a plain chat message and a
+    /// deliberate "remember X" both ranked in the same semantic search.
+    /// Raw messages are already preserved separately by chat-log
+    /// persistence (`[chat_log]`) when enabled, and deliberate notes now go
+    /// through `note_add` (`src/memory/notes.rs`) instead of this path.
+    #[serde(default = "default_memory_auto_save")]
     pub auto_save: bool,
     /// Run memory/session hygiene (archiving + retention cleanup)
     #[serde(default = "default_hygiene_enabled")]
@@ -3062,6 +3073,9 @@ fn default_sqlite_journal_mode() -> String {
 fn default_embedding_provider() -> String {
     "none".into()
 }
+fn default_memory_auto_save() -> bool {
+    false
+}
 fn default_hygiene_enabled() -> bool {
     true
 }
@@ -3106,7 +3120,7 @@ impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
             backend: "sqlite".into(),
-            auto_save: true,
+            auto_save: default_memory_auto_save(),
             hygiene_enabled: default_hygiene_enabled(),
             archive_after_days: default_archive_after_days(),
             purge_after_days: default_purge_after_days(),
@@ -9750,10 +9764,22 @@ default_temperature = 0.7
     }
 
     #[test]
+    async fn memory_config_auto_save_omitted_in_toml_defaults_to_false() {
+        // elfClaw: a config.toml with a [memory] section but no explicit
+        // auto_save key must still get the new false default, not error out
+        // on a "missing field" (the field has no bare #[serde(default)],
+        // only the fn-based one added alongside this test).
+        let toml = "backend = \"sqlite\"\n";
+        let parsed: MemoryConfig = toml::from_str(toml).unwrap();
+        assert!(!parsed.auto_save);
+    }
+
+    #[test]
     async fn memory_config_default_hygiene_settings() {
         let m = MemoryConfig::default();
         assert_eq!(m.backend, "sqlite");
-        assert!(m.auto_save);
+        // elfClaw 2026-09-23: flipped default — see elfclaw.md §7.4.
+        assert!(!m.auto_save);
         assert!(m.hygiene_enabled);
         assert_eq!(m.archive_after_days, 7);
         assert_eq!(m.purge_after_days, 30);

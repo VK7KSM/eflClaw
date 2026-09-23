@@ -63,6 +63,9 @@ pub mod memory_observe;
 pub mod memory_recall;
 pub mod memory_store;
 pub mod model_routing_config;
+pub mod note_add;
+pub mod note_done;
+pub mod note_list;
 pub mod openclaw_migration;
 pub mod pdf_read;
 pub mod pptx_read;
@@ -146,6 +149,9 @@ pub use memory_observe::MemoryObserveTool;
 pub use memory_recall::MemoryRecallTool;
 pub use memory_store::MemoryStoreTool;
 pub use model_routing_config::ModelRoutingConfigTool;
+pub use note_add::NoteAddTool;
+pub use note_done::NoteDoneTool;
+pub use note_list::NoteListTool;
 pub use openclaw_migration::OpenClawMigrationTool;
 pub use pdf_read::PdfReadTool;
 pub use pptx_read::PptxReadTool;
@@ -185,7 +191,8 @@ pub fn tool_risk_tier(name: &str) -> ToolRiskTier {
         | "subagent_list" | "delegate_coordination_status"
         | "screenshot" | "cli_discovery" | "self_check"
         | "web_search"                      // read-only search
-        | "cron_add" | "cron_remove" | "cron_update" => ToolRiskTier::Safe, // metadata only; shell cmds validated independently
+        | "cron_add" | "cron_remove" | "cron_update"
+        | "note_add" | "note_list" | "note_done" => ToolRiskTier::Safe, // metadata only; shell cmds validated independently
 
         // Sensitive: write operations, network access
         "shell" | "process" | "file_write" | "file_edit" | "apply_patch"
@@ -238,6 +245,15 @@ pub fn default_tool_risk_tiers() -> HashMap<&'static str, ToolRiskTier> {
         ("cron_add", Safe),    // scheduling only; shell commands validated independently
         ("cron_remove", Safe), // metadata-only operation
         ("cron_update", Safe), // metadata-only operation
+        // elfClaw 2026-09-23: notes are purely local, no side effects outside
+        // their own small notes.db — unlike memory_store/memory_forget
+        // (embedding memory, Restricted below), there is no reason to gate
+        // "remember this" behind an approval prompt. See elfclaw.md §7/§8:
+        // approval should protect real outward actions, not deterministic
+        // local writes.
+        ("note_add", Safe),
+        ("note_list", Safe),
+        ("note_done", Safe),
         // Sensitive: always require approval
         ("generate_pairing_code", Sensitive),
         // Restricted: hidden from non-CLI channels
@@ -461,6 +477,7 @@ pub fn all_tools_with_runtime(
         Arc::new(MemoryRecallTool::new(memory.clone())),
         Arc::new(MemoryForgetTool::new(memory, security.clone())),
         Arc::new(ScheduleTool::new(security.clone(), root_config.clone())),
+        // (note_add/note_list/note_done pushed below once NoteStore opens)
         Arc::new(TaskPlanTool::new(security.clone())),
         Arc::new(ModelRoutingConfigTool::new(
             config.clone(),
@@ -479,6 +496,22 @@ pub fn all_tools_with_runtime(
             workspace_dir.to_path_buf(),
         )),
     ];
+
+    // elfClaw 2026-09-23: notes ("记事") — see src/memory/notes.rs. A separate
+    // small SQLite file from brain.db, so a failure here (e.g. a permissions
+    // problem on workspace_dir) shouldn't take down every other tool;
+    // degrade to "notes unavailable this run" instead of panicking.
+    match crate::memory::notes::NoteStore::open(workspace_dir) {
+        Ok(store) => {
+            let notes = Arc::new(store);
+            tool_arcs.push(Arc::new(NoteAddTool::new(notes.clone())));
+            tool_arcs.push(Arc::new(NoteListTool::new(notes.clone())));
+            tool_arcs.push(Arc::new(NoteDoneTool::new(notes)));
+        }
+        Err(e) => {
+            tracing::warn!("Notes unavailable this run (failed to open notes.db): {e}");
+        }
+    }
 
     if has_shell_access {
         tool_arcs.push(Arc::new(ShellTool::new_with_syscall_detector(
