@@ -53,8 +53,8 @@ Telegram（必留）、邮件监控（IMAP，收信分类通知，不自动回�
 | 路由 | 处理 |
 |---|---|
 | `/api/chat` | **保留**，用作不经 Telegram 的测试入口（走完整 agent 流程：工具、记忆） |
-| `/v1/chat/completions`、`/v1/models` | 删除（OpenAI 兼容） |
-| `/webhook`、`/whatsapp`、`/linq`、`/wati`、`/nextcloud-talk` | 删除 |
+| `/v1/chat/completions`、`/v1/models` | **已删除（2026-09-23，Step 5）**：`src/gateway/openai_compat.rs` 整个文件删除（唯二用途——`/v1/models` 路由和被 `/v1/chat/completions` 覆盖前的旧 handler——都已确认无其他调用方）；`openclaw_compat.rs` 里的 `handle_v1_chat_completions_with_tools`（含专属 `Oai*` 请求/响应结构体）一并删除，只留 `/api/chat` |
+| `/webhook`、`/whatsapp`、`/linq`、`/wati`、`/nextcloud-talk` | **暂缓**（见第 10 节 Step 5 说明：会级联到独立的 channel 实现文件，改动面明显更大，本次只处理了自包含的 OpenAI 兼容层） |
 | `/api/*`（仪表盘）、`/ws/chat`、`/api/events` | 保留（Web 仪表盘要用） |
 | `/pair`、`/health`、`/metrics` | 保留 |
 
@@ -184,7 +184,13 @@ gemini-3.5-flash: key A → key B → ...
   - Telegram 离线消息不再丢弃：启动探测（"startup probe"）以前会把探测响应里的消息直接吞掉（只取 update_id 推进 offset，内容从不处理）——`getUpdates` 不会因为返回过一次就消费掉更新，所以只要探测不动 offset，紧接着的正式轮询会重新收到同一批消息并正常处理。改动是纯删除（删掉推进 offset 那段），配了一个 wiremock 集成测试，在旧代码上跑确认会超时失败，新代码上通过。
   - 429/503 分类处理：已随多 key 轮换一起完成（见 §5.4）。
   - **未处理**：Telegram 相册跨 `getUpdates` 轮询批次被拆分的问题（见第 11 节，改动面更大且非用户反馈的实际痛点，往后放）。
-- **Step 5**：Shell/工具权限收紧（第 8 节）+ 网关精简（第 4 节路由表）。
+- **Step 5（进行中，2026-09-23）**：
+  - **已完成**：网关精简第一部分——删除 OpenAI 兼容层（`/v1/chat/completions`、`/v1/models`）。`src/gateway/openai_compat.rs` 整个文件（720 行）确认无其他调用方后整体删除；`openclaw_compat.rs` 里专为该兼容层写的 `handle_v1_chat_completions_with_tools` handler、8 个 `Oai*` 请求/响应结构体、对应的 7 个单测一并删除，只保留 `/api/chat`（唯一需要保留的、被 `run_gateway_chat_with_tools` 走完整 agent 循环的入口）。纯删除，`cargo test --lib` 前后同为 11 个预置失败（Windows 符号链接权限相关，与本次改动无关），无新增失败；`cargo clippy` 在两个改动文件里零新增问题。
+  - **暂缓，原因是改动面比预期大，需要单独一步做**：
+    1. `/webhook`、`/whatsapp`、`/linq`、`/wati`、`/nextcloud-talk` 路由删除——调查发现这些会级联到独立的 channel 实现文件（如 `src/channels/whatsapp.rs`/`whatsapp_web.rs`）和 `AppState` 里的多个专属字段，不是单文件自包含改动。
+    2. `self_check`/`check_logs` 自检模块删除——调查发现全代码库有 32 处引用，横跨 `src/agent/loop_.rs`、`src/channels/mod.rs`、`src/cron/scheduler.rs`、`src/elfclaw_log/mod.rs`、`src/tools/mod.rs`、`src/tools/source_sync.rs` 六个文件，和 CLAUDE.md §14 提到的 SelfCheckGate 三层防御机制绑在一起，删除前需要先确认这套防御机制是否还有其他地方依赖。
+    3. Shell/工具权限收紧本体（第 8 节：默认对聊天 AI 隐藏 shell、cf-crawler/新闻抓取/技能索引改成原生 Rust 类型化工具、按任务显式授权 shell）——尚未开始设计。
+  - 后续会话按这个顺序继续：先做 2（self_check 影响面调查更清楚后再删），再做 3（第 8 节设计+实现），最后视情况处理 1（如果精力允许）。
 - **Step 6**：清理约束弱模型的旧 prompt——只删已经被对应代码保证覆盖的那部分，不是一次性全删。
 
 ## 11. 已发现、暂缓到对应 Step 修复的安全问题

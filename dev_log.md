@@ -2,6 +2,69 @@
 
 ---
 
+## 2026-09-23 — 稳定化 Step 5（第一部分）：删除 OpenAI 兼容网关层
+
+按 `elfclaw.md` §10 Step 5、§4 网关路由取舍表。这一步只做了网关精简里自包含、
+不级联到其他模块的部分；网关精简的另外两块（webhook/whatsapp/linq/wati/
+nextcloud-talk 路由、self_check/check_logs 自检模块）和 shell/工具权限收紧本体
+（elfclaw.md 第 8 节）明确暂缓，理由见下方"未处理"部分。
+
+### 改了什么
+
+- 删除 `src/gateway/openai_compat.rs`（整个文件，720 行）。确认其两个用途——
+  `/v1/models` 路由的 handler、被 `/v1/chat/completions` 路由覆盖前的旧
+  `handle_v1_chat_completions`（no-tools、no-memory 的简单版本，实际从未被任何
+  路由挂载，纯死代码）——在全代码库里都没有其他调用方（`grep -rln` 确认，
+  仅 `gateway/mod.rs` 三处引用：`CHAT_COMPLETIONS_MAX_BODY_SIZE`、
+  `handle_v1_models`、`.merge(openai_compat_routes)`）。
+- `src/gateway/openclaw_compat.rs`：删除 `handle_v1_chat_completions_with_tools`
+  handler（真正被 `/v1/chat/completions` 路由使用的那个，走完整 agent loop 的
+  OpenAI 兼容 shim）、专为它写的 8 个 `Oai*` 请求/响应结构体
+  （`OaiChatRequest`/`OaiMessage`/`OaiChatResponse`/`OaiChoice`/`OaiUsage`/
+  `OaiStreamChunk`/`OaiStreamChoice`/`OaiDelta`）、辅助函数 `unix_timestamp`，
+  以及对应的 7 个单测（`oai_request_deserializes_with_extra_fields` 等）。
+  只保留 `handle_api_chat`（`/api/chat`，唯一需要留的测试入口）和它的 2 个单测。
+  同步清理不再需要的 `axum::body::Body`、`serde::Serialize` 导入，更新模块顶部
+  文档注释。
+- `src/gateway/mod.rs`：删除 `pub(crate) mod openai_compat;` 声明、
+  `openai_compat_routes` 子路由器构造块（含独立 512KB body-limit layer）、
+  `.route("/v1/models", ...)` 和 `.merge(openai_compat_routes)` 两行、启动横幅
+  里对应的两条 `println!` 提示文本。
+
+### 为什么
+
+elfClaw 只直接服务 Telegram（用户明确的保留功能清单），OpenAI 兼容的
+`/v1/chat/completions`/`/v1/models` 是上游 OpenClaw 迁移期遗留的兼容层，没有
+任何调用方——不是抽象层的一部分，是纯粹的攻击面 + 维护负担。`/api/chat` 保留是
+因为它是唯一"不经 Telegram 直接测试完整 agent 流程"的入口，elfclaw.md 明确要求
+保留。
+
+### 验证
+
+- `cargo check --quiet`：编译通过，零警告。
+- `cargo test --lib -- gateway::`：73 个测试全过。
+- `cargo test --lib`（全量）：4190 passed / 11 failed（与改动前完全相同的
+  11 个 Windows 符号链接权限相关预置失败 + 1 个已知无关的 vision 测试，无新增
+  失败；测试总数从 4205 降到 4190，正好对应删掉的 15 个 OpenAI 兼容层专属测试）。
+- `cargo clippy --quiet --lib --tests -- -D warnings`：全仓库有 249 个预置错误
+  （历史遗留，与本次改动无关），但 `grep` 确认两个改动文件（`gateway/mod.rs`、
+  `gateway/openclaw_compat.rs`）里零命中，本次改动没有引入新的 clippy 问题。
+- `cargo fmt --all -- --check`：两个改动文件均已是标准格式。
+- `资料/config.toml`：确认无任何字段引用这两个已删路由（`grep` 空结果），
+  这两个路由本来就不是 config-gated 的，删除对配置文件零影响。
+
+### 未处理（明确暂缓，理由见 `elfclaw.md` §10 Step 5）
+
+1. `/webhook`、`/whatsapp`、`/linq`、`/wati`、`/nextcloud-talk` 路由删除——
+   调查发现会级联到独立 channel 实现文件（`src/channels/whatsapp.rs` 等）和
+   `AppState` 里的多个专属字段，不是像 openai_compat 这样的自包含改动。
+2. `self_check`/`check_logs` 自检模块删除——调查发现全代码库 32 处引用，横跨
+   6 个文件，和 CLAUDE.md §14 提到的 SelfCheckGate 三层防御机制绑定，删除前
+   需要先确认该防御机制的其他依赖方。
+3. Shell/工具权限收紧本体（elfclaw.md 第 8 节）——尚未开始设计。
+
+---
+
 ## 2026-09-23 — 稳定化 Step 4：Telegram 离线消息不丢弃
 
 按 `elfclaw.md` §10 Step 4。多 key 轮换 provider 和 429/503 分类处理已经在更早
