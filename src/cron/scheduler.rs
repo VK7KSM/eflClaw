@@ -247,8 +247,6 @@ async fn run_agent_job(
                         the user can ONLY see your final text response.\n\
                      4. Do NOT call send_telegram — the system delivers your response automatically.\n\
                      5. Do NOT wait for other agents — you ARE the agent responsible.\n\
-                     6. Do NOT call self_check or check_logs — these are user-initiated diagnostic \
-                        tools and MUST NOT be called from automated background tasks.\n\
                      \n\
                      Task: {prompt}",
                     id = job.id
@@ -272,8 +270,6 @@ async fn run_agent_job(
                         the user can ONLY see your final text response.\n\
                      4. Do NOT call send_telegram — the system delivers your response automatically.\n\
                      5. Do NOT wait for other agents — you ARE the agent responsible.\n\
-                     6. Do NOT call self_check or check_logs — these are user-initiated diagnostic \
-                        tools and MUST NOT be called from automated background tasks.\n\
                      \n\
                      Task: {prompt}",
                     id = job.id

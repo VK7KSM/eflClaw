@@ -44,9 +44,9 @@ Telegram（必留）、邮件监控（IMAP，收信分类通知，不自动回�
 ### 删除
 
 - 小智（Xiaozhi）语音设备渠道
-- `self_check` / `check_logs` 自检模块
-- OpenAI 兼容网关（`/v1/chat/completions`、`/v1/models`，`src/gateway/openai_compat.rs`）
-- 其他聊天软件 webhook 兼容层：`/webhook`、`/whatsapp`、`/linq`、`/wati`、`/nextcloud-talk`
+- `self_check` / `check_logs` 自检模块（**已删除，2026-09-23，Step 5**）
+- OpenAI 兼容网关（`/v1/chat/completions`、`/v1/models`，`src/gateway/openai_compat.rs`，**已删除，2026-09-23，Step 5**）
+- 其他聊天软件 webhook 兼容层：`/webhook`、`/whatsapp`、`/linq`、`/wati`、`/nextcloud-talk`（暂缓，见第 10 节 Step 5）
 
 ### 网关路由取舍
 
@@ -185,12 +185,12 @@ gemini-3.5-flash: key A → key B → ...
   - 429/503 分类处理：已随多 key 轮换一起完成（见 §5.4）。
   - **未处理**：Telegram 相册跨 `getUpdates` 轮询批次被拆分的问题（见第 11 节，改动面更大且非用户反馈的实际痛点，往后放）。
 - **Step 5（进行中，2026-09-23）**：
-  - **已完成**：网关精简第一部分——删除 OpenAI 兼容层（`/v1/chat/completions`、`/v1/models`）。`src/gateway/openai_compat.rs` 整个文件（720 行）确认无其他调用方后整体删除；`openclaw_compat.rs` 里专为该兼容层写的 `handle_v1_chat_completions_with_tools` handler、8 个 `Oai*` 请求/响应结构体、对应的 7 个单测一并删除，只保留 `/api/chat`（唯一需要保留的、被 `run_gateway_chat_with_tools` 走完整 agent 循环的入口）。纯删除，`cargo test --lib` 前后同为 11 个预置失败（Windows 符号链接权限相关，与本次改动无关），无新增失败；`cargo clippy` 在两个改动文件里零新增问题。
+  - **已完成（第一部分）**：网关精简——删除 OpenAI 兼容层（`/v1/chat/completions`、`/v1/models`）。`src/gateway/openai_compat.rs` 整个文件（720 行）确认无其他调用方后整体删除；`openclaw_compat.rs` 里专为该兼容层写的 `handle_v1_chat_completions_with_tools` handler、8 个 `Oai*` 请求/响应结构体、对应的 7 个单测一并删除，只保留 `/api/chat`（唯一需要保留的、被 `run_gateway_chat_with_tools` 走完整 agent 循环的入口）。纯删除，`cargo test --lib` 前后同为 11 个预置失败（Windows 符号链接权限相关，与本次改动无关），无新增失败；`cargo clippy` 在两个改动文件里零新增问题。
+  - **已完成（第二部分）**：`self_check`/`check_logs` 自检模块删除。调查确认这是一套完整的 `/selfcheck` 用户命令功能（非死代码）：`SelfCheckGate`（开关状态机，仅 `/selfcheck` 命令能打开）→ `self_check(action="analyze")` 收集日志/源码 → 用 worker model 跑一次隔离的 `agent::loop_::run()` 分析 → 报告存到 `homework/`；`check_logs` 是配套的日志查询工具，两者都被硬编码为"未经 `/selfcheck` 打开就对聊天 AI 隐藏"。全部删除：`src/tools/self_check.rs`（888 行）、`src/tools/check_logs.rs`（129 行）整体删除；`channels/mod.rs` 里的 `/selfcheck` 命令解析、gate 开关调用、两段系统提示词说明、`effective_excluded_tools` 里的 gate 分支全部移除并简化；`channels/telegram.rs` 的 Telegram 命令菜单去掉 `selfcheck` 条目；`cron/scheduler.rs` 两处后台任务 prompt 里"禁止调用 self_check/check_logs"的规则连带删除（工具已不存在，规则本身变得多余）；`tools/mod.rs` 移除模块声明/`pub use`/风险分级/构造调用；`elfclaw_log/mod.rs`、`tools/source_sync.rs`、`agent/loop_.rs` 更新了引用这两个工具的过时注释。`query_recent()` 保留（`gateway/api.rs` 的仪表盘日志接口仍在用）；`source_sync` 工具本身保留（是独立注册的常驻工具，不是 self_check 专属）。验证：`cargo test --lib` 4181 passed，同样 11 个预置失败无新增（测试数从 4190 降到 4181，对应删掉的自检模块专属单测）；`cargo clippy` 在全部改动文件里零新增问题；`cargo fmt --all -- --check` 改动前后均为 154 处预置漂移，未引入新的格式问题；`资料/config.toml` 确认无字段引用这两个工具。
   - **暂缓，原因是改动面比预期大，需要单独一步做**：
     1. `/webhook`、`/whatsapp`、`/linq`、`/wati`、`/nextcloud-talk` 路由删除——调查发现这些会级联到独立的 channel 实现文件（如 `src/channels/whatsapp.rs`/`whatsapp_web.rs`）和 `AppState` 里的多个专属字段，不是单文件自包含改动。
-    2. `self_check`/`check_logs` 自检模块删除——调查发现全代码库有 32 处引用，横跨 `src/agent/loop_.rs`、`src/channels/mod.rs`、`src/cron/scheduler.rs`、`src/elfclaw_log/mod.rs`、`src/tools/mod.rs`、`src/tools/source_sync.rs` 六个文件，和 CLAUDE.md §14 提到的 SelfCheckGate 三层防御机制绑在一起，删除前需要先确认这套防御机制是否还有其他地方依赖。
-    3. Shell/工具权限收紧本体（第 8 节：默认对聊天 AI 隐藏 shell、cf-crawler/新闻抓取/技能索引改成原生 Rust 类型化工具、按任务显式授权 shell）——尚未开始设计。
-  - 后续会话按这个顺序继续：先做 2（self_check 影响面调查更清楚后再删），再做 3（第 8 节设计+实现），最后视情况处理 1（如果精力允许）。
+    2. Shell/工具权限收紧本体（第 8 节：默认对聊天 AI 隐藏 shell、cf-crawler/新闻抓取/技能索引改成原生 Rust 类型化工具、按任务显式授权 shell）——尚未开始设计。
+  - 后续会话按这个顺序继续：先做第 8 节设计+实现，最后视情况处理 webhook 系路由删除（如果精力允许）。
 - **Step 6**：清理约束弱模型的旧 prompt——只删已经被对应代码保证覆盖的那部分，不是一次性全删。
 
 ## 11. 已发现、暂缓到对应 Step 修复的安全问题

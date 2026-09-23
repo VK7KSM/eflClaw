@@ -239,9 +239,9 @@ pub fn format_unix_timestamp(unix_secs: u64) -> String {
 
 // ── Public query API ─────────────────────────────────────────────
 
-// elfClaw: exposes query_recent() so tools (check_logs) can read the log DB without shell commands
+// elfClaw: exposes query_recent() so the dashboard API can read the log DB directly
 /// Query recent log entries from the SQLite store.
-/// Used by the `check_logs` tool so the agent can inspect runtime logs without shell commands.
+/// Used by `gateway::api::handle_api_logs_recent` to serve the dashboard's log view.
 pub fn query_recent(
     limit: usize,
     level_filter: Option<&str>,

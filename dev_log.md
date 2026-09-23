@@ -2,6 +2,78 @@
 
 ---
 
+## 2026-09-23 — 稳定化 Step 5（第二部分）：删除 self_check/check_logs 自检模块
+
+按 `elfclaw.md` §4"删除"列表、§10 Step 5。这是 Step 5 网关精简之后的下一块暂缓项，
+本条把它做完。
+
+### 改了什么
+
+- 删除 `src/tools/self_check.rs`（888 行）、`src/tools/check_logs.rs`（129 行）整个文件。
+- `src/tools/mod.rs`：移除 `pub mod self_check;`/`pub mod check_logs;`、对应
+  `pub use`、`tool_risk_tier()` 里的 `"self_check"`/`"check_logs"` 分支、以及
+  `all_tools_with_runtime()` 里构造 `SelfCheckTool`（连带它专属构造的
+  `SourceSyncTool`/`ContentSearchTool`/`FileReadTool` 三个"影子实例"）和
+  `CheckLogsTool` 的两处代码块。`source_sync_arc`（真正被全局共享注册的
+  `SourceSyncTool` 实例）不受影响，继续保留。
+- `src/channels/mod.rs`：
+  - 删除系统提示词里"日志查询规则"（引导用 `check_logs` 而非 shell）和
+    "`self_check` 工具"（两步走的自检+复核流程说明）两段文字。
+  - 删除 `/selfcheck` 命令解析块（`is_selfcheck_command`、打开
+    `SelfCheckGate`、改写 `msg.content` 强制调用 `self_check`），以及它在
+    memory 自动保存排除条件、处理结束后关闭 gate 两处的引用；`/reflect`
+    命令的 `let mut msg = msg;` 声明保留（仍需要给 `/reflect` 用）。
+  - `effective_excluded_tools` 构造简化为纯 if/else 表达式，去掉专门给
+    self_check gate 用的 `if !SelfCheckGate::is_open() { 追加排除 self_check +
+    check_logs }` 分支。
+- `src/channels/telegram.rs`：Telegram Bot 命令菜单（`setMyCommands`）里去掉
+  `{ "command": "selfcheck", ... }` 一条。
+- `src/cron/scheduler.rs`：两处（agent-with-subagents / 普通 agent）后台任务
+  system prompt 里"规则 6：禁止调用 self_check 或 check_logs"整条删除（工具
+  已不存在，规则本身失去意义，属于典型的"约束已被代码本身保证、prompt 里的
+  文字变成纯浪费 token"场景，和 elfclaw.md Step 6 的清理原则一致，顺手一起做）。
+- `src/elfclaw_log/mod.rs`、`src/tools/source_sync.rs`、`src/agent/loop_.rs`：
+  更新三处引用了 self_check/check_logs 的过时注释，使其准确反映当前状态
+  （`query_recent()` 现在的真实调用方是 `gateway::api::handle_api_logs_recent`
+  仪表盘接口，不再是 `check_logs`）。
+
+### 为什么
+
+`self_check`/`check_logs` 是一套完整的"AI 自己诊断自己"功能：用户发
+`/selfcheck [重点]` 打开一个全局 gate，让 chat AI 调用 `self_check
+(action="analyze")`——这个工具会克隆 elfclaw/zeroclaw 源码仓库、查询最近
+错误/警告日志、用 worker model 跑一次隔离的 `agent::loop_::run()` 生成诊断
+报告、存到 `homework/` 目录。虽然这套机制本身设计得不算粗糙（有防递归调用、
+防并发分析的锁，报告生成有"反编造规则"约束），但它正是用户最初抱怨的那类
+"越自检越乱"复杂度的来源之一，且不在 elfclaw.md §4 的保留功能清单里，故按
+计划整体删除。
+
+顺带发现一个只在删除后才需要记录、不必再修的细节：`analyze_inner()` 调用
+隔离 agent 时最后一个参数（工具过滤）传的是 `None`——即"不过滤"，对
+shell/git_operations 等危险工具的排除完全靠 prompt 文字("## 禁止使用的
+工具：shell/git_operations/..."）而非代码层硬限制，属于典型的"信任模型自觉"
+反模式。既然整个功能已删除，这个风险随之自然消失，不需要单独修——记录在
+这里是为了未来如果有人想恢复类似的"隔离子 agent 诊断"功能，应该用真正的
+工具白名单/过滤参数而不是 prompt 约束。
+
+### 验证
+
+- `cargo check --quiet`：编译通过，零警告（含 `git stash`/`pop` 后重跑确认）。
+- 全代码库 `grep -rn "self_check|check_logs|SelfCheckGate|selfcheck"
+  src/ tests/`：只剩 `elfclaw_log/mod.rs` 里已更新为准确说明的注释，
+  无死引用、无编译期悬空引用。
+- `cargo test --lib`：4181 passed / 11 failed，与改动前完全相同的 11 个
+  Windows 符号链接权限预置失败（无关），无新增失败；测试总数从 4190 降到
+  4181，对应删掉的 9 个自检模块专属单测。
+- `cargo clippy --quiet --lib --tests -- -D warnings`：全仓库预置 249 个
+  历史遗留错误（与本次改动无关），`grep` 确认本次改动的 7 个文件里零命中。
+- `cargo fmt --all -- --check`：改动前后均为 154 处预置格式漂移（`git
+  stash` 对比确认完全一致），本次改动没有引入新的格式问题。
+- `资料/config.toml`：确认无任何字段引用 `self_check`/`check_logs`/
+  `selfcheck`，删除对配置文件零影响。
+
+---
+
 ## 2026-09-23 — 稳定化 Step 5（第一部分）：删除 OpenAI 兼容网关层
 
 按 `elfclaw.md` §10 Step 5、§4 网关路由取舍表。这一步只做了网关精简里自包含、

@@ -24,7 +24,6 @@ pub mod browser;
 pub mod browser_open;
 pub mod caller_context;
 pub mod channel_ack_config;
-pub mod check_logs;
 pub mod cli_discovery;
 pub mod composio;
 pub mod content_search;
@@ -77,7 +76,6 @@ pub mod schedule;
 pub mod schema;
 pub mod screenshot;
 pub mod search_chat_log;
-pub mod self_check;
 pub mod send_email;
 pub mod send_telegram;
 pub mod send_voice;
@@ -112,8 +110,6 @@ pub use bg_run::{
 pub use browser::{BrowserTool, ComputerUseConfig};
 pub use browser_open::BrowserOpenTool;
 pub use channel_ack_config::ChannelAckConfigTool;
-#[allow(unused_imports)]
-pub use check_logs::CheckLogsTool;
 pub use composio::ComposioTool;
 pub use content_search::ContentSearchTool;
 pub use cron_add::CronAddTool;
@@ -163,7 +159,6 @@ pub use schedule::ScheduleTool;
 pub use schema::{CleaningStrategy, SchemaCleanr};
 pub use screenshot::ScreenshotTool;
 pub use search_chat_log::SearchChatLogTool;
-pub use self_check::SelfCheckTool;
 pub use send_email::SendEmailTool;
 pub use send_telegram::SendTelegramTool;
 pub use send_voice::SendVoiceTool;
@@ -187,9 +182,9 @@ pub fn tool_risk_tier(name: &str) -> ToolRiskTier {
         "get_current_time" | "memory_recall" | "image_info" | "glob_search"
         | "content_search" | "file_read" | "pdf_read" | "docx_read"
         | "pptx_read" | "xlsx_read" | "cron_list" | "cron_runs"
-        | "check_logs" | "search_chat_log" | "bg_status"
+        | "search_chat_log" | "bg_status"
         | "subagent_list" | "delegate_coordination_status"
-        | "screenshot" | "cli_discovery" | "self_check"
+        | "screenshot" | "cli_discovery"
         | "web_search"                      // read-only search
         | "cron_add" | "cron_remove" | "cron_update"
         | "note_add" | "note_list" | "note_done" => ToolRiskTier::Safe, // metadata only; shell cmds validated independently
@@ -548,18 +543,6 @@ pub fn all_tools_with_runtime(
         tool_arcs.push(Arc::new(GlobSearchTool::new(security.clone())));
         tool_arcs.push(content_search_arc.clone());
         tool_arcs.push(Arc::new(SqliteQueryTool::new(security.clone())));
-
-        // elfClaw: self_check tool — programmatic source-level diagnostics
-        tool_arcs.push(Arc::new(SelfCheckTool::new(
-            security.clone(),
-            Arc::new(root_config.clone()),
-            // Safety: we know the concrete types behind these Arc<dyn Tool>.
-            // SelfCheckTool stores them as Arc<ConcreteType> so we need to
-            // construct fresh instances that share SecurityPolicy.
-            Arc::new(SourceSyncTool::new(security.clone())),
-            Arc::new(ContentSearchTool::new(security.clone())),
-            Arc::new(FileReadTool::new(security.clone())),
-        )));
     }
     if runtime.as_any().is::<crate::runtime::WasmRuntime>() {
         tool_arcs.push(Arc::new(WasmModuleTool::new(
@@ -728,9 +711,6 @@ pub fn all_tools_with_runtime(
             )));
         }
     }
-
-    // elfClaw: check_logs tool — always available so agent can query runtime logs
-    tool_arcs.push(Arc::new(CheckLogsTool::new()));
 
     // elfClaw: source_sync tool — clone/pull source repos for debug analysis
     tool_arcs.push(source_sync_arc);

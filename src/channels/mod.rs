@@ -582,29 +582,6 @@ fn build_runtime_status_section(config: &crate::config::Config) -> String {
         }
     }
 
-    // elfClaw: explicit log inspection rule — prevents agent from defaulting to shell commands
-    section.push_str(
-        "\n**⚠️ 日志查询规则（必须遵守）**：\
-         当用户要求查看、检查、查询运行日志、错误记录或系统状态时，\
-         **必须首先使用 `check_logs` 工具**。\
-         禁止使用 shell 命令（tail/cat/grep/Get-Content 在 Windows 环境不可用且可能被安全策略拦截）。\
-         `check_logs` 支持过滤：level=error/warn/info/debug，\
-         category=tool_call/cron_job/llm_call/channel_message/system，since_minutes=N。\n"
-    );
-
-    // elfClaw: self_check tool — autonomous diagnostics with two-pass verification
-    section.push_str(
-        "\n`self_check` 工具：用户说「自检」「健康检查」「debug自检」或问「什么出问题了」时调用。\n\
-         第一步：调用 self_check(action=\"analyze\")\n\
-         第二步（必须执行）：收到报告后进行二次复核：\n\
-           - 检查每个「🔴严重/🟡中等」问题是否有日志证据\n\
-           - 如果用户询问了特定服务/功能（如 MCP、cron、推送），用 check_logs 查询相关 INFO 日志\n\
-             示例：check_logs(level=\"info\", category=\"agent_lifecycle\", since_minutes=60)\n\
-           - 对有疑问的部分调用 check_logs 验证（最多 5 次工具调用）\n\
-           - 检查是否有用户操作错误被误归为系统缺陷\n\
-         第三步：向用户呈现：原始报告（完整保留）+ 复核结论（标注 ✅确认/⚠️存疑/❌误报）\n"
-    );
-
     // elfClaw: GitHub MCP tool guidance
     section.push_str(
         "\nGitHub MCP 工具（如果已配置）：\
@@ -1959,24 +1936,8 @@ async fn process_channel_message(
     } else {
         msg
     };
-    // elfClaw: mutable for /selfcheck command rewrite
+    // elfClaw: mutable for /reflect command rewrite
     let mut msg = msg;
-
-    // ── elfClaw: /selfcheck command — open gate and rewrite message ──
-    let is_selfcheck_command = msg.content.starts_with("/selfcheck");
-    if is_selfcheck_command {
-        let user_prompt = msg.content.strip_prefix("/selfcheck").unwrap_or("").trim();
-        let user_prompt = if user_prompt.is_empty() {
-            "执行全面自检：检查系统日志、错误模式、服务健康状态".to_string()
-        } else {
-            user_prompt.to_string()
-        };
-        crate::tools::self_check::SelfCheckGate::open(&user_prompt);
-        msg.content = format!(
-            "请立即调用 self_check 工具（action=\"analyze\"）执行自检：{}",
-            user_prompt
-        );
-    }
 
     // ── elfClaw: /reflect command — deep self-reflection using main model ──
     let is_reflect_command = msg.content.starts_with("/reflect");
@@ -2044,9 +2005,8 @@ async fn process_channel_message(
     };
     if ctx.auto_save_memory
         && msg.content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
-        && !is_selfcheck_command
         && !is_reflect_command
-    // elfClaw: diagnostic/reflection data must not pollute memory
+    // elfClaw: reflection data must not pollute memory
     {
         let autosave_key = conversation_memory_key(&msg);
         let _ = ctx
@@ -2383,24 +2343,12 @@ async fn process_channel_message(
         excluded
     };
 
-    // elfClaw: build effective excluded_tools with self_check gate
-    let effective_excluded_tools: Vec<String> = {
-        let mut excluded = if msg.channel == "cli" {
-            vec![]
-        } else if msg.id.starts_with("email-digest-") {
-            email_digest_excluded_tools.clone()
-        } else {
-            ctx.non_cli_excluded_tools.as_ref().clone()
-        };
-        // self_check + check_logs gated: excluded unless user opened via /selfcheck
-        if !crate::tools::self_check::SelfCheckGate::is_open() {
-            for tool_name in &["self_check", "check_logs"] {
-                if !excluded.iter().any(|t| t == tool_name) {
-                    excluded.push(tool_name.to_string());
-                }
-            }
-        }
-        excluded
+    let effective_excluded_tools: Vec<String> = if msg.channel == "cli" {
+        vec![]
+    } else if msg.id.starts_with("email-digest-") {
+        email_digest_excluded_tools.clone()
+    } else {
+        ctx.non_cli_excluded_tools.as_ref().clone()
     };
 
     // Build safety heartbeat config for this message processing
@@ -2492,11 +2440,6 @@ async fn process_channel_message(
     // Clean up approval dispatcher (drop sender side so receiver closes)
     drop(non_cli_approval_ctx);
     let _ = approval_dispatcher.await;
-
-    // elfClaw: close self-check gate after processing, regardless of success/failure
-    if is_selfcheck_command {
-        crate::tools::self_check::SelfCheckGate::close();
-    }
 
     if let Some(handle) = draft_updater {
         let _ = handle.await;

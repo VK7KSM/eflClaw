@@ -1770,7 +1770,7 @@ pub async fn run(
 
     if let Some(msg) = message {
         // Auto-save user message to memory (skip short/trivial messages and Background tasks).
-        // elfClaw: Background tasks (cron/delegate/self_check) have machine-generated prompts,
+        // elfClaw: Background tasks (cron/delegate) have machine-generated prompts,
         // not user conversations — saving them would pollute memory recall for future sessions.
         if config.memory.auto_save
             && run_context != super::RunContext::Background

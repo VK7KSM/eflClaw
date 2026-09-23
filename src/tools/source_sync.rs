@@ -6,7 +6,7 @@
 // 2. HTTP ZIP fallback: download GitHub ZIP archive when git is unavailable
 //
 // Restricted to a hardcoded URL allowlist and workspace-sandboxed target dirs.
-// Agent uses this alongside check_logs + file_read + content_search for debug.
+// Agent uses this alongside file_read + content_search for debug.
 
 use super::traits::{Tool, ToolResult};
 use crate::security::SecurityPolicy;
