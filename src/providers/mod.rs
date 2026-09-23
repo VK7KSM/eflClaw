@@ -1468,6 +1468,66 @@ pub fn create_resilient_provider(
     )
 }
 
+/// Build the provider-chain entries for the primary provider: one for
+/// `api_key`, plus one more per entry in `extra_keys` (from
+/// `reliability.api_keys`).
+///
+/// elfClaw: `reliability.api_keys` used to be threaded into `ReliableProvider`
+/// and "rotated" inside its retry loop, but the `Provider` trait has no way
+/// to swap a key on an existing instance — that path was a no-op that only
+/// logged a warning claiming rotation happened (see dev_log 2026-09-23).
+/// Fixed at the right layer instead: each extra key becomes its own
+/// provider-chain entry (the same pattern `create_resilient_provider_with_options`
+/// already used for `fallback_providers` — just the same provider/model with
+/// a different credential). The existing model-chain-outer /
+/// provider-chain-middle loop in `reliable.rs` then naturally rotates
+/// model-first, key-second — e.g. with keys `[A,B,C]` and models
+/// `[3.8-flash, 3.7-flash]`: `3.8/A → 3.8/B → 3.8/C → 3.7/A → 3.7/B → 3.7/C`.
+///
+/// An extra key that fails to construct a provider (or is an empty string)
+/// is skipped with a warning rather than aborting the whole chain — the
+/// primary key and any other extra keys should still be usable.
+fn expand_primary_provider_keys(
+    primary_name: &str,
+    api_key: Option<&str>,
+    api_url: Option<&str>,
+    extra_keys: &[String],
+    options: &ProviderRuntimeOptions,
+) -> anyhow::Result<Vec<(String, Box<dyn Provider>)>> {
+    let build = |key: Option<&str>| -> anyhow::Result<Box<dyn Provider>> {
+        match primary_name {
+            "openai-codex" | "openai_codex" | "codex" => {
+                create_provider_with_options(primary_name, key, options)
+            }
+            _ => create_provider_with_url_and_options(primary_name, key, api_url, options),
+        }
+    };
+
+    let mut providers = vec![(primary_name.to_string(), build(api_key)?)];
+
+    for (idx, extra_key) in extra_keys.iter().enumerate() {
+        if extra_key.is_empty() {
+            continue;
+        }
+        match build(Some(extra_key.as_str())) {
+            Ok(provider) => {
+                // 1-based, human-facing suffix; "#1" is implicit (the primary).
+                providers.push((format!("{primary_name}#{}", idx + 2), provider));
+            }
+            Err(error) => {
+                tracing::warn!(
+                    provider = primary_name,
+                    key_index = idx + 2,
+                    %error,
+                    "Ignoring invalid extra API key during initialization"
+                );
+            }
+        }
+    }
+
+    Ok(providers)
+}
+
 /// Create provider chain with retry/fallback behavior and auth runtime options.
 pub fn create_resilient_provider_with_options(
     primary_name: &str,
@@ -1476,15 +1536,13 @@ pub fn create_resilient_provider_with_options(
     reliability: &crate::config::ReliabilityConfig,
     options: &ProviderRuntimeOptions,
 ) -> anyhow::Result<Box<dyn Provider>> {
-    let mut providers: Vec<(String, Box<dyn Provider>)> = Vec::new();
-
-    let primary_provider = match primary_name {
-        "openai-codex" | "openai_codex" | "codex" => {
-            create_provider_with_options(primary_name, api_key, options)?
-        }
-        _ => create_provider_with_url_and_options(primary_name, api_key, api_url, options)?,
-    };
-    providers.push((primary_name.to_string(), primary_provider));
+    let mut providers: Vec<(String, Box<dyn Provider>)> = expand_primary_provider_keys(
+        primary_name,
+        api_key,
+        api_url,
+        &reliability.api_keys,
+        options,
+    )?;
 
     for fallback in &reliability.fallback_providers {
         if fallback == primary_name || providers.iter().any(|(name, _)| name == fallback) {
@@ -1527,7 +1585,6 @@ pub fn create_resilient_provider_with_options(
         reliability.provider_retries,
         reliability.provider_backoff_ms,
     )
-    .with_api_keys(reliability.api_keys.clone())
     .with_model_fallbacks(reliability.model_fallbacks.clone())
     .with_vision_override(options.model_support_vision);
 
@@ -2344,6 +2401,65 @@ mod tests {
         assert!(create_provider("google-gemini", Some("test-key")).is_ok());
         // Should also work without key (will try CLI auth)
         assert!(create_provider("gemini", None).is_ok());
+    }
+
+    // ── Multi-key expansion (elfClaw, 2026-09-23) ──
+    // These test `expand_primary_provider_keys` directly (name + count of the
+    // returned chain entries) rather than round-tripping through
+    // `create_resilient_provider_with_options`'s `Box<dyn Provider>`, because
+    // `Provider` has no downcast — inspecting the Vec it builds is the
+    // narrowest way to pin this behavior down without a network mock.
+
+    #[test]
+    fn expand_primary_provider_keys_with_no_extras_returns_just_primary() {
+        let opts = ProviderRuntimeOptions::default();
+        let entries =
+            expand_primary_provider_keys("gemini", Some("primary-key"), None, &[], &opts).unwrap();
+        let names: Vec<&str> = entries.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["gemini"]);
+    }
+
+    #[test]
+    fn expand_primary_provider_keys_appends_one_entry_per_extra_key() {
+        let opts = ProviderRuntimeOptions::default();
+        let extra = vec![
+            "key-b".to_string(),
+            "key-c".to_string(),
+            "key-d".to_string(),
+        ];
+        let entries =
+            expand_primary_provider_keys("gemini", Some("key-a"), None, &extra, &opts).unwrap();
+        let names: Vec<&str> = entries.iter().map(|(n, _)| n.as_str()).collect();
+        // Primary is unsuffixed ("#1" is implicit); extras start at "#2" and
+        // stay in the same order as `reliability.api_keys` — this ordering is
+        // what makes the outer model-chain / middle-provider-chain loop in
+        // `reliable.rs` rotate model-first, key-second across the pool.
+        assert_eq!(names, vec!["gemini", "gemini#2", "gemini#3", "gemini#4"]);
+    }
+
+    #[test]
+    fn expand_primary_provider_keys_skips_empty_extra_keys() {
+        let opts = ProviderRuntimeOptions::default();
+        let extra = vec!["".to_string(), "key-b".to_string(), "".to_string()];
+        let entries =
+            expand_primary_provider_keys("gemini", Some("key-a"), None, &extra, &opts).unwrap();
+        let names: Vec<&str> = entries.iter().map(|(n, _)| n.as_str()).collect();
+        // Empty strings are silently skipped, but the index suffix still
+        // reflects each key's original position in the configured list —
+        // easier to correlate a warning log back to `config.toml` than a
+        // renumbered "next available" index would be.
+        assert_eq!(names, vec!["gemini", "gemini#3"]);
+    }
+
+    #[test]
+    fn expand_primary_provider_keys_with_no_primary_key_still_adds_extras() {
+        // A user might rely on CLI/env auth for the primary but still list
+        // extra keys for rotation — should not require a primary key.
+        let opts = ProviderRuntimeOptions::default();
+        let extra = vec!["key-b".to_string()];
+        let entries = expand_primary_provider_keys("gemini", None, None, &extra, &opts).unwrap();
+        let names: Vec<&str> = entries.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["gemini", "gemini#2"]);
     }
 
     #[test]

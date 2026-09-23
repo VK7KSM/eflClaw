@@ -17,8 +17,22 @@
 - 清理仓库根目录垃圾文件（`tmp_check.zip`、`test_script*.sh` 等）。
 - 验证：`cargo check`/`cargo test --lib` 全过（4146 passed，11 个 pre-existing 失败与本次无关）；用真实部署的 `资料/config.toml` 跑了一次解析测试，确认删除 `[economic]`/`[agents_ipc]` 字段后旧配置文件依然能正常加载（`Config` 顶层无 `deny_unknown_fields`，残留字段被静默忽略）。
 
+### 提前插入：多 Gemini key + 多模型轮询（用户明确要求优先于 Step 2）
+
+排查发现 `src/providers/reliable.rs` 的 `ReliableProvider.rotate_key()` 是**完全不起作用的死代码**：429 触发时会选出下一个 key，但只打一行警告日志"选中了但没法应用（`Provider` trait 没有 `set_api_key`）"，然后照样用原 key 重试——不管配了几个 key，实际永远只用第一个。这很可能是之前额度问题的直接原因之一。
+
+修法：把"额外 key"从"运行时在 `ReliableProvider` 内部轮换"改成"构造阶段为每个 key 建一个独立 provider 实例，追加到 provider 链"（`src/providers/mod.rs` 新增 `expand_primary_provider_keys`），复用已有的 `fallback_providers` 机制，不用改三层重试循环的结构，天然产生"模型先轮完、再换 key"的顺序。同时：
+
+- `src/providers/reliable.rs`：删掉 4 处死掉的 `rotate_key()` 警告分支和相关字段/方法；新增 `is_gemini_daily_quota_exhausted`，区分 Gemini 的"日额度耗尽"（`...PerDay...-FreeTier`）和"每分钟限额"（`...PerMinute...`），只有日额度耗尽才立刻跳过这个 key。
+- `src/providers/gemini.rs`：`max_output_tokens` 从写死的 `8192` 改成 `GEMINI_MAX_OUTPUT_TOKENS = 65536`——思考 token 和回复共用配额，8192 太小导致思考没写完就被截断、返回空文本，又被当成故障重试。
+- `资料/config.toml`：按 `elfclaw.md` §5.1 换成新模型池（`default_model="gemini-3.8-flash"`，`summary_model`/`worker_model="gemini-3.5-flash"`），`[reliability.model_fallbacks]` 填好两条链；`api_keys` 留空待用户建好额外 key 后填入。
+
+验证：`cargo check`/`cargo clippy`（改动文件无新增问题）/`cargo test --lib` 全过（4151+ passed，同样 11 个 pre-existing 失败无关）；额外用真实部署的 `资料/config.toml` 验证过一次解析且模型池字段生效（临时测试，未提交）。
+
+详见 `elfclaw.md` §5.4（含还没做的部分：503 未做"跳过剩余 key 直接换模型"的优化、额度耗尽没有转成"今天额度用完了"的友好提示给用户、耗尽状态没有持久化到磁盘）。
+
 ### 下一步
-用户明确要求优先解决"多 Gemini key + 多模型轮询"（`elfclaw.md` 第 5 节），先于 Step 2（cron 重写）。
+Step 2（cron 重写）。
 
 ## 2026-05-11 — K6 新机部署：cf-crawler 运行环境恢复
 

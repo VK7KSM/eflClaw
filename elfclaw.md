@@ -110,6 +110,23 @@ gemini-3.5-flash: key A → key B → ...
 - `gemini-embedding-2` 与旧的 `gemini-embedding-001` 向量**不兼容**，不能混用；反正记忆库要重新设计，直接从新模型起步。
 - Live 系列模型（`gemini-3.8-live` 等）只支持 WebSocket 实时语音，不能用于普通文字对话/工具调用，不要接入对话池。
 
+### 5.4 实现状态（2026-09-23）
+
+**已解决**（`src/providers/mod.rs` / `reliable.rs` / `gemini.rs`）：
+
+- **多 key 轮换以前是完全不起作用的死代码**：`ReliableProvider` 里的 `rotate_key()` 会选出下一个 key，但只打一行警告日志"选中了但没法应用（`Provider` trait 没有 `set_api_key`）"，然后照样用原来的 key 重试——不管配置几个 key，实际永远只用第一个。已确认这是过去 429 频繁触发的直接原因之一。
+- **改法**：`reliability.api_keys`（已有的配置字段，加密/脱敏都已经现成接好）不再传进 `ReliableProvider` 内部去"轮换"，而是在 `create_resilient_provider_with_options` 构造阶段，给每个额外 key 各建一个独立的 provider 实例，追加到 provider 链上（和 `fallback_providers` 用的是同一套机制，只是同一个 provider/模型换不同 key）。已有的"模型外层循环 → provider（现在也是 key）中层循环 → 重试内层循环"三层结构不用改，天然就产生"模型先轮完，再换下一个模型"的顺序——这正是 §5.2 要的效果，不需要额外写调度逻辑。
+- **Gemini 每日额度 429 的判定**：新增 `is_gemini_daily_quota_exhausted`，专门识别 Gemini 报错里的 `GenerateRequestsPerDay...-FreeTier` 字样，和"每分钟"限额（`...PerMinute...`）区分开——只有"日额度耗尽"才会立刻跳过这个 key（不再在同一个耗尽的 key 上重试烧掉退避时间），每分钟限额仍走原来"退避重试，重试完自然换下一个 key"的路径。
+- **`maxOutputTokens` 从写死的 `8192` 改成 `65536`**（所有配置的模型都支持）：思考 token 和回复 token 共用同一个输出配额，8192 在思考深度稍高时就会被思考本身耗尽，导致返回空文本，而空文本又被当成"临时故障"去重试——白白浪费额度。
+- 测试：`src/providers/mod.rs` 新增 4 个测试直接验证 key 展开逻辑（数量、命名、跳过空字符串、无主 key 时仍能加额外 key）；`src/providers/reliable.rs` 新增 3 个测试验证 Gemini 每日/每分钟额度判定的区分度；删除了两个只测死代码行为的旧测试。
+
+**还没做**（按影响排序，后续步骤补）：
+
+1. **503（模型过载）目前还是会把一个模型的所有 key 都试一遍才换模型**，没有做"503 直接跳过剩余 key、换模型"的优化。不是正确性问题（迟早会换到下一个模型），只是慢——每个耗尽的 key 上还要等一次退避。
+2. **"整条池子都耗尽"目前只会抛一个聚合错误**，还没有在 `channels/mod.rs` 接一层"识别到全部是配额/频率错误 → 回复用户'今天额度用完了'"的转换。现在用户看到的还是原始错误堆栈。
+3. **额度耗尽状态没有持久化**：现在完全靠"live 请求时判定 429/503，当场跳过"，不需要单独的计数器就能正确工作（耗尽的 key 每次被试到都会很快拿到同样的 429 并跳过，不会重试），但每轮对话仍然会为每个已耗尽的 key/模型多花一次请求去确认"确实还没恢复"。加一个磁盘持久化的"跳过到什么时候"状态是优化项，不是必须项。
+4. `资料/config.toml` 已经按上面的方案更新（`default_model`/`summary_model`/`worker_model` 换成新模型池，`[reliability.model_fallbacks]` 填好两条链），但 `api_keys = []` 还是空的——等用户建好额外的 Google 项目和 key 再填进去。
+
 ## 6. Cron / 提醒重新设计
 
 1. **心跳不再让 LLM 同步任务。** 改为代码从 `HEARTBEAT.md` 解析出任务定义（固定 key 标识），直接与数据库对账，该增的增、该删的删，不经过一次 LLM 调用。

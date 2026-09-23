@@ -5,6 +5,7 @@ use super::Provider;
 use async_trait::async_trait;
 use futures_util::{stream, StreamExt};
 use std::collections::{HashMap, HashSet};
+#[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
@@ -160,7 +161,39 @@ fn is_non_retryable_rate_limit(err: &anyhow::Error) -> bool {
         }
     }
 
-    false
+    is_gemini_daily_quota_exhausted(&lower)
+}
+
+/// elfClaw: detect a Gemini free-tier PER-DAY quota exhaustion, as opposed to
+/// a per-minute rate limit (which should keep retrying/rotating normally).
+///
+/// Gemini embeds the quota metric name in the error, e.g.
+/// `GenerateRequestsPerDayPerProjectPerModel-FreeTier` for the daily cap vs
+/// `GenerateRequestsPerMinutePerProjectPerModel-FreeTier` for the per-minute
+/// one. Treating a daily exhaustion as non-retryable makes the caller (see
+/// `chat_with_system` etc.) skip straight to the next provider-chain entry
+/// (the next key, or the next model) instead of burning `max_retries` worth
+/// of backoff against a key that provably won't recover until tomorrow.
+///
+/// A bare "exceeded your current quota" with no day/minute hint at all
+/// (message shape changed, or a non-Gemini provider using similar wording)
+/// is treated as retryable/rotatable rather than guessed at — false
+/// positives here would incorrectly give up on a key that might still work.
+fn is_gemini_daily_quota_exhausted(lower_msg: &str) -> bool {
+    let has_gemini_quota_wording = lower_msg.contains("exceeded your current quota")
+        || lower_msg.contains("resource_exhausted")
+        || lower_msg.contains("resourceexhausted");
+    if !has_gemini_quota_wording {
+        return false;
+    }
+
+    // Normalize away separators/case so "Per Day", "PerDay", "per_day" all
+    // match the same "perday" needle.
+    let normalized: String = lower_msg
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
+    normalized.contains("perday")
 }
 
 /// Try to extract a Retry-After value (in milliseconds) from an error message.
@@ -233,20 +266,24 @@ fn push_failure(
 // Three-level failover strategy: model chain → provider chain → retry loop.
 //   Outer loop:  iterate model fallback chain (original model first, then
 //                configured alternatives).
-//   Middle loop: iterate registered providers in priority order.
+//   Middle loop: iterate registered providers in priority order. elfClaw:
+//                this is also where extra API keys live — each key from
+//                `reliability.api_keys` is pre-expanded into its own chain
+//                entry at construction time (see
+//                `providers::create_resilient_provider_with_options`), so
+//                "rotate to the next key" and "fall back to the next
+//                provider" are the same mechanism.
 //   Inner loop:  retry the same (provider, model) pair with exponential
-//                backoff, rotating API keys on rate-limit errors.
+//                backoff.
 // Loop invariant: `failures` accumulates every failed attempt so the final
 // error message gives operators a complete diagnostic trail.
 
-/// Provider wrapper with retry, fallback, auth rotation, and model failover.
+/// Provider wrapper with retry, fallback, and model failover. Multi-key
+/// rotation is not handled here — see the module-level note above.
 pub struct ReliableProvider {
     providers: Vec<(String, Box<dyn Provider>)>,
     max_retries: u32,
     base_backoff_ms: u64,
-    /// Extra API keys for rotation (index tracks round-robin position).
-    api_keys: Vec<String>,
-    key_index: AtomicUsize,
     /// Per-model fallback chains: model_name → [fallback_model_1, fallback_model_2, ...]
     model_fallbacks: HashMap<String, Vec<String>>,
     /// Provider-scoped model remaps: provider_name → [model_1, model_2, ...]
@@ -265,18 +302,10 @@ impl ReliableProvider {
             providers,
             max_retries,
             base_backoff_ms: base_backoff_ms.max(50),
-            api_keys: Vec::new(),
-            key_index: AtomicUsize::new(0),
             model_fallbacks: HashMap::new(),
             provider_model_fallbacks: HashMap::new(),
             vision_override: None,
         }
-    }
-
-    /// Set additional API keys for round-robin rotation on rate-limit errors.
-    pub fn with_api_keys(mut self, keys: Vec<String>) -> Self {
-        self.api_keys = keys;
-        self
     }
 
     /// Set per-model fallback chains.
@@ -345,15 +374,6 @@ impl ReliableProvider {
         }
 
         chain
-    }
-
-    /// Advance to the next API key and return it, or None if no extra keys configured.
-    fn rotate_key(&self) -> Option<&str> {
-        if self.api_keys.is_empty() {
-            return None;
-        }
-        let idx = self.key_index.fetch_add(1, Ordering::Relaxed) % self.api_keys.len();
-        Some(&self.api_keys[idx])
     }
 
     /// Compute backoff duration, respecting Retry-After if present.
@@ -437,21 +457,6 @@ impl Provider for ReliableProvider {
                                     failure_reason,
                                     &error_detail,
                                 );
-
-                                // Rate-limit with rotatable keys: cycle to the next API key
-                                // so the retry hits a different quota bucket.
-                                if rate_limited && !non_retryable_rate_limit {
-                                    if let Some(new_key) = self.rotate_key() {
-                                        tracing::warn!(
-                                            provider = provider_name,
-                                            error = %error_detail,
-                                            "Rate limited; key rotation selected key ending ...{} \
-                                             but cannot apply (Provider trait has no set_api_key). \
-                                             Retrying with original key.",
-                                            &new_key[new_key.len().saturating_sub(4)..]
-                                        );
-                                    }
-                                }
 
                                 if non_retryable {
                                     tracing::warn!(
@@ -562,19 +567,6 @@ impl Provider for ReliableProvider {
                                     failure_reason,
                                     &error_detail,
                                 );
-
-                                if rate_limited && !non_retryable_rate_limit {
-                                    if let Some(new_key) = self.rotate_key() {
-                                        tracing::warn!(
-                                            provider = provider_name,
-                                            error = %error_detail,
-                                            "Rate limited; key rotation selected key ending ...{} \
-                                             but cannot apply (Provider trait has no set_api_key). \
-                                             Retrying with original key.",
-                                            &new_key[new_key.len().saturating_sub(4)..]
-                                        );
-                                    }
-                                }
 
                                 if non_retryable {
                                     tracing::warn!(
@@ -694,19 +686,6 @@ impl Provider for ReliableProvider {
                                     &error_detail,
                                 );
 
-                                if rate_limited && !non_retryable_rate_limit {
-                                    if let Some(new_key) = self.rotate_key() {
-                                        tracing::warn!(
-                                            provider = provider_name,
-                                            error = %error_detail,
-                                            "Rate limited; key rotation selected key ending ...{} \
-                                             but cannot apply (Provider trait has no set_api_key). \
-                                             Retrying with original key.",
-                                            &new_key[new_key.len().saturating_sub(4)..]
-                                        );
-                                    }
-                                }
-
                                 if non_retryable {
                                     tracing::warn!(
                                         provider = provider_name,
@@ -809,19 +788,6 @@ impl Provider for ReliableProvider {
                                     failure_reason,
                                     &error_detail,
                                 );
-
-                                if rate_limited && !non_retryable_rate_limit {
-                                    if let Some(new_key) = self.rotate_key() {
-                                        tracing::warn!(
-                                            provider = provider_name,
-                                            error = %error_detail,
-                                            "Rate limited; key rotation selected key ending ...{} \
-                                             but cannot apply (Provider trait has no set_api_key). \
-                                             Retrying with original key.",
-                                            &new_key[new_key.len().saturating_sub(4)..]
-                                        );
-                                    }
-                                }
 
                                 if non_retryable {
                                     tracing::warn!(
@@ -1492,35 +1458,19 @@ mod tests {
         assert!(!fallback_seen.iter().any(|m| m == "glm-5"));
     }
 
-    // ── New tests: auth rotation ──
-
-    #[tokio::test]
-    async fn auth_rotation_cycles_keys() {
-        let provider = ReliableProvider::new(
-            vec![(
-                "p".into(),
-                Box::new(MockProvider {
-                    calls: Arc::new(AtomicUsize::new(0)),
-                    fail_until_attempt: 0,
-                    response: "ok",
-                    error: "",
-                }),
-            )],
-            0,
-            1,
-        )
-        .with_api_keys(vec!["key-a".into(), "key-b".into(), "key-c".into()]);
-
-        // Rotate 5 times, verify round-robin
-        let keys: Vec<&str> = (0..5).map(|_| provider.rotate_key().unwrap()).collect();
-        assert_eq!(keys, vec!["key-a", "key-b", "key-c", "key-a", "key-b"]);
-    }
-
-    #[tokio::test]
-    async fn auth_rotation_returns_none_when_empty() {
-        let provider = ReliableProvider::new(vec![], 0, 1);
-        assert!(provider.rotate_key().is_none());
-    }
+    // elfClaw: the old `with_api_keys`/`rotate_key` stub was removed 2026-09-23
+    // — it selected a "next key" but had no way to apply it (`Provider` trait
+    // has no `set_api_key`), so it only logged a misleading warning and
+    // retried with the SAME key every time. Real multi-key rotation now
+    // happens at provider-CONSTRUCTION time in
+    // `providers::create_resilient_provider_with_options`: each extra key
+    // from `reliability.api_keys` becomes its own `(name, Box<dyn Provider>)`
+    // chain entry (same pattern as `fallback_providers`), so the existing
+    // provider-chain-fallback loop below (already covered by
+    // `falls_back_after_retries_exhausted` and friends) *is* the rotation
+    // mechanism — no extra logic was needed inside `ReliableProvider` itself.
+    // See `create_resilient_gemini_provider_expands_extra_keys_into_chain` in
+    // `providers/mod.rs` for the construction-time test.
 
     // ── New tests: Retry-After parsing ──
 
@@ -1584,6 +1534,54 @@ mod tests {
         assert!(
             !is_non_retryable_rate_limit(&err),
             "generic rate-limit 429 should remain retryable"
+        );
+    }
+
+    // ── Gemini daily-quota classification ──
+    // Real Gemini free-tier error shapes (trimmed): the daily cap names its
+    // quota metric "...PerDay...-FreeTier", the per-minute cap names it
+    // "...PerMinute...-FreeTier". Both share the same "exceeded your current
+    // quota" prefix, so the day/minute wording is the only reliable signal.
+
+    #[test]
+    fn non_retryable_rate_limit_detects_gemini_daily_quota() {
+        let err = anyhow::anyhow!(
+            "{}",
+            r#"Gemini API error (429 Too Many Requests): {"error":{"code":429,"message":"You exceeded your current quota, please check your plan and billing details.","status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[{"quotaMetric":"generativelanguage.googleapis.com/generate_content_free_tier_requests","quotaId":"GenerateRequestsPerDayPerProjectPerModel-FreeTier"}]}]}}"#
+        );
+        assert!(
+            is_non_retryable_rate_limit(&err),
+            "Gemini daily quota exhaustion should skip retries on this key and \
+             move to the next provider-chain entry (next key/model)"
+        );
+    }
+
+    #[test]
+    fn non_retryable_rate_limit_does_not_flag_gemini_per_minute_quota() {
+        let err = anyhow::anyhow!(
+            "{}",
+            r#"Gemini API error (429 Too Many Requests): {"error":{"code":429,"message":"You exceeded your current quota, please check your plan and billing details.","status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[{"quotaMetric":"generativelanguage.googleapis.com/generate_content_free_tier_requests","quotaId":"GenerateRequestsPerMinutePerProjectPerModel-FreeTier"}]}]}}"#
+        );
+        assert!(
+            !is_non_retryable_rate_limit(&err),
+            "a per-minute-only Gemini 429 should stay retryable — this key's \
+             daily budget is not exhausted, only its short-term rate"
+        );
+    }
+
+    #[test]
+    fn non_retryable_rate_limit_does_not_flag_bare_exceeded_quota_with_no_window_hint() {
+        // If Gemini ever changes the message shape and drops the
+        // day/minute-scoped quotaId, err on the side of retryable rather
+        // than guessing — a false "exhausted for today" would strand a key
+        // that might still work.
+        let err = anyhow::anyhow!(
+            "429 Too Many Requests: you exceeded your current quota, please retry later"
+        );
+        assert!(
+            !is_non_retryable_rate_limit(&err),
+            "an 'exceeded your current quota' message with no day/minute hint \
+             should not be guessed at as a daily exhaustion"
         );
     }
 

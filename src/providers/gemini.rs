@@ -414,6 +414,15 @@ const LOAD_CODE_ASSIST_ENDPOINT: &str =
 /// Public API endpoint for API key users.
 const PUBLIC_API_ENDPOINT: &str = "https://generativelanguage.googleapis.com/v1beta";
 
+/// elfClaw: max output tokens sent as `generationConfig.maxOutputTokens`.
+/// Thinking tokens (see `thinking_config`/`build_thinking_config`) are billed
+/// out of this same budget, so this must be generous rather than tight —
+/// see the call site for why a small cap here caused empty replies. 65536 is
+/// the ceiling every Gemini 3.x/2.5 Flash and Pro model supports; it is not
+/// per-model because none of the models used in the configured chat/text
+/// pools need a smaller one today.
+const GEMINI_MAX_OUTPUT_TOKENS: u32 = 65536;
+
 // ══════════════════════════════════════════════════════════════════════════════
 // TOKEN REFRESH
 // ══════════════════════════════════════════════════════════════════════════════
@@ -1222,7 +1231,16 @@ impl GeminiProvider {
             system_instruction,
             generation_config: GenerationConfig {
                 temperature,
-                max_output_tokens: 8192,
+                // elfClaw: thinking tokens are billed out of this same budget
+                // (see build_thinking_config below), so a low cap here starves
+                // the actual reply once thinkingLevel is anything above
+                // "minimal" — the model can spend its whole budget thinking
+                // and return empty text, which upstream code was treating as
+                // a transient failure and retrying. 65536 is the max every
+                // Gemini 3.x/2.5 Flash and Pro model in the configured pools
+                // supports as of 2026-09; depth is controlled by
+                // thinkingLevel below, not by capping total output.
+                max_output_tokens: GEMINI_MAX_OUTPUT_TOKENS,
                 // elfClaw: 0-4 thinking intensity → model-specific thinkingConfig (or None if unsupported)
                 thinking_config: self
                     .thinking_level
