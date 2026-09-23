@@ -3350,29 +3350,12 @@ pub struct AutonomyConfig {
     /// Restrict absolute filesystem paths to workspace-relative references. Default: `true`.
     /// Resolved paths outside the workspace still require `allowed_roots`.
     pub workspace_only: bool,
-    /// Allowlist of executable names permitted for shell execution.
-    pub allowed_commands: Vec<String>,
     /// Explicit path denylist. Default includes system-critical paths and sensitive dotdirs.
     pub forbidden_paths: Vec<String>,
     /// Maximum actions allowed per hour per policy. Default: `100`.
     pub max_actions_per_hour: u32,
     /// Maximum cost per day in cents per policy. Default: `1000`.
     pub max_cost_per_day_cents: u32,
-
-    /// Require explicit approval for medium-risk shell commands.
-    #[serde(default = "default_true")]
-    pub require_approval_for_medium_risk: bool,
-
-    /// Block high-risk shell commands even if allowlisted.
-    #[serde(default = "default_true")]
-    pub block_high_risk_commands: bool,
-
-    /// Additional environment variables allowed for shell tool subprocesses.
-    ///
-    /// These names are explicitly allowlisted and merged with the built-in safe
-    /// baseline (`PATH`, `HOME`, etc.) after `env_clear()`.
-    #[serde(default)]
-    pub shell_env_passthrough: Vec<String>,
 
     /// Allow `file_read` to access sensitive workspace secrets such as `.env`,
     /// key material, and credential files.
@@ -3470,14 +3453,12 @@ fn default_always_ask() -> Vec<String> {
 
 fn default_non_cli_excluded_tools() -> Vec<String> {
     [
-        "shell",
         "file_write",
         "file_edit",
         "git_operations",
         "browser",
         "browser_open",
         "http_request",
-        "schedule",
         "cron_add",
         "cron_remove",
         "cron_update",
@@ -3581,21 +3562,6 @@ impl Default for AutonomyConfig {
         Self {
             level: AutonomyLevel::Supervised,
             workspace_only: true,
-            allowed_commands: vec![
-                "git".into(),
-                "npm".into(),
-                "cargo".into(),
-                "ls".into(),
-                "cat".into(),
-                "grep".into(),
-                "find".into(),
-                "echo".into(),
-                "pwd".into(),
-                "wc".into(),
-                "head".into(),
-                "tail".into(),
-                "date".into(),
-            ],
             forbidden_paths: vec![
                 "/etc".into(),
                 "/root".into(),
@@ -3619,9 +3585,6 @@ impl Default for AutonomyConfig {
             ],
             max_actions_per_hour: 20,
             max_cost_per_day_cents: 500,
-            require_approval_for_medium_risk: true,
-            block_high_risk_commands: true,
-            shell_env_passthrough: vec![],
             allow_sensitive_file_reads: false,
             allow_sensitive_file_writes: false,
             auto_approve: default_auto_approve(),
@@ -6030,7 +5993,6 @@ fn default_otp_challenge_max_attempts() -> u8 {
 
 fn default_otp_gated_actions() -> Vec<String> {
     vec![
-        "shell".to_string(),
         "file_write".to_string(),
         "browser_open".to_string(),
         "browser".to_string(),
@@ -7819,13 +7781,6 @@ impl Config {
         if self.autonomy.max_actions_per_hour == 0 {
             anyhow::bail!("autonomy.max_actions_per_hour must be greater than 0");
         }
-        for (i, env_name) in self.autonomy.shell_env_passthrough.iter().enumerate() {
-            if !is_valid_env_var_name(env_name) {
-                anyhow::bail!(
-                    "autonomy.shell_env_passthrough[{i}] is invalid ({env_name}); expected [A-Za-z_][A-Za-z0-9_]*"
-                );
-            }
-        }
         let mut seen_non_cli_excluded = std::collections::HashSet::new();
         for (i, tool_name) in self.autonomy.non_cli_excluded_tools.iter().enumerate() {
             let normalized = tool_name.trim();
@@ -9605,17 +9560,11 @@ mod tests {
         let a = AutonomyConfig::default();
         assert_eq!(a.level, AutonomyLevel::Supervised);
         assert!(a.workspace_only);
-        assert!(a.allowed_commands.contains(&"git".to_string()));
-        assert!(a.allowed_commands.contains(&"cargo".to_string()));
         assert!(a.forbidden_paths.contains(&"/etc".to_string()));
         assert_eq!(a.max_actions_per_hour, 20);
         assert_eq!(a.max_cost_per_day_cents, 500);
-        assert!(a.require_approval_for_medium_risk);
-        assert!(a.block_high_risk_commands);
-        assert!(a.shell_env_passthrough.is_empty());
         assert!(!a.allow_sensitive_file_reads);
         assert!(!a.allow_sensitive_file_writes);
-        assert!(a.non_cli_excluded_tools.contains(&"shell".to_string()));
         assert!(a.non_cli_excluded_tools.contains(&"delegate".to_string()));
     }
 
@@ -9624,13 +9573,9 @@ mod tests {
         let raw = r#"
 level = "supervised"
 workspace_only = true
-allowed_commands = ["git"]
 forbidden_paths = ["/etc"]
 max_actions_per_hour = 20
 max_cost_per_day_cents = 500
-require_approval_for_medium_risk = true
-block_high_risk_commands = true
-shell_env_passthrough = []
 auto_approve = ["file_read"]
 always_ask = []
 allowed_roots = []
@@ -9644,7 +9589,6 @@ allowed_roots = []
             !parsed.allow_sensitive_file_writes,
             "Missing allow_sensitive_file_writes must default to false"
         );
-        assert!(parsed.non_cli_excluded_tools.contains(&"shell".to_string()));
         assert!(parsed
             .non_cli_excluded_tools
             .contains(&"browser".to_string()));
@@ -9868,13 +9812,9 @@ ws_url = "ws://127.0.0.1:3002"
             autonomy: AutonomyConfig {
                 level: AutonomyLevel::Full,
                 workspace_only: false,
-                allowed_commands: vec!["docker".into()],
                 forbidden_paths: vec!["/secret".into()],
                 max_actions_per_hour: 50,
                 max_cost_per_day_cents: 1000,
-                require_approval_for_medium_risk: false,
-                block_high_risk_commands: true,
-                shell_env_passthrough: vec!["DATABASE_URL".into()],
                 allow_sensitive_file_reads: false,
                 allow_sensitive_file_writes: false,
                 auto_approve: vec!["file_read".into()],

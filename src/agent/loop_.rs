@@ -210,7 +210,11 @@ pub(crate) fn scrub_credentials(input: &str) -> String {
             // Preserve first 4 Unicode chars for context, then redact
             // Use char-based slicing to avoid panicking on multi-byte CJK characters.
             let prefix_s: String = val.chars().take(4).collect();
-            let prefix: &str = if prefix_s.len() < val.len() { &prefix_s } else { "" };
+            let prefix: &str = if prefix_s.len() < val.len() {
+                &prefix_s
+            } else {
+                ""
+            };
 
             if full_match.contains(':') {
                 if full_match.contains('"') {
@@ -1603,14 +1607,6 @@ pub async fn run(
     // ── Build system prompt from workspace MD files (OpenClaw framework) ──
     let skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
 
-    // elfClaw: register SKILL.toml tools (web_scrape, web_crawl, web_login, etc.)
-    let skill_tools =
-        crate::skills::create_skill_tools(&skills, Arc::clone(&security), &config.workspace_dir);
-    if !skill_tools.is_empty() {
-        tracing::info!(count = skill_tools.len(), "Skill tools registered");
-        tools_registry.extend(skill_tools);
-    }
-
     // elfClaw: filter tool registry when running as a named delegate agent (cron delegate_to)
     if let Some(ref allowed) = allowed_tools {
         let allowed_set: std::collections::HashSet<&str> =
@@ -2139,19 +2135,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
 
     let skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
 
-    // elfClaw: register SKILL.toml tools (web_scrape, web_crawl, web_login, etc.)
-    let skill_tools =
-        crate::skills::create_skill_tools(&skills, Arc::clone(&security), &config.workspace_dir);
-    if !skill_tools.is_empty() {
-        tracing::info!(
-            count = skill_tools.len(),
-            "Skill tools registered in process_message"
-        );
-        tools_registry.extend(skill_tools);
-    }
-
     let mut tool_descs: Vec<(&str, &str)> = vec![
-        ("shell", "Execute terminal commands."),
         ("file_read", "Read file contents."),
         ("file_write", "Write file contents."),
         ("memory_store", "Save to memory."),
@@ -3532,7 +3516,6 @@ Tail"#;
 
         assert!(instructions.contains("## Tool Use Protocol"));
         assert!(instructions.contains("<tool_call>"));
-        assert!(instructions.contains("shell"));
         assert!(instructions.contains("file_read"));
         assert!(instructions.contains("file_write"));
     }
@@ -3559,7 +3542,6 @@ Tail"#;
             .iter()
             .filter_map(|t| t["function"]["name"].as_str())
             .collect();
-        assert!(names.contains(&"shell"));
         assert!(names.contains(&"file_read"));
     }
 
@@ -3958,15 +3940,15 @@ Done."#;
 
     #[test]
     fn parse_glm_style_browser_open_url() {
+        // elfClaw 2026-09-23: browser_open used to be incorrectly aliased to
+        // "shell" and rewritten into a raw curl command, which silently
+        // bypassed browser_open's own allowlist/URL validation. It now
+        // resolves to the real browser_open tool with its "url" argument.
         let response = "browser_open/url>https://example.com";
         let calls = parse_glm_style_tool_calls(response);
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "shell");
-        assert!(calls[0].1["command"].as_str().unwrap().contains("curl"));
-        assert!(calls[0].1["command"]
-            .as_str()
-            .unwrap()
-            .contains("example.com"));
+        assert_eq!(calls[0].0, "browser_open");
+        assert_eq!(calls[0].1["url"], "https://example.com");
     }
 
     #[test]
@@ -4065,16 +4047,23 @@ browser_open/url>https://example.com"#;
         let response = "Checking...\nbrowser_open/url>https://example.com\nDone";
         let (text, calls) = parse_tool_calls(response);
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "shell");
+        assert_eq!(calls[0].name, "browser_open");
         assert!(text.contains("Checking"));
         assert!(text.contains("Done"));
     }
 
     #[test]
-    fn parse_glm_style_rejects_non_http_url_param() {
+    fn parse_glm_style_passes_non_http_url_param_through_for_tool_to_reject() {
+        // elfClaw 2026-09-23: the parser no longer special-cases
+        // browser_open's URL (that was only done to build a curl command
+        // for the old shell alias). Scheme/URL validation is now the real
+        // browser_open tool's job (see validate_url in browser_open.rs), so
+        // the parser just passes the raw value through.
         let response = "browser_open/url>javascript:alert(1)";
         let calls = parse_glm_style_tool_calls(response);
-        assert!(calls.is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "browser_open");
+        assert_eq!(calls[0].1["url"], "javascript:alert(1)");
     }
 
     #[test]
@@ -4438,14 +4427,12 @@ Let me check the result."#;
     }
 
     #[test]
-    fn parse_glm_shortened_body_browser_open_maps_to_shell_command() {
-        // browser_open aliases to shell, and shortened calls must still emit
-        // shell's canonical "command" argument.
+    fn parse_glm_shortened_body_browser_open_resolves_to_browser_open_tool() {
+        // elfClaw 2026-09-23: browser_open no longer aliases to "shell" —
+        // it resolves to itself, with its default "url" argument.
         let call = parse_glm_shortened_body("browser_open>https://example.com").unwrap();
-        assert_eq!(call.name, "shell");
-        let cmd = call.arguments["command"].as_str().unwrap();
-        assert!(cmd.contains("curl"));
-        assert!(cmd.contains("example.com"));
+        assert_eq!(call.name, "browser_open");
+        assert_eq!(call.arguments["url"], "https://example.com");
     }
 
     #[test]
@@ -4467,7 +4454,10 @@ Let me check the result."#;
 
     #[test]
     fn map_tool_name_alias_direct_coverage() {
-        assert_eq!(map_tool_name_alias("bash"), "shell");
+        // elfClaw 2026-09-23: shell removed entirely — "bash" now falls
+        // through unchanged (no alias target exists) rather than resolving
+        // to "shell".
+        assert_eq!(map_tool_name_alias("bash"), "bash");
         assert_eq!(map_tool_name_alias("filelist"), "file_list");
         assert_eq!(map_tool_name_alias("memorystore"), "memory_store");
         assert_eq!(map_tool_name_alias("memoryforget"), "memory_forget");
@@ -4476,6 +4466,15 @@ Let me check the result."#;
             map_tool_name_alias("totally_unknown_tool"),
             "totally_unknown_tool"
         );
+    }
+
+    #[test]
+    fn map_tool_name_alias_preserves_browser_and_web_search() {
+        // elfClaw 2026-09-23: regression test for a pre-existing bug where
+        // these three real tools were incorrectly aliased to "shell".
+        assert_eq!(map_tool_name_alias("browser_open"), "browser_open");
+        assert_eq!(map_tool_name_alias("browser"), "browser");
+        assert_eq!(map_tool_name_alias("web_search"), "web_search");
     }
 
     #[test]

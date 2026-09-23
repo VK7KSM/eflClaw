@@ -411,13 +411,6 @@ fn tool_description_zh(tool_name: &str, args: &serde_json::Value) -> String {
         "generate_pairing_code" => {
             "生成新的 Web 客户端配对码（6位数字），新码将替换之前未使用的旧码。".into()
         }
-        "shell" => {
-            let cmd = args
-                .get("command")
-                .and_then(|v| v.as_str())
-                .unwrap_or("(unknown)");
-            format!("在系统终端执行命令：\n`{cmd}`")
-        }
         "file_write" => {
             let path = args
                 .get("path")
@@ -437,10 +430,7 @@ fn tool_description_zh(tool_name: &str, args: &serde_json::Value) -> String {
                 .get("url")
                 .and_then(|v| v.as_str())
                 .unwrap_or("(unknown)");
-            let method = args
-                .get("method")
-                .and_then(|v| v.as_str())
-                .unwrap_or("GET");
+            let method = args.get("method").and_then(|v| v.as_str()).unwrap_or("GET");
             format!("发送 HTTP 请求：{method} {url}")
         }
         "send_email" => {
@@ -448,10 +438,7 @@ fn tool_description_zh(tool_name: &str, args: &serde_json::Value) -> String {
                 .get("to")
                 .and_then(|v| v.as_str())
                 .unwrap_or("(unknown)");
-            let subject = args
-                .get("subject")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let subject = args.get("subject").and_then(|v| v.as_str()).unwrap_or("");
             format!("发送邮件到 {to}\n主题：{subject}")
         }
         "send_telegram" => {
@@ -467,10 +454,7 @@ fn tool_description_zh(tool_name: &str, args: &serde_json::Value) -> String {
                 .and_then(|v| v.as_str())
                 .or_else(|| args.get("prompt").and_then(|v| v.as_str()))
                 .unwrap_or("(unknown)");
-            let schedule = args
-                .get("schedule")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let schedule = args.get("schedule").and_then(|v| v.as_str()).unwrap_or("");
             format!("创建定时任务：{schedule}\n内容：{cmd}")
         }
         "cron_run" => {
@@ -1753,10 +1737,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
 
     /// Parse multiple Telegram updates sharing a `media_group_id` into a single
     /// `ChannelMessage` containing all attachment markers.
-    async fn try_parse_media_group(
-        &self,
-        group: &[&serde_json::Value],
-    ) -> Option<ChannelMessage> {
+    async fn try_parse_media_group(&self, group: &[&serde_json::Value]) -> Option<ChannelMessage> {
         let first_update = group.first()?;
         let first_message = first_update.get("message")?;
 
@@ -3739,16 +3720,12 @@ Ensure only one `zeroclaw` process is using this bot token."
             if let Some(results) = data.get("result").and_then(serde_json::Value::as_array) {
                 // Pre-pass: advance all offsets immediately, then split into standalone
                 // updates and media-group buckets.
-                let mut media_groups: std::collections::HashMap<
-                    String,
-                    Vec<&serde_json::Value>,
-                > = std::collections::HashMap::new();
+                let mut media_groups: std::collections::HashMap<String, Vec<&serde_json::Value>> =
+                    std::collections::HashMap::new();
                 let mut standalone: Vec<&serde_json::Value> = Vec::new();
 
                 for update in results {
-                    if let Some(uid) =
-                        update.get("update_id").and_then(serde_json::Value::as_i64)
-                    {
+                    if let Some(uid) = update.get("update_id").and_then(serde_json::Value::as_i64) {
                         offset = uid + 1;
                     }
                     if let Some(mgid) = update
@@ -3829,12 +3806,8 @@ Ensure only one `zeroclaw` process is using this bot token."
                     };
 
                     if let Some(first_update) = group.first() {
-                        if let Some((
-                            reaction_chat_id,
-                            reaction_message_id,
-                            chat_type,
-                            sender_id,
-                        )) = Self::extract_update_message_ack_target(first_update)
+                        if let Some((reaction_chat_id, reaction_message_id, chat_type, sender_id)) =
+                            Self::extract_update_message_ack_target(first_update)
                         {
                             let reaction_ctx = AckReactionContext {
                                 text: &msg.content,

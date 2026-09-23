@@ -1084,10 +1084,6 @@ async fn main() -> Result<()> {
                 }
             );
             println!(
-                "  Allowed commands:  {}",
-                config.autonomy.allowed_commands.join(", ")
-            );
-            println!(
                 "  Max actions/hour:  {}",
                 config.autonomy.max_actions_per_hour
             );

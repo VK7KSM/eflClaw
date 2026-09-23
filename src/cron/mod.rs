@@ -1,5 +1,4 @@
 use crate::config::Config;
-use crate::security::SecurityPolicy;
 use anyhow::{bail, Result};
 
 pub mod heartbeat_decl;
@@ -16,10 +15,33 @@ pub use schedule::{
 };
 #[allow(unused_imports)]
 pub use store::{
-    add_agent_job, add_job, add_message_job, add_shell_job, due_jobs, get_job, list_jobs,
-    list_runs, record_last_run, record_run, remove_job, reschedule_after_run, update_job,
+    add_agent_job, add_job, add_message_job, due_jobs, get_job, list_jobs, list_runs,
+    record_last_run, record_run, remove_job, reschedule_after_run, update_job,
 };
 pub use types::{CronJob, CronJobPatch, CronRun, DeliveryConfig, JobType, Schedule, SessionTarget};
+
+/// elfClaw 2026-09-23: CLI-only convenience wrapper for `zeroclaw cron add*`
+/// — creates an agent-type job from the CLI's plain `command` string (which
+/// reads as free text / an instruction, not a literal shell command; see the
+/// `zeroclaw cron add`/`add-at`/`add-every`/`once` --help examples, e.g.
+/// "Good morning", "Check system health"). Shell jobs were removed entirely.
+fn add_cli_agent_job(config: &Config, schedule: Schedule, command: &str) -> Result<CronJob> {
+    // elfClaw: preserve add_shell_job's old auto-delete-after-run behavior
+    // for one-shot `at` schedules (a fired one-shot job has nothing left to
+    // do, recurring cron/every jobs should stay).
+    let delete_after_run = matches!(schedule, Schedule::At { .. });
+    add_agent_job(
+        config,
+        None,
+        schedule,
+        command,
+        SessionTarget::Isolated,
+        None,
+        None,
+        delete_after_run,
+        None,
+    )
+}
 
 #[allow(clippy::needless_pass_by_value)]
 pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<()> {
@@ -65,11 +87,11 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                 expr: expression,
                 tz,
             };
-            let job = add_shell_job(config, None, schedule, &command)?;
+            let job = add_cli_agent_job(config, schedule, &command)?;
             println!("✅ Added cron job {}", job.id);
-            println!("  Expr: {}", job.expression);
-            println!("  Next: {}", job.next_run.to_rfc3339());
-            println!("  Cmd : {}", job.command);
+            println!("  Expr  : {}", job.expression);
+            println!("  Next  : {}", job.next_run.to_rfc3339());
+            println!("  Prompt: {}", job.prompt.unwrap_or_default());
             Ok(())
         }
         crate::CronCommands::AddAt { at, command } => {
@@ -77,26 +99,26 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                 .map_err(|e| anyhow::anyhow!("Invalid RFC3339 timestamp for --at: {e}"))?
                 .with_timezone(&chrono::Utc);
             let schedule = Schedule::At { at };
-            let job = add_shell_job(config, None, schedule, &command)?;
+            let job = add_cli_agent_job(config, schedule, &command)?;
             println!("✅ Added one-shot cron job {}", job.id);
-            println!("  At  : {}", job.next_run.to_rfc3339());
-            println!("  Cmd : {}", job.command);
+            println!("  At    : {}", job.next_run.to_rfc3339());
+            println!("  Prompt: {}", job.prompt.unwrap_or_default());
             Ok(())
         }
         crate::CronCommands::AddEvery { every_ms, command } => {
             let schedule = Schedule::Every { every_ms };
-            let job = add_shell_job(config, None, schedule, &command)?;
+            let job = add_cli_agent_job(config, schedule, &command)?;
             println!("✅ Added interval cron job {}", job.id);
             println!("  Every(ms): {every_ms}");
             println!("  Next     : {}", job.next_run.to_rfc3339());
-            println!("  Cmd      : {}", job.command);
+            println!("  Prompt   : {}", job.prompt.unwrap_or_default());
             Ok(())
         }
         crate::CronCommands::Once { delay, command } => {
             let job = add_once(config, &delay, &command)?;
             println!("✅ Added one-shot cron job {}", job.id);
-            println!("  At  : {}", job.next_run.to_rfc3339());
-            println!("  Cmd : {}", job.command);
+            println!("  At    : {}", job.next_run.to_rfc3339());
+            println!("  Prompt: {}", job.prompt.unwrap_or_default());
             Ok(())
         }
         crate::CronCommands::Update {
@@ -130,16 +152,15 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                 None
             };
 
-            if let Some(ref cmd) = command {
-                let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
-                if !security.is_command_allowed(cmd) {
-                    bail!("Command blocked by security policy: {cmd}");
-                }
-            }
-
             let patch = CronJobPatch {
                 schedule,
-                command,
+                // elfClaw 2026-09-23: `--command` updates both columns —
+                // `command` for display/back-compat, `prompt` because that's
+                // what the scheduler actually executes for agent-type jobs
+                // (shell jobs, which used `command` as the executable, were
+                // removed entirely).
+                command: command.clone(),
+                prompt: command,
                 name,
                 ..CronJobPatch::default()
             };
@@ -177,7 +198,7 @@ pub fn add_once_at(
     command: &str,
 ) -> Result<CronJob> {
     let schedule = Schedule::At { at };
-    add_shell_job(config, None, schedule, command)
+    add_cli_agent_job(config, schedule, command)
 }
 
 pub fn pause_job(config: &Config, id: &str) -> Result<CronJob> {
@@ -239,9 +260,8 @@ mod tests {
     }
 
     fn make_job(config: &Config, expr: &str, tz: Option<&str>, cmd: &str) -> CronJob {
-        add_shell_job(
+        add_cli_agent_job(
             config,
-            None,
             Schedule::Cron {
                 expr: expr.into(),
                 tz: tz.map(Into::into),
@@ -361,9 +381,8 @@ mod tests {
     fn update_preserves_unchanged_fields() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
-        let job = add_shell_job(
+        let job = add_cli_agent_job(
             &config,
-            Some("original-name".into()),
             Schedule::Cron {
                 expr: "*/5 * * * *".into(),
                 tz: None,
@@ -376,7 +395,8 @@ mod tests {
 
         let updated = get_job(&config, &job.id).unwrap();
         assert_eq!(updated.command, "echo changed");
-        assert_eq!(updated.name.as_deref(), Some("original-name"));
+        assert_eq!(updated.prompt.as_deref(), Some("echo changed"));
+        assert_eq!(updated.name, None, "unset name must be preserved as None");
         assert_eq!(updated.expression, "*/5 * * * *");
     }
 
@@ -405,14 +425,5 @@ mod tests {
             None,
         );
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn update_security_allows_safe_command() {
-        let tmp = TempDir::new().unwrap();
-        let config = test_config(&tmp);
-
-        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
-        assert!(security.is_command_allowed("echo safe"));
     }
 }

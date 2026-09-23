@@ -5,7 +5,6 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "lowercase")]
 pub enum JobType {
     #[default]
-    Shell,
     Agent,
     /// elfClaw 2026-09-23: a plain-text reminder with no LLM call at fire
     /// time. The stored `prompt` is delivered as-is via `delivery` — no
@@ -19,7 +18,6 @@ pub enum JobType {
 impl From<JobType> for &'static str {
     fn from(value: JobType) -> Self {
         match value {
-            JobType::Shell => "shell",
             JobType::Agent => "agent",
             JobType::Message => "message",
         }
@@ -31,11 +29,10 @@ impl TryFrom<&str> for JobType {
 
     fn try_from(value: &str) -> Result<Self, Self::Error> {
         match value.to_lowercase().as_str() {
-            "shell" => Ok(JobType::Shell),
             "agent" => Ok(JobType::Agent),
             "message" => Ok(JobType::Message),
             _ => Err(format!(
-                "Invalid job type '{}'. Expected one of: 'shell', 'agent', 'message'",
+                "Invalid job type '{}'. Expected one of: 'agent', 'message'",
                 value
             )),
         }
@@ -163,15 +160,19 @@ mod tests {
 
     #[test]
     fn job_type_try_from_accepts_known_values_case_insensitive() {
-        assert_eq!(JobType::try_from("shell").unwrap(), JobType::Shell);
-        assert_eq!(JobType::try_from("SHELL").unwrap(), JobType::Shell);
         assert_eq!(JobType::try_from("agent").unwrap(), JobType::Agent);
         assert_eq!(JobType::try_from("AgEnT").unwrap(), JobType::Agent);
+        assert_eq!(JobType::try_from("message").unwrap(), JobType::Message);
+        assert_eq!(JobType::try_from("MESSAGE").unwrap(), JobType::Message);
     }
 
     #[test]
     fn job_type_try_from_rejects_invalid_values() {
         assert!(JobType::try_from("").is_err());
         assert!(JobType::try_from("unknown").is_err());
+        assert!(
+            JobType::try_from("shell").is_err(),
+            "shell jobs were removed entirely (elfclaw.md §8)"
+        );
     }
 }

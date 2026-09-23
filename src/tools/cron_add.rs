@@ -56,7 +56,7 @@ impl Tool for CronAddTool {
     }
 
     fn description(&self) -> &str {
-        "Create a scheduled cron job (shell, agent, or message) with cron/at/every schedules. \
+        "Create a scheduled cron job (agent or message) with cron/at/every schedules. \
          Use job_type='message' with a fixed 'message' text for a plain reminder/scheduled \
          send — it is delivered exactly as written with NO LLM call at fire time, so prefer \
          it whenever the reminder doesn't need the model to look anything up or decide what \
@@ -80,8 +80,7 @@ impl Tool for CronAddTool {
                     "type": "object",
                     "description": "Schedule object: {kind:'cron',expr,tz?} recurring | {kind:'at',at} one-time | {kind:'every',every_ms} recurring interval"
                 },
-                "job_type": { "type": "string", "enum": ["shell", "agent", "message"] },
-                "command": { "type": "string" },
+                "job_type": { "type": "string", "enum": ["agent", "message"] },
                 "prompt": { "type": "string" },
                 "message": {
                     "type": "string",
@@ -108,11 +107,6 @@ impl Tool for CronAddTool {
                 "delegate_to": {
                     "type": ["string", "null"],
                     "description": "Name of a configured sub-agent (from [agents.*]) to delegate this job to. When set, the job's prompt is automatically routed to that agent via the delegate tool instead of being executed by the main agent."
-                },
-                "approved": {
-                    "type": "boolean",
-                    "description": "Set true to explicitly approve medium/high-risk shell commands in supervised mode",
-                    "default": false
                 }
             },
             "required": ["schedule"]
@@ -155,7 +149,6 @@ impl Tool for CronAddTool {
 
         let job_type = match args.get("job_type").and_then(serde_json::Value::as_str) {
             Some("agent") => JobType::Agent,
-            Some("shell") => JobType::Shell,
             Some("message") => JobType::Message,
             Some(other) => {
                 return Ok(ToolResult {
@@ -170,7 +163,15 @@ impl Tool for CronAddTool {
                 } else if args.get("prompt").is_some() {
                     JobType::Agent
                 } else {
-                    JobType::Shell
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(
+                            "Missing 'job_type' (agent|message), or provide 'message' or 'prompt' \
+                             so it can be inferred."
+                                .to_string(),
+                        ),
+                    });
                 }
             }
         };
@@ -180,38 +181,8 @@ impl Tool for CronAddTool {
             .get("delete_after_run")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(default_delete_after_run);
-        let approved = args
-            .get("approved")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
 
         let result = match job_type {
-            JobType::Shell => {
-                let command = match args.get("command").and_then(serde_json::Value::as_str) {
-                    Some(command) if !command.trim().is_empty() => command,
-                    _ => {
-                        return Ok(ToolResult {
-                            success: false,
-                            output: String::new(),
-                            error: Some("Missing 'command' for shell job".to_string()),
-                        });
-                    }
-                };
-
-                if let Err(reason) = self.security.validate_command_execution(command, approved) {
-                    return Ok(ToolResult {
-                        success: false,
-                        output: String::new(),
-                        error: Some(reason),
-                    });
-                }
-
-                if let Some(blocked) = self.enforce_mutation_allowed("cron_add") {
-                    return Ok(blocked);
-                }
-
-                cron::add_shell_job(&self.config, name, schedule, command)
-            }
             JobType::Agent => {
                 let prompt = match args.get("prompt").and_then(serde_json::Value::as_str) {
                     Some(prompt) if !prompt.trim().is_empty() => prompt,
@@ -450,24 +421,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn adds_shell_job() {
-        let tmp = TempDir::new().unwrap();
-        let cfg = test_config(&tmp).await;
-        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
-        let result = tool
-            .execute(json!({
-                "schedule": { "kind": "cron", "expr": "*/5 * * * *" },
-                "job_type": "shell",
-                "command": "echo ok"
-            }))
-            .await
-            .unwrap();
-
-        assert!(result.success, "{:?}", result.error);
-        assert!(result.output.contains("next_run"));
-    }
-
-    #[tokio::test]
     async fn adds_message_job_with_delivery() {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp).await;
@@ -552,35 +505,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blocks_disallowed_shell_command() {
-        let tmp = TempDir::new().unwrap();
-        let mut config = Config {
-            workspace_dir: tmp.path().join("workspace"),
-            config_path: tmp.path().join("config.toml"),
-            ..Config::default()
-        };
-        config.autonomy.allowed_commands = vec!["echo".into()];
-        config.autonomy.level = AutonomyLevel::Supervised;
-        tokio::fs::create_dir_all(&config.workspace_dir)
-            .await
-            .unwrap();
-        let cfg = Arc::new(config);
-        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
-
-        let result = tool
-            .execute(json!({
-                "schedule": { "kind": "cron", "expr": "*/5 * * * *" },
-                "job_type": "shell",
-                "command": "curl https://example.com"
-            }))
-            .await
-            .unwrap();
-
-        assert!(!result.success);
-        assert!(result.error.unwrap_or_default().contains("not allowed"));
-    }
-
-    #[tokio::test]
     async fn blocks_mutation_in_read_only_mode() {
         let tmp = TempDir::new().unwrap();
         let mut config = Config {
@@ -595,9 +519,10 @@ mod tests {
 
         let result = tool
             .execute(json!({
-                "schedule": { "kind": "cron", "expr": "*/5 * * * *" },
-                "job_type": "shell",
-                "command": "echo ok"
+                "schedule": { "kind": "at", "at": "2099-01-01T00:00:00Z" },
+                "job_type": "message",
+                "message": "reminder",
+                "delivery": {"mode": "announce", "channel": "telegram", "to": "123"}
             }))
             .await
             .unwrap();
@@ -624,8 +549,9 @@ mod tests {
         let result = tool
             .execute(json!({
                 "schedule": { "kind": "cron", "expr": "*/5 * * * *" },
-                "job_type": "shell",
-                "command": "echo ok"
+                "job_type": "agent",
+                "prompt": "do the thing",
+                "recurring_confirmed": true
             }))
             .await
             .unwrap();
@@ -639,46 +565,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn medium_risk_shell_command_requires_approval() {
-        let tmp = TempDir::new().unwrap();
-        let mut config = Config {
-            workspace_dir: tmp.path().join("workspace"),
-            config_path: tmp.path().join("config.toml"),
-            ..Config::default()
-        };
-        config.autonomy.allowed_commands = vec!["touch".into()];
-        config.autonomy.level = AutonomyLevel::Supervised;
-        std::fs::create_dir_all(&config.workspace_dir).unwrap();
-        let cfg = Arc::new(config);
-        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
-
-        let denied = tool
-            .execute(json!({
-                "schedule": { "kind": "cron", "expr": "*/5 * * * *" },
-                "job_type": "shell",
-                "command": "touch cron-approval-test"
-            }))
-            .await
-            .unwrap();
-        assert!(!denied.success);
-        assert!(denied
-            .error
-            .unwrap_or_default()
-            .contains("explicit approval"));
-
-        let approved = tool
-            .execute(json!({
-                "schedule": { "kind": "cron", "expr": "*/5 * * * *" },
-                "job_type": "shell",
-                "command": "touch cron-approval-test",
-                "approved": true
-            }))
-            .await
-            .unwrap();
-        assert!(approved.success, "{:?}", approved.error);
-    }
-
-    #[tokio::test]
     async fn rejects_invalid_schedule() {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp).await;
@@ -687,8 +573,10 @@ mod tests {
         let result = tool
             .execute(json!({
                 "schedule": { "kind": "every", "every_ms": 0 },
-                "job_type": "shell",
-                "command": "echo nope"
+                "job_type": "message",
+                "message": "reminder",
+                "delivery": {"mode": "announce", "channel": "telegram", "to": "123"},
+                "recurring_confirmed": true
             }))
             .await
             .unwrap();

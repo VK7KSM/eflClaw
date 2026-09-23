@@ -1,6 +1,6 @@
 use super::traits::{Tool, ToolResult};
 use crate::config::Config;
-use crate::cron::{self, JobType};
+use crate::cron;
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use chrono::Utc;
@@ -32,12 +32,7 @@ impl Tool for CronRunTool {
         json!({
             "type": "object",
             "properties": {
-                "job_id": { "type": "string" },
-                "approved": {
-                    "type": "boolean",
-                    "description": "Set true to explicitly approve medium/high-risk shell commands in supervised mode",
-                    "default": false
-                }
+                "job_id": { "type": "string" }
             },
             "required": ["job_id"]
         })
@@ -62,11 +57,6 @@ impl Tool for CronRunTool {
                 });
             }
         };
-        let approved = args
-            .get("approved")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
-
         if !self.security.can_act() {
             return Ok(ToolResult {
                 success: false,
@@ -93,19 +83,6 @@ impl Tool for CronRunTool {
                 });
             }
         };
-
-        if matches!(job.job_type, JobType::Shell) {
-            if let Err(reason) = self
-                .security
-                .validate_command_execution(&job.command, approved)
-            {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(reason),
-                });
-            }
-        }
 
         if !self.security.record_action() {
             return Ok(ToolResult {
@@ -186,9 +163,24 @@ mod tests {
 
     #[tokio::test]
     async fn force_runs_job_and_records_history() {
+        // elfClaw 2026-09-23: uses a message job (no LLM call, always
+        // succeeds deterministically) rather than an agent job — this test
+        // is about the run-history recording mechanism, not about actually
+        // executing a job, and agent jobs need a real provider to succeed.
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp).await;
-        let job = cron::add_job(&cfg, "*/5 * * * *", "echo run-now").unwrap();
+        let job = cron::add_message_job(
+            &cfg,
+            None,
+            crate::cron::Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "run-now reminder",
+            None,
+            false,
+        )
+        .unwrap();
         let tool = CronRunTool::new(cfg.clone(), test_security(&cfg));
 
         let result = tool.execute(json!({ "job_id": job.id })).await.unwrap();
@@ -281,35 +273,6 @@ mod tests {
         let result = tool.execute(json!({ "job_id": job.id })).await.unwrap();
         assert!(!result.success);
         assert!(result.error.unwrap_or_default().contains("read-only"));
-    }
-
-    #[tokio::test]
-    async fn shell_run_requires_approval_for_medium_risk() {
-        let tmp = TempDir::new().unwrap();
-        let mut config = Config {
-            workspace_dir: tmp.path().join("workspace"),
-            config_path: tmp.path().join("config.toml"),
-            ..Config::default()
-        };
-        config.autonomy.level = AutonomyLevel::Supervised;
-        config.autonomy.allowed_commands = vec!["touch".into()];
-        std::fs::create_dir_all(&config.workspace_dir).unwrap();
-        let cfg = Arc::new(config);
-        let job = cron::add_job(&cfg, "*/5 * * * *", "touch cron-run-approval").unwrap();
-        let tool = CronRunTool::new(cfg.clone(), test_security(&cfg));
-
-        let denied = tool.execute(json!({ "job_id": job.id })).await.unwrap();
-        assert!(!denied.success);
-        assert!(denied
-            .error
-            .unwrap_or_default()
-            .contains("explicit approval"));
-
-        let approved = tool
-            .execute(json!({ "job_id": job.id, "approved": true }))
-            .await
-            .unwrap();
-        assert!(approved.success, "{:?}", approved.error);
     }
 
     #[tokio::test]

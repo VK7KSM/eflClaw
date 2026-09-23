@@ -542,12 +542,7 @@ fn build_runtime_status_section(config: &crate::config::Config) -> String {
     section.push_str("\n\n## Runtime Status\n\n");
 
     // Autonomy
-    let _ = writeln!(
-        section,
-        "**Autonomy**: {:?} | allowed_commands: [{}]",
-        config.autonomy.level,
-        config.autonomy.allowed_commands.join(", ")
-    );
+    let _ = writeln!(section, "**Autonomy**: {:?}", config.autonomy.level);
 
     // Worker model + agents
     if let Some(ref wm) = config.worker_model {
@@ -4191,27 +4186,12 @@ pub async fn start_channels(config: Config) -> Result<()> {
         }
     }
 
-    // elfClaw: register SKILL.toml tools (web_scrape, web_crawl, web_login, etc.)
     let skills = crate::skills::load_skills_with_config(&workspace, &config);
-    let skill_tools = crate::skills::create_skill_tools(&skills, Arc::clone(&security), &workspace);
-    if !skill_tools.is_empty() {
-        tracing::info!(
-            count = skill_tools.len(),
-            "Skill tools registered in daemon"
-        );
-        built_tools.extend(skill_tools);
-    }
 
     let tools_registry = Arc::new(built_tools);
 
-    // skills already loaded above for tool registration
-
     // Collect tool descriptions for the prompt
     let mut tool_descs: Vec<(&str, &str)> = vec![
-        (
-            "shell",
-            "Execute terminal commands. Use when: running local checks, build/test commands, diagnostics. Don't use when: a safer dedicated tool exists, or command is destructive without approval.",
-        ),
         (
             "file_read",
             "Read file contents. Use when: inspecting project files, configs, logs. Don't use when: a targeted search is enough.",

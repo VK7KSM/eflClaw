@@ -69,18 +69,15 @@ pub mod note_list;
 pub mod openclaw_migration;
 pub mod pdf_read;
 pub mod pptx_read;
-pub mod process;
 pub mod proxy_config;
 pub mod pushover;
 pub mod quota_tools;
-pub mod schedule;
 pub mod schema;
 pub mod screenshot;
 pub mod search_chat_log;
 pub mod send_email;
 pub mod send_telegram;
 pub mod send_voice;
-pub mod shell;
 // elfClaw: Batch 2 upstream merge — orchestration settings loader
 pub mod orchestration_settings;
 pub mod source_sync;
@@ -153,10 +150,8 @@ pub use note_list::NoteListTool;
 pub use openclaw_migration::OpenClawMigrationTool;
 pub use pdf_read::PdfReadTool;
 pub use pptx_read::PptxReadTool;
-pub use process::ProcessTool;
 pub use proxy_config::ProxyConfigTool;
 pub use pushover::PushoverTool;
-pub use schedule::ScheduleTool;
 #[allow(unused_imports)]
 pub use schema::{CleaningStrategy, SchemaCleanr};
 pub use screenshot::ScreenshotTool;
@@ -164,7 +159,6 @@ pub use search_chat_log::SearchChatLogTool;
 pub use send_email::SendEmailTool;
 pub use send_telegram::SendTelegramTool;
 pub use send_voice::SendVoiceTool;
-pub use shell::ShellTool;
 pub use source_sync::SourceSyncTool;
 pub use sqlite_query::SqliteQueryTool;
 pub use subagent_list::SubAgentListTool;
@@ -193,7 +187,7 @@ pub fn tool_risk_tier(name: &str) -> ToolRiskTier {
         | "note_add" | "note_list" | "note_done" => ToolRiskTier::Safe, // metadata only; shell cmds validated independently
 
         // Sensitive: write operations, network access
-        "shell" | "process" | "file_write" | "file_edit" | "apply_patch"
+        "file_write" | "file_edit" | "apply_patch"
         | "git_operations" | "http_request" | "web_fetch"
         | "browser" | "browser_open" | "send_email" | "send_telegram"
         | "send_voice" | "cron_run" | "source_sync" => ToolRiskTier::Sensitive, // cron_run: immediate execution
@@ -239,7 +233,7 @@ pub fn default_tool_risk_tiers() -> HashMap<&'static str, ToolRiskTier> {
         ("cron_list", Safe),
         ("cron_runs", Safe),
         ("search_chat_log", Safe),
-        ("web_search", Safe),  // read-only search, no side effects
+        ("web_search", Safe), // read-only search, no side effects
         // elfClaw 2026-09-23: native cf-crawler tools (elfclaw.md §8 point 2).
         // health/scrape/crawl are read-only network calls, same tier as web_search.
         // web_login is deliberately left at Standard (default supervised approval)
@@ -247,7 +241,7 @@ pub fn default_tool_risk_tiers() -> HashMap<&'static str, ToolRiskTier> {
         ("web_health", Safe),
         ("web_scrape", Safe),
         ("web_crawl", Safe),
-        ("cron_add", Safe),    // scheduling only; shell commands validated independently
+        ("cron_add", Safe), // scheduling only; shell commands validated independently
         ("cron_remove", Safe), // metadata-only operation
         ("cron_update", Safe), // metadata-only operation
         // elfClaw 2026-09-23: notes are purely local, no side effects outside
@@ -262,14 +256,12 @@ pub fn default_tool_risk_tiers() -> HashMap<&'static str, ToolRiskTier> {
         // Sensitive: always require approval
         ("generate_pairing_code", Sensitive),
         // Restricted: hidden from non-CLI channels
-        ("shell", Restricted),
         ("file_write", Restricted),
         ("file_edit", Restricted),
         ("git_operations", Restricted),
         ("browser", Restricted),
         ("browser_open", Restricted),
         ("http_request", Restricted),
-        ("schedule", Restricted),
         ("cron_run", Restricted), // immediate command execution — keep Restricted
         ("memory_store", Restricted),
         ("memory_forget", Restricted),
@@ -385,13 +377,9 @@ pub fn default_tools_with_runtime(
     security: Arc<SecurityPolicy>,
     runtime: Arc<dyn RuntimeAdapter>,
 ) -> Vec<Box<dyn Tool>> {
-    let has_shell_access = runtime.has_shell_access();
     let has_filesystem_access = runtime.has_filesystem_access();
     let mut tools: Vec<Box<dyn Tool>> = Vec::new();
 
-    if has_shell_access {
-        tools.push(Box::new(ShellTool::new(security.clone(), runtime.clone())));
-    }
     if has_filesystem_access {
         tools.push(Box::new(FileReadTool::new(security.clone())));
         tools.push(Box::new(FileWriteTool::new(security.clone())));
@@ -459,16 +447,6 @@ pub fn all_tools_with_runtime(
 ) -> Vec<Box<dyn Tool>> {
     let has_shell_access = runtime.has_shell_access();
     let has_filesystem_access = runtime.has_filesystem_access();
-    let zeroclaw_dir = root_config
-        .config_path
-        .parent()
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| runtime.storage_path());
-    let syscall_detector = Arc::new(crate::security::SyscallAnomalyDetector::new(
-        root_config.security.syscall_anomaly.clone(),
-        &zeroclaw_dir,
-        root_config.security.audit.clone(),
-    ));
 
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
         Arc::new(CronAddTool::new(config.clone(), security.clone())),
@@ -481,7 +459,6 @@ pub fn all_tools_with_runtime(
         Arc::new(MemoryObserveTool::new(memory.clone(), security.clone())),
         Arc::new(MemoryRecallTool::new(memory.clone())),
         Arc::new(MemoryForgetTool::new(memory, security.clone())),
-        Arc::new(ScheduleTool::new(security.clone(), root_config.clone())),
         // (note_add/note_list/note_done pushed below once NoteStore opens)
         Arc::new(TaskPlanTool::new(security.clone())),
         Arc::new(ModelRoutingConfigTool::new(
@@ -519,16 +496,6 @@ pub fn all_tools_with_runtime(
     }
 
     if has_shell_access {
-        tool_arcs.push(Arc::new(ShellTool::new_with_syscall_detector(
-            security.clone(),
-            runtime.clone(),
-            Some(syscall_detector.clone()),
-        )));
-        tool_arcs.push(Arc::new(ProcessTool::new_with_syscall_detector(
-            security.clone(),
-            runtime.clone(),
-            Some(syscall_detector),
-        )));
         tool_arcs.push(Arc::new(GitOperationsTool::new(
             security.clone(),
             workspace_dir.to_path_buf(),
@@ -915,7 +882,7 @@ mod tests {
     fn default_tools_has_expected_count() {
         let security = Arc::new(SecurityPolicy::default());
         let tools = default_tools(security);
-        assert_eq!(tools.len(), 7);
+        assert_eq!(tools.len(), 6);
         assert!(tools.iter().any(|tool| tool.name() == "apply_patch"));
     }
 
@@ -981,7 +948,6 @@ mod tests {
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"browser_open"));
-        assert!(names.contains(&"schedule"));
         assert!(names.contains(&"model_routing_config"));
         assert!(names.contains(&"pushover"));
         assert!(names.contains(&"proxy_config"));
@@ -1156,7 +1122,6 @@ mod tests {
         let security = Arc::new(SecurityPolicy::default());
         let tools = default_tools(security);
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
-        assert!(names.contains(&"shell"));
         assert!(names.contains(&"file_read"));
         assert!(names.contains(&"file_write"));
         assert!(names.contains(&"file_edit"));

@@ -9,9 +9,6 @@ use std::time::{Duration, SystemTime};
 mod audit;
 pub mod index;
 mod templates;
-mod tool_handler;
-
-pub use tool_handler::SkillToolHandler;
 
 const OPEN_SKILLS_REPO_URL: &str = "https://github.com/besoeasy/open-skills";
 const OPEN_SKILLS_SYNC_MARKER: &str = ".zeroclaw-open-skills-sync";
@@ -145,8 +142,8 @@ fn parse_allowed_from_tools_md(workspace_dir: &Path) -> Option<HashSet<String>> 
         // Only match `##` level headings (not `#` or `###`)
         if line.starts_with("## ") {
             let was_in = in_installed_section;
-            in_installed_section = line.contains("已安装")
-                || line.to_ascii_lowercase().contains("installed skill");
+            in_installed_section =
+                line.contains("已安装") || line.to_ascii_lowercase().contains("installed skill");
             // Stop as soon as we leave the installed-skills section
             if was_in && !in_installed_section {
                 break;
@@ -171,7 +168,9 @@ fn parse_allowed_from_tools_md(workspace_dir: &Path) -> Option<HashSet<String>> 
         // Valid skill dir name: ASCII alphanumeric + `-` + `_`, at least one alphanumeric char
         if !cell.is_empty()
             && cell.len() <= 64
-            && cell.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            && cell
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
             && cell.chars().any(|c| c.is_ascii_alphanumeric())
         {
             names.insert(cell.to_lowercase());
@@ -195,7 +194,12 @@ fn load_workspace_skills(
 ) -> Vec<Skill> {
     let skills_dir = workspace_dir.join("skills");
     let allowed = parse_allowed_from_tools_md(workspace_dir);
-    load_skills_from_directory(&skills_dir, allow_scripts, trusted_skill_roots, allowed.as_ref())
+    load_skills_from_directory(
+        &skills_dir,
+        allow_scripts,
+        trusted_skill_roots,
+        allowed.as_ref(),
+    )
 }
 
 fn resolve_trusted_skill_roots(workspace_dir: &Path, raw_roots: &[String]) -> Vec<PathBuf> {
@@ -958,45 +962,6 @@ pub fn skills_to_prompt_with_mode(
 /// Get the skills directory path
 pub fn skills_dir(workspace_dir: &Path) -> PathBuf {
     workspace_dir.join("skills")
-}
-
-/// Create tool handlers for all skill tools
-pub fn create_skill_tools(
-    skills: &[Skill],
-    security: std::sync::Arc<crate::security::SecurityPolicy>,
-    workspace_dir: &std::path::Path,
-) -> Vec<Box<dyn crate::tools::Tool>> {
-    let mut tools: Vec<Box<dyn crate::tools::Tool>> = Vec::new();
-
-    for skill in skills {
-        for tool_def in &skill.tools {
-            match SkillToolHandler::new(
-                skill.name.clone(),
-                tool_def.clone(),
-                security.clone(),
-                workspace_dir.to_path_buf(),
-            ) {
-                Ok(handler) => {
-                    tracing::debug!(
-                        skill = %skill.name,
-                        tool = %tool_def.name,
-                        "Registered skill tool"
-                    );
-                    tools.push(Box::new(handler));
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        skill = %skill.name,
-                        tool = %tool_def.name,
-                        error = %e,
-                        "Failed to create skill tool handler"
-                    );
-                }
-            }
-        }
-    }
-
-    tools
 }
 
 /// Initialize the skills directory with a README

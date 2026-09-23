@@ -5717,3 +5717,66 @@ Skynet（K3 D:\ZeroClaw_Skynet）部署 1250+ Skill 目录，原用 content_sear
 - sqlite_query 不涉及 DDL，不会破坏现有 DB
 - skills.db 仅在表为空时导入，重启不重复写
 - K3 现有可执行文件不变；只在下次部署新版时生效
+
+---
+
+## 2026-09-24 — 彻底移除 shell/process/schedule 三个工具（elfclaw.md §8 第 3 条，Step 7）
+
+### 背景
+
+用户提问："agent 运行爬虫和发邮件等工具时如何调用程序的？不用shell用什么启动程序？如果能用其他方式启动程序，那就干脆移除shell，这是90%报错的根源。"
+
+调查确认：邮件走 `src/tools/send_email.rs`（lettre 原生 Rust SMTP 库，从未用过 shell）；爬虫、浏览器、git、MCP、截图、source_sync 等一系列工具都已经用 tokio::process::Command/std::process::Command 直接传参调用可执行文件，不经过 shell 解释——`shell` 工具本身唯一存在的意义是让 LLM 自由拼接命令行字符串，而这正是本轮会话反复复现的"AI 自作主张改配置文件/prompt"投诉链路的根本起点。用户确认后指示"彻底移除shell"。进一步询问是否连带删除 `process`（后台进程管理，spawn 子命令本身就需要一条裸 shell 命令）和 `schedule`（其工具描述原文写的是"仅管理 shell 定时任务"，本身就建议改用 cron_add）后，用户选择"一起删（推荐）"。
+
+### 删除的文件
+
+- `src/tools/shell.rs`（900 行）—— ShellTool
+- `src/tools/process.rs`（905 行）—— ProcessTool（后台进程 spawn/list/output/kill，spawn 需要裸 shell 命令）
+- `src/tools/schedule.rs`（768 行）—— ScheduleTool（其描述文本本身就说"仅管理 shell 定时任务"、推荐用 cron_add）
+- `src/skills/tool_handler.rs`（880 行）—— SkillToolHandler，SKILL.toml kind="shell" → 可调用 Tool 的桥接层。其构造函数硬编码"只支持 kind=\"shell\""，除此之外没有第二种用途，随 shell 一起删除。
+
+### 改动的文件（按依赖链，用 cargo check 报错逐层定位，而不是人工全量 grep）
+
+- **src/tools/mod.rs**：移除三个工具的模块声明/pub use/风险分级条目/构造调用；all_tools_with_runtime() 里原本只为 ShellTool/ProcessTool 的 new_with_syscall_detector 构造函数服务的 SyscallAnomalyDetector 局部变量一并删除（SyscallAnomalyDetector 类型本身保留在 src/security/syscall_anomaly.rs，现在没有生产调用方，留给后续会话判断是否也该删）。
+- **src/cron/types.rs**：JobType 枚举删除 Shell 变体，只保留 Agent/Message。
+- **src/cron/store.rs**：删除 add_shell_job()；add_job() 改为薄测试夹具包装（内部转调 add_agent_job，25+ 个测试调用点签名不变）。**生产安全修复**：SQLite job_type 列的 `DEFAULT 'shell'`（CREATE TABLE 和 add_column_if_missing 迁移里各一处）改成 `DEFAULT 'agent'`，并新增一条幂等迁移 `UPDATE cron_jobs SET job_type = 'agent' WHERE job_type = 'shell'`——因为 JobType::TryFrom 不再接受 "shell"，K6 生产库里如果存在旧的 shell 类型任务行，不迁移的话下次 get_job/list_jobs 读到这一行就会解析失败，破坏整张表的可读性。这个 bug 是写测试时被 migration_falls_back_to_legacy_expression 测试失败暴露出来的，不是人工审查发现的。
+- **src/cron/mod.rs**：CLI 的 cron add/add-at/add-every/once 命令改用新的 add_cli_agent_job() 辅助函数（把 CLI 传入的 command 字符串当 agent prompt 处理，保留 Schedule::At 一次性任务触发后自动删除的行为）；cron update 的 --command 参数同时写 command（展示用）和 prompt（agent 类型任务实际执行的字段）两列。
+- **src/gateway/api.rs**：POST /api/cron（web 仪表盘）同样从 add_shell_job 改为 add_agent_job。
+- **src/security/policy.rs**（改动量最大的单文件）：删除 CommandRiskLevel 枚举、SecurityPolicy 的 allowed_commands/require_approval_for_medium_risk/block_high_risk_commands/shell_env_passthrough 四个字段、command_risk_level/validate_command_execution/allowed_commands_summary/is_command_allowed/forbidden_path_argument 五个方法，以及整套 shell 命令字符串解析辅助函数（split_unquoted_segments、contains_unquoted_shell_variable_expansion 等 11 个）。保留 forbidden_paths/is_path_allowed/is_resolved_path_allowed（确认被 file_write/file_edit/sqlite_query 等非 shell 工具使用，不是 shell 专属）。
+- **src/config/schema.rs**：AutonomyConfig 删除上述四个对应字段及其默认值、Config::validate() 里的 shell_env_passthrough 校验循环；default_non_cli_excluded_tools()/default_otp_gated_actions() 移除 "shell" 条目。
+- **src/skills/mod.rs** / **src/agent/loop_.rs** / **src/channels/mod.rs**：删除 create_skill_tools() 调用点（SkillToolHandler 已不存在）；三处硬编码的工具描述兜底列表移除 "shell" 条目。
+- **src/channels/telegram.rs**：tool_description_zh() 移除 "shell" 匹配分支。
+- **src/tools/cron_add.rs/cron_run.rs/cron_update.rs**：移除 job_type="shell" 分支和 approved 参数/schema 字段；job_type schema 枚举从 ["shell","agent","message"] 收窄为 ["agent","message"]。
+- **src/cron/scheduler.rs**：删除 run_job_command/run_job_command_with_timeout（含实际 Command::new("sh").arg("-lc")... 调用）及配套 SHELL_JOB_TIMEOUT_SECS 常量。
+- **src/main.rs**：CLI 配置状态展示命令删除一处打印 allowed_commands 的代码。
+
+### 顺带修复的独立预置 bug（非本次改动引入，借机发现）
+
+src/agent/loop_/parsing.rs 的 map_tool_name_alias()：曾把 "shell" | "bash" | "sh" | "exec" | "command" | "cmd" | "browser_open" | "browser" | "web_search" 全部映射到 "shell"。这行代码把三个**真实存在、彼此独立**的工具（browser_open——打开经域名白名单校验的 URL；browser——浏览器自动化/抓取；web_search——只读搜索）全部错误地别名成 "shell"。移除 shell 之前，这意味着 LLM 用 GLM 简写格式调用 `browser_open/url>https://...` 时，会被 parse_glm_style_tool_calls/parse_glm_shortened_body 静默改写成 `{"command": "curl -s '...'"}` 并路由给 shell 工具执行——**完全绕过了 browser_open 工具自己的域名白名单和 validate_url 校验**，属于独立于本次改动的真实安全问题（用回归测试直接证明：修复前 map_tool_name_alias("browser_open") 返回 "shell"）。移除 shell 之后，这个错误映射的后果从"静默绕过安全校验去执行任意 curl"变成"报 tool not found: shell 错误"，但连带后果是 browser_open/browser/web_search 三个真实工具本身也被写坏了（调用即失败）。一并修：删除整个别名分支，让这三个名字落回 `_ => tool_name` 兜底分支解析为自身；同时因为 "shell" 已不存在为任何工具的真实名字，bash/sh/exec/command/cmd 这组别名也没有再映射到 "shell" 的意义，一并从别名表移除（现在会干净地报"工具不存在"而不是被误导向一个不存在的目标）。
+
+受影响并修复的测试（src/agent/loop_.rs）：map_tool_name_alias_direct_coverage（新增 map_tool_name_alias_preserves_browser_and_web_search 专项回归测试）、parse_glm_style_browser_open_url、parse_glm_style_rejects_non_http_url_param（改名为 parse_glm_style_passes_non_http_url_param_through_for_tool_to_reject，断言从"应生成空调用列表"改为"应生成 browser_open 调用、把 URL 校验交给工具自己做"）、parse_glm_style_tool_call_integration、parse_glm_shortened_body_browser_open_maps_to_shell_command（改名为 parse_glm_shortened_body_browser_open_resolves_to_browser_open_tool）。
+
+### 测试修复方式（三类，按情况区别对待）
+
+1. **断言微调**：底层行为搬家/改名，一行断言跟着改（多数情况）。
+2. **整体删除**：测试本身就是在测已删除的功能（如 blocks_disallowed_shell_command、medium_risk_shell_command_requires_approval、adds_shell_job、shell_run_requires_approval_for_medium_risk、readonly_blocks_even_safe_commands、update_security_allows_safe_command 等约 90 个测试）。
+3. **改用新夹具重写**：测试本身在测一个仍然有效、与 job_type 无关的行为（限流/读写只读模式/运行历史记录），只是恰好用了 shell 类型的测试夹具——改用 add_agent_job/add_message_job 重写而不是删除，保留原有覆盖面。例如 cron_run.rs 的 force_runs_job_and_records_history 原本用 cron::add_job（现在建的是 agent 类型任务）然后**真的执行**它——测试环境没有真实 provider API key，agent 执行必然失败；这条测试的真实目的是验证"运行历史记录"机制而不是"任务真的能跑通"，改用 add_message_job（不调用 LLM，确定性成功）重写后测试意图更准确。
+
+### 验证
+
+- `cargo check --quiet --lib --bins`：0 错误。
+- `cargo test --lib`：4040 passed，10 failed——全部核对确认是本会话开始前就存在、与本次改动无关的失败：5 个 Windows 符号链接/硬链接权限问题（沙箱环境不允许创建符号链接，Os { code: 1314, ... }）、runtime::wasm/tools::screenshot 两处失败在完全未被本次改动触碰的文件里（git diff --stat 确认）、security::policy 的两处 checklist_* 失败断言的是 Unix 风格绝对路径语义（is_path_allowed("/")），该函数本身未被本次改动修改（git diff 确认零差异）、channels::tests::e2e_failed_vision_turn_* 与 vision/provider 能力相关、和本次改动区域无关。之前会话记录的"11 个预置失败"基线里有一个 tools::process::kill_terminates_process，随 process.rs 整体删除而消失，新基线正好是 10 个，与本次实测结果吻合。
+- `cargo clippy --quiet --lib --tests -- -D warnings`：245 个预置错误（历史基线约 244-249 个），全部核对确认不在本次任何一个改动文件内。
+- `cargo fmt --all` + 逐文件核对：fmt 额外格式化了 12 个不在本次改动范围内的文件（src/agent/agent.rs、observability/*.rs 等历史遗留漂移），已用 git checkout -- 全部撤销；剩余的 --check 漂移文件与本次改动的 21 个文件交集为空（comm -12 核实）。
+
+### 未处理，留给后续会话判断
+
+- `src/security/syscall_anomaly.rs`（678 行）：类型本身完整保留，但生产代码里已无调用方（唯一调用方是已删除的 ShellTool::new_with_syscall_detector/ProcessTool::new_with_syscall_detector）。是否也该删除留给后续会话判断，本次不在"移除 shell"这一件事的范围内扩大改动面。
+- `资料/skills/{elfradio-runner,skill-creator,scientific-tools,self-improving,skill-evolution-manager}`：5 个纯 SKILL.md（无 SKILL.toml）技能，提示词内容假设 AI 拥有 shell/命令行访问能力（如 self-improving 明确声明想写 AGENTS.md/SOUL.md/HEARTBEAT.md）。这些只是注入 system prompt 的文本内容，不是可调用工具，shell 移除后不会造成任何代码层面的功能损坏，只是提示词里描述的能力已经不存在——未删除，留给用户/后续会话按需处理（是用户自己的/第三方内容，不擅自删）。
+  ⚠️ 资料/ 目录是 .gitignore 忽略的本地部署参考镜像，不随 git push 同步——若要处理这些文件，改动同样需要手动同步到 K6 两个实例才会生效。
+
+### 风险 / 回滚
+
+- 纯删除 + 收窄枚举，无新增行为；回滚只需 git revert 本次 commit。
+- SQLite 迁移（job_type='shell' → 'agent'）是幂等的 UPDATE，重复执行无副作用；K6 生产库首次启动新版本时会自动跑这条迁移，之后不再需要手动干预。
+- 资料/config.toml/资料/skills/** 本次会话未改动（上一轮会话已完成对应部分），本条无新增的手动同步需求。

@@ -7,13 +7,10 @@ use crate::security::SecurityPolicy;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use futures_util::{stream, StreamExt};
-use std::process::Stdio;
 use std::sync::Arc;
-use tokio::process::Command;
 use tokio::time::{self, Duration};
 
 const MIN_POLL_SECONDS: u64 = 5;
-const SHELL_JOB_TIMEOUT_SECS: u64 = 120;
 const SCHEDULER_COMPONENT: &str = "scheduler";
 
 // elfClaw: truncate to nearest UTF-8 char boundary (safe for CJK multi-byte)
@@ -77,7 +74,6 @@ async fn execute_job_with_retry(
 
     for attempt in 0..=retries {
         let (success, output) = match job.job_type {
-            JobType::Shell => run_job_command(config, security, job).await,
             JobType::Agent => Box::pin(run_agent_job(config, security, job)).await,
             // elfClaw 2026-09-23: no LLM call, so there is nothing here that
             // can fail on a 429/503 — this always succeeds. `deliver_if_configured`
@@ -465,98 +461,6 @@ pub(crate) async fn deliver_announcement(
     crate::channels::deliver_to_channel(config, channel, target, output).await
 }
 
-async fn run_job_command(
-    config: &Config,
-    security: &SecurityPolicy,
-    job: &CronJob,
-) -> (bool, String) {
-    run_job_command_with_timeout(
-        config,
-        security,
-        job,
-        Duration::from_secs(SHELL_JOB_TIMEOUT_SECS),
-    )
-    .await
-}
-
-async fn run_job_command_with_timeout(
-    config: &Config,
-    security: &SecurityPolicy,
-    job: &CronJob,
-    timeout: Duration,
-) -> (bool, String) {
-    if !security.can_act() {
-        return (
-            false,
-            "blocked by security policy: autonomy is read-only".to_string(),
-        );
-    }
-
-    if security.is_rate_limited() {
-        return (
-            false,
-            "blocked by security policy: rate limit exceeded".to_string(),
-        );
-    }
-
-    if !security.is_command_allowed(&job.command) {
-        return (
-            false,
-            format!(
-                "blocked by security policy: command not allowed: {}",
-                job.command
-            ),
-        );
-    }
-
-    if let Some(path) = security.forbidden_path_argument(&job.command) {
-        return (
-            false,
-            format!("blocked by security policy: forbidden path argument: {path}"),
-        );
-    }
-
-    if !security.record_action() {
-        return (
-            false,
-            "blocked by security policy: action budget exhausted".to_string(),
-        );
-    }
-
-    let child = match Command::new("sh")
-        .arg("-lc")
-        .arg(&job.command)
-        .current_dir(&config.workspace_dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(e) => return (false, format!("spawn error: {e}")),
-    };
-
-    match time::timeout(timeout, child.wait_with_output()).await {
-        Ok(Ok(output)) => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let combined = format!(
-                "status={}\nstdout:\n{}\nstderr:\n{}",
-                output.status,
-                stdout.trim(),
-                stderr.trim()
-            );
-            (output.status.success(), combined)
-        }
-        Ok(Err(e)) => (false, format!("spawn error: {e}")),
-        Err(_) => (
-            false,
-            format!("job timed out after {}s", timeout.as_secs_f64()),
-        ),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -608,6 +512,9 @@ mod tests {
         config
     }
 
+    // elfClaw 2026-09-23: defaults to JobType::Agent (shell jobs were removed
+    // entirely) — `command` is kept populated too for the handful of tests
+    // that still just need a job to exist and don't care about job_type.
     fn test_job(command: &str) -> CronJob {
         CronJob {
             id: "test-job".into(),
@@ -617,9 +524,9 @@ mod tests {
                 tz: None,
             },
             command: command.into(),
-            prompt: None,
+            prompt: Some(command.into()),
             name: None,
-            job_type: JobType::Shell,
+            job_type: JobType::Agent,
             session_target: SessionTarget::Isolated,
             model: None,
             delegate_to: None,
@@ -653,206 +560,6 @@ mod tests {
         let (success, output) = execute_job_with_retry(&config, &security, &job).await;
         assert!(success);
         assert_eq!(output, "带孩子看牙医");
-    }
-
-    #[tokio::test]
-    async fn run_job_command_success() {
-        let tmp = TempDir::new().unwrap();
-        let config = test_config(&tmp).await;
-        let job = test_job("echo scheduler-ok");
-        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
-
-        let (success, output) = run_job_command(&config, &security, &job).await;
-        assert!(success);
-        assert!(output.contains("scheduler-ok"));
-        // ExitStatus::fmt produces "exit status: 0" on Unix, "exit code: 0" on Windows.
-        assert!(
-            output.contains("status=exit status: 0") || output.contains("status=exit code: 0"),
-            "expected exit status 0 in output, got: {output}"
-        );
-    }
-
-    #[tokio::test]
-    async fn run_job_command_failure() {
-        let tmp = TempDir::new().unwrap();
-        let config = test_config(&tmp).await;
-        let job = test_job("ls definitely_missing_file_for_scheduler_test");
-        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
-
-        let (success, output) = run_job_command(&config, &security, &job).await;
-        assert!(!success);
-        // ExitStatus::fmt produces "exit status:" on Unix, "exit code:" on Windows.
-        assert!(
-            output.contains("status=exit status:") || output.contains("status=exit code:"),
-            "expected exit status in output, got: {output}"
-        );
-    }
-
-    #[tokio::test]
-    async fn run_job_command_times_out() {
-        let tmp = TempDir::new().unwrap();
-        let mut config = test_config(&tmp).await;
-        config.autonomy.allowed_commands = vec!["sleep".into()];
-        let job = test_job("sleep 1");
-        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
-
-        let (success, output) =
-            run_job_command_with_timeout(&config, &security, &job, Duration::from_millis(50)).await;
-        assert!(!success);
-        assert!(output.contains("job timed out after"));
-    }
-
-    #[tokio::test]
-    async fn run_job_command_blocks_disallowed_command() {
-        let tmp = TempDir::new().unwrap();
-        let mut config = test_config(&tmp).await;
-        config.autonomy.allowed_commands = vec!["echo".into()];
-        let job = test_job("curl https://evil.example");
-        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
-
-        let (success, output) = run_job_command(&config, &security, &job).await;
-        assert!(!success);
-        assert!(output.contains("blocked by security policy"));
-        assert!(output.contains("command not allowed"));
-    }
-
-    #[tokio::test]
-    async fn run_job_command_blocks_forbidden_path_argument() {
-        let tmp = TempDir::new().unwrap();
-        let mut config = test_config(&tmp).await;
-        config.autonomy.allowed_commands = vec!["cat".into()];
-        let job = test_job("cat /etc/passwd");
-        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
-
-        let (success, output) = run_job_command(&config, &security, &job).await;
-        assert!(!success);
-        assert!(output.contains("blocked by security policy"));
-        assert!(output.contains("forbidden path argument"));
-        assert!(output.contains("/etc/passwd"));
-    }
-
-    #[tokio::test]
-    async fn run_job_command_blocks_forbidden_option_assignment_path_argument() {
-        let tmp = TempDir::new().unwrap();
-        let mut config = test_config(&tmp).await;
-        config.autonomy.allowed_commands = vec!["grep".into()];
-        let job = test_job("grep --file=/etc/passwd root ./src");
-        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
-
-        let (success, output) = run_job_command(&config, &security, &job).await;
-        assert!(!success);
-        assert!(output.contains("blocked by security policy"));
-        assert!(output.contains("forbidden path argument"));
-        assert!(output.contains("/etc/passwd"));
-    }
-
-    #[tokio::test]
-    async fn run_job_command_blocks_forbidden_short_option_attached_path_argument() {
-        let tmp = TempDir::new().unwrap();
-        let mut config = test_config(&tmp).await;
-        config.autonomy.allowed_commands = vec!["grep".into()];
-        let job = test_job("grep -f/etc/passwd root ./src");
-        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
-
-        let (success, output) = run_job_command(&config, &security, &job).await;
-        assert!(!success);
-        assert!(output.contains("blocked by security policy"));
-        assert!(output.contains("forbidden path argument"));
-        assert!(output.contains("/etc/passwd"));
-    }
-
-    #[tokio::test]
-    async fn run_job_command_blocks_tilde_user_path_argument() {
-        let tmp = TempDir::new().unwrap();
-        let mut config = test_config(&tmp).await;
-        config.autonomy.allowed_commands = vec!["cat".into()];
-        let job = test_job("cat ~root/.ssh/id_rsa");
-        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
-
-        let (success, output) = run_job_command(&config, &security, &job).await;
-        assert!(!success);
-        assert!(output.contains("blocked by security policy"));
-        assert!(output.contains("forbidden path argument"));
-        assert!(output.contains("~root/.ssh/id_rsa"));
-    }
-
-    #[tokio::test]
-    async fn run_job_command_blocks_input_redirection_path_bypass() {
-        let tmp = TempDir::new().unwrap();
-        let mut config = test_config(&tmp).await;
-        config.autonomy.allowed_commands = vec!["cat".into()];
-        let job = test_job("cat </etc/passwd");
-        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
-
-        let (success, output) = run_job_command(&config, &security, &job).await;
-        assert!(!success);
-        assert!(output.contains("blocked by security policy"));
-        assert!(output.contains("command not allowed"));
-    }
-
-    #[tokio::test]
-    async fn run_job_command_blocks_readonly_mode() {
-        let tmp = TempDir::new().unwrap();
-        let mut config = test_config(&tmp).await;
-        config.autonomy.level = crate::security::AutonomyLevel::ReadOnly;
-        let job = test_job("echo should-not-run");
-        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
-
-        let (success, output) = run_job_command(&config, &security, &job).await;
-        assert!(!success);
-        assert!(output.contains("blocked by security policy"));
-        assert!(output.contains("read-only"));
-    }
-
-    #[tokio::test]
-    async fn run_job_command_blocks_rate_limited() {
-        let tmp = TempDir::new().unwrap();
-        let mut config = test_config(&tmp).await;
-        config.autonomy.max_actions_per_hour = 0;
-        let job = test_job("echo should-not-run");
-        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
-
-        let (success, output) = run_job_command(&config, &security, &job).await;
-        assert!(!success);
-        assert!(output.contains("blocked by security policy"));
-        assert!(output.contains("rate limit exceeded"));
-    }
-
-    #[tokio::test]
-    async fn execute_job_with_retry_recovers_after_first_failure() {
-        let tmp = TempDir::new().unwrap();
-        let mut config = test_config(&tmp).await;
-        config.reliability.scheduler_retries = 1;
-        config.reliability.provider_backoff_ms = 1;
-        config.autonomy.allowed_commands = vec!["sh".into()];
-        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
-
-        tokio::fs::write(
-            config.workspace_dir.join("retry-once.sh"),
-            "#!/bin/sh\nif [ -f retry-ok.flag ]; then\n  echo recovered\n  exit 0\nfi\ntouch retry-ok.flag\nexit 1\n",
-        )
-        .await
-        .unwrap();
-        let job = test_job("sh ./retry-once.sh");
-
-        let (success, output) = execute_job_with_retry(&config, &security, &job).await;
-        assert!(success);
-        assert!(output.contains("recovered"));
-    }
-
-    #[tokio::test]
-    async fn execute_job_with_retry_exhausts_attempts() {
-        let tmp = TempDir::new().unwrap();
-        let mut config = test_config(&tmp).await;
-        config.reliability.scheduler_retries = 1;
-        config.reliability.provider_backoff_ms = 1;
-        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
-
-        let job = test_job("ls always_missing_for_retry_test");
-
-        let (success, output) = execute_job_with_retry(&config, &security, &job).await;
-        assert!(!success);
-        assert!(output.contains("always_missing_for_retry_test"));
     }
 
     #[tokio::test]

@@ -697,12 +697,18 @@ pub(super) fn parse_function_call_tool_calls(response: &str) -> Vec<ParsedToolCa
 
 /// Parse GLM-style tool calls from response text.
 /// Map tool name aliases from various LLM providers to ZeroClaw tool names.
-/// This handles variations like "fileread" -> "file_read", "bash" -> "shell", etc.
+/// This handles variations like "fileread" -> "file_read", etc.
 pub(super) fn map_tool_name_alias(tool_name: &str) -> &str {
     match tool_name {
-        // Shell variations (including GLM aliases that map to shell)
-        "shell" | "bash" | "sh" | "exec" | "command" | "cmd" | "browser_open" | "browser"
-        | "web_search" => "shell",
+        // elfClaw 2026-09-23: shell/bash/sh/exec/command/cmd used to alias to
+        // "shell", which no longer exists as a tool (removed entirely —
+        // elfclaw.md §8). That old arm also incorrectly caught
+        // "browser_open" | "browser" | "web_search" — three real, still-
+        // existing tools — and rewrote them to "shell" too, silently
+        // misdirecting any LLM call to them into shell execution. Dropping
+        // the whole arm lets all of these fall through to `_ => tool_name`:
+        // shell-ish names now cleanly fail as "tool not found", and the
+        // three real tools resolve to themselves as they should.
         // Messaging variations
         "send_message" | "sendmessage" => "message_send",
         // File tool variations

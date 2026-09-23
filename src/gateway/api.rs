@@ -299,7 +299,20 @@ pub async fn handle_api_cron_add(
         tz: None,
     };
 
-    match crate::cron::add_shell_job(&config, body.name, schedule, &body.command) {
+    // elfClaw 2026-09-23: shell jobs were removed entirely — the dashboard's
+    // `command` field is treated as an agent prompt now (same repurposing as
+    // the `zeroclaw cron add` CLI command).
+    match crate::cron::add_agent_job(
+        &config,
+        body.name,
+        schedule,
+        &body.command,
+        crate::cron::SessionTarget::Isolated,
+        None,
+        None,
+        false,
+        None,
+    ) {
         Ok(job) => Json(serde_json::json!({
             "status": "ok",
             "job": {

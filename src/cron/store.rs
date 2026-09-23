@@ -19,12 +19,28 @@ impl rusqlite::types::FromSql for JobType {
     }
 }
 
+// elfClaw 2026-09-23: kept as a thin test-fixture convenience wrapper (25+
+// call sites across the cron/tools test suites use it to build a job with a
+// one-line expr+text pair without caring which job type it is). Backed by
+// add_agent_job — not add_shell_job, which no longer exists — since shell
+// jobs were removed entirely (elfclaw.md §8: no free-form command strings
+// anywhere in the agent-facing surface).
 pub fn add_job(config: &Config, expression: &str, command: &str) -> Result<CronJob> {
     let schedule = Schedule::Cron {
         expr: expression.to_string(),
         tz: None,
     };
-    add_shell_job(config, None, schedule, command)
+    add_agent_job(
+        config,
+        None,
+        schedule,
+        command,
+        SessionTarget::Isolated,
+        None,
+        None,
+        false,
+        None,
+    )
 }
 
 // elfClaw: find an existing job by name for idempotent deduplication
@@ -45,85 +61,6 @@ pub fn find_job_by_name(config: &Config, name: &str) -> Result<Option<CronJob>> 
     })
 }
 
-pub fn add_shell_job(
-    config: &Config,
-    name: Option<String>,
-    schedule: Schedule,
-    command: &str,
-) -> Result<CronJob> {
-    // elfClaw 2026-09-23: resolve a missing tz to config.cron.default_tz
-    // before anything else touches `schedule` — the dedup-update branch
-    // below reuses this same value, so both the create and update paths get
-    // the default applied consistently.
-    let schedule = apply_default_tz(config, schedule);
-
-    // elfClaw: idempotent dedup — if a job with the same name already exists, update it
-    if let Some(ref job_name) = name {
-        if let Ok(Some(existing)) = find_job_by_name(config, job_name) {
-            tracing::info!(
-                job_id = %existing.id,
-                name = %job_name,
-                "Cron dedup: updating existing shell job instead of creating duplicate"
-            );
-            crate::elfclaw_log::log_cron_event(
-                &existing.id,
-                job_name,
-                "dedup_update",
-                serde_json::json!({"action": "updated existing shell job"}),
-            );
-            let patch = CronJobPatch {
-                schedule: Some(schedule),
-                command: Some(command.to_string()),
-                ..CronJobPatch::default()
-            };
-            return update_job(config, &existing.id, patch);
-        }
-    }
-
-    let now = Utc::now();
-    validate_schedule(&schedule, now)?;
-    let next_run = next_run_for_schedule(&schedule, now)?;
-    let id = Uuid::new_v4().to_string();
-    let expression = schedule_cron_expression(&schedule).unwrap_or_default();
-    let schedule_json = serde_json::to_string(&schedule)?;
-
-    let delete_after_run = matches!(schedule, Schedule::At { .. });
-
-    with_connection(config, |conn| {
-        conn.execute(
-            "INSERT INTO cron_jobs (
-                id, expression, command, schedule, job_type, prompt, name, session_target, model,
-                enabled, delivery, delete_after_run, created_at, next_run
-             ) VALUES (?1, ?2, ?3, ?4, 'shell', NULL, ?5, 'isolated', NULL, 1, ?6, ?7, ?8, ?9)",
-            params![
-                id,
-                expression,
-                command,
-                schedule_json,
-                name,
-                serde_json::to_string(&DeliveryConfig::default())?,
-                if delete_after_run { 1 } else { 0 },
-                now.to_rfc3339(),
-                next_run.to_rfc3339(),
-            ],
-        )
-        .context("Failed to insert cron shell job")?;
-        Ok(())
-    })?;
-
-    // elfClaw: log new job creation
-    if let Some(ref job_name) = name {
-        crate::elfclaw_log::log_cron_event(
-            &id,
-            job_name,
-            "created",
-            serde_json::json!({"type": "shell"}),
-        );
-    }
-
-    get_job(config, &id)
-}
-
 #[allow(clippy::too_many_arguments)]
 pub fn add_agent_job(
     config: &Config,
@@ -136,7 +73,10 @@ pub fn add_agent_job(
     delete_after_run: bool,
     delegate_to: Option<String>,
 ) -> Result<CronJob> {
-    // elfClaw 2026-09-23: see the matching comment in add_shell_job.
+    // elfClaw 2026-09-23: resolve a missing tz to config.cron.default_tz before
+    // anything else touches `schedule` — the dedup-update branch below reuses
+    // this same value, so both the create and update paths get the default
+    // applied consistently.
     let schedule = apply_default_tz(config, schedule);
 
     // elfClaw: idempotent dedup — if a job with the same name already exists, update it
@@ -721,7 +661,7 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>)
             expression       TEXT NOT NULL,
             command          TEXT NOT NULL,
             schedule         TEXT,
-            job_type         TEXT NOT NULL DEFAULT 'shell',
+            job_type         TEXT NOT NULL DEFAULT 'agent',
             prompt           TEXT,
             name             TEXT,
             session_target   TEXT NOT NULL DEFAULT 'isolated',
@@ -754,7 +694,7 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>)
     .context("Failed to initialize cron schema")?;
 
     add_column_if_missing(&conn, "schedule", "TEXT")?;
-    add_column_if_missing(&conn, "job_type", "TEXT NOT NULL DEFAULT 'shell'")?;
+    add_column_if_missing(&conn, "job_type", "TEXT NOT NULL DEFAULT 'agent'")?;
     add_column_if_missing(&conn, "prompt", "TEXT")?;
     add_column_if_missing(&conn, "name", "TEXT")?;
     add_column_if_missing(&conn, "session_target", "TEXT NOT NULL DEFAULT 'isolated'")?;
@@ -763,6 +703,22 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>)
     add_column_if_missing(&conn, "delivery", "TEXT")?;
     add_column_if_missing(&conn, "delete_after_run", "INTEGER NOT NULL DEFAULT 0")?;
     add_column_if_missing(&conn, "delegate_to", "TEXT")?;
+
+    // elfClaw 2026-09-23 (elfclaw.md §8: shell removed entirely): JobType no
+    // longer has a Shell variant, so any pre-existing row with the old
+    // job_type='shell' (either an explicitly-created shell job, or a legacy
+    // row that predates the job_type column and picked up the old DEFAULT
+    // 'shell') would fail to parse and break every read of the whole table.
+    // Converting them to 'agent' keeps them readable/listable — their old
+    // shell `command` text becomes an agent prompt that will just fail
+    // cleanly on next run (no provider will make sense of a shell command as
+    // a prompt) rather than corrupting `list_jobs`/`get_job` entirely.
+    // Idempotent: a no-op once no rows are left with job_type='shell'.
+    conn.execute(
+        "UPDATE cron_jobs SET job_type = 'agent' WHERE job_type = 'shell'",
+        [],
+    )
+    .context("Failed to migrate legacy shell-type cron jobs to agent")?;
 
     f(&conn)
 }
@@ -791,7 +747,7 @@ mod tests {
 
         let job = add_job(&config, "*/5 * * * *", "echo ok").unwrap();
         assert_eq!(job.expression, "*/5 * * * *");
-        assert_eq!(job.command, "echo ok");
+        assert_eq!(job.prompt.as_deref(), Some("echo ok"));
         assert!(matches!(job.schedule, Schedule::Cron { .. }));
     }
 
@@ -818,34 +774,60 @@ mod tests {
             expr: "0 8 * * *".into(),
             tz: Some("America/Los_Angeles".into()),
         };
-        let job = add_shell_job(&config, None, schedule, "echo morning").unwrap();
+        let job = add_agent_job(
+            &config,
+            None,
+            schedule,
+            "echo morning",
+            SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
         match job.schedule {
             Schedule::Cron { tz, .. } => assert_eq!(tz.as_deref(), Some("America/Los_Angeles")),
             other => panic!("expected Schedule::Cron, got {other:?}"),
         }
     }
 
+    // elfClaw 2026-09-23: add_agent_job stores whatever delete_after_run the
+    // caller passes rather than auto-computing it from the schedule kind
+    // (that auto-compute — At schedules default to true — now lives at the
+    // cron_add tool layer, see `default_delete_after_run` in cron_add.rs).
+    // This just checks the store layer honors the flag either way.
     #[test]
-    fn add_shell_job_marks_at_schedule_for_auto_delete() {
+    fn add_agent_job_stores_delete_after_run_as_given() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
 
-        let one_shot = add_shell_job(
+        let one_shot = add_agent_job(
             &config,
             None,
             Schedule::At {
                 at: Utc::now() + ChronoDuration::minutes(10),
             },
             "echo once",
+            SessionTarget::Isolated,
+            None,
+            None,
+            true,
+            None,
         )
         .unwrap();
         assert!(one_shot.delete_after_run);
 
-        let recurring = add_shell_job(
+        let recurring = add_agent_job(
             &config,
             None,
             Schedule::Every { every_ms: 60_000 },
             "echo recurring",
+            SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            None,
         )
         .unwrap();
         assert!(!recurring.delete_after_run);

@@ -203,12 +203,15 @@ gemini-3.5-flash: key A → key B → ...
    `src/skills/index.rs`/`audit.rs` 本身不调用 shell，这条指的就是 SKILL.toml 的 `kind="shell"` 模板
    机制本身，cf-crawler 是当前唯一使用该机制处理复杂 JSON 参数的技能，已随上述改动解决。
 3. **shell 只在用户明确对某个具体任务授权时才能执行**，授权范围限定在那次任务，不是全局打开一个"shell 权限开关"。
-   **尚未实现**——这是本节剩下唯一没做的部分。第 1 条已经把 shell 从聊天 AI 默认可见工具里拿掉，
-   相当于把开关默认拨到"关"；第 3 条要的是"用户可以为某一次具体任务临时授权"的机制，目前代码里没有
-   对应的、范围限定到单次任务的开关（`/selfcheck` 用过的那种全局 `AtomicBool` gate 模式已经在
-   Step 5 第二部分随 self_check 一起删除，且那种设计本身也不是"限定到单次任务"，不适合直接照搬）。
-   需要先决定 UX——2026-09-23 问过用户，明确选择"暂不设计，先做 Step 6"，即优先级上排在
-   Step 6 之后，等有更明确的想法再回来做，不在本次会话里草率设计。
+   **问题已被更彻底的方案取代，2026-09-23（Step 7）**：本条原本设想的是"按任务临时授权"这种细粒度开关机制，
+   但用户在被问到"agent 跑爬虫/发邮件到底怎么调用外部程序、是不是必须用 shell"之后，回答是二者都不用
+   shell（爬虫走 `src/tools/cf_crawler.rs` 的 `tokio::process::Command` 直调 exe，邮件走 `lettre` 原生 SMTP 库），
+   于是直接指示"那就彻底移除shell"——不再需要任何授权机制，因为压根没有可供授权的 shell 工具了。
+   `shell`/`process`/`schedule` 三个工具（`process`/`schedule` 与 `shell` 同属"LLM 自由拼命令字符串"这一类风险，
+   一并删除）连同 `src/skills/tool_handler.rs`（`SKILL.toml` `kind="shell"` → 可调用工具的桥接层，唯一用途就是
+   执行 shell 定义的技能工具）整体从代码库删除，`SecurityPolicy`/`AutonomyConfig` 里所有 shell 命令白名单/风险分级
+   相关字段和方法（`allowed_commands`、`command_risk_level`、`validate_command_execution` 等）一并删除。详细改动
+   清单见 dev_log.md 对应条目。
 4. 移除 `self_check`/`check_logs`（已在第 4 节列为删除项，这里重复强调原因：这类"自检"是 AI 自己诊断自己出的错，容易越检查越乱）。**已完成，2026-09-23（Step 5 第二部分）。**
 
 ## 9. 验证方式：不需要每次都烧 Gemini 额度
@@ -260,6 +263,21 @@ gemini-3.5-flash: key A → key B → ...
   本次只清理了这次会话自己造成的过时内容，没有对整个技能库做地毯式审计——那是规模完全不同的另一项工作，
   不在"清理这次改动留下的旧约束"这个 Step 6 的原始意图范围内。同样是 `.gitignore` 忽略的本地文件，需要手动
   同步到 K6 才生效（见 dev_log.md）。
+- **Step 7（已完成，2026-09-23）**：`shell`/`process`/`schedule` 工具彻底移除（第 8 节第 3 条，问题被
+  用户"彻底移除shell"的指示直接取代，不再需要按任务授权设计）。同时修了一个借此机会才发现的独立预置
+  bug：`agent/loop_/parsing.rs` 的 `map_tool_name_alias()` 把真实存在的 `browser_open`/`browser`/
+  `web_search` 三个工具错误地别名到 `"shell"`（历史遗留，与本次改动无关），导致 LLM 以 GLM 简写格式调用
+  `browser_open/url>...` 时会被静默改写成裸 `curl` shell 命令执行，完全绕过 `browser_open` 工具自己的
+  域名白名单/URL 校验（`validate_url`）——这是本次改动之前就存在的、真实可复现的安全问题（用测试直接
+  证明：修复前 `map_tool_name_alias("browser_open")` 返回 `"shell"`），移除 shell 后这个错误映射的后果
+  从"静默绕过安全校验"变成"报错找不到 shell 工具"，但 `browser_open`/`browser`/`web_search` 三个真实工具
+  本身也被连带弄坏了（调用它们会失败）——两个问题一并修：三个工具名不再被别名重写，落回各自本名；
+  新增回归测试锁定这个行为。详细改动清单、`cron` 表 `job_type` 列 `DEFAULT 'shell'` 迁移安全修复
+  （K6 生产库里若有旧 shell 类型任务行，原本会在下次读取时因枚举不再接受 `"shell"` 而解析失败，新增
+  幂等迁移把旧值改写成 `'agent'`）、以及 5 个纯文本 skill 文件（`elfradio-runner`/`skill-creator`/
+  `scientific-tools`/`self-improving`/`skill-evolution-manager`）里假设 shell 可用但现已失效的提示文字
+  （这些是 prose-only skill，只影响系统提示词文本，不是可调用工具，未删除，留给后续会话按需处理），
+  见 dev_log.md 对应条目。
 
 ## 11. 已发现、暂缓到对应 Step 修复的安全问题
 
@@ -270,16 +288,12 @@ gemini-3.5-flash: key A → key B → ...
   `audit_allowlisting_one_real_pattern_does_not_hide_a_second_real_pattern`——先在旧代码上跑确认失败（真的会漏报
   `rm -rf /`），再在新代码上确认通过。
 - `cron_add`/`cron_update` 当前被设为免审批，但内部 `validate_command_execution` 信任的是**模型自己传的 `approved` 参数**，等于没有人工审批。
-  **仍未修复，2026-09-23 复核后发现 elfclaw.md 原先的判断是错的**：原文写"此问题随 Step 5 自然消除"，理由是"shell 命令
-  生成不该由模型现编"——但 Step 5 第一条只是把**独立的 `shell` 工具**从聊天 AI 隐藏，`cron_add(job_type="shell", ...)`
-  是完全不同的代码路径，`cron_add` 工具本身仍是 Safe 级（免审批、对所有渠道可见），聊天 AI 现在仍能调用
-  `cron_add(job_type="shell", command="...", approved=true)` 自己给自己批准，创建一个稍后由 scheduler 直接执行的
-  shell 定时任务，完全绕开人工审批。**实际风险面比最初以为的窄**：`validate_command_execution` 对 High 风险命令
-  （`rm`/`mkfs`/`dd`/`chmod`/`curl`/`wget` 等）在 `block_high_risk_commands=true`（部署默认值）时无条件硬拒绝，不看
-  `approved`；只有 Medium 风险且已经在 `allowed_commands` 窄白名单内的命令，才会被这个自报 `approved` 绕过审批。
-  **判断为暂不修**：真正的修法需要让 `cron_add` 知道调用方是不是聊天渠道（当前 `Tool::execute()` 签名不带渠道信息，
-  要么改 trait 签名影响所有工具，要么复用某种全局状态——本会话刚删掉的 `SelfCheckGate` 就是这类反模式，不该照搬）；
-  这本质上和第 8 节第 3 条"shell 按任务临时授权机制"是同一个未决的设计问题，用户已经选择暂缓，这里不单独抢先做。
+  **已彻底解决，2026-09-23（Step 7，随 shell 整体移除一并消除，不是单独修的）**：之前判断"暂不修"是因为修法
+  需要给 `cron_add` 引入调用方渠道信息，改动面大；但 Step 7 把 `JobType::Shell` 变体、`cron_add`/`cron_update`
+  的 `approved` 参数、以及它们各自调用的 `validate_command_execution` 全部删除了——**这个漏洞依附的代码路径
+  本身已经不存在**，不再需要单独设计权限模型。现在 `cron_add`/`cron_update` 只能创建 `agent`（走完整 agent
+  循环+其自身工具权限）或 `message`（纯文本提醒，不执行任何代码）类型的任务，两者都不存在"模型自报
+  已审批"这种绕过方式。
 - `sqlite_query` 的受保护数据库路径检查是字符串后缀匹配，Windows 8.3 短文件名或路径变体可能绕过。
   **已修复，2026-09-23**：新增 `system_db_match()` 辅助函数，比较 `Path::file_name()` 而不是字符串后缀——顺带修了一个
   过度拦截的副作用 bug（原来的 `"...".ends_with("brain.db")` 会把 `my_brain.db` 这种无关文件也误判为受保护数据库）。
