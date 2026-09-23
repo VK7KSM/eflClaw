@@ -2,6 +2,47 @@
 
 ---
 
+## 2026-09-23 — 稳定化 Step 4：Telegram 离线消息不丢弃
+
+按 `elfclaw.md` §10 Step 4。多 key 轮换 provider 和 429/503 分类处理已经在更早
+（Step 2 之前，用户明确要求优先）完成，本条只补 Telegram 离线消息这一块。
+
+### 根因
+
+`TelegramChannel::listen()` 进入正式长轮询循环前，先用 `timeout=0` 的
+"startup probe" 试探性调用一次 `getUpdates`，目的是检测上一个守护进程实例
+是不是还占着轮询槽位（避免一进入正式轮询就撞上 409 冲突）。但探测成功后，
+代码会把响应里每条更新的 `update_id` 拿出来推进 `offset`——**消息内容本身
+从来没有被处理过，直接被扔掉**。守护进程离线/重启期间用户发来的消息，
+就这样在启动的一瞬间被吞掉，界面上没有任何报错，用户只会觉得"发了没反应"。
+
+### 修复
+
+Telegram 的 `getUpdates` 不会因为返回过一次就把更新标记为已消费——只有
+调用方在**后续请求**里传入更高的 `offset` 才算"确认收到"。所以只要探测
+阶段不去动 `offset`，紧跟着的正式长轮询用同一个 `offset` 发起请求，会
+拿到完全相同的一批更新，这次会走完整的解析链路（相册、语音、图片等）
+正常处理。修复是纯删除：把探测成功分支里"推进 offset"那段代码删掉，
+只保留"探测成功，跳出探测循环"这一句。
+
+### 验证
+
+新增 `tests/telegram_offline_messages.rs`（wiremock 集成测试）：mock
+`getUpdates` 在 `offset=0` 时返回一条待处理消息，`offset` 不是 0 时返回
+空结果（模拟真实 Telegram 语义）。在**旧代码**上跑这个测试确认会超时
+失败（`timed out waiting for the offline message to be delivered`）；
+在修复后的代码上跑确认通过。`cargo check`/`cargo clippy`（无新增问题）/
+`cargo test --lib`（channels::telegram 169 passed，2 个 pre-existing
+symlink 权限失败与本次无关）。
+
+### 未处理
+
+Telegram 相册在跨 `getUpdates` 长轮询批次时可能被拆成两条消息——修复
+需要跨多次 poll 缓冲相册分组状态，改动面比离线消息这个大，且不是用户
+反馈过的实际痛点，记录在 elfclaw.md §11，往后放。
+
+---
+
 ## 2026-09-23 — 稳定化 Step 3：记忆重新设计
 
 按 `elfclaw.md` §7 逐条实现（7 条全部完成）。

@@ -176,10 +176,14 @@ gemini-3.5-flash: key A → key B → ...
   - 用 `git-filter-repo` 清理 git 全部历史中的 6 处真实密钥泄露（代理 key、Gmail 应用密码、crawler token、Telegram bot token、CF Worker secret、pairing token），强推 `origin/main`。
   - 删除仍携带旧历史的 3 个残留 dependabot 分支（会自动重新生成）；GitHub 密钥扫描告警标记为已解决。
   - `CLAUDE.md` §0 补充中文输出规则，明确覆盖 commit message。
-- **Step 1**：删除第 4 节列出的死代码和垃圾文件（纯删除，无行为变化，`cargo test` 前后一致）。
-- **Step 2**：Cron/提醒重写（第 6 节），含 K6 现有 22 个重复任务的清理脚本（先备份）。
-- **Step 3**：记忆重写（第 7 节）。
-- **Step 4**：模型路由 + 多 key 轮换 provider（第 5 节）+ Telegram 离线消息不丢弃 + 429/503 分类处理。
+- **Step 1（已完成，2026-09-23）**：删除第 4 节列出的死代码和垃圾文件（纯删除，无行为变化，`cargo test` 前后一致）。
+- **Step 2（已完成，2026-09-23）**：Cron/提醒重写（第 6 节，7 条全部完成）。
+- **Step 3（已完成，2026-09-23）**：记忆重写（第 7 节，7 条全部完成）。
+- **Step 4（已完成，2026-09-23）**：
+  - 多 key 轮换 provider（第 5 节，实际先于 Step 2 完成——用户明确要求优先）：修好了完全不生效的 key 轮换死代码、Gemini 每日额度 429 正确分类、输出上限 8192→65536。
+  - Telegram 离线消息不再丢弃：启动探测（"startup probe"）以前会把探测响应里的消息直接吞掉（只取 update_id 推进 offset，内容从不处理）——`getUpdates` 不会因为返回过一次就消费掉更新，所以只要探测不动 offset，紧接着的正式轮询会重新收到同一批消息并正常处理。改动是纯删除（删掉推进 offset 那段），配了一个 wiremock 集成测试，在旧代码上跑确认会超时失败，新代码上通过。
+  - 429/503 分类处理：已随多 key 轮换一起完成（见 §5.4）。
+  - **未处理**：Telegram 相册跨 `getUpdates` 轮询批次被拆分的问题（见第 11 节，改动面更大且非用户反馈的实际痛点，往后放）。
 - **Step 5**：Shell/工具权限收紧（第 8 节）+ 网关精简（第 4 节路由表）。
 - **Step 6**：清理约束弱模型的旧 prompt——只删已经被对应代码保证覆盖的那部分，不是一次性全删。
 
@@ -188,7 +192,7 @@ gemini-3.5-flash: key A → key B → ...
 - skill 审计的高危模式检测用 `find_map`，只报告第一个命中的模式，白名单声明一个模式就可能连带放过同文件里的其他危险模式（如 `rm -rf`）。→ Step 5 一并修。
 - `cron_add`/`cron_update` 当前被设为免审批，但内部 `validate_command_execution` 信任的是**模型自己传的 `approved` 参数**，等于没有人工审批。→ Step 8 节原则实施后，shell 命令生成本身就不该由模型现编，此问题随 Step 5 自然消除。
 - `sqlite_query` 的受保护数据库路径检查是字符串后缀匹配，Windows 8.3 短文件名或路径变体可能绕过。→ Step 5。
-- Telegram 相册在跨 `getUpdates` 长轮询批次时可能被拆成两条消息。→ Step 4（跟 Telegram 一起改）。
+- Telegram 相册在跨 `getUpdates` 长轮询批次时可能被拆成两条消息。**Step 4 未处理**——相册分组逻辑需要跨多次 poll 缓冲，改动面比离线消息那个大，且不是用户反馈过的实际痛点，往后放。
 
 ## 12. 密钥与账号管理
 

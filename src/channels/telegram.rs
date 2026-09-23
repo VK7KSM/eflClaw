@@ -3620,19 +3620,24 @@ impl Channel for TelegramChannel {
                                 .and_then(serde_json::Value::as_bool)
                                 .unwrap_or(false);
                             if ok {
-                                // Slot claimed — advance offset past any queued updates.
-                                if let Some(results) =
-                                    data.get("result").and_then(serde_json::Value::as_array)
-                                {
-                                    for update in results {
-                                        if let Some(uid) = update
-                                            .get("update_id")
-                                            .and_then(serde_json::Value::as_i64)
-                                        {
-                                            offset = uid + 1;
-                                        }
-                                    }
-                                }
+                                // elfClaw 2026-09-23: this used to advance
+                                // `offset` past every update_id in the probe
+                                // response — silently discarding any message
+                                // sent while the daemon was offline/restarting.
+                                // `getUpdates` doesn't consume updates just by
+                                // returning them; they stay pending until a
+                                // *later* call passes a higher offset. So the
+                                // fix is simply to leave `offset` untouched
+                                // here: the main long-poll loop below reuses
+                                // this same value on its first request, gets
+                                // the identical batch back, and processes it
+                                // for real through the full parse chain
+                                // (media groups, voice, photos, etc.) instead
+                                // of just reading `update_id` and throwing the
+                                // rest away. This probe's only job is
+                                // detecting whether the getUpdates slot is
+                                // free (ok=true, no 409) before entering that
+                                // loop — not consuming messages.
                                 break; // Probe succeeded; enter the long-poll loop.
                             }
 
