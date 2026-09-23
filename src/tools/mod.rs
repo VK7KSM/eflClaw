@@ -18,13 +18,11 @@
 pub mod agent_load_tracker;
 pub mod agent_selection;
 pub mod apply_patch;
-pub mod auth_profile;
 pub mod bg_run;
 pub mod browser;
 pub mod browser_open;
 pub mod caller_context;
 pub mod cf_crawler;
-pub mod channel_ack_config;
 pub mod cli_discovery;
 pub mod composio;
 pub mod content_search;
@@ -62,14 +60,11 @@ pub mod memory_forget;
 pub mod memory_observe;
 pub mod memory_recall;
 pub mod memory_store;
-pub mod model_routing_config;
 pub mod note_add;
 pub mod note_done;
 pub mod note_list;
-pub mod openclaw_migration;
 pub mod pdf_read;
 pub mod pptx_read;
-pub mod proxy_config;
 pub mod pushover;
 pub mod quota_tools;
 pub mod schema;
@@ -91,9 +86,7 @@ pub mod traits;
 pub mod url_validation;
 pub mod wasm_module;
 pub mod wasm_tool;
-pub mod web_access_config;
 pub mod web_fetch;
-pub mod web_search_config;
 pub mod web_search_tool;
 pub mod xlsx_read;
 
@@ -108,7 +101,6 @@ pub use bg_run::{
 pub use browser::{BrowserTool, ComputerUseConfig};
 pub use browser_open::BrowserOpenTool;
 pub use cf_crawler::{WebCrawlTool, WebHealthTool, WebLoginTool, WebScrapeTool};
-pub use channel_ack_config::ChannelAckConfigTool;
 pub use composio::ComposioTool;
 pub use content_search::ContentSearchTool;
 pub use cron_add::CronAddTool;
@@ -143,14 +135,11 @@ pub use memory_forget::MemoryForgetTool;
 pub use memory_observe::MemoryObserveTool;
 pub use memory_recall::MemoryRecallTool;
 pub use memory_store::MemoryStoreTool;
-pub use model_routing_config::ModelRoutingConfigTool;
 pub use note_add::NoteAddTool;
 pub use note_done::NoteDoneTool;
 pub use note_list::NoteListTool;
-pub use openclaw_migration::OpenClawMigrationTool;
 pub use pdf_read::PdfReadTool;
 pub use pptx_read::PptxReadTool;
-pub use proxy_config::ProxyConfigTool;
 pub use pushover::PushoverTool;
 #[allow(unused_imports)]
 pub use schema::{CleaningStrategy, SchemaCleanr};
@@ -192,24 +181,19 @@ pub fn tool_risk_tier(name: &str) -> ToolRiskTier {
         | "browser" | "browser_open" | "send_email" | "send_telegram"
         | "send_voice" | "cron_run" | "source_sync" => ToolRiskTier::Sensitive, // cron_run: immediate execution
 
-        // Restricted: security/config changes
-        "model_routing_config" | "proxy_config" | "web_access_config"
-        | "web_search_config" | "channel_ack_config" | "manage_auth_profile"
-        | "openclaw_migration" | "wasm_module" => ToolRiskTier::Restricted,
+        // Restricted: sandboxed module execution
+        "wasm_module" => ToolRiskTier::Restricted,
 
         // Standard: everything else (memory writes, delegation, etc.)
         _ => ToolRiskTier::Standard,
     }
 }
 pub use wasm_module::WasmModuleTool;
-pub use web_access_config::WebAccessConfigTool;
 pub use web_fetch::WebFetchTool;
-pub use web_search_config::WebSearchConfigTool;
 pub use web_search_tool::WebSearchTool;
 pub use xlsx_read::XlsxReadTool;
 
-pub use auth_profile::ManageAuthProfileTool;
-pub use quota_tools::{CheckProviderQuotaTool, EstimateQuotaCostTool, SwitchProviderTool};
+pub use quota_tools::{CheckProviderQuotaTool, EstimateQuotaCostTool};
 
 use crate::config::{Config, DelegateAgentConfig};
 use crate::memory::Memory;
@@ -265,11 +249,6 @@ pub fn default_tool_risk_tiers() -> HashMap<&'static str, ToolRiskTier> {
         ("cron_run", Restricted), // immediate agent-job execution — keep Restricted
         ("memory_store", Restricted),
         ("memory_forget", Restricted),
-        ("proxy_config", Restricted),
-        ("web_search_config", Restricted),
-        ("web_access_config", Restricted),
-        ("model_routing_config", Restricted),
-        ("channel_ack_config", Restricted),
         ("pushover", Restricted),
         ("composio", Restricted),
         ("delegate", Restricted),
@@ -461,17 +440,13 @@ pub fn all_tools_with_runtime(
         Arc::new(MemoryForgetTool::new(memory, security.clone())),
         // (note_add/note_list/note_done pushed below once NoteStore opens)
         Arc::new(TaskPlanTool::new(security.clone())),
-        Arc::new(ModelRoutingConfigTool::new(
-            config.clone(),
-            security.clone(),
-        )),
-        Arc::new(ChannelAckConfigTool::new(config.clone(), security.clone())),
-        Arc::new(ProxyConfigTool::new(config.clone(), security.clone())),
-        Arc::new(WebAccessConfigTool::new(config.clone(), security.clone())),
-        Arc::new(WebSearchConfigTool::new(config.clone(), security.clone())),
-        Arc::new(ManageAuthProfileTool::new(config.clone())),
+        // elfClaw 2026-09-24: tools that rewrite config.toml (model routing,
+        // provider switching, proxy, URL access, web search, ACK reactions,
+        // auth profiles, OpenClaw migration) were removed — the agent must not
+        // change the runtime configuration it depends on to run. Only
+        // personality/memory files (SOUL/USER/IDENTITY/TOOLS.md, memory) stay
+        // agent-editable.
         Arc::new(CheckProviderQuotaTool::new(config.clone())),
-        Arc::new(SwitchProviderTool::new(config.clone())),
         Arc::new(EstimateQuotaCostTool),
         Arc::new(PushoverTool::new(
             security.clone(),
@@ -513,10 +488,6 @@ pub fn all_tools_with_runtime(
     tool_arcs.push(Arc::new(WebLoginTool::new(security.clone())));
 
     if has_filesystem_access {
-        tool_arcs.push(Arc::new(OpenClawMigrationTool::new(
-            config.clone(),
-            security.clone(),
-        )));
         let file_read_arc: Arc<dyn Tool> = Arc::new(FileReadTool::new(security.clone()));
         let file_write_arc: Arc<dyn Tool> = Arc::new(FileWriteTool::new(security.clone()));
         let content_search_arc: Arc<dyn Tool> = Arc::new(ContentSearchTool::new(security.clone()));
@@ -948,12 +919,23 @@ mod tests {
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"browser_open"));
-        assert!(names.contains(&"model_routing_config"));
+        // Agent must not be able to rewrite its own runtime config.
+        for removed in [
+            "model_routing_config",
+            "switch_provider",
+            "proxy_config",
+            "web_access_config",
+            "web_search_config",
+            "channel_ack_config",
+            "manage_auth_profile",
+            "openclaw_migration",
+        ] {
+            assert!(
+                !names.contains(&removed),
+                "{removed} must not be registered"
+            );
+        }
         assert!(names.contains(&"pushover"));
-        assert!(names.contains(&"proxy_config"));
-        assert!(names.contains(&"web_access_config"));
-        assert!(names.contains(&"web_search_config"));
-        assert!(names.contains(&"openclaw_migration"));
     }
 
     #[test]
@@ -1036,12 +1018,23 @@ mod tests {
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"browser_open"));
         assert!(names.contains(&"content_search"));
-        assert!(names.contains(&"model_routing_config"));
+        // Agent must not be able to rewrite its own runtime config.
+        for removed in [
+            "model_routing_config",
+            "switch_provider",
+            "proxy_config",
+            "web_access_config",
+            "web_search_config",
+            "channel_ack_config",
+            "manage_auth_profile",
+            "openclaw_migration",
+        ] {
+            assert!(
+                !names.contains(&removed),
+                "{removed} must not be registered"
+            );
+        }
         assert!(names.contains(&"pushover"));
-        assert!(names.contains(&"proxy_config"));
-        assert!(names.contains(&"web_access_config"));
-        assert!(names.contains(&"web_search_config"));
-        assert!(names.contains(&"openclaw_migration"));
     }
 
     #[test]

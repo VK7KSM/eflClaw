@@ -2,7 +2,6 @@
 //!
 //! These tools allow the agent to:
 //! - Check quota status conversationally
-//! - Switch providers when rate limited
 //! - Estimate quota costs before operations
 //! - Report usage metrics to the user
 
@@ -15,7 +14,6 @@ use crate::tools::{Tool, ToolResult};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::json;
-use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -244,142 +242,6 @@ impl Tool for CheckProviderQuotaTool {
     }
 }
 
-/// Tool for switching the default provider/model in config.toml.
-///
-/// Writes `default_provider` and `default_model` to config.toml so the
-/// change persists across requests. Uses the same Config::save() pattern
-/// as ModelRoutingConfigTool.
-pub struct SwitchProviderTool {
-    config: Arc<Config>,
-}
-
-impl SwitchProviderTool {
-    pub fn new(config: Arc<Config>) -> Self {
-        Self { config }
-    }
-
-    fn load_config_without_env(&self) -> Result<Config> {
-        let contents = std::fs::read_to_string(&self.config.config_path).map_err(|error| {
-            anyhow::anyhow!(
-                "Failed to read config file {}: {error}",
-                self.config.config_path.display()
-            )
-        })?;
-
-        let mut parsed: Config = toml::from_str(&contents).map_err(|error| {
-            anyhow::anyhow!(
-                "Failed to parse config file {}: {error}",
-                self.config.config_path.display()
-            )
-        })?;
-        parsed.config_path.clone_from(&self.config.config_path);
-        parsed.workspace_dir.clone_from(&self.config.workspace_dir);
-        Ok(parsed)
-    }
-}
-
-#[async_trait]
-impl Tool for SwitchProviderTool {
-    fn name(&self) -> &str {
-        "switch_provider"
-    }
-
-    fn description(&self) -> &str {
-        "Switch to a different AI provider/model by updating config.toml. \
-         Use when current provider is rate-limited or when user explicitly \
-         requests a specific provider for a task. The change persists across requests."
-    }
-
-    fn parameters_schema(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "provider": {
-                    "type": "string",
-                    "description": "Provider name (e.g., 'gemini', 'openai', 'anthropic')",
-                },
-                "model": {
-                    "type": "string",
-                    "description": "Specific model (optional, e.g., 'gemini-2.5-flash', 'claude-opus-4')"
-                },
-                "reason": {
-                    "type": "string",
-                    "description": "Reason for switching (for logging and user notification)"
-                }
-            },
-            "required": ["provider"]
-        })
-    }
-
-    async fn execute(&self, args: serde_json::Value) -> Result<ToolResult> {
-        let provider = args["provider"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("Missing provider"))?;
-        let model = args.get("model").and_then(|v| v.as_str());
-        let reason = args
-            .get("reason")
-            .and_then(|v| v.as_str())
-            .unwrap_or("user request");
-
-        // Load config from disk (without env overrides), update, and save
-        let save_result = async {
-            let mut cfg = self.load_config_without_env()?;
-            let previous_provider = cfg.default_provider.clone();
-            let previous_model = cfg.default_model.clone();
-
-            cfg.default_provider = Some(provider.to_string());
-            if let Some(m) = model {
-                cfg.default_model = Some(m.to_string());
-            }
-
-            cfg.save().await?;
-            Ok::<_, anyhow::Error>((previous_provider, previous_model))
-        }
-        .await;
-
-        match save_result {
-            Ok((prev_provider, prev_model)) => {
-                let mut output = format!(
-                    "Switched provider to '{provider}'{}. Reason: {reason}",
-                    model.map(|m| format!(" (model: {m})")).unwrap_or_default(),
-                );
-
-                if let Some(pp) = &prev_provider {
-                    let _ = write!(output, "\nPrevious: {pp}");
-                    if let Some(pm) = &prev_model {
-                        let _ = write!(output, " ({pm})");
-                    }
-                }
-
-                let _ = write!(
-                    output,
-                    "\n\n<!-- metadata: {} -->",
-                    json!({
-                        "action": "switch_provider",
-                        "provider": provider,
-                        "model": model,
-                        "reason": reason,
-                        "previous_provider": prev_provider,
-                        "previous_model": prev_model,
-                        "persisted": true,
-                    })
-                );
-
-                Ok(ToolResult {
-                    success: true,
-                    output,
-                    error: None,
-                })
-            }
-            Err(e) => Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!("Failed to update config: {e}")),
-            }),
-        }
-    }
-}
-
 /// Tool for estimating quota cost before expensive operations.
 ///
 /// Allows agent to predict: "это займет ~100 токенов"
@@ -469,16 +331,6 @@ mod tests {
     }
 
     #[test]
-    fn test_switch_provider_schema() {
-        let tool = SwitchProviderTool::new(Arc::new(Config::default()));
-        let schema = tool.parameters_schema();
-        assert!(schema["required"]
-            .as_array()
-            .unwrap()
-            .contains(&json!("provider")));
-    }
-
-    #[test]
     fn test_estimate_quota_schema() {
         let tool = EstimateQuotaCostTool;
         let schema = tool.parameters_schema();
@@ -494,39 +346,10 @@ mod tests {
     }
 
     #[test]
-    fn test_switch_provider_name_and_description() {
-        let tool = SwitchProviderTool::new(Arc::new(Config::default()));
-        assert_eq!(tool.name(), "switch_provider");
-        assert!(tool.description().contains("Switch"));
-    }
-
-    #[test]
     fn test_estimate_quota_cost_name_and_description() {
         let tool = EstimateQuotaCostTool;
         assert_eq!(tool.name(), "estimate_quota_cost");
         assert!(tool.description().contains("cost"));
-    }
-
-    #[tokio::test]
-    async fn test_switch_provider_execute() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let config = Config {
-            workspace_dir: tmp.path().to_path_buf(),
-            config_path: tmp.path().join("config.toml"),
-            ..Config::default()
-        };
-        config.save().await.unwrap();
-        let tool = SwitchProviderTool::new(Arc::new(config));
-        let result = tool
-            .execute(json!({"provider": "gemini", "model": "gemini-2.5-flash", "reason": "rate limited"}))
-            .await
-            .unwrap();
-        assert!(result.success);
-        assert!(result.output.contains("gemini"));
-        assert!(result.output.contains("rate limited"));
-        // Verify config was actually updated
-        let saved = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
-        assert!(saved.contains("gemini"));
     }
 
     #[tokio::test]

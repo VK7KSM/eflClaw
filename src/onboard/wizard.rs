@@ -6180,7 +6180,7 @@ async fn scaffold_workspace(
          - Memory is limited — if you want to remember something, WRITE IT TO A FILE\n\
          - \"Mental notes\" don't survive session restarts. Files do.\n\
          - When someone says \"remember this\" -> update daily file or MEMORY.md\n\
-         - When you learn a lesson -> write it to MEMORY.md (core files like AGENTS.md/TOOLS.md are read-only to you; suggest changes to your human)\n"
+         - When you learn a lesson -> update TOOLS.md, MEMORY.md, or the relevant skill (AGENTS.md is read-only to you; suggest changes to your human)\n"
             .to_string()
     } else if memory_disabled {
         "## Memory System\n\n\
@@ -6200,7 +6200,7 @@ async fn scaffold_workspace(
              - Memory is limited — if you want to remember something, STORE IT\n\
              - \"Mental notes\" don't survive session restarts. Stored memory does.\n\
              - When someone says \"remember this\" -> use memory_store\n\
-             - When you learn a lesson -> use memory_store (core files like AGENTS.md/TOOLS.md are read-only to you; suggest changes to your human)\n"
+             - When you learn a lesson -> use memory_store, or update TOOLS.md or the relevant skill (AGENTS.md is read-only to you; suggest changes to your human)\n"
         )
     };
 
@@ -6228,7 +6228,7 @@ async fn scaffold_workspace(
          - **Vibe:** Sharp, direct, resourceful. Not corporate. Not a chatbot.\n\
          - **Emoji:** \u{1f980}\n\n\
          ---\n\n\
-         Your human maintains this file (it is read-only to you).\n"
+         Update this file as you evolve. Your identity is yours to shape.\n"
     );
 
     let agents = format!(
@@ -6252,7 +6252,7 @@ async fn scaffold_workspace(
          Stay silent when it's casual banter or someone already answered.\n\n\
          ## Tools & Skills\n\n\
          Skills are listed in the system prompt. Use `read` on a skill's SKILL.md for details.\n\
-         Local notes (SSH hosts, device names, etc.) live in `TOOLS.md`, maintained by your human.\n\n\
+         Keep local notes (SSH hosts, device names, etc.) in `TOOLS.md`.\n\n\
          {crash_recovery_block}\n\n\
          ## Sub-task Scoping\n\n\
          - Break complex work into focused sub-tasks with clear success criteria.\n\
@@ -6355,7 +6355,7 @@ async fn scaffold_workspace(
            - Use when: memory is incorrect, stale, or explicitly requested to be removed.\n\
            - Don't use when: uncertain about impact; verify before deleting.\n\n\
          ---\n\
-         *Maintained by your human — this file is read-only to you.*\n";
+         *Add whatever helps you do your job. This is your cheat sheet.*\n";
 
     let bootstrap = format!(
         "# BOOTSTRAP.md — Hello, World\n\n\
@@ -6366,7 +6366,7 @@ async fn scaffold_workspace(
          Don't interrogate. Don't be robotic. Just... talk.\n\
          Introduce yourself as {agent} and get to know each other.\n\n\
          ## After You Know Each Other\n\n\
-         Tell your human what you learned so they can update these files (they are read-only to you):\n\
+         Update these files with what you learned:\n\
          - `IDENTITY.md` — your name, vibe, emoji\n\
          - `USER.md` — their preferences, work context\n\
          - `SOUL.md` — boundaries and behavior\n\n\

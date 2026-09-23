@@ -55,6 +55,16 @@ elfClaw 最大的优势——**运行几乎不占系统资源**——是三者�
    ③ `skills/` 目录是否也要锁（与"让 AI 帮忙写技能"用法冲突，仍待用户决定）；④ 五个 `*_config` 工具
    （`model_routing_config`/`proxy_config`/`web_access_config`/`web_search_config`/`channel_ack_config`）是结构化
    地改 `config.toml` 的，不受文件名单约束——是否保留给聊天 AI 用待用户决定（见第 11 节）。
+   **2026-09-24 用户纠正并定下边界（Step 8 补充）**：原则是"**只拦会导致运行不稳定的，不要把正常运行也拦掉
+   再去解决拦出来的报错**"。
+   - `SOUL.md`/`USER.md`/`IDENTITY.md`/`TOOLS.md` 本来就是设计给 AI 改的（性格、偏好、身份、本地笔记这类
+     "高级配置"），改坏了也不会让 elfClaw 报错——**已放开**，偏好照旧写回这几个文件。
+   - 仍锁：`AGENTS.md`、`HEARTBEAT.md`、`BOOTSTRAP.md`、`config.toml`（改坏会影响调度、系统提示词或启动）。
+   - `skills/`、`workers/*.md` **不锁**（③ 已定）。
+   - **agent 不许动底层运行配置，包括不许换模型**（④ 已定）：删除全部 8 个会改写 `config.toml` 的工具——
+     上述 5 个 `*_config`，外加 `switch_provider`（切换默认模型/提供商）、`manage_auth_profile`（切换账号
+     配置）、`openclaw_migration`（合并外部配置）。只读的 `check_provider_quota`/`estimate_quota_cost` 保留。
+     子 agent 工具（`delegate`/`subagent_spawn`）只接受 agent 名字，模型由配置决定，agent 选不了，无需改动。
 5. **审批不是安全边界，能力收窄才是。** 把危险能力从模型手里拿掉之后，大部分工具可以免审批；只留 `send_email` 这类真正对外的动作需要确认。
 6. **约束弱模型的 prompt，只在对应代码保证做好之后才删。** 不是先删 prompt 再补代码，是反过来。
 7. **不要教 AI"应该做什么"，而要让它做不了不该做的事。** 这条是前 6 条的总纲。
@@ -314,6 +324,9 @@ gemini-3.5-flash: key A → key B → ...
   5. **提示词里让 AI 改核心文件的指令**（现在会被代码拦截、白白失败）：部署版 `AGENTS.md`/`SOUL.md`/`TOOLS.md`
      和脚手架模板里的"学到教训就更新 AGENTS.md/TOOLS.md""把学到的写回 USER.md/SOUL.md/IDENTITY.md""删除
      BOOTSTRAP.md"等全部改为：记到 `MEMORY.md` / 用 `note_add` 记事 / 告诉爸爸由他改。
+     **更正**：这条做过头了——用户指出 `SOUL.md`/`USER.md`/`IDENTITY.md`/`TOOLS.md` 本来就该让 AI 改，锁住它们是
+     "制造问题再解决问题"。已撤回：这四个文件移出保护名单，相关指令恢复原样（只有 `SOUL.md` 里"日程提醒"一条
+     保留为 `note_add`，那是 Step 3 的代码驱动提醒，与文件保护无关）。
   6. **技能提示词还在宣传调不了的工具**：`SKILL.toml` 的 `[[tools]]` 以前会被渲染进系统提示词，但唯一能执行
      它们的桥接层（仅支持 `kind="shell"`）已随 Step 7 删除——新装的技能会让模型去调"不存在的工具"。不再渲染。
   7. **解析器里残留的 curl 命令拼接**：`build_curl_command` 和两处 `"shell"` 分支（把 URL 改写成
@@ -351,7 +364,9 @@ gemini-3.5-flash: key A → key B → ...
   单测里可靠复现（依赖 NTFS 卷是否启用 8.3 别名生成，这点因环境而异，本沙箱环境对符号链接/硬链接相关测试也缺相应权限
   ——是已知的 11 个预置测试失败之一），修复的正确性基于 `tokio::fs::canonicalize()`/Windows API 文档保证的标准行为
   （解析短文件名和符号链接到规范长文件名），不是靠这类场景的直接测试验证。
-- **五个 `*_config` 工具让聊天 AI 能改自己的 `config.toml`（2026-09-24 复查发现，待用户决定）**：
+- **五个 `*_config` 工具让聊天 AI 能改自己的 `config.toml`（2026-09-24 复查发现）**——**已解决**：用户定下
+  "agent 不许动底层配置、不许换模型"，这 5 个连同 `switch_provider`/`manage_auth_profile`/`openclaw_migration`
+  共 8 个改写 `config.toml` 的工具已全部删除（见第 3 节第 4 条）。原始记录：
   `model_routing_config`/`proxy_config`/`web_access_config`/`web_search_config`/`channel_ack_config` 都会直接写回
   `config.toml`。代码里它们被标为 Restricted（注释写"对非 CLI 渠道隐藏"），但**默认分级只在 `tool_overrides`
   里点名时才生效**，部署配置又是 `non_cli_excluded_tools = []`，所以 Telegram 上的聊天 AI 实际上能看到并调用它们；

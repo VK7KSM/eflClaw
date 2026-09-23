@@ -1,11 +1,14 @@
 use std::path::Path;
 
-/// elfClaw 2026-09-24: core identity/config files the agent must never write
-/// to itself (elfclaw.md §3 point 4). In production the agent rewrote
-/// HEARTBEAT.md 14 times and a third-party skill (`self-improving`)
-/// explicitly wants write access to AGENTS.md/SOUL.md/HEARTBEAT.md — this
-/// list is the canonical OpenClaw identity file set (see
-/// `src/onboard/wizard.rs`'s scaffolding list) plus `config.toml`.
+/// elfClaw 2026-09-24: core config files the agent must never write to itself
+/// (elfclaw.md §3 point 4). In production the agent rewrote HEARTBEAT.md 14
+/// times; a broken write to any of these breaks scheduling, the system prompt
+/// or startup.
+///
+/// SOUL.md / USER.md / IDENTITY.md / TOOLS.md are deliberately NOT here: they
+/// are designed for the agent to update (preferences, speaking style,
+/// identity, local notes), and a bad edit to them cannot make elfClaw fail.
+/// Only lock what can break a run.
 ///
 /// `config.toml` is matched by name because the deployed layout keeps it one
 /// level above `workspace/`, and with `workspace_only = false` the resolved-
@@ -14,16 +17,8 @@ use std::path::Path;
 ///
 /// `HEARTBEAT_DATA.md` (the auxiliary, agent-writable data file) is
 /// deliberately NOT on this list.
-const PROTECTED_IDENTITY_FILENAMES: &[&str] = &[
-    "IDENTITY.md",
-    "AGENTS.md",
-    "HEARTBEAT.md",
-    "SOUL.md",
-    "USER.md",
-    "TOOLS.md",
-    "BOOTSTRAP.md",
-    "config.toml",
-];
+const PROTECTED_IDENTITY_FILENAMES: &[&str] =
+    &["AGENTS.md", "HEARTBEAT.md", "BOOTSTRAP.md", "config.toml"];
 
 /// Returns true when a path's file name matches a protected identity file,
 /// regardless of directory depth (mirrors [`crate::security::sensitive_paths::is_sensitive_file_path`]'s
@@ -55,7 +50,14 @@ mod tests {
         assert!(is_protected_identity_file(Path::new("HEARTBEAT.md")));
         assert!(is_protected_identity_file(Path::new("heartbeat.md")));
         assert!(is_protected_identity_file(Path::new("AGENTS.md")));
-        assert!(is_protected_identity_file(Path::new("soul.md")));
+        assert!(is_protected_identity_file(Path::new("bootstrap.md")));
+    }
+
+    #[test]
+    fn personality_and_notes_files_stay_writable() {
+        for name in ["SOUL.md", "USER.md", "IDENTITY.md", "TOOLS.md", "soul.md"] {
+            assert!(!is_protected_identity_file(Path::new(name)), "{name}");
+        }
     }
 
     #[test]

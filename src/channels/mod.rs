@@ -597,7 +597,7 @@ fn build_runtime_status_section(config: &crate::config::Config) -> String {
          - Installing packages or system dependencies\n\n\
          ALLOWED actions:\n\
          - Reading files, and writing non-core files, in your workspace directory \
-           (AGENTS.md/SOUL.md/TOOLS.md/HEARTBEAT.md/IDENTITY.md/USER.md/BOOTSTRAP.md/config.toml are read-only; \
+           (AGENTS.md/HEARTBEAT.md/BOOTSTRAP.md/config.toml are read-only;\
            put data you need to keep in HEARTBEAT_DATA.md or other non-core files)\n\
          - Using all registered tools (within their permission gates)\n\
          - Memory operations (recall, store, search)\n\
@@ -4220,10 +4220,6 @@ pub async fn start_channels(config: Config) -> Result<()> {
             "Execute actions on 1000+ apps via Composio (Gmail, Notion, GitHub, Slack, etc.). Use action='list' to discover actions, 'list_accounts' to retrieve connected account IDs, 'execute' to run (optionally with connected_account_id), and 'connect' for OAuth.",
         ));
     }
-    tool_descs.push((
-        "schedule",
-        "Manage scheduled tasks (create/list/get/cancel/pause/resume). Supports recurring cron and one-shot delays.",
-    ));
     tool_descs.push((
         "pushover",
         "Send a Pushover notification to your device. Requires PUSHOVER_TOKEN and PUSHOVER_USER_KEY in .env file.",

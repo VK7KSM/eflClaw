@@ -5852,3 +5852,48 @@ src/agent/loop_/parsing.rs 的 map_tool_name_alias()：曾把 "shell" | "bash" |
 2. `skills/` 目录是否也锁（与"让 AI 帮忙写技能"冲突）；`workers/*.md`（子 agent 工作手册，本质也是 prompt）是否也锁——不在 §3 第 4 条原始名单里。
 3. 五个 `*_config` 工具能结构化地改 `config.toml`，不受文件名单约束，且 Restricted 默认分级实际没生效、`web_access_config` 在部署配置里免审批（见 elfclaw.md §11）。
 4. `src/security/syscall_anomaly.rs`（678 行）生产代码已无调用方（Step 7 遗留）。
+
+---
+
+## 2026-09-24 — Step 8 补充：按用户原则收窄文件保护、删除 agent 改底层配置的工具
+
+### 用户的纠正与原则
+
+> USER.md/SOUL.md/IDENTITY.md 本质上不算核心文件，设计就是可以用来改的……你要改的是可能出现报错的不稳定运行情况，而不是把稳定运行也限制掉导致报错的发生，然后再去解决，不要制造问题再解决问题！
+> TOOLS.md 也放开。直接不允许 agent 换模型，agent 只回答问题做事情就好，不要动自己的基础配置，性格记忆之类的高级配置才允许修改。涉及到程序运行稳定的底层配置是不许动的。
+> skills/ 目录和 workers/*.md 不需要上锁。
+
+（另：上一轮我在回答用户问题之前就动手改了代码，用户指出"我让你先回答问题，你着急做啥"——以后用户先提问时先回答，确认后再动手。）
+
+### 改动
+
+1. **保护名单收窄**：`src/security/protected_identity_files.rs` 去掉 `SOUL.md`/`USER.md`/`IDENTITY.md`/`TOOLS.md`，只留 `AGENTS.md`/`HEARTBEAT.md`/`BOOTSTRAP.md`/`config.toml`。新增测试 `personality_and_notes_files_stay_writable` 锁定这四个文件可写。
+2. **撤回上一轮对这四个文件的提示词改动**：
+   - `src/onboard/wizard.rs`：IDENTITY.md 模板恢复"Update this file as you evolve"；BOOTSTRAP.md 模板恢复"Update these files with what you learned"；AGENTS.md 模板恢复"Keep local notes … in TOOLS.md"；TOOLS.md 模板结尾恢复"This is your cheat sheet"；"学到教训"一句改为"更新 TOOLS.md、MEMORY.md 或相关 skill（AGENTS.md 只读）"。
+   - `src/channels/mod.rs`：部署模式提示里的只读文件清单改为 `AGENTS.md/HEARTBEAT.md/BOOTSTRAP.md/config.toml`。
+   - `资料/SOUL.md`："持续进化"恢复为偏好写回 `USER.md`、风格写回本文件、新技能写回 `IDENTITY.md`；"日程提醒"一条保留 `note_add`（Step 3 的代码驱动提醒，与文件保护无关）。
+   - `资料/AGENTS.md`：恢复"Keep local notes in TOOLS.md"；"学到教训"改为写 `TOOLS.md`/`MEMORY.md`/相关 skill。`资料/TOOLS.md` 结尾恢复原文。
+3. **删除 8 个会改写 `config.toml` 的 agent 工具**（agent 不许动底层配置、不许换模型）：
+   - 整文件删除：`src/tools/model_routing_config.rs`、`proxy_config.rs`、`web_access_config.rs`、`web_search_config.rs`、`channel_ack_config.rs`、`auth_profile.rs`（`manage_auth_profile`，切换账号配置）、`openclaw_migration.rs`（合并外部配置）。删前确认在 `src/tools/` 之外无任何引用。
+   - `src/tools/quota_tools.rs` 删除 `SwitchProviderTool`（`switch_provider`，会 `cfg.save()` 改默认提供商/模型）及其 3 个测试；只读的 `check_provider_quota`、`estimate_quota_cost` 保留。
+   - `src/tools/mod.rs`：去掉模块声明、`pub use`、两张风险分级表里的条目、注册代码；两个测试改为断言这 8 个工具**不再注册**。
+   - `src/config/schema.rs`：`default_non_cli_excluded_tools()` 去掉已不存在的 5 个 `*_config` 名字。
+   - `资料/config.toml`：`auto_approve` 去掉 `web_access_config`。
+   - 删 `web_access_config` 前确认过：它管的"首次访问域名需审批"流程在部署配置里是关闭的（`require_first_visit_approval = false`），不影响现有功能。
+   - 子 agent 工具（`delegate`/`subagent_spawn`）只接受 agent 名字，模型来自配置，agent 选不了，无需改。
+4. **顺带发现的 Step 7 遗漏**：`src/channels/mod.rs`（Telegram 聊天系统提示词）和 `src/agent/loop_.rs` 的硬编码工具说明里还在介绍 Step 7 已删除的 `schedule` 工具——从 Step 7 起，每条聊天都会告诉模型有一个不存在的工具，调用即"找不到工具"。已删除；`loop_.rs` 两处 `model_routing_config` 说明一并删除。
+
+### 验证
+
+- `cargo test --lib`：4021 passed，10 failed（与基线相同的 10 个；通过数从 4055 降到 4021 是删掉的工具文件自带的测试）。
+- `cargo test --no-fail-fast --test '*'`：230 passed，3 failed（预置的 `agent_loop_robustness` 循环检测测试）。
+- `cargo clippy`：206 个（原 247，删掉的工具文件自带的旧错误随之消失）；逐文件对比无任何文件增加，`git blame` 核对无报错落在本次改动行上。
+
+### 复查中发现、未处理（待用户决定）
+
+- `file_write`/`file_edit` 可以用文本整文件覆盖运行时数据库（`cron/jobs.db`、`memory/brain.db`、`notes.db`、`state/elfclaw-logs.db`），覆盖后定时任务/记忆会出错。`sqlite_query` 已挡住对这些库执行 SQL，但整文件覆盖没挡。生产日志里没出现过，按用户"只修真正会出问题的"原则暂未改动。
+- `资料/config.toml` 的 `forbidden_paths` 里 `"资料/config.toml"`、`"config.toml"` 两条是相对路径、实际不生效（真正的保护现在由代码按文件名做），无害，未改。
+
+### ⚠️ K6 手动同步
+
+清单同上一条（`config.toml`、`skills/cf-crawler/SKILL.toml`、`workers/news_fetcher.md`、`AGENTS.md`、`TOOLS.md`、`SOUL.md`），本次 `AGENTS.md`/`TOOLS.md`/`SOUL.md`/`config.toml` 内容又有更新，以本地最新版为准。
