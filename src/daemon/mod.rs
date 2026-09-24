@@ -159,19 +159,39 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
                     &declared,
                     parse_errors.is_empty(),
                 ) {
-                    Ok(report) if report.total_changes() > 0 => {
-                        tracing::info!(
-                            created = report.created.len(),
-                            updated = report.updated.len(),
-                            removed = report.removed.len(),
-                            "Startup heartbeat reconcile applied changes"
-                        );
+                    Ok(report) => {
+                        if report.total_changes() > 0 {
+                            tracing::info!(
+                                created = report.created.len(),
+                                updated = report.updated.len(),
+                                removed = report.removed.len(),
+                                "Startup heartbeat reconcile applied changes"
+                            );
+                        }
+                        for err in &report.errors {
+                            tracing::warn!("Startup heartbeat reconcile: {err}");
+                        }
                     }
-                    Ok(_) => {}
                     Err(e) => tracing::warn!("Startup heartbeat reconcile failed: {e}"),
                 }
             }
             Err(e) => tracing::debug!("Startup heartbeat reconcile skipped: {e}"),
+        }
+        match crate::cron::news::reconcile(&config) {
+            Ok(report) => {
+                if report.total_changes() > 0 {
+                    tracing::info!(
+                        created = report.created.len(),
+                        updated = report.updated.len(),
+                        removed = report.removed.len(),
+                        "Startup news-slot reconcile applied changes"
+                    );
+                }
+                for err in &report.errors {
+                    tracing::warn!("Startup news-slot reconcile: {err}");
+                }
+            }
+            Err(e) => tracing::warn!("Startup news-slot reconcile failed: {e}"),
         }
     }
 
@@ -338,6 +358,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
     interval.tick().await; // consume the instant first tick — first real execution waits full interval
 
     let heartbeat_path = config.workspace_dir.join("HEARTBEAT.md");
+    let mut last_reported_errors: Vec<String> = Vec::new();
 
     loop {
         interval.tick().await;
@@ -389,45 +410,67 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
         // a model to misjudge. See `src/cron/heartbeat_decl.rs`.
         let (declared, parse_errors) =
             crate::cron::heartbeat_decl::parse_heartbeat_task_declarations(&content);
-        match crate::cron::heartbeat_decl::reconcile(&config, &declared, parse_errors.is_empty()) {
-            Ok(report) => {
+        let heartbeat_report =
+            crate::cron::heartbeat_decl::reconcile(&config, &declared, parse_errors.is_empty());
+        // elfClaw 2026-09-24: news slots (HEARTBEAT_DATA.toml) are reconciled
+        // on the same tick; the news_schedule tool also reconciles right after
+        // each change, so this mainly picks up hand edits.
+        let news_report = crate::cron::news::reconcile(&config);
+        match (heartbeat_report, news_report) {
+            (Ok(hb), Ok(news)) => {
                 crate::health::mark_component_ok("heartbeat");
-                let mut messages: Vec<String> = report
+                let changes: Vec<String> = hb
                     .created
                     .iter()
                     .map(|n| format!("+ 新建任务: {n}"))
-                    .chain(report.updated.iter().map(|n| format!("~ 更新任务: {n}")))
-                    .chain(report.removed.iter().map(|n| format!("- 移除任务: {n}")))
-                    .chain(
-                        report
-                            .errors
-                            .iter()
-                            .map(|e| format!("! 解析/对账出错: {e}")),
-                    )
-                    .chain(parse_errors.iter().map(|e| format!("! 解析出错: {e}")))
+                    .chain(hb.updated.iter().map(|n| format!("~ 更新任务: {n}")))
+                    .chain(hb.removed.iter().map(|n| format!("- 移除任务: {n}")))
+                    .chain(news.created.iter().map(|n| format!("+ 新建新闻时段: {n}")))
+                    .chain(news.updated.iter().map(|n| format!("~ 更新新闻时段: {n}")))
+                    .chain(news.removed.iter().map(|n| format!("- 移除新闻时段: {n}")))
                     .collect();
-                if !messages.is_empty() {
+                let mut errors: Vec<String> = hb
+                    .errors
+                    .iter()
+                    .map(|e| format!("! 对账出错: {e}"))
+                    .chain(
+                        parse_errors
+                            .iter()
+                            .map(|e| format!("! HEARTBEAT.md 解析出错: {e}")),
+                    )
+                    .chain(news.errors.iter().map(|e| format!("! 新闻时段: {e}")))
+                    .collect();
+                errors.sort();
+                // Changes are always reported; a standing error only when it
+                // first appears or changes — not again every tick.
+                let errors_changed = errors != last_reported_errors;
+                if !changes.is_empty() || errors_changed {
                     tracing::info!(
-                        created = report.created.len(),
-                        updated = report.updated.len(),
-                        removed = report.removed.len(),
-                        errors = report.errors.len() + parse_errors.len(),
-                        "Heartbeat: HEARTBEAT.md reconciled"
+                        changes = changes.len(),
+                        errors = errors.len(),
+                        "Heartbeat: HEARTBEAT.md / news slots reconciled"
                     );
-                    messages.sort();
-                    if let Some((channel, target)) = &delivery {
-                        let text = format!("[心跳对账]\n{}", messages.join("\n"));
-                        if let Err(e) = crate::cron::scheduler::deliver_announcement(
-                            &config, channel, target, &text,
-                        )
-                        .await
-                        {
-                            tracing::warn!("Heartbeat reconcile-report delivery failed: {e}");
+                    let mut lines = changes;
+                    lines.sort();
+                    if errors_changed {
+                        lines.extend(errors.iter().cloned());
+                    }
+                    if !lines.is_empty() {
+                        if let Some((channel, target)) = &delivery {
+                            let text = format!("[心跳对账]\n{}", lines.join("\n"));
+                            if let Err(e) = crate::cron::scheduler::deliver_announcement(
+                                &config, channel, target, &text,
+                            )
+                            .await
+                            {
+                                tracing::warn!("Heartbeat reconcile-report delivery failed: {e}");
+                            }
                         }
                     }
+                    last_reported_errors = errors;
                 }
             }
-            Err(e) => {
+            (Err(e), _) | (_, Err(e)) => {
                 crate::health::mark_component_error("heartbeat", e.to_string());
                 tracing::warn!("Heartbeat reconcile failed: {e}");
                 crate::elfclaw_log::log_error(

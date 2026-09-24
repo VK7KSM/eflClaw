@@ -571,18 +571,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn file_edit_allows_heartbeat_data_file() {
-        let dir = std::env::temp_dir().join("zeroclaw_test_file_edit_heartbeat_data_allowed");
+    async fn file_edit_allows_non_core_file() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_edit_non_core_allowed");
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
-        tokio::fs::write(dir.join("HEARTBEAT_DATA.md"), "original")
+        tokio::fs::write(dir.join("MEMORY.md"), "original")
             .await
             .unwrap();
 
         let tool = FileEditTool::new(test_security(dir.clone()));
         let result = tool
             .execute(json!({
-                "path": "HEARTBEAT_DATA.md",
+                "path": "MEMORY.md",
                 "old_string": "original",
                 "new_string": "updated"
             }))
@@ -590,7 +590,7 @@ mod tests {
             .unwrap();
 
         assert!(result.success, "{:?}", result.error);
-        let content = tokio::fs::read_to_string(dir.join("HEARTBEAT_DATA.md"))
+        let content = tokio::fs::read_to_string(dir.join("MEMORY.md"))
             .await
             .unwrap();
         assert_eq!(content, "updated");

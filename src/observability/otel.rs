@@ -440,15 +440,15 @@ mod tests {
             tool: "shell".into(),
             duration: Duration::from_millis(10),
             success: true,
-        args: None,
-        error: None,
+            args: None,
+            error: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             tool: "file_read".into(),
             duration: Duration::from_millis(5),
             success: false,
-        args: None,
-        error: None,
+            args: None,
+            error: None,
         });
         obs.record_event(&ObserverEvent::TurnComplete);
         obs.record_event(&ObserverEvent::ChannelMessage {

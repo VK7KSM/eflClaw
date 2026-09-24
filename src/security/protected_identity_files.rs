@@ -15,10 +15,16 @@ use std::path::Path;
 /// path check only vets the parent directory — a relative `"config.toml"`
 /// entry in `forbidden_paths` never matches the real absolute path.
 ///
-/// `HEARTBEAT_DATA.md` (the auxiliary, agent-writable data file) is
-/// deliberately NOT on this list.
-const PROTECTED_IDENTITY_FILENAMES: &[&str] =
-    &["AGENTS.md", "HEARTBEAT.md", "BOOTSTRAP.md", "config.toml"];
+/// `HEARTBEAT_DATA.toml` is agent-*modifiable* but only through the
+/// `news_schedule`/`news_report` tools, which validate and write it in code;
+/// a free-form `file_write` could leave it unparseable.
+const PROTECTED_IDENTITY_FILENAMES: &[&str] = &[
+    "AGENTS.md",
+    "HEARTBEAT.md",
+    "BOOTSTRAP.md",
+    "config.toml",
+    "HEARTBEAT_DATA.toml",
+];
 
 /// Returns true when a path's file name matches a protected identity file,
 /// regardless of directory depth (mirrors [`crate::security::sensitive_paths::is_sensitive_file_path`]'s
@@ -36,8 +42,8 @@ pub fn is_protected_identity_file(path: &Path) -> bool {
 pub fn protected_identity_file_block_message(path: &str) -> String {
     format!(
         "Writing to '{path}' is blocked: it is a protected core identity/config file \
-(see elfclaw.md §3 point 4). If you need to persist data, write it to HEARTBEAT_DATA.md \
-or another non-core file instead."
+(see elfclaw.md §3 point 4). News slots/sources are changed with the news_schedule tool; \
+other data can go to MEMORY.md or another non-core file."
     )
 }
 
@@ -82,8 +88,9 @@ mod tests {
     }
 
     #[test]
-    fn allows_heartbeat_data_and_unrelated_files() {
-        assert!(!is_protected_identity_file(Path::new("HEARTBEAT_DATA.md")));
+    fn allows_non_core_files_but_not_the_news_data_file() {
+        assert!(is_protected_identity_file(Path::new("HEARTBEAT_DATA.toml")));
+        assert!(!is_protected_identity_file(Path::new("MEMORY.md")));
         assert!(!is_protected_identity_file(Path::new("homework/notes.md")));
         assert!(!is_protected_identity_file(Path::new(
             "workers/news_fetcher.md"

@@ -2,6 +2,7 @@ use crate::config::Config;
 use anyhow::{bail, Result};
 
 pub mod heartbeat_decl;
+pub mod news;
 mod schedule;
 mod store;
 mod types;

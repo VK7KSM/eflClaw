@@ -69,6 +69,9 @@ elfClaw 最大的优势——**运行几乎不占系统资源**——是三者�
    （6 个新闻时段 + 新闻源搜索），新闻源全部挪进 `资料/HEARTBEAT_DATA.md`；HEARTBEAT.md 里写死了
    "HEARTBEAT_DATA.md 约定"（四节结构、各节谁改、能改什么）。约定**不做代码校验**：没有任何代码解析
    HEARTBEAT_DATA.md，写错了最多影响某个时段抓哪些源，不会让程序报错——按"只拦会导致不稳定的"原则不需要。
+   **2026-09-24 Step 10 取代上述做法**：数据文件改为只由代码写入的 `HEARTBEAT_DATA.toml`，agent 通过 `news_schedule`/
+   `news_report` 工具修改；HEARTBEAT.md 用 `news-rules` 规则块写死 agent 能改的边界，由代码逐条校验。原因：让模型整文件
+   重写数据文件容易改坏，且 worker 回写封禁记录会覆盖主 agent 刚做的修改；另外用户要求主 agent 能自己增删新闻时段。
 5. **审批不是安全边界，能力收窄才是。** 把危险能力从模型手里拿掉之后，大部分工具可以免审批；只留 `send_email` 这类真正对外的动作需要确认。
 6. **约束弱模型的 prompt，只在对应代码保证做好之后才删。** 不是先删 prompt 再补代码，是反过来。
 7. **不要教 AI"应该做什么"，而要让它做不了不该做的事。** 这条是前 6 条的总纲。
@@ -369,8 +372,10 @@ gemini-3.5-flash: key A → key B → ...
   + 同时间其他任务给出提醒；`cron_remove` 支持按名字删除全部同名任务；`heartbeat:`/`news:`/`note:` 受管任务不能被
   `cron_remove`/`cron_update` 改动（以前删了会被对账重建，工具却回复成功）；`cron_update` 不能改名到已有名字；HEARTBEAT.md
   有解析错误时对账不删除任务；名字跨任务类型复用会把 agent 任务改坏的问题。详见 dev_log.md。
-  **第二部分（待做）**：新闻时段改为 `news_schedule`/`news_report` 结构化工具 + 代码维护的 `HEARTBEAT_DATA.toml`，
-  取代让模型直接编辑数据文件（整文件重写易出错、worker 回写封禁记录会覆盖主 agent 刚做的修改、失败次数靠模型自己数）。
+  **第二部分（已完成，2026-09-24）**：新闻时段改为 `news_schedule`（主 agent 增删改时段和源）/`news_report`（worker 上报
+  抓取结果、登记候选源）结构化工具 + 只由代码写入的 `HEARTBEAT_DATA.toml`；HEARTBEAT.md 用 `news-rules` 规则块写死推送对象、
+  子 agent、静默时段、数量上限、封禁阈值。计数封禁、剔除封禁源、同步定时任务全部由代码完成；数据文件读写加锁（实测无锁时并发
+  改动会丢失）。另修了心跳错误每小时重复发 Telegram 的问题。取代 Step 9 让模型直接编辑数据文件的做法。详见 dev_log.md。
 
 ## 11. 已发现、暂缓到对应 Step 修复的安全问题
 

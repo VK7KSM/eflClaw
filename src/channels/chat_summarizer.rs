@@ -145,12 +145,7 @@ async fn process_single_file(
     if let (Some(ref correction), Some(mem)) = (&corrections, memory) {
         let key = format!("correction_{}_{}", entry.date, log.chat_id);
         if let Err(e) = mem
-            .store(
-                &key,
-                correction,
-                crate::memory::MemoryCategory::Core,
-                None,
-            )
+            .store(&key, correction, crate::memory::MemoryCategory::Core, None)
             .await
         {
             tracing::warn!("Failed to store correction in memory: {e}");
@@ -262,7 +257,8 @@ mod tests {
 
     #[test]
     fn parse_summary_with_corrections() {
-        let response = "摘要：讨论了时区设置\n话题：时区,配置\n纠错：用户纠正了时区应该用AEST而不是UTC";
+        let response =
+            "摘要：讨论了时区设置\n话题：时区,配置\n纠错：用户纠正了时区应该用AEST而不是UTC";
         let (summary, topics, corrections) = parse_summary_response(response);
         assert_eq!(summary, "讨论了时区设置");
         assert_eq!(topics.as_deref(), Some("时区,配置"));

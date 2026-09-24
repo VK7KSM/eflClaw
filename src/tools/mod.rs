@@ -60,6 +60,8 @@ pub mod memory_forget;
 pub mod memory_observe;
 pub mod memory_recall;
 pub mod memory_store;
+pub mod news_report;
+pub mod news_schedule;
 pub mod note_add;
 pub mod note_done;
 pub mod note_list;
@@ -135,6 +137,8 @@ pub use memory_forget::MemoryForgetTool;
 pub use memory_observe::MemoryObserveTool;
 pub use memory_recall::MemoryRecallTool;
 pub use memory_store::MemoryStoreTool;
+pub use news_report::NewsReportTool;
+pub use news_schedule::NewsScheduleTool;
 pub use note_add::NoteAddTool;
 pub use note_done::NoteDoneTool;
 pub use note_list::NoteListTool;
@@ -173,7 +177,8 @@ pub fn tool_risk_tier(name: &str) -> ToolRiskTier {
         | "web_search_tool"                 // read-only search
         | "web_health" | "web_scrape" | "web_crawl" // read-only cf-crawler calls
         | "cron_add" | "cron_remove" | "cron_update"
-        | "note_add" | "note_list" | "note_done" => ToolRiskTier::Safe, // metadata only
+        | "note_add" | "note_list" | "note_done"
+        | "news_schedule" | "news_report" => ToolRiskTier::Safe, // metadata only; news changes are bounded by HEARTBEAT.md news-rules
 
         // Sensitive: write operations, network access
         "file_write" | "file_edit" | "apply_patch"
@@ -237,6 +242,10 @@ pub fn default_tool_risk_tiers() -> HashMap<&'static str, ToolRiskTier> {
         ("note_add", Safe),
         ("note_list", Safe),
         ("note_done", Safe),
+        // elfClaw 2026-09-24: typed news-slot management; every change is
+        // validated against the HEARTBEAT.md news-rules by code.
+        ("news_schedule", Safe),
+        ("news_report", Safe),
         // Sensitive: always require approval
         ("generate_pairing_code", Sensitive),
         // Restricted: hidden from non-CLI channels
@@ -429,6 +438,8 @@ pub fn all_tools_with_runtime(
 
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
         Arc::new(CronAddTool::new(config.clone(), security.clone())),
+        Arc::new(NewsScheduleTool::new(config.clone(), security.clone())),
+        Arc::new(NewsReportTool::new(config.clone(), security.clone())),
         Arc::new(CronListTool::new(config.clone())),
         Arc::new(CronRemoveTool::new(config.clone(), security.clone())),
         Arc::new(CronUpdateTool::new(config.clone(), security.clone())),

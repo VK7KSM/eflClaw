@@ -3637,8 +3637,9 @@ mod tests {
         assert!(tool.validate_output_path("path", "HEARTBEAT.md").is_err());
         assert!(tool.validate_output_path("path", "config.toml").is_err());
         assert!(tool
-            .validate_output_path("path", "HEARTBEAT_DATA.md")
-            .is_ok());
+            .validate_output_path("path", "HEARTBEAT_DATA.toml")
+            .is_err());
+        assert!(tool.validate_output_path("path", "MEMORY.md").is_ok());
     }
 
     #[test]

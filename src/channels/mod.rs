@@ -597,8 +597,8 @@ fn build_runtime_status_section(config: &crate::config::Config) -> String {
          - Installing packages or system dependencies\n\n\
          ALLOWED actions:\n\
          - Reading files, and writing non-core files, in your workspace directory \
-           (AGENTS.md/HEARTBEAT.md/BOOTSTRAP.md/config.toml are read-only;\
-           put data you need to keep in HEARTBEAT_DATA.md or other non-core files)\n\
+           (AGENTS.md/HEARTBEAT.md/BOOTSTRAP.md/config.toml/HEARTBEAT_DATA.toml are read-only \
+           to file tools; manage daily news slots and sources with the news_schedule tool)\n\
          - Using all registered tools (within their permission gates)\n\
          - Memory operations (recall, store, search)\n\
          - Sending messages via configured channels\n\

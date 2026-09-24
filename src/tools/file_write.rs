@@ -513,19 +513,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn file_write_allows_heartbeat_data_file() {
-        let dir = std::env::temp_dir().join("zeroclaw_test_file_write_heartbeat_data_allowed");
+    async fn file_write_allows_non_core_file() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_write_non_core_allowed");
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
 
         let tool = FileWriteTool::new(test_security(dir.clone()));
         let result = tool
-            .execute(json!({"path": "HEARTBEAT_DATA.md", "content": "- source: example.com"}))
+            .execute(json!({"path": "MEMORY.md", "content": "- source: example.com"}))
             .await
             .unwrap();
 
         assert!(result.success, "{:?}", result.error);
-        assert!(dir.join("HEARTBEAT_DATA.md").exists());
+        assert!(dir.join("MEMORY.md").exists());
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
