@@ -6237,3 +6237,52 @@ K6 上在群里说一句 hello，输入 50,182 token、耗时 20.3 秒。用 Gem
 3. **截图存到了 workspace 外面**：cf-crawler 把截图写到进程当前目录下的 `homework\screenshots\`，而 `run_cf_crawler` 没有设置工作目录。K6 上这个目录是实例目录，所以截图落在 `ZeroClaw_Workspace\homework\`，不在 `workspace\` 里，agent 读不到也发不出去。
 4. **Cloudflare 浏览器渲染限流**：Worker 返回 `Unable to create new browser: code: 429: Rate limit exceeded`，是免费计划对每分钟新开浏览器数量的限制。新闻 worker 在一轮里并行抓多个需要浏览器的源时就会触发，被当成"源失败"计数，可能把好的源误封。
 5. （顺带发现）3.8/3.7-flash 不支持 `thinkingLevel=minimal`，`reasoning_level = 0` 时这两个模型会返回 400。当前配置是 2，不受影响。
+
+
+---
+
+## 2026-09-24 — 对话模型改为 3.6 优先、记住已用完额度的 key、cf-crawler 四个问题修复
+
+### 模型顺序与额度（用户决定：3.6 最快，先用完 6 个 key 的 3.6 额度再用 3.7、3.8）
+
+- `资料/config.toml`（同步到 K6）：`default_model` 从 `gemini-3.8-flash` 改为 `gemini-3.6-flash`；`[reliability.model_fallbacks]` 改为 `"gemini-3.6-flash" = ["gemini-3.7-flash", "gemini-3.8-flash", "gemini-3.5-flash"]`。顶部注释原来写的是"model 先轮完才换 key"，和实际顺序正好相反，已改正（实际是同一个模型先把所有 key 轮完，再换下一个模型）。
+- **`src/providers/reliable.rs`：额度冷却**。新增 `cooldowns`（内存里的"key + 模型 → 跳过到何时"）：
+  - Gemini 当日额度用完的 429（`is_gemini_daily_quota_exhausted`），跳过到下一个太平洋时间午夜（`until_next_pacific_midnight`，用 chrono-tz 的 America/Los_Angeles 计算，自动处理夏令时）；
+  - 其他 429 按每分钟限流处理，跳过 60 秒；
+  - 请求成功就清除该组合的冷却记录；
+  - 如果所有组合都在冷却中，照样全部试一遍，不会不试就拒绝。
+  - 效果：6 个 key 的 3.6 额度依次用完后，后续请求直接从还有额度的组合开始，不用每条消息都先把已经用完的 key 试一遍。只存内存，重启后每个已用完的组合最多多试一次。
+- **`src/providers/gemini.rs`**：3.7/3.8-flash 不支持 `thinkingLevel=minimal`（实测返回 400），`reasoning_level = 0` 时这两个模型改用 `low`；3.5/3.6 仍然用 minimal。
+
+### cf-crawler（elfClaw 工具层 + cf-crawler 048a7e6，已推送）
+
+1. **`web_login` 参数改成 cf-crawler login 的真实格式**：`session_id`、`login_url`、`credentials{username_field, username, password_field, password}` 必填，`submit_selector`、`success_url_contains` 可选；空字段直接报错。风险等级改为 Sensitive（要提交账号密码，需要审批）。
+2. **账号密码不进日志、不进审批提示**：新增 `util::redact_sensitive_json`，按字段名结构化脱敏（password/passwd/secret/token/api_key/apikey/credential，任意层级、任意长度都替换成 `[REDACTED]`）。用在三处：工具调用日志的参数摘要（`agent/loop_/execution.rs`）、Telegram 审批提示的默认分支、其他渠道的默认审批提示（`channels/traits.rs`）。原来的正则脱敏只处理 8 位以上的值，而且日志摘要根本没有做脱敏。
+3. **截图和 persist_path 落进 workspace**：`run_cf_crawler` 设置工作目录为 workspace。原来 K6 上截图会落到 `ZeroClaw_Workspace\homework\`（实例目录，在 workspace 外面），agent 读不到。
+4. **CF 浏览器限流**：
+   - cf-crawler 的 scrape-page 失败时把 Worker 的报错原文放进 `error` 字段；
+   - elfClaw 的 `is_browser_rate_limited` 能识别限流（包括 login 使用的 `ok` 字段）；
+   - 抓取和登录共用 `run_with_browser_retry`：限流时自动等 20 秒、40 秒各重试一次，仍然限流就返回带「CF浏览器限流」字样的中文说明；
+   - 同时运行的 cf-crawler 进程最多 2 个（`RUN_SLOTS`，health 不受限），减少并行抓取时的浏览器突发；
+   - `news::record_results` 把原因里带「限流」或 "rate limit" 的失败记为临时失败（`ReportOutcome.transient`），不计入封禁次数，`news_report` 的返回里会单独列出。
+5. **`web_crawl`**：`allowed_patterns`（字符串）改为 cf-crawler 实际使用的 `include_patterns` / `exclude_patterns`（数组），新增 `session_id`；工具描述里的默认页数改正为 20（原来写的是 5）。
+6. **`web_scrape`**：strategy 增加 `paywall_bypass`，描述里说明各策略的区别和截图保存位置。
+- 部署用的文档同步更新：`资料/skills/cf-crawler/SKILL.md`（新的 web_login/web_crawl 参数、paywall_bypass、限流说明）、`资料/workers/news_fetcher.md`（遇到「CF浏览器限流」时 reason 照写，不计入失败次数）、K6 的 `TOOLS.md`（三个工具的签名）。
+
+### 验证
+
+- 新增测试：
+  - 当日额度 429 后，后续请求直接跳过那个 key，3 次请求中第一个 key 只被试了 1 次；
+  - 全部组合都在冷却中时照样尝试，成功后清除冷却；
+  - 太平洋时间午夜的计算（夏令时 PDT、冬令时 PST 各一例，以及差 1 分钟到午夜的情况）；
+  - 思考档 0 在 3.7/3.8 上用 low、在 3.5/3.6 上用 minimal；
+  - `redact_sensitive_json` 能处理嵌套、短值和大小写；
+  - `web_login` 参数格式与 cf-crawler 一致，空密码被拒绝；
+  - 能识别 success 和 ok 两种形式的限流；
+  - 限流失败不计入封禁次数。
+- 变异验证：去掉"跳过冷却中的组合"那一步，对应测试失败；恢复后通过。
+- 端到端（临时测试，已删除），用新打包的 cf-crawler 和真实 Worker：
+  - 截图文件落在 workspace 的 `homework\screenshots\` 下；
+  - 不存在的域名能拿到 `getaddrinfo ENOTFOUND` 报错原文；
+  - `web_login` 的新参数通过 cf-crawler 校验，撞上浏览器限流后自动等待重试，然后真正进入 Worker 的浏览器登录流程（测试页 example.com 没有登录框，最终超时，符合预期）。
+- 全量：`cargo test --lib` 4091 通过，10 个失败全部是已知基线（第二次运行时那个偶发失败的计时测试也出现了）；集成测试 230 通过、3 个失败（已知基线）；clippy 用 git blame 逐行核对，新增 0。

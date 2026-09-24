@@ -479,7 +479,7 @@ fn tool_description_zh(tool_name: &str, args: &serde_json::Value) -> String {
             format!("修改定时任务配置：{job_id}")
         }
         _ => {
-            let args_str = args.to_string();
+            let args_str = crate::util::redact_sensitive_json(args).to_string();
             if args_str.len() > 200 {
                 format!("执行工具 {tool_name}")
             } else {

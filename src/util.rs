@@ -118,9 +118,69 @@ pub enum MaybeSet<T> {
     Null,
 }
 
+/// Object keys whose values are replaced by `redact_sensitive_json`
+/// (matched case-insensitively as substrings, e.g. `password_field`,
+/// `api_key`, `credentials`).
+const SENSITIVE_KEY_PARTS: &[&str] = &[
+    "password",
+    "passwd",
+    "secret",
+    "token",
+    "api_key",
+    "apikey",
+    "credential",
+];
+
+/// elfClaw 2026-09-24: copy of `value` with every object value whose key looks
+/// sensitive replaced by `"[REDACTED]"`, at any depth and whatever its length
+/// or type. For tool arguments that are written to logs or shown in approval
+/// prompts (e.g. `web_login` credentials) — unlike the regex-based
+/// `scrub_credentials`, short values and nested objects are covered too.
+pub fn redact_sensitive_json(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.iter()
+                .map(|(key, v)| {
+                    let lower = key.to_ascii_lowercase();
+                    let redacted = if SENSITIVE_KEY_PARTS.iter().any(|part| lower.contains(part)) {
+                        serde_json::Value::String("[REDACTED]".into())
+                    } else {
+                        redact_sensitive_json(v)
+                    };
+                    (key.clone(), redacted)
+                })
+                .collect(),
+        ),
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(redact_sensitive_json).collect())
+        }
+        other => other.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redact_sensitive_json_hides_nested_and_short_values() {
+        let args = serde_json::json!({
+            "session_id": "zeroclaw_session",
+            "login_url": "https://example.com/login",
+            "credentials": {"username": "zeroclaw_user", "password": "pw1"},
+            "steps": [{"api_key": "k"}, {"note": "keep"}],
+            "Token": 42
+        });
+        let redacted = redact_sensitive_json(&args);
+        assert_eq!(redacted["credentials"], "[REDACTED]");
+        assert_eq!(redacted["steps"][0]["api_key"], "[REDACTED]");
+        assert_eq!(redacted["steps"][1]["note"], "keep");
+        assert_eq!(redacted["Token"], "[REDACTED]");
+        assert_eq!(redacted["session_id"], "zeroclaw_session");
+        assert_eq!(redacted["login_url"], "https://example.com/login");
+        let text = redacted.to_string();
+        assert!(!text.contains("pw1") && !text.contains("zeroclaw_user"));
+    }
 
     #[test]
     fn test_truncate_ascii_no_truncation() {

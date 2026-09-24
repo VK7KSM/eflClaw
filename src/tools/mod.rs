@@ -184,7 +184,8 @@ pub fn tool_risk_tier(name: &str) -> ToolRiskTier {
         "file_write" | "file_edit" | "apply_patch"
         | "git_operations" | "http_request" | "web_fetch"
         | "browser" | "browser_open" | "send_email" | "send_telegram"
-        | "send_voice" | "cron_run" | "source_sync" => ToolRiskTier::Sensitive, // cron_run: immediate execution
+        | "send_voice" | "cron_run" | "source_sync"
+        | "web_login" => ToolRiskTier::Sensitive, // cron_run: immediate execution; web_login: submits credentials
 
         // Restricted: sandboxed module execution
         "wasm_module" => ToolRiskTier::Restricted,

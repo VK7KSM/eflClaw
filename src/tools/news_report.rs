@@ -124,6 +124,13 @@ impl Tool for NewsReportTool {
                 if !outcome.watching.is_empty() {
                     let _ = write!(output, "\n观察中：{}", outcome.watching.join(", "));
                 }
+                if !outcome.transient.is_empty() {
+                    let _ = write!(
+                        output,
+                        "\n临时限流（不计入失败次数）：{}",
+                        outcome.transient.join(", ")
+                    );
+                }
                 if !outcome.ignored.is_empty() {
                     let _ = write!(
                         output,

@@ -134,7 +134,7 @@ pub trait Channel: Send + Sync {
         arguments: &serde_json::Value,
         thread_ts: Option<String>,
     ) -> anyhow::Result<()> {
-        let raw_args = arguments.to_string();
+        let raw_args = crate::util::redact_sensitive_json(arguments).to_string();
         let args_preview = if raw_args.len() > 220 {
             let end = crate::util::floor_utf8_char_boundary(&raw_args, 220);
             format!("{}...", &raw_args[..end])

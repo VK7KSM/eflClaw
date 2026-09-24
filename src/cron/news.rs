@@ -563,11 +563,23 @@ pub struct ReportOutcome {
     pub newly_banned: Vec<String>,
     pub watching: Vec<String>,
     pub ignored: Vec<String>,
+    /// Failed for a transient, not-the-source's-fault reason (see
+    /// `is_transient_failure`); not counted toward a ban.
+    pub transient: Vec<String>,
+}
+
+/// elfClaw 2026-09-24: a failure caused by our own crawler being throttled
+/// (Cloudflare Browser Rendering's per-minute browser limit — `web_scrape`
+/// tells the worker to report it as "CF浏览器限流") says nothing about the
+/// source, so it must not push a working source toward a ban.
+fn is_transient_failure(reason: &str) -> bool {
+    reason.contains("限流") || reason.to_ascii_lowercase().contains("rate limit")
 }
 
 /// Count failures in code: `ban_after_failures` consecutive-or-not failures
 /// ban a source; a success clears its record. URLs that aren't a source of
-/// any slot are ignored rather than recorded.
+/// any slot are ignored rather than recorded; transient failures are recorded
+/// but not counted.
 pub fn record_results(
     data: &mut NewsData,
     rules: &NewsRules,
@@ -588,6 +600,10 @@ pub fn record_results(
         outcome.recorded += 1;
         if result.ok {
             data.source_status.retain(|s| s.url != result.url);
+            continue;
+        }
+        if is_transient_failure(&result.reason) {
+            outcome.transient.push(result.url.clone());
             continue;
         }
         let entry = match data.source_status.iter().position(|s| s.url == result.url) {
@@ -1085,6 +1101,33 @@ ban_after_failures = 3
             "t",
         );
         assert_eq!(outcome.ignored.len(), 1);
+    }
+
+    #[test]
+    fn crawler_rate_limit_failures_do_not_count_toward_a_ban() {
+        let r = rules();
+        let mut data = NewsData {
+            slots: vec![slot("科技", "09:30", &["https://b.example.com"])],
+            ..NewsData::default()
+        };
+        let throttled = [SourceResult {
+            url: "https://b.example.com".into(),
+            ok: false,
+            reason: "CF浏览器限流".into(),
+        }];
+        for _ in 0..5 {
+            let outcome = record_results(&mut data, &r, &throttled, "t");
+            assert_eq!(outcome.transient, vec!["https://b.example.com".to_string()]);
+            assert!(outcome.newly_banned.is_empty() && outcome.watching.is_empty());
+        }
+        assert!(!is_banned(&data, "https://b.example.com"));
+        assert!(data.source_status.is_empty());
+
+        assert!(is_transient_failure(
+            "Browser Rendering Rate Limit exceeded"
+        ));
+        assert!(!is_transient_failure("403"));
+        assert!(!is_transient_failure(""));
     }
 
     #[test]

@@ -26,7 +26,12 @@ async fn execute_one_tool(
         tool: call_name.to_string(),
     });
     let start = Instant::now();
-    let args_summary = Some(truncate_str(&call_arguments.to_string(), 200));
+    // elfClaw 2026-09-24: sensitive fields (e.g. web_login credentials) are
+    // redacted before the arguments reach the logs.
+    let args_summary = Some(truncate_str(
+        &crate::util::redact_sensitive_json(&call_arguments).to_string(),
+        200,
+    ));
 
     let Some(tool) = find_tool(tools_registry, call_name) else {
         let reason = format!("Unknown tool: {call_name}");
@@ -62,10 +67,7 @@ async fn execute_one_tool(
             let error_msg = if r.success {
                 None
             } else {
-                Some(truncate_str(
-                    r.error.as_deref().unwrap_or(&r.output),
-                    200,
-                ))
+                Some(truncate_str(r.error.as_deref().unwrap_or(&r.output), 200))
             };
             observer.record_event(&ObserverEvent::ToolCall {
                 tool: call_name.to_string(),

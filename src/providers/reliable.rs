@@ -350,6 +350,36 @@ fn push_failure(
     ));
 }
 
+/// elfClaw 2026-09-24: how long later requests should skip a (key, model)
+/// entry after this error. A Gemini daily-quota 429 lasts until the quota
+/// resets (midnight US Pacific); any other 429 is treated as a per-minute
+/// limit. Other errors leave no cooldown.
+fn quota_cooldown(err: &anyhow::Error, now: chrono::DateTime<chrono::Utc>) -> Option<Duration> {
+    if !is_rate_limited(err) {
+        return None;
+    }
+    if is_gemini_daily_quota_exhausted(&err.to_string().to_lowercase()) {
+        Some(until_next_pacific_midnight(now))
+    } else {
+        Some(Duration::from_secs(60))
+    }
+}
+
+/// Time from `now` until the next midnight in America/Los_Angeles (DST-aware).
+fn until_next_pacific_midnight(now: chrono::DateTime<chrono::Utc>) -> Duration {
+    use chrono::TimeZone;
+    let tz = chrono_tz::America::Los_Angeles;
+    let tomorrow = now.with_timezone(&tz).date_naive() + chrono::Days::new(1);
+    let midnight = tomorrow.and_hms_opt(0, 0, 0).expect("valid time");
+    tz.from_local_datetime(&midnight)
+        .earliest()
+        .map_or(Duration::from_secs(24 * 3600), |next| {
+            (next.with_timezone(&chrono::Utc) - now)
+                .to_std()
+                .unwrap_or(Duration::from_secs(60))
+        })
+}
+
 // ── Resilient Provider Wrapper ────────────────────────────────────────────
 // Failover strategy (elfClaw 2026-09-24, see `call_with_failover`):
 //   The attempt order is flattened once: model fallback chain (original model
@@ -381,6 +411,12 @@ pub struct ReliableProvider {
     provider_model_fallbacks: HashMap<String, Vec<String>>,
     /// Vision support override from config (`None` = defer to provider).
     vision_override: Option<bool>,
+    /// elfClaw 2026-09-24: (provider entry, model) → skip until. Entries that
+    /// hit a 429 are skipped by later requests until their quota is back, so
+    /// e.g. six keys' daily gemini-3.6-flash quota is used up one after
+    /// another without re-probing the exhausted ones on every message.
+    /// In memory only: after a restart each exhausted entry costs one probe.
+    cooldowns: parking_lot::Mutex<HashMap<(String, String), Instant>>,
 }
 
 impl ReliableProvider {
@@ -396,6 +432,7 @@ impl ReliableProvider {
             model_fallbacks: HashMap::new(),
             provider_model_fallbacks: HashMap::new(),
             vision_override: None,
+            cooldowns: parking_lot::Mutex::new(HashMap::new()),
         }
     }
 
@@ -491,6 +528,19 @@ impl ReliableProvider {
 
         let passes = self.max_retries + 1;
         let mut skipped = vec![false; entries.len()];
+        {
+            let now = Instant::now();
+            let mut cooldowns = self.cooldowns.lock();
+            cooldowns.retain(|_, until| *until > now);
+            for (index, &(provider_name, _, sent_model)) in entries.iter().enumerate() {
+                skipped[index] =
+                    cooldowns.contains_key(&(provider_name.to_string(), sent_model.to_string()));
+            }
+        }
+        // Never refuse without trying: if everything is cooling down, try it all.
+        if skipped.iter().all(|s| *s) {
+            skipped.fill(false);
+        }
         let mut failures = Vec::new();
         let mut tallies: Vec<(String, String)> = Vec::new();
         let mut all_rate_limited = true;
@@ -509,6 +559,9 @@ impl ReliableProvider {
                 let started = Instant::now();
                 match call(provider, sent_model).await {
                     Ok(resp) => {
+                        self.cooldowns
+                            .lock()
+                            .remove(&(provider_name.to_string(), sent_model.to_string()));
                         if pass > 0 || sent_model != model {
                             tracing::info!(
                                 provider = provider_name,
@@ -528,6 +581,18 @@ impl ReliableProvider {
                         let failure_reason = failure_reason(rate_limited, non_retryable);
                         let error_detail = compact_error_detail(&e);
                         let status = http_status(&e);
+                        if let Some(cooldown) = quota_cooldown(&e, chrono::Utc::now()) {
+                            tracing::info!(
+                                provider = provider_name,
+                                model = sent_model,
+                                cooldown_secs = cooldown.as_secs(),
+                                "Rate limited; skipping this key/model for later requests"
+                            );
+                            self.cooldowns.lock().insert(
+                                (provider_name.to_string(), sent_model.to_string()),
+                                Instant::now() + cooldown,
+                            );
+                        }
 
                         push_failure(
                             &mut failures,
@@ -2337,6 +2402,102 @@ mod tests {
         );
         let result = provider.simple_chat("hi", "m-a", 0.0).await.unwrap();
         assert_eq!(result, "m-a via key d");
+    }
+
+    const GEMINI_DAILY_429: &str = "Gemini API error (429 Too Many Requests): You exceeded your \
+        current quota, please check your plan and billing details. Quota exceeded for metric: \
+        GenerateRequestsPerDayPerProjectPerModel-FreeTier";
+
+    #[tokio::test]
+    async fn daily_quota_429_skips_that_key_on_later_requests_until_reset() {
+        let key_a = Arc::new(ScriptedModelMock {
+            script: [("m-a", vec![Err(GEMINI_DAILY_429)])].into_iter().collect(),
+            seen: parking_lot::Mutex::new(Vec::new()),
+        });
+        let key_b = Arc::new(ScriptedModelMock {
+            script: [("m-a", vec![Ok("m-a via key b")])].into_iter().collect(),
+            seen: parking_lot::Mutex::new(Vec::new()),
+        });
+        let provider = ReliableProvider::new(
+            vec![
+                (
+                    "gemini".into(),
+                    Box::new(key_a.clone()) as Box<dyn Provider>,
+                ),
+                (
+                    "gemini#2".into(),
+                    Box::new(key_b.clone()) as Box<dyn Provider>,
+                ),
+            ],
+            2,
+            1,
+        );
+        for _ in 0..3 {
+            let result = provider.simple_chat("hi", "m-a", 0.0).await.unwrap();
+            assert_eq!(result, "m-a via key b");
+        }
+        // Key a was probed once; the next two requests went straight to key b.
+        assert_eq!(key_a.seen.lock().len(), 1);
+        assert_eq!(key_b.seen.lock().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn cooldowns_never_stop_a_request_from_trying_when_everything_is_cooling() {
+        let key_a = Arc::new(ScriptedModelMock {
+            script: [("m-a", vec![Err(GEMINI_DAILY_429), Ok("recovered")])]
+                .into_iter()
+                .collect(),
+            seen: parking_lot::Mutex::new(Vec::new()),
+        });
+        let provider = ReliableProvider::new(
+            vec![(
+                "gemini".into(),
+                Box::new(key_a.clone()) as Box<dyn Provider>,
+            )],
+            0,
+            1,
+        );
+        assert!(provider.simple_chat("hi", "m-a", 0.0).await.is_err());
+        // Only entry is cooling down → it is tried anyway, and success clears it.
+        assert_eq!(
+            provider.simple_chat("hi", "m-a", 0.0).await.unwrap(),
+            "recovered"
+        );
+        assert!(provider.cooldowns.lock().is_empty());
+    }
+
+    #[test]
+    fn quota_cooldown_runs_to_pacific_midnight_for_daily_and_60s_otherwise() {
+        use chrono::TimeZone;
+        // 2026-09-24 06:59 UTC = 23:59 PDT on the 23rd → reset in one minute.
+        let now = chrono::Utc.with_ymd_and_hms(2026, 9, 24, 6, 59, 0).unwrap();
+        assert_eq!(
+            quota_cooldown(&anyhow::anyhow!(GEMINI_DAILY_429), now),
+            Some(Duration::from_secs(60))
+        );
+        // 07:00 UTC = 00:00 PDT → a full day.
+        let now = chrono::Utc.with_ymd_and_hms(2026, 9, 24, 7, 0, 0).unwrap();
+        assert_eq!(
+            until_next_pacific_midnight(now),
+            Duration::from_secs(24 * 3600)
+        );
+        // Winter (PST, UTC-8): 2026-12-01 08:00 UTC = 00:00 PST.
+        let now = chrono::Utc.with_ymd_and_hms(2026, 12, 1, 8, 0, 0).unwrap();
+        assert_eq!(
+            until_next_pacific_midnight(now),
+            Duration::from_secs(24 * 3600)
+        );
+
+        let per_minute =
+            anyhow::anyhow!("Gemini API error (429 Too Many Requests): per minute limit");
+        assert_eq!(
+            quota_cooldown(&per_minute, now),
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(
+            quota_cooldown(&anyhow::anyhow!(GEMINI_503_TRICKY), now),
+            None
+        );
     }
 
     #[test]

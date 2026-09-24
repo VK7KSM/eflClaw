@@ -1114,9 +1114,13 @@ impl GeminiProvider {
             })
         } else if model.contains("gemini-3") {
             // Gemini 3 Flash: thinkingLevel, "minimal" ≈ near-off; levels 3+ map to "high"
+            // elfClaw 2026-09-24: gemini-3.7/3.8-flash reject "minimal" with a 400
+            // ("Thinking level MINIMAL is not supported for this model", verified
+            // against the live API); 3.5/3.6 accept it. Their lowest level is "low".
+            let supports_minimal = !(model.contains("gemini-3.7") || model.contains("gemini-3.8"));
             let lvl = match level {
-                0 => "minimal",
-                1 => "low",
+                0 if supports_minimal => "minimal",
+                0 | 1 => "low",
                 2 => "medium",
                 _ => "high",
             };
@@ -2555,6 +2559,26 @@ mod tests {
         assert_eq!(usage.prompt_token_count, Some(120));
         assert_eq!(usage.candidates_token_count, Some(40));
         assert_eq!(usage.cached_content_token_count, None);
+    }
+
+    #[test]
+    fn thinking_level_zero_avoids_minimal_on_models_that_reject_it() {
+        let level_of = |model: &str| {
+            GeminiProvider::build_thinking_config(0, model)
+                .and_then(|c| c.thinking_level)
+                .unwrap()
+        };
+        assert_eq!(level_of("gemini-3.8-flash"), "low");
+        assert_eq!(level_of("gemini-3.7-flash"), "low");
+        assert_eq!(level_of("gemini-3.6-flash"), "minimal");
+        assert_eq!(level_of("gemini-3.5-flash"), "minimal");
+        // Other levels are unchanged.
+        assert_eq!(
+            GeminiProvider::build_thinking_config(2, "gemini-3.8-flash")
+                .and_then(|c| c.thinking_level)
+                .unwrap(),
+            "medium"
+        );
     }
 
     #[test]
