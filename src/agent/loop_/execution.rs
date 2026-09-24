@@ -62,7 +62,10 @@ async fn execute_one_tool(
             let error_msg = if r.success {
                 None
             } else {
-                Some(truncate_str(r.error.as_deref().unwrap_or(&r.output), 200))
+                Some(truncate_str(
+                    r.error.as_deref().unwrap_or(&r.output),
+                    200,
+                ))
             };
             observer.record_event(&ObserverEvent::ToolCall {
                 tool: call_name.to_string(),

@@ -93,8 +93,12 @@ pub fn integration_settings(config: &Config) -> serde_json::Value {
             let category = entry.category;
 
             let (configured, fields) = match category {
-                IntegrationCategory::AiModel => build_ai_model_fields(&id, config),
-                IntegrationCategory::Chat => build_chat_fields(entry.name, config),
+                IntegrationCategory::AiModel => {
+                    build_ai_model_fields(&id, config)
+                }
+                IntegrationCategory::Chat => {
+                    build_chat_fields(entry.name, config)
+                }
                 _ => (false, vec![]),
             };
 
@@ -123,7 +127,10 @@ pub fn integration_settings(config: &Config) -> serde_json::Value {
     })
 }
 
-fn build_ai_model_fields(id: &str, config: &Config) -> (bool, Vec<serde_json::Value>) {
+fn build_ai_model_fields(
+    id: &str,
+    config: &Config,
+) -> (bool, Vec<serde_json::Value>) {
     // Check if there's a matching provider entry in model_providers
     let provider_entry = config.model_providers.get(id);
     let has_provider_key = provider_entry
@@ -132,11 +139,7 @@ fn build_ai_model_fields(id: &str, config: &Config) -> (bool, Vec<serde_json::Va
         .unwrap_or(false);
 
     // Fallback to global api_key
-    let has_global_key = config
-        .api_key
-        .as_ref()
-        .map(|k| !k.is_empty())
-        .unwrap_or(false);
+    let has_global_key = config.api_key.as_ref().map(|k| !k.is_empty()).unwrap_or(false);
     let has_key = has_provider_key || has_global_key;
 
     let masked = if has_provider_key {
@@ -162,7 +165,10 @@ fn build_ai_model_fields(id: &str, config: &Config) -> (bool, Vec<serde_json::Va
     (has_key, fields)
 }
 
-fn build_chat_fields(name: &str, config: &Config) -> (bool, Vec<serde_json::Value>) {
+fn build_chat_fields(
+    name: &str,
+    config: &Config,
+) -> (bool, Vec<serde_json::Value>) {
     match name {
         "Telegram" => {
             let configured = config.channels_config.telegram.is_some();

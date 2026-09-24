@@ -647,12 +647,7 @@ mod tests {
         });
         // 7 failures — just below budget of 8
         for i in 0..7 {
-            det.record_call(
-                "shell",
-                &format!(r#"{{"cmd":"fail{i}"}}"#),
-                &format!("err{i}"),
-                false,
-            );
+            det.record_call("shell", &format!(r#"{{"cmd":"fail{i}"}}"#), &format!("err{i}"), false);
         }
         assert_eq!(det.check(), DetectionVerdict::Continue);
     }

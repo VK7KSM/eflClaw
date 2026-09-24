@@ -113,7 +113,9 @@ impl ChatIndex {
             .prepare("SELECT corrections FROM chat_summaries LIMIT 0")
             .is_ok();
         if !has_corrections {
-            let _ = conn.execute_batch("ALTER TABLE chat_summaries ADD COLUMN corrections TEXT;");
+            let _ = conn.execute_batch(
+                "ALTER TABLE chat_summaries ADD COLUMN corrections TEXT;",
+            );
         }
 
         Ok(())
@@ -507,19 +509,8 @@ mod tests {
         let idx = test_index(&tmp);
         assert_eq!(idx.summary_count().unwrap(), 0);
 
-        idx.upsert_summary(
-            "telegram",
-            "1",
-            "A",
-            "2026-01-01",
-            "s",
-            None,
-            None,
-            None,
-            1,
-            "h",
-        )
-        .unwrap();
+        idx.upsert_summary("telegram", "1", "A", "2026-01-01", "s", None, None, None, 1, "h")
+            .unwrap();
         assert_eq!(idx.summary_count().unwrap(), 1);
     }
 

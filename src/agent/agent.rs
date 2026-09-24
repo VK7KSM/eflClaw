@@ -409,11 +409,7 @@ impl Agent {
                         duration: start.elapsed(),
                         success: r.success,
                         args: None,
-                        error: if r.success {
-                            None
-                        } else {
-                            r.error.clone().or_else(|| Some(r.output.clone()))
-                        },
+                        error: if r.success { None } else { r.error.clone().or_else(|| Some(r.output.clone())) },
                     });
                     if r.success {
                         r.output

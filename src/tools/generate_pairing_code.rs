@@ -99,8 +99,7 @@ impl Tool for GeneratePairingCodeTool {
             None => {
                 return Ok(ToolResult {
                     success: false,
-                    output: "Gateway is not running or pairing guard is not registered."
-                        .to_string(),
+                    output: "Gateway is not running or pairing guard is not registered.".to_string(),
                     error: None,
                 });
             }
@@ -134,8 +133,10 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_without_caller_context() {
-        let tool =
-            GeneratePairingCodeTool::new(vec!["telegram".to_string()], vec!["alice".to_string()]);
+        let tool = GeneratePairingCodeTool::new(
+            vec!["telegram".to_string()],
+            vec!["alice".to_string()],
+        );
         let result = tool.execute(json!({})).await.unwrap();
         assert!(!result.success);
         assert!(result.output.contains("no caller context"));
@@ -145,8 +146,10 @@ mod tests {
     async fn rejects_unauthorized_channel() {
         use super::super::caller_context::{CallerInfo, CALLER_INFO};
 
-        let tool =
-            GeneratePairingCodeTool::new(vec!["telegram".to_string()], vec!["alice".to_string()]);
+        let tool = GeneratePairingCodeTool::new(
+            vec!["telegram".to_string()],
+            vec!["alice".to_string()],
+        );
 
         let caller = CallerInfo {
             channel: "discord".to_string(),
@@ -163,8 +166,10 @@ mod tests {
     async fn rejects_unauthorized_user() {
         use super::super::caller_context::{CallerInfo, CALLER_INFO};
 
-        let tool =
-            GeneratePairingCodeTool::new(vec!["telegram".to_string()], vec!["alice".to_string()]);
+        let tool = GeneratePairingCodeTool::new(
+            vec!["telegram".to_string()],
+            vec!["alice".to_string()],
+        );
 
         let caller = CallerInfo {
             channel: "telegram".to_string(),
@@ -187,8 +192,10 @@ mod tests {
         let guard = Arc::new(PairingGuard::new(true, &[]));
         register_global_pairing_guard(guard);
 
-        let tool =
-            GeneratePairingCodeTool::new(vec!["telegram".to_string()], vec!["alice".to_string()]);
+        let tool = GeneratePairingCodeTool::new(
+            vec!["telegram".to_string()],
+            vec!["alice".to_string()],
+        );
 
         let caller = CallerInfo {
             channel: "telegram".to_string(),

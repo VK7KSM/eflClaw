@@ -346,7 +346,8 @@ mod tests {
 
     #[test]
     fn factory_gemini() {
-        let p = create_embedding_provider("gemini", Some("test-key"), "gemini-embedding-001", 768);
+        let p =
+            create_embedding_provider("gemini", Some("test-key"), "gemini-embedding-001", 768);
         assert_eq!(p.name(), "gemini");
         assert_eq!(p.dimensions(), 768);
     }
