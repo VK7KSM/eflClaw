@@ -2835,6 +2835,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_tool_call_loop_records_tool_result_urls_in_source_link_ledger() {
+        // Two tool calls in one turn run in parallel (join_all); both results
+        // must reach the ledger opened around the loop (cron's with_ledger).
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"count_tool","arguments":{"value":"https://a.example.com/one"}}
+</tool_call>
+<tool_call>
+{"name":"count_tool","arguments":{"value":"https://b.example.com/two"}}
+</tool_call>"#,
+            "done",
+        ]);
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "count_tool",
+            Arc::clone(&invocations),
+        ))];
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run tool calls"),
+        ];
+        let observer = NoopObserver;
+
+        let (result, urls) = crate::agent::source_links::with_ledger(run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            &crate::config::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+        ))
+        .await;
+
+        assert_eq!(result.expect("loop should finish"), "done");
+        assert_eq!(invocations.load(Ordering::SeqCst), 2);
+        assert!(urls.contains("https://a.example.com/one"), "{urls:?}");
+        assert!(urls.contains("https://b.example.com/two"), "{urls:?}");
+    }
+
+    #[tokio::test]
     async fn run_tool_call_loop_deduplicates_repeated_tool_calls() {
         let provider = ScriptedProvider::from_text_responses(vec![
             r#"<tool_call>

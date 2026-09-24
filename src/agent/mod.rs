@@ -6,6 +6,7 @@ pub mod loop_;
 pub mod memory_loader;
 pub mod prompt;
 pub mod research;
+pub mod source_links;
 
 #[cfg(test)]
 mod tests;

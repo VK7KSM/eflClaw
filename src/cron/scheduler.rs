@@ -278,9 +278,12 @@ async fn run_agent_job(
     // model snapshot stored at creation time — see RunContext::Background resolution
     let model_override: Option<String> = None;
 
-    let run_result = match job.session_target {
+    // elfClaw 2026-09-24: collect every URL tool results returned during the
+    // run; the final text is checked against them below (see
+    // agent::source_links) so the model cannot deliver links it rewrote.
+    let (run_result, mut source_urls) = match job.session_target {
         SessionTarget::Main | SessionTarget::Isolated => {
-            Box::pin(crate::agent::run(
+            crate::agent::source_links::with_ledger(Box::pin(crate::agent::run(
                 config.clone(),
                 Some(prefixed_prompt),
                 None,
@@ -291,13 +294,34 @@ async fn run_agent_job(
                 Some(effective_max_iterations),
                 crate::agent::RunContext::Background, // elfClaw: cron uses worker_model
                 effective_allowed_tools, // elfClaw: Some(vec) for delegate_to, None otherwise
-            ))
+            )))
             .await
         }
     };
+    // Links written into the job's own prompt are legitimate too.
+    source_urls.extend(crate::agent::source_links::urls_in(&prompt));
 
     match run_result {
         Ok(response) => {
+            let check = crate::agent::source_links::enforce(&response, &source_urls);
+            if !check.repaired.is_empty() || !check.removed.is_empty() {
+                tracing::warn!(
+                    job_id = %job.id,
+                    repaired = check.repaired.len(),
+                    removed = check.removed.len(),
+                    "Cron output links differed from tool results; corrected before delivery"
+                );
+                crate::elfclaw_log::log_cron_event(
+                    &job.id,
+                    &name,
+                    "link_check",
+                    serde_json::json!({
+                        "repaired": check.repaired,
+                        "removed": check.removed,
+                    }),
+                );
+            }
+            let response = check.output;
             // elfClaw: log cron job completion outcome
             if response.trim().is_empty() {
                 tracing::info!(job_id = %job.id, "Cron job completed (empty output)");

@@ -63,6 +63,12 @@ async fn execute_one_tool(
 
     match tool_result {
         Ok(r) => {
+            // elfClaw 2026-09-24: remember which URLs tools really returned, so a
+            // scheduled job's final text can be checked against them.
+            crate::agent::source_links::record(&r.output);
+            if let Some(error) = &r.error {
+                crate::agent::source_links::record(error);
+            }
             let duration = start.elapsed();
             let error_msg = if r.success {
                 None
