@@ -6188,3 +6188,12 @@ K6 上在群里说一句 hello，输入 50,182 token、耗时 20.3 秒。用 Gem
 - 验证：`npm run check` 通过；用源码（tsx）和重新打包的 `release/cf-crawler-win-x64.exe`（sha256 前缀 `74d39cf3`，旧的是 `ff5cc31f`，和 K6 上的一致）分别跑 scrape-page 和 health，每一行都是完整 JSON、以换行结尾，结果都是成功。
 - **更正**：上一条记录说"health 命令用的是正确的换行"，这是错的，health 也有同样的问题，只有 help 和报错路径是对的。`src/tools/cf_crawler.rs` 的注释已同步更正。
 - elfClaw 的解析（e8514db60）保持兼容，新旧 exe 都能用。新 exe 还没部署到 K6（K6 当时正在系统更新重启）。
+
+---
+
+## 2026-09-24 — cf-crawler 修复推送并部署到 K6
+
+- cf-crawler `ead4483` 已推送到 GitHub（VK7KSM/cf-crawler main）。
+- K6 在 17:06 完成系统更新并重启，elfClaw 通过计划任务 elfClaw_Workspace 自动启动，开机自启验证正常。
+- 新 exe（sha256 前缀 `74d39cf3`）替换了 `workspace\tools\cf-crawler-win-x64.exe`；旧的留在同目录，名为 `cf-crawler-win-x64.exe.prev`，和 `zeroclaw.exe.prev`、`config.toml.prev` 一起等用户确认后再删。cf-crawler 是每次调用时才启动的独立进程，替换文件不需要重启 elfClaw。
+- K6 实测：scrape-page（V2EX RSS）和 health 都是退出码 0，结果行是完整 JSON，`success`/`ok` 为 true，行尾不再有字面 `\n`。
