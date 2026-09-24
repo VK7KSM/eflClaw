@@ -6197,3 +6197,43 @@ K6 上在群里说一句 hello，输入 50,182 token、耗时 20.3 秒。用 Gem
 - K6 在 17:06 完成系统更新并重启，elfClaw 通过计划任务 elfClaw_Workspace 自动启动，开机自启验证正常。
 - 新 exe（sha256 前缀 `74d39cf3`）替换了 `workspace\tools\cf-crawler-win-x64.exe`；旧的留在同目录，名为 `cf-crawler-win-x64.exe.prev`，和 `zeroclaw.exe.prev`、`config.toml.prev` 一起等用户确认后再删。cf-crawler 是每次调用时才启动的独立进程，替换文件不需要重启 elfClaw。
 - K6 实测：scrape-page（V2EX RSS）和 health 都是退出码 0，结果行是完整 JSON，`success`/`ok` 为 true，行尾不再有字面 `\n`。
+
+---
+
+## 2026-09-24 — 多 key 轮换没生效：配置里的 key 带了尖括号；cf-crawler 全功能实测
+
+### Gemini 多 key
+
+- 用户在 K6 的 `config.toml` 里 `[reliability] api_keys` 加了 5 个 key，但每个都写成了 `"<…>"`（照抄了配置注释里的示例 `"<key_b_明文或enc2:...>"`），尖括号会作为 key 的一部分发给 Google。而且改配置时 elfClaw 已经在运行，provider 链只在启动时构建，所以当时也没有载入。
+- 处理：
+  - 备份原配置为 `config.toml.before-keyfix`，只去掉 `api_keys` 这一行里的尖括号，其余逐字不变；
+  - 重启 elfClaw；
+  - 把同一份配置同步回本地 `资料/config.toml`（gitignore，不入库），避免以后部署时用旧资料版把 key 覆盖掉。
+- 验证：
+  - 6 个 key（主 key 加 5 个）用"列出模型"接口逐一测试，全部返回 200；
+  - 用这份配置调用 `expand_primary_provider_keys`（临时测试，已删除），得到的链是 `gemini, gemini#2 … gemini#6`。
+- 说明：
+  - 503 是模型本身过载，和 key 无关（按 §5.2 设计，503 时本轮跳过同模型的其他 key）。多 key 只能解决 429（额度），解决不了 503。16:53 那次除了 503，3.8/3.7/3.5 还返回了当日额度耗尽的 429，这正是多 key 能解决的情况。
+  - 直接测试时发现 3.8/3.7 在那段时间对很小的请求也返回 503，而 3.6 对约 4.5 万 token 的请求 2.7 秒就正常返回，说明 503 和请求大小无关。
+
+### cf-crawler 全功能实测（通过 elfClaw 工具层 + 新 exe + 真实 Worker；临时测试，已删除）
+
+| 用法 | 结果 |
+|---|---|
+| health | ✅ |
+| scrape feed / edge_fetch（V2EX RSS） | ✅ 10KB markdown，25 条 |
+| scrape listing / edge_fetch（ABC News） | ✅ 80 条 |
+| scrape listing / edge_browser（Hacker News） | ✅ 80 条 |
+| scrape listing / auto（linux.do，CF 防护） | ✅ 自动升级到 edge_browser，29 条（第一次因浏览器限流失败） |
+| scrape screenshot / edge_browser | ✅ 生成 PNG（第一次因浏览器限流失败） |
+| scrape paywall_bypass（SCMP） | ✅ 通过 wayback_machine，71 条 |
+| crawl-site（example.com，3 页） | ✅ |
+| login（elfClaw 的 web_login） | ❌ 参数格式和 cf-crawler 不一致，必定失败 |
+
+发现的问题（尚未修，等用户确认）：
+
+1. **`web_login` 参数不匹配**：elfClaw 发送 `{url, steps, session_id}`，cf-crawler 的 login 要求 `{session_id（必填）, login_url, credentials{username_field, username, password_field, password}, submit_selector?, success_url_contains?}`，zod 校验直接报错。
+2. **`web_crawl`**：elfClaw 的 `allowed_patterns`（逗号分隔字符串）在 cf-crawler 里叫 `include_patterns`（数组），会被悄悄丢弃；工具描述里写"默认 5 页"，cf-crawler 实际默认 20 页。
+3. **截图存到了 workspace 外面**：cf-crawler 把截图写到进程当前目录下的 `homework\screenshots\`，而 `run_cf_crawler` 没有设置工作目录。K6 上这个目录是实例目录，所以截图落在 `ZeroClaw_Workspace\homework\`，不在 `workspace\` 里，agent 读不到也发不出去。
+4. **Cloudflare 浏览器渲染限流**：Worker 返回 `Unable to create new browser: code: 429: Rate limit exceeded`，是免费计划对每分钟新开浏览器数量的限制。新闻 worker 在一轮里并行抓多个需要浏览器的源时就会触发，被当成"源失败"计数，可能把好的源误封。
+5. （顺带发现）3.8/3.7-flash 不支持 `thinkingLevel=minimal`，`reasoning_level = 0` 时这两个模型会返回 400。当前配置是 2，不受影响。
