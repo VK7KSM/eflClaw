@@ -568,6 +568,23 @@ pub struct TelegramChannel {
     ack_reaction: Option<AckReactionConfig>,
 }
 
+/// elfClaw 2026-09-24: result of trying to read a Telegram update as a voice
+/// message (see `TelegramChannel::try_parse_voice_message`).
+#[derive(Debug)]
+enum VoiceOutcome {
+    /// Not a voice message, transcription disabled, or sender not allowed.
+    NotVoice,
+    /// Transcribed into a normal incoming message.
+    Message(ChannelMessage),
+    /// An allowed sender's voice message could not be transcribed; `notice`
+    /// is sent back to them instead of dropping the message silently.
+    Failed {
+        reply_target: String,
+        thread_id: Option<String>,
+        notice: String,
+    },
+}
+
 impl TelegramChannel {
     pub fn new(
         bot_token: String,
@@ -1842,11 +1859,28 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         })
     }
 
+    /// elfClaw 2026-09-24: text sent back when an authorized user's voice
+    /// message could not be turned into text. A missing Groq key gets a
+    /// pointer to the config; anything else a short, sanitized reason.
+    fn voice_failure_notice(err: &anyhow::Error) -> String {
+        let raw = err.to_string();
+        if raw.contains("Missing transcription API key") {
+            return "⚠️ 语音没能转成文字：还没有配置 Groq 语音识别的 key\
+                    （config.toml 的 [transcription] api_key）。可以先改发文字。"
+                .to_string();
+        }
+        let reason =
+            crate::util::truncate_with_ellipsis(&crate::providers::sanitize_api_error(&raw), 150);
+        format!("⚠️ 语音没能转成文字：{reason}。请稍后重发，或改发文字。")
+    }
+
     /// Attempt to parse a Telegram update as a voice message and transcribe it.
     ///
-    /// Returns `None` if the message is not a voice message, transcription is disabled,
-    /// or the message exceeds duration limits.
-    async fn try_parse_voice_message(&self, update: &serde_json::Value) -> Option<ChannelMessage> {
+    /// Returns `VoiceOutcome::NotVoice` if the update is not a voice message,
+    /// transcription is disabled, or the sender is not allowed;
+    /// `VoiceOutcome::Failed` (with a notice for the sender) when an allowed
+    /// sender's voice message could not be transcribed.
+    async fn try_parse_voice_message(&self, update: &serde_json::Value) -> VoiceOutcome {
         // Check if transcription is enabled before doing anything else
         let config = match self.transcription.as_ref() {
             Some(c) => c,
@@ -1860,21 +1894,16 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                         );
                     }
                 }
-                return None;
+                return VoiceOutcome::NotVoice;
             }
         };
-        let message = update.get("message")?;
+        let Some(message) = update.get("message") else {
+            return VoiceOutcome::NotVoice;
+        };
 
-        let metadata = Self::parse_voice_metadata(message)?;
-
-        if metadata.duration_secs > config.max_duration_secs {
-            tracing::info!(
-                "Skipping voice message: duration {}s exceeds limit {}s",
-                metadata.duration_secs,
-                config.max_duration_secs
-            );
-            return None;
-        }
+        let Some(metadata) = Self::parse_voice_metadata(message) else {
+            return VoiceOutcome::NotVoice;
+        };
 
         let (username, sender_id, sender_identity) = Self::extract_sender_info(message);
 
@@ -1892,18 +1921,21 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                     .map(|u| u.iter().cloned().collect::<Vec<_>>())
                     .unwrap_or_default()
             );
-            return None;
+            return VoiceOutcome::NotVoice;
         }
 
         if !self.passes_mention_only_gate(message, sender_id.as_deref(), None) {
-            return None;
+            return VoiceOutcome::NotVoice;
         }
 
-        let chat_id = message
+        let Some(chat_id) = message
             .get("chat")
             .and_then(|chat| chat.get("id"))
             .and_then(serde_json::Value::as_i64)
-            .map(|id| id.to_string())?;
+            .map(|id| id.to_string())
+        else {
+            return VoiceOutcome::NotVoice;
+        };
 
         let message_id = message
             .get("message_id")
@@ -1920,13 +1952,32 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         } else {
             chat_id.clone()
         };
+        let failed = |notice: String| VoiceOutcome::Failed {
+            reply_target: reply_target.clone(),
+            thread_id: thread_id.clone(),
+            notice,
+        };
+
+        // elfClaw 2026-09-24: checked only after the sender is known to be
+        // allowed, so the "too long" notice never goes to strangers.
+        if metadata.duration_secs > config.max_duration_secs {
+            tracing::info!(
+                "Skipping voice message: duration {}s exceeds limit {}s",
+                metadata.duration_secs,
+                config.max_duration_secs
+            );
+            return failed(format!(
+                "⚠️ 这条语音有 {} 秒，超过 {} 秒的上限，没有转成文字。请分段发送或改发文字。",
+                metadata.duration_secs, config.max_duration_secs
+            ));
+        }
 
         // Download and transcribe
         let file_path = match self.get_file_path(&metadata.file_id).await {
             Ok(p) => p,
             Err(e) => {
                 tracing::warn!("Failed to get voice file path: {e}");
-                return None;
+                return failed("⚠️ 语音下载失败，没有转成文字。请稍后重发。".to_string());
             }
         };
 
@@ -1936,7 +1987,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             Ok(d) => d,
             Err(e) => {
                 tracing::warn!("Failed to download voice file: {e}");
-                return None;
+                return failed("⚠️ 语音下载失败，没有转成文字。请稍后重发。".to_string());
             }
         };
 
@@ -1945,13 +1996,13 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 Ok(t) => t,
                 Err(e) => {
                     tracing::warn!("Voice transcription failed: {e}");
-                    return None;
+                    return failed(Self::voice_failure_notice(&e));
                 }
             };
 
         if text.trim().is_empty() {
             tracing::info!("Voice transcription returned empty text, skipping");
-            return None;
+            return failed("⚠️ 没听清这条语音（识别结果为空），请再说一遍或改发文字。".to_string());
         }
 
         // Cache transcription for reply-context lookups
@@ -1976,7 +2027,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             format!("[Voice] {text}")
         };
 
-        Some(ChannelMessage {
+        VoiceOutcome::Message(ChannelMessage {
             id: format!("telegram_{chat_id}_{message_id}"),
             sender: sender_identity,
             reply_target,
@@ -3748,13 +3799,30 @@ Ensure only one `zeroclaw` process is using this bot token."
                         m
                     } else if let Some(m) = self.try_parse_approval_callback_query(update) {
                         m
-                    } else if let Some(m) = self.try_parse_voice_message(update).await {
-                        m
-                    } else if let Some(m) = self.try_parse_attachment_message(update).await {
-                        m
                     } else {
-                        self.handle_unauthorized_message(update).await;
-                        continue;
+                        match self.try_parse_voice_message(update).await {
+                            VoiceOutcome::Message(m) => m,
+                            VoiceOutcome::Failed {
+                                reply_target,
+                                thread_id,
+                                notice,
+                            } => {
+                                let notice =
+                                    SendMessage::new(notice, &reply_target).in_thread(thread_id);
+                                if let Err(e) = self.send(&notice).await {
+                                    tracing::warn!("Failed to send voice failure notice: {e}");
+                                }
+                                continue;
+                            }
+                            VoiceOutcome::NotVoice => {
+                                if let Some(m) = self.try_parse_attachment_message(update).await {
+                                    m
+                                } else {
+                                    Box::pin(self.handle_unauthorized_message(update)).await;
+                                    continue;
+                                }
+                            }
+                        }
                     };
 
                     if let Some((reaction_chat_id, reaction_message_id, chat_type, sender_id)) =
@@ -5843,7 +5911,7 @@ mod tests {
         });
 
         let parsed = ch.try_parse_voice_message(&update).await;
-        assert!(parsed.is_none());
+        assert!(matches!(parsed, VoiceOutcome::NotVoice));
     }
 
     #[tokio::test]
@@ -5863,8 +5931,58 @@ mod tests {
             }
         });
 
-        let parsed = ch.try_parse_voice_message(&update).await;
-        assert!(parsed.is_none());
+        // elfClaw 2026-09-24: the sender is told why instead of being ignored.
+        match ch.try_parse_voice_message(&update).await {
+            VoiceOutcome::Failed {
+                reply_target,
+                notice,
+                ..
+            } => {
+                assert_eq!(reply_target, "456");
+                assert!(
+                    notice.contains("30 秒") && notice.contains("5 秒"),
+                    "{notice}"
+                );
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn try_parse_voice_message_too_long_from_stranger_gets_no_notice() {
+        let mut tc = crate::config::TranscriptionConfig::default();
+        tc.enabled = true;
+        tc.max_duration_secs = 5;
+        let ch = TelegramChannel::new("token".into(), vec!["alice".into()], false, true)
+            .with_transcription(tc);
+        let update = serde_json::json!({
+            "message": {
+                "message_id": 4,
+                "voice": { "file_id": "voice_file", "duration": 30 },
+                "from": { "id": 999, "username": "bob" },
+                "chat": { "id": 456, "type": "private" }
+            }
+        });
+        assert!(matches!(
+            ch.try_parse_voice_message(&update).await,
+            VoiceOutcome::NotVoice
+        ));
+    }
+
+    #[test]
+    fn voice_failure_notice_points_to_config_when_key_is_missing() {
+        let missing = anyhow::anyhow!(
+            "Missing transcription API key: set [transcription].api_key or GROQ_API_KEY environment variable"
+        );
+        let notice = TelegramChannel::voice_failure_notice(&missing);
+        assert!(notice.contains("[transcription] api_key"), "{notice}");
+
+        let other = anyhow::anyhow!("Groq API error (500): upstream timeout");
+        let notice = TelegramChannel::voice_failure_notice(&other);
+        assert!(
+            notice.starts_with("⚠️ 语音没能转成文字：Groq API error (500)"),
+            "{notice}"
+        );
     }
 
     #[tokio::test]
@@ -5885,7 +6003,7 @@ mod tests {
         });
 
         let parsed = ch.try_parse_voice_message(&update).await;
-        assert!(parsed.is_none());
+        assert!(matches!(parsed, VoiceOutcome::NotVoice));
         assert!(ch.voice_transcriptions.lock().is_empty());
     }
 

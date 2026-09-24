@@ -6328,3 +6328,34 @@ K6 上在群里说一句 hello，输入 50,182 token、耗时 20.3 秒。用 Gem
 ### 范围
 
 只对定时任务（新闻推送、提醒等 agent 类型任务）的推送内容做核对；和主 agent 的实时聊天不在范围内。新闻 worker 写进 `homework/news/*.md` 的文件内容也没有核对（那是 worker 自己的工作文件，不会直接发给用户）。
+
+---
+
+## 2026-09-24 — 语音转文字恢复（Groq key 在全新部署时丢失）+ 语音失败时回复提示
+
+### Groq key
+
+- 用户反馈 Telegram 语音被直接忽略。原因：今天全新部署 K6 时用的是 `资料/config.toml`，而 2026-05-11 用户在旧 Workspace 配置里加的 `[transcription].api_key` 不在资料版里，部署后就丢了（Skynet 实例的配置里还保留着）。转写因此报"Missing transcription API key"，代码只打一行警告，然后返回 None，消息被悄悄丢掉。这是部署时的失误。
+- 处理：在 K6 配置和资料版的 `[transcription]` 段加 `api_key = ""`（第 668 行，附注释），由用户自己填入 key；用户填好后核对确认只有这一行不同，验证 key 有效（Groq `/v1/models` 可用，含 `whisper-large-v3-turbo`），同步回资料版，19:21 重启生效。
+- 以后部署都以 K6 上的配置为准：先拉回来和资料版对比，再决定怎么改。
+
+### 语音失败时回复提示（`src/channels/telegram.rs`）
+
+- `try_parse_voice_message` 的返回值从 `Option<ChannelMessage>` 改为 `VoiceOutcome`，有三种结果：
+  - `NotVoice`：不是语音、转写已关闭，或发送者没有权限；
+  - `Message`：转成了文字，按普通消息处理；
+  - `Failed { reply_target, thread_id, notice }`：失败，带要回给用户的提示。
+- 监听循环收到 `Failed` 时，把 `notice` 发给用户，并且不再往下交给附件解析或"未授权用户"处理。
+- 提示文案：
+  - 语音太长："这条语音有 X 秒，超过 Y 秒的上限…"；
+  - 下载失败："语音下载失败…"；
+  - 缺少 key：指向 `config.toml` 的 `[transcription] api_key`；
+  - 其他转写错误：脱敏并截断后的原因；
+  - 识别结果为空："没听清这条语音…"。
+- 时长检查挪到了权限检查之后，保证只有允许的用户会收到提示，陌生人发来的超长语音仍然悄悄忽略。解析函数本身不发消息，所以测试不用联网。
+- 测试：
+  - 超长语音返回 `Failed`，提示里带实际时长和上限；
+  - 陌生人发来的超长语音返回 `NotVoice`；
+  - 缺少 key 的提示指向配置位置，其他错误带原因；
+  - 原有的"转写关闭""未授权发送者"两个测试改成断言 `NotVoice`。
+- 全量：`cargo test --lib` 4103 通过，10 个失败全部是已知基线；集成测试 230 通过、3 个失败（已知基线）；clippy 新增 0（`handle_unauthorized_message` 原有的 large_futures 警告，在挪动的那一处按建议加了 `Box::pin`）。
