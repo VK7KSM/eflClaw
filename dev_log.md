@@ -6035,7 +6035,7 @@ Step 9 的做法是"agent 直接编辑 HEARTBEAT_DATA.md"。审核时发现它�
 
 ### 部署
 
-- 本机按 release profile 编译（基于 8fe812267），zeroclaw.exe 27.8MB，上传到 K6。
+- 本机编译（基于 8fe812267），zeroclaw.exe 27.8MB，上传到 K6。**更正**：并非按仓库的 release profile（`opt-level="z"`，追求体积最小）编译，而是按"最高性能"覆盖成 `opt-level=3` + `-C target-cpu=skylake` + fat LTO + `codegen-units=1`，另加 `--features wasm-tools`。体积比以前约 19MB 的版本大，主要就是 `opt-level=3` 造成的（大量内联和循环展开），与删了多少代码关系不大。
 - 旧目录 `C:\dev\elfClaw\ZeroClaw_Workspace` 先改名留作参照，验收通过后已**整个删除**；新实例只从旧实例带过来 `.secret_key`（config 里的加密值要靠它解密）、`workspace\tools\`（cf-crawler、github-mcp-server）、`workspace\skills\`（10 个技能，cf-crawler 换成新版）。数据库（jobs.db、brain.db、日志、skills.db 等）一律不带，由程序重建。
 - 计划任务：`elfClaw_Skynet` **禁用**（不是删除，需要时可重新启用）；`elfClaw_Workspace` 保留开机自启。
 - 配置文件来源：
@@ -6072,3 +6072,40 @@ Step 9 的做法是"agent 直接编辑 HEARTBEAT_DATA.md"。审核时发现它�
 
 - config 里 `[agents_ipc]`、`[economic]` 是本版本不认识的配置段，启动时会有 Unknown config 警告。
 - `api_keys` 为空，目前只有一个 Gemini key，没有多 key 轮换。
+
+---
+
+## 2026-09-24 — 减少每次请求的 token、提高回复速度（配置 + 渠道提示词结构）
+
+### 起因
+
+K6 上在群里说一句 hello，输入 50,182 token、耗时 20.3 秒。用 Gemini 的 countTokens 实测拆分：技能说明全文 17,239、内置工具定义 11,116、工作区 md 约 8,400、GitHub MCP 41 个工具 7,356、prompts.chat MCP 10 个工具 1,869，其余是固定说明。慢主要因为 `reasoning_level = 3`（Gemini 3 Flash 的 "high"）。详细分析和设计写在 elfclaw.md 第 14 节。
+
+### 配置（`资料/config.toml`，同步到 K6）
+
+- `reasoning_level` 3 → 2（medium）。
+- `[skills] prompt_injection_mode` full → compact。
+- `[mcp] enabled = false`，prompts.chat 和 GitHub 两个 MCP 服务器全部删除（用户决定）。GitHub MCP 的明文 `ghp_` 令牌也随之从配置里删掉；K6 上的 `github-mcp-server.exe` 一并删除。
+
+### 代码
+
+- **`src/channels/mod.rs`**
+  - 系统提示词只放不变的内容。当前时间、未完成记事、定时任务列表、纠错规则、聊天摘要收集到 `turn_context` 里，通过 `attach_turn_context()` 附在当前这条用户消息前面；不进系统提示词，也不存进历史。上下文过载的重试路径也同样附上。目的是让系统提示词、工具定义和之前的聊天记录在两次请求之间完全不变，Gemini 隐式前缀缓存才能命中。
+  - `build_channel_system_prompt` 去掉时间段，新增 `current_time_section()`。
+  - `build_runtime_status_section` 拆成两部分：`build_runtime_static_section`（进缓存提示词；子 agent 名字排序，避免 HashMap 顺序每次启动不同）和 `build_cron_jobs_section`（每条消息附带）。删掉了 GitHub MCP 的说明文字。
+  - 新增 `ChannelSystemPrompt` / `SystemPromptSource`：`ctx.system_prompt` 从 `Arc<String>` 改成它，每条消息比对 7 个工作区 md 的修改时间和大小，有变化才重建。修复了"AI 改了 SOUL/USER/MEMORY.md 要重启才生效"的问题。测试用 `ChannelSystemPrompt::fixed(..)`。
+  - 聊天历史：`MAX_CHANNEL_HISTORY` 从 50 改为 20；新增 `history_last_active` 字段和 `expire_idle_sender_history()`，某人闲置满 1 小时（`CHANNEL_HISTORY_IDLE_TTL`）后，下条消息到来时先清空其历史。启动时从聊天日志恢复的历史不受影响（没有活动记录的不会被清空）。
+- **`src/providers/gemini.rs`**：解析 `usageMetadata` 里的 `cachedContentTokenCount` 和 `thoughtsTokenCount`。
+- **`src/elfclaw_log/mod.rs`**：新增 `log_llm_token_breakdown`，每次 Gemini 调用都记一条 `LLM tokens: … prompt=… cached=… thoughts=…`，用来验证缓存命中和思考用量。
+
+### 测试
+
+- 新增：
+  - 两条消息之间系统提示词逐字节一致，时间只出现在当前用户消息里，第二次请求中的旧消息就是存下来的原样，历史里没有时间块；
+  - `attach_turn_context` 只改当前用户消息，空内容或最后一条不是用户消息时不做任何改动；
+  - `ChannelSystemPrompt`：文件不变时返回同一个缓存对象，改了 SOUL.md、新建 MEMORY.md 后下一次立即重建；`fixed` 永远不变；
+  - 固定运行状态段里子 agent 按字母排序，且不含 cron 和 GitHub MCP；
+  - 闲置清空：首次不清空，59 分钟不清空，满 1 小时清空，从最新一条重新计时，其他人不受影响；
+  - 历史上限 20 条；
+  - Gemini 用量能解析出缓存和思考 token 数。
+- 全量结果：`cargo test --lib` 4074 通过，10 个失败全部是已知基线；集成测试 230 通过、3 个失败（已知基线）；clippy 用逐行 git blame 核对，新增问题为 0（顺手把改到的 3 处 `push_str(&format!)` 换成了 `writeln!`）；fmt 只作用于本次改动的 3 个文件。

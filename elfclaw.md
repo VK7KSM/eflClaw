@@ -201,6 +201,7 @@ gemini-3.5-flash: key A → key B → ...
 5. embedding 调用失败时**照样把原文存下来**（不算向量），不能因为一次 429 就丢整条写入。✅ `sqlite.rs::store()` 降级为 `embedding=NULL`，不再 `?` 直接丢弃整次写入。
 6. 中文全文检索启用 trigram 分词（SQLite FTS5 默认的 unicode61 分词器对中文基本不起作用）。✅ `tokenize='trigram case_sensitive 0'` + 存量数据库自动迁移重建索引。
 7. 系统提示词的"当前时间"**只保留一处实时注入**，消除"启动时烘焙一份、每条消息又追加一份"导致的两个时间源打架。✅ 只留 `build_channel_system_prompt`（每条消息都刷新）那一处。
+   **更新（2026-09-24）**：当前时间连同其他每条消息都会变的内容，已经整体移出系统提示词，改为附在当前这条用户消息前面（见第 14 节）；唯一注入点现在是 `current_time_section()`。
 
 **范围外**：`memory_store`/`memory_forget`（embedding 记忆的写入口）仍是 Restricted 级、需要审批——这两个不是"记事"用的工具，记事已经有了免审批的 `note_add`，embedding 记忆作为辅助系统保持原有审批级别不动。
 
@@ -419,6 +420,25 @@ gemini-3.5-flash: key A → key B → ...
 - **GitHub token**（`ghp_...`）：仅用于操作 `VK7KSM/eflClaw` 和 `VK7KSM/cf-crawler` 两个仓库，不用于其他仓库。
 - **Gemini key 池**：目前已验证 `daishuvpn@gmail.com` 一个 key（可正常调用 3.8/3.7/3.6/3.5-flash/3.5-flash-lite/embedding-2，首次请求偶发 503 属正常现象）；另有 `khunkasim@gmail.com` 一个 key 尚未测试。用户会补齐到至少 5 个。**多账号轮换放大免费额度违反 Google APIs 服务条款 §2(d)，用户已知晓此风险并选择承担，不再讨论。**
 - **已清理的历史泄露密钥**（用户确认均已失效/过期，不需要轮换，只是清理历史避免 GitHub 骚扰）：LLM 代理 key（`sk-2c87...`）、Gmail 应用密码、`CF_CRAWLER_TOKEN`、Telegram bot token、CF Worker secret、gateway pairing token。
+
+## 14. 请求体积与响应速度（2026-09-24）
+
+**起因**：K6 上在群里说一句 hello，输入是 50,182 token，耗时 20.3 秒。用 Gemini 官方计数接口实测，这 5 万 token 的构成是：技能说明全文 17,239（`prompt_injection_mode = "full"`，其中 agent-browser 一个就占 7,149）、内置工具定义 11,116、工作区 md 文件约 8,400、GitHub MCP 的 41 个工具 7,356、prompts.chat MCP 的 10 个工具 1,869，其余是固定说明。慢主要是因为 `reasoning_level = 3`，对 Gemini 3 Flash 就是最高的 "high" 思考档。
+
+**要点：模型接口没有状态，每次请求都要带上全部内容。** 不存在"第一次发过、以后就不发"这种做法。能做的只有两件事：让每次发的内容变少，以及让 Gemini 自带的隐式前缀缓存（默认开启，开头至少 4096 token 完全相同才能命中）真正命中。
+
+**Cloudflare AI Gateway 不能解决这个问题**：它的缓存是整个请求一模一样才命中（按完整请求体算哈希），而我们每条消息内容都不同，不会减少发给 Gemini 的 token，还多绕了一层。
+
+**改动**：
+
+1. 配置：`reasoning_level` 3 → 2（medium）；技能改为 `prompt_injection_mode = "compact"`（只放名字和简介，用到时模型再读 SKILL.md）；两个 MCP 服务器全部移除（`[mcp] enabled = false`），GitHub MCP 的明文令牌也一起从配置里删掉了。
+2. **系统提示词只放不变的内容**：当前时间、未完成的记事、定时任务列表、学到的纠错规则、聊天摘要，这些每条消息都可能变，改由 `attach_turn_context()` 附在当前这条用户消息前面（以"[系统附加的实时信息，不是用户说的话]"开头），不写进系统提示词，也不存进聊天历史。这样系统提示词、工具定义和之前的聊天记录在两次请求之间一个字都不变，满足前缀缓存命中的条件。原来的 `build_runtime_status_section` 拆成两部分：固定的 `build_runtime_static_section`（自主等级、子 agent 列表按字母排序、能力边界，放进缓存的系统提示词）和每条消息都刷新的 `build_cron_jobs_section`。GitHub MCP 的说明文字也一并删掉了。
+3. **工作区 md 文件改了立即生效**：以前系统提示词只在启动时生成一次，AI 改了 SOUL/USER/MEMORY.md 要重启才生效。现在由 `ChannelSystemPrompt` 在每条消息时比对 7 个文件（AGENTS/SOUL/TOOLS/IDENTITY/USER/BOOTSTRAP/MEMORY.md）的修改时间和大小，有变化才重建，没变化就原样复用。
+4. **聊天历史**：每人最多保留条数从 50 降到 20；某个人超过 1 小时没发消息，下一条消息到来时先清空他的历史（`expire_idle_sender_history`）。更早的上下文仍然可以通过每条消息附带的聊天摘要、首条消息的记忆检索和 `search_chat_log` 找回。
+5. **可以验证**：Gemini 每次调用都会多记一条 `LLM tokens: gemini/<model> prompt=… cached=… thoughts=…` 日志（`elfclaw_log::log_llm_token_breakdown`）。`cached` 表示命中缓存的 token 数，`thoughts` 表示思考用掉的 token 数（这部分不算在输出 token 里）。
+
+**记忆相关说明**：MEMORY.md 属于工作区 md 文件，每次请求都整份附带，单个文件最多 2 万字符，超出部分会被截断，所以应该只放精选的长期信息。记忆库 brain.db 不会整份发送：只在一段对话的第一条消息时，按相关度附上最多 4 条（最多 4000 字符），其他时候由模型需要时自己调 `memory_recall` 去查。
+
 
 ## 13. 代码语言约束
 

@@ -111,8 +111,16 @@ use tokio_util::sync::CancellationToken;
 
 /// Per-sender conversation history for channel messages.
 type ConversationHistoryMap = Arc<Mutex<HashMap<String, Vec<ChatMessage>>>>;
+/// Per-sender time of the last incoming message (see `expire_idle_sender_history`).
+type HistoryActivityMap = Arc<Mutex<HashMap<String, Instant>>>;
 /// Maximum history messages to keep per sender.
-const MAX_CHANNEL_HISTORY: usize = 50;
+/// elfClaw 2026-09-24: 50 → 20. The whole history is resent with every
+/// message; older context stays reachable through memory recall, the chat-log
+/// summaries injected per message, and `search_chat_log`.
+const MAX_CHANNEL_HISTORY: usize = 20;
+/// elfClaw 2026-09-24: a sender's history is dropped once they have been idle
+/// this long, so a new conversation does not drag the previous one along.
+const CHANNEL_HISTORY_IDLE_TTL: Duration = Duration::from_secs(60 * 60);
 /// Minimum user-message length (in chars) for auto-save to memory.
 /// Messages shorter than this (e.g. "ok", "thanks") are not stored,
 /// reducing noise in memory recall.
@@ -258,13 +266,14 @@ struct ChannelRuntimeContext {
     memory: Arc<dyn Memory>,
     tools_registry: Arc<Vec<Box<dyn Tool>>>,
     observer: Arc<dyn Observer>,
-    system_prompt: Arc<String>,
+    system_prompt: Arc<ChannelSystemPrompt>,
     model: Arc<String>,
     temperature: f64,
     auto_save_memory: bool,
     max_tool_iterations: usize,
     min_relevance_score: f64,
     conversation_histories: ConversationHistoryMap,
+    history_last_active: HistoryActivityMap,
     provider_cache: ProviderCacheMap,
     route_overrides: RouteSelectionMap,
     api_key: Option<String>,
@@ -496,6 +505,116 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
     }
 }
 
+/// Workspace files injected into the channel system prompt by
+/// `load_openclaw_bootstrap_files`. Any change to one of them makes
+/// `ChannelSystemPrompt::current` rebuild the prompt.
+const PROMPT_WORKSPACE_FILES: [&str; 7] = [
+    "AGENTS.md",
+    "SOUL.md",
+    "TOOLS.md",
+    "IDENTITY.md",
+    "USER.md",
+    "BOOTSTRAP.md",
+    "MEMORY.md",
+];
+
+/// (modified time, length) of each `PROMPT_WORKSPACE_FILES` entry; `None` when
+/// the file is missing or unreadable.
+type WorkspaceFilesStamp = Vec<Option<(SystemTime, u64)>>;
+
+fn workspace_files_stamp(workspace_dir: &std::path::Path) -> WorkspaceFilesStamp {
+    PROMPT_WORKSPACE_FILES
+        .iter()
+        .map(|name| {
+            let meta = std::fs::metadata(workspace_dir.join(name)).ok()?;
+            Some((meta.modified().ok()?, meta.len()))
+        })
+        .collect()
+}
+
+/// Everything needed to (re)build the channel base system prompt.
+struct SystemPromptSource {
+    workspace_dir: PathBuf,
+    model: String,
+    tool_descs: Vec<(String, String)>,
+    skills: Vec<crate::skills::Skill>,
+    identity: crate::config::IdentityConfig,
+    bootstrap_max_chars: Option<usize>,
+    native_tools: bool,
+    skills_mode: crate::config::SkillsPromptInjectionMode,
+    /// Appended verbatim after the built prompt (text-mode tool instructions,
+    /// static runtime section).
+    suffix: String,
+}
+
+impl SystemPromptSource {
+    fn build(&self) -> String {
+        let tool_descs: Vec<(&str, &str)> = self
+            .tool_descs
+            .iter()
+            .map(|(name, desc)| (name.as_str(), desc.as_str()))
+            .collect();
+        let mut prompt = build_system_prompt_with_mode(
+            &self.workspace_dir,
+            &self.model,
+            &tool_descs,
+            &self.skills,
+            Some(&self.identity),
+            self.bootstrap_max_chars,
+            self.native_tools,
+            self.skills_mode,
+        );
+        prompt.push_str(&self.suffix);
+        prompt
+    }
+}
+
+/// elfClaw 2026-09-24: the channel base system prompt. It used to be built once
+/// at startup, so edits to SOUL.md/USER.md/MEMORY.md etc. (which the agent is
+/// allowed to make) only took effect after a restart. `current()` now checks
+/// the files' modified time/length on every message and rebuilds when any of
+/// them changed. Between changes the prompt stays byte-identical, which Gemini's
+/// implicit prefix cache relies on.
+struct ChannelSystemPrompt {
+    source: Option<SystemPromptSource>,
+    cached: Mutex<(WorkspaceFilesStamp, Arc<String>)>,
+}
+
+impl ChannelSystemPrompt {
+    /// A prompt that never changes (tests).
+    fn fixed(prompt: String) -> Self {
+        Self {
+            source: None,
+            cached: Mutex::new((Vec::new(), Arc::new(prompt))),
+        }
+    }
+
+    fn from_source(source: SystemPromptSource) -> Self {
+        let stamp = workspace_files_stamp(&source.workspace_dir);
+        let prompt = Arc::new(source.build());
+        Self {
+            source: Some(source),
+            cached: Mutex::new((stamp, prompt)),
+        }
+    }
+
+    /// The current prompt, rebuilt first if a workspace prompt file changed.
+    fn current(&self) -> Arc<String> {
+        let mut cached = self.cached.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(source) = &self.source {
+            let stamp = workspace_files_stamp(&source.workspace_dir);
+            if stamp != cached.0 {
+                tracing::info!("Workspace prompt files changed; rebuilding channel system prompt");
+                *cached = (stamp, Arc::new(source.build()));
+            }
+        }
+        Arc::clone(&cached.1)
+    }
+}
+
+/// Stable per-chat system prompt: base prompt + channel delivery rules + the
+/// reply target. Contains nothing that changes between messages of the same
+/// chat — per-message context goes through `attach_turn_context` instead.
 fn build_channel_system_prompt(
     base_prompt: &str,
     channel_name: &str,
@@ -522,21 +641,43 @@ fn build_channel_system_prompt(
         prompt.push_str(&context);
     }
 
-    // Inject fresh current time so the LLM knows the exact moment,
-    // overriding any stale startup-time baked into the base prompt.
-    let now = chrono::Local::now();
-    prompt.push_str(&format!(
-        "\n\n## Current Date & Time\n\n{} ({})\n",
-        now.format("%Y-%m-%d %H:%M:%S"),
-        now.format("%Z")
-    ));
-
     prompt
 }
 
-// elfClaw: build dynamic runtime status section so agent knows its current environment
-// (cron jobs, autonomy config, configured agents, worker model)
-fn build_runtime_status_section(config: &crate::config::Config) -> String {
+/// "## Current Date & Time" block for the per-message context.
+fn current_time_section() -> String {
+    let now = chrono::Local::now();
+    format!(
+        "## Current Date & Time\n\n{} ({})\n",
+        now.format("%Y-%m-%d %H:%M:%S"),
+        now.format("%Z")
+    )
+}
+
+/// elfClaw 2026-09-24: per-message context (current time, open notes, cron
+/// jobs, learned corrections, chat summaries) is put in front of the CURRENT
+/// user message only — never into the system prompt and never into the stored
+/// history. The system prompt, tool declarations and earlier turns then stay
+/// byte-identical between requests, which is what Gemini's implicit prefix
+/// cache needs (a changing timestamp inside the system prompt used to break
+/// the cache for everything after it on every message).
+fn attach_turn_context(history: &mut [ChatMessage], turn_context: &str) {
+    let turn_context = turn_context.trim();
+    if turn_context.is_empty() {
+        return;
+    }
+    if let Some(last) = history.last_mut().filter(|m| m.role == "user") {
+        last.content = format!(
+            "[系统附加的实时信息，不是用户说的话]\n{turn_context}\n\n[用户消息]\n{}",
+            last.content
+        );
+    }
+}
+
+// elfClaw: static runtime facts (autonomy, worker model, configured agents,
+// capability boundaries). Part of the cached system prompt; the live cron job
+// list is per-message context (`build_cron_jobs_section`).
+fn build_runtime_static_section(config: &crate::config::Config) -> String {
     use std::fmt::Write;
     let mut section = String::new();
     section.push_str("\n\n## Runtime Status\n\n");
@@ -549,41 +690,12 @@ fn build_runtime_status_section(config: &crate::config::Config) -> String {
         let _ = writeln!(section, "**Worker Model**: {wm}");
     }
     if !config.agents.is_empty() {
-        let agent_names: Vec<_> = config.agents.keys().map(|s| s.as_str()).collect();
+        let mut agent_names: Vec<_> = config.agents.keys().map(|s| s.as_str()).collect();
+        // Sorted: HashMap order is random per process, and this text is part
+        // of the cached prompt prefix.
+        agent_names.sort_unstable();
         let _ = writeln!(section, "**Configured Agents**: {}", agent_names.join(", "));
     }
-
-    // Cron jobs (dynamic — read from store each time)
-    if config.cron.enabled {
-        match crate::cron::list_jobs(config) {
-            Ok(jobs) if !jobs.is_empty() => {
-                let _ = writeln!(section, "\n**Active Cron Jobs** ({} total):", jobs.len());
-                for job in &jobs {
-                    let name = job.name.as_deref().unwrap_or("unnamed");
-                    let enabled = if job.enabled { "on" } else { "off" };
-                    let delegate = job.delegate_to.as_deref().unwrap_or("-");
-                    let job_type: &str = job.job_type.clone().into();
-                    let _ = writeln!(
-                        section,
-                        "- id=`{}` name=\"{}\" enabled={} type={} delegate={} schedule={}",
-                        job.id, name, enabled, job_type, delegate, &job.expression
-                    );
-                }
-            }
-            Ok(_) => {
-                let _ = writeln!(section, "**Cron Jobs**: none configured");
-            }
-            Err(_) => {} // elfClaw: silently skip if store unavailable
-        }
-    }
-
-    // elfClaw: GitHub MCP tool guidance
-    section.push_str(
-        "\nGitHub MCP 工具（如果已配置）：\
-         当需要手动查阅源码时，可使用 github__search_code、\
-         github__get_file_contents 等 MCP 工具直接查询 elfClaw/zeroclaw 仓库源码。\
-         这些工具通过 GitHub API 工作，不需要本地安装 git。\n",
-    );
 
     // elfClaw: capability boundary declaration for deployed daemon
     section.push_str("\n## Capability Boundaries\n\n");
@@ -607,6 +719,37 @@ fn build_runtime_status_section(config: &crate::config::Config) -> String {
          and these changes require the administrator to edit files and restart the service.\n"
     );
 
+    section
+}
+
+// elfClaw: live cron job list (read from the store on every message) so the
+// agent knows what is scheduled; per-message context, see `attach_turn_context`.
+fn build_cron_jobs_section(config: &crate::config::Config) -> String {
+    use std::fmt::Write;
+    let mut section = String::new();
+    if !config.cron.enabled {
+        return section;
+    }
+    match crate::cron::list_jobs(config) {
+        Ok(jobs) if !jobs.is_empty() => {
+            let _ = writeln!(section, "## Active Cron Jobs ({} total)\n", jobs.len());
+            for job in &jobs {
+                let name = job.name.as_deref().unwrap_or("unnamed");
+                let enabled = if job.enabled { "on" } else { "off" };
+                let delegate = job.delegate_to.as_deref().unwrap_or("-");
+                let job_type: &str = job.job_type.clone().into();
+                let _ = writeln!(
+                    section,
+                    "- id=`{}` name=\"{}\" enabled={} type={} delegate={} schedule={}",
+                    job.id, name, enabled, job_type, delegate, &job.expression
+                );
+            }
+        }
+        Ok(_) => {
+            let _ = writeln!(section, "## Active Cron Jobs\n\nnone configured");
+        }
+        Err(_) => {} // elfClaw: silently skip if store unavailable
+    }
     section
 }
 
@@ -1107,6 +1250,29 @@ fn clear_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(sender_key);
+}
+
+/// elfClaw 2026-09-24: drop `sender_key`'s history when their previous message
+/// is at least `CHANNEL_HISTORY_IDLE_TTL` older than `now`, then record `now` as
+/// their latest activity. A sender with no recorded activity (first message
+/// since startup, including histories restored from the chat log) is never
+/// expired. Returns whether the history was dropped.
+fn expire_idle_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str, now: Instant) -> bool {
+    let expired = {
+        let mut last_active = ctx
+            .history_last_active
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let expired = last_active
+            .get(sender_key)
+            .is_some_and(|t| now.saturating_duration_since(*t) >= CHANNEL_HISTORY_IDLE_TTL);
+        last_active.insert(sender_key.to_string(), now);
+        expired
+    };
+    if expired {
+        clear_sender_history(ctx, sender_key);
+    }
+    expired
 }
 
 fn compact_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) -> bool {
@@ -2032,6 +2198,10 @@ async fn process_channel_message(
     println!("  ⏳ Processing message...");
     let started_at = Instant::now();
 
+    if expire_idle_sender_history(ctx.as_ref(), &history_key, started_at) {
+        tracing::info!(history_key = %history_key, "Channel history expired after idle period");
+    }
+
     let had_prior_history = ctx
         .conversation_histories
         .lock()
@@ -2099,8 +2269,14 @@ async fn process_channel_message(
         }
     }
 
-    let mut system_prompt =
-        build_channel_system_prompt(ctx.system_prompt.as_str(), &msg.channel, &msg.reply_target);
+    let base_prompt = ctx.system_prompt.current();
+    let system_prompt =
+        build_channel_system_prompt(base_prompt.as_str(), &msg.channel, &msg.reply_target);
+
+    // elfClaw 2026-09-24: everything below changes from message to message, so
+    // it is collected into `turn_context` and attached to the current user
+    // message (see `attach_turn_context`), keeping `system_prompt` stable.
+    let mut turn_context = current_time_section();
 
     // elfClaw 2026-09-23: inject open notes/reminders fresh on every message
     // (not baked into the cached startup prompt — a note can be added or
@@ -2110,13 +2286,14 @@ async fn process_channel_message(
     // ChannelRuntimeContext, which has ~24 construction sites (mostly
     // tests) that a new required field would touch.
     match crate::memory::notes::NoteStore::open(&ctx.workspace_dir) {
-        Ok(store) => system_prompt.push_str(&crate::memory::notes::open_notes_for_prompt(&store)),
+        Ok(store) => turn_context.push_str(&crate::memory::notes::open_notes_for_prompt(&store)),
         Err(e) => tracing::warn!("Notes unavailable for this turn (failed to open notes.db): {e}"),
     }
 
-    // elfClaw: inject dynamic runtime status (cron jobs, autonomy, agents) so agent
-    // knows its current environment and can self-diagnose tool/config issues
-    system_prompt.push_str(&build_runtime_status_section(&ctx.config));
+    // elfClaw: live cron job list so the agent knows what is scheduled
+    // (the static runtime facts are in the cached system prompt).
+    turn_context.push_str("\n\n");
+    turn_context.push_str(&build_cron_jobs_section(&ctx.config));
 
     // elfClaw: inject learned correction rules into system prompt (self-improving)
     {
@@ -2132,13 +2309,13 @@ async fn process_channel_message(
         if !corrections.is_empty() {
             use std::collections::HashSet;
             let mut seen = HashSet::new();
-            system_prompt.push_str("\n\n## 已学习的纠错规则\n\n");
-            system_prompt.push_str("以下是从过往对话中学到的纠错。遇到相关场景时必须遵守：\n\n");
+            turn_context.push_str("\n\n## 已学习的纠错规则\n\n");
+            turn_context.push_str("以下是从过往对话中学到的纠错。遇到相关场景时必须遵守：\n\n");
             let mut count = 0;
             for entry in &corrections {
                 let normalized = entry.content.trim().to_lowercase();
                 if seen.insert(normalized) {
-                    system_prompt.push_str(&format!("- {}\n", entry.content.trim()));
+                    let _ = writeln!(turn_context, "- {}", entry.content.trim());
                     count += 1;
                     if count >= 20 {
                         break;
@@ -2160,13 +2337,14 @@ async fn process_channel_message(
             if let Ok(index) = chat_index::ChatIndex::open(ctx.workspace_dir.as_path()) {
                 if let Ok(summaries) = index.get_recent_cross_user_summaries(&msg.sender, 5) {
                     if !summaries.is_empty() {
-                        system_prompt.push_str("\n\n## 其他用户的近期对话摘要\n");
+                        turn_context.push_str("\n\n## 其他用户的近期对话摘要\n");
                         for s in &summaries {
                             let topics = s.topics.as_deref().unwrap_or("-");
-                            system_prompt.push_str(&format!(
-                                "- {} ({}): {} [话题: {}]\n",
+                            let _ = writeln!(
+                                turn_context,
+                                "- {} ({}): {} [话题: {}]",
                                 s.chat_name, s.date, s.summary, topics
-                            ));
+                            );
                         }
                     }
                 }
@@ -2179,15 +2357,16 @@ async fn process_channel_message(
         if let Ok(index) = chat_index::ChatIndex::open(ctx.workspace_dir.as_path()) {
             if let Ok(summaries) = index.get_user_summaries(&msg.sender, 7) {
                 if !summaries.is_empty() {
-                    system_prompt.push_str("\n\n## 你与此用户的近期对话记录摘要\n");
+                    turn_context.push_str("\n\n## 你与此用户的近期对话记录摘要\n");
                     for s in &summaries {
                         let topics = s.topics.as_deref().unwrap_or("-");
-                        system_prompt.push_str(&format!(
-                            "- {} ({}条消息): {} [话题: {}]\n",
+                        let _ = writeln!(
+                            turn_context,
+                            "- {} ({}条消息): {} [话题: {}]",
                             s.date, s.msg_count, s.summary, topics
-                        ));
+                        );
                     }
-                    system_prompt.push_str("如需回忆更多细节，可使用 search_chat_log 工具搜索。\n");
+                    turn_context.push_str("如需回忆更多细节，可使用 search_chat_log 工具搜索。\n");
                 }
             }
         }
@@ -2245,6 +2424,7 @@ async fn process_channel_message(
             history.insert(prior_end, boundary);
         }
     }
+    attach_turn_context(&mut history, &turn_context);
     let use_streaming = target_channel
         .as_ref()
         .is_some_and(|ch| ch.supports_draft_updates());
@@ -2769,6 +2949,7 @@ async fn process_channel_message(
                     if attempt == 2 {
                         retry_history.push(ChatMessage::user(&msg.content));
                     }
+                    attach_turn_context(&mut retry_history, &turn_context);
 
                     eprintln!(
                         "  🔄 Context retry attempt {attempt}: {} history turns",
@@ -4244,19 +4425,25 @@ pub async fn start_channels(config: Config) -> Result<()> {
         None
     };
     let native_tools = provider.supports_native_tools();
-    let mut system_prompt = build_system_prompt_with_mode(
-        &workspace,
-        &model,
-        &tool_descs,
-        &skills,
-        Some(&config.identity),
+    let mut prompt_suffix = String::new();
+    if !native_tools {
+        prompt_suffix.push_str(&build_tool_instructions(tools_registry.as_ref()));
+    }
+    prompt_suffix.push_str(&build_runtime_static_section(&config));
+    let system_prompt = ChannelSystemPrompt::from_source(SystemPromptSource {
+        workspace_dir: workspace.clone(),
+        model: model.clone(),
+        tool_descs: tool_descs
+            .iter()
+            .map(|(name, desc)| ((*name).to_string(), (*desc).to_string()))
+            .collect(),
+        skills: skills.clone(),
+        identity: config.identity.clone(),
         bootstrap_max_chars,
         native_tools,
-        config.skills.prompt_injection_mode,
-    );
-    if !native_tools {
-        system_prompt.push_str(&build_tool_instructions(tools_registry.as_ref()));
-    }
+        skills_mode: config.skills.prompt_injection_mode,
+        suffix: prompt_suffix,
+    });
 
     if !skills.is_empty() {
         println!(
@@ -4411,6 +4598,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
             }
             Arc::new(Mutex::new(seed))
         },
+        history_last_active: Arc::new(Mutex::new(HashMap::new())),
         provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
         route_overrides: Arc::new(Mutex::new(HashMap::new())),
         api_key: config.api_key.clone(),
@@ -4654,13 +4842,14 @@ mod tests {
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("system".to_string()),
+            system_prompt: Arc::new(ChannelSystemPrompt::fixed("system".to_string())),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(histories)),
+            history_last_active: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -4713,13 +4902,14 @@ mod tests {
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("system".to_string()),
+            system_prompt: Arc::new(ChannelSystemPrompt::fixed("system".to_string())),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            history_last_active: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -4775,13 +4965,14 @@ mod tests {
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("system".to_string()),
+            system_prompt: Arc::new(ChannelSystemPrompt::fixed("system".to_string())),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(histories)),
+            history_last_active: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -5260,13 +5451,14 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ChannelSystemPrompt::fixed("test-system-prompt".to_string())),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            history_last_active: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -5329,13 +5521,14 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ChannelSystemPrompt::fixed("test-system-prompt".to_string())),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            history_last_active: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -5412,13 +5605,14 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ChannelSystemPrompt::fixed("test-system-prompt".to_string())),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            history_last_active: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -5481,13 +5675,14 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ChannelSystemPrompt::fixed("test-system-prompt".to_string())),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            history_last_active: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -5559,13 +5754,14 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ChannelSystemPrompt::fixed("test-system-prompt".to_string())),
             model: Arc::new("default-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            history_last_active: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -5658,13 +5854,14 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ChannelSystemPrompt::fixed("test-system-prompt".to_string())),
             model: Arc::new("default-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            history_last_active: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(route_overrides)),
             api_key: None,
@@ -5739,13 +5936,14 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ChannelSystemPrompt::fixed("test-system-prompt".to_string())),
             model: Arc::new("default-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            history_last_active: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -5833,13 +6031,14 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ChannelSystemPrompt::fixed("test-system-prompt".to_string())),
             model: Arc::new("startup-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            history_last_active: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -5917,13 +6116,14 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ChannelSystemPrompt::fixed("test-system-prompt".to_string())),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
             max_tool_iterations: 12,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            history_last_active: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -5989,13 +6189,14 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ChannelSystemPrompt::fixed("test-system-prompt".to_string())),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
             max_tool_iterations: 3,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            history_last_active: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -6178,13 +6379,14 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ChannelSystemPrompt::fixed("test-system-prompt".to_string())),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            history_last_active: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -6268,13 +6470,14 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ChannelSystemPrompt::fixed("test-system-prompt".to_string())),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            history_last_active: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -6370,13 +6573,14 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ChannelSystemPrompt::fixed("test-system-prompt".to_string())),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            history_last_active: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -6454,13 +6658,14 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ChannelSystemPrompt::fixed("test-system-prompt".to_string())),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            history_last_active: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -6523,13 +6728,14 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ChannelSystemPrompt::fixed("test-system-prompt".to_string())),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            history_last_active: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -6605,12 +6811,124 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[test]
-    fn build_channel_system_prompt_injects_fresh_current_time() {
-        // The one real-time injection point now (see the removed test above).
-        let prompt = build_channel_system_prompt("base", "telegram", "12345");
-        assert!(prompt.contains("## Current Date & Time"));
+    fn build_channel_system_prompt_is_stable_and_time_goes_to_turn_context() {
+        // elfClaw 2026-09-24: the per-chat system prompt must not change between
+        // messages (Gemini implicit prefix cache); the current time is part of
+        // the per-message context instead.
+        let first = build_channel_system_prompt("base", "telegram", "12345");
+        let second = build_channel_system_prompt("base", "telegram", "12345");
+        assert_eq!(first, second);
+        assert!(!first.contains("## Current Date & Time"));
+        assert!(first.contains("reply_target=12345"));
+
+        let time = current_time_section();
+        assert!(time.contains("## Current Date & Time"));
         let this_year = chrono::Local::now().format("%Y").to_string();
-        assert!(prompt.contains(&this_year));
+        assert!(time.contains(&this_year));
+    }
+
+    #[test]
+    fn attach_turn_context_prefixes_only_the_current_user_message() {
+        let mut history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("earlier"),
+            ChatMessage::assistant("reply"),
+            ChatMessage::user("now"),
+        ];
+        attach_turn_context(&mut history, "\n## Current Date & Time\n\nX\n");
+        assert_eq!(history[0].content, "sys");
+        assert_eq!(history[1].content, "earlier");
+        let last = &history[3].content;
+        assert!(last.starts_with("[系统附加的实时信息，不是用户说的话]\n## Current Date & Time"));
+        assert!(last.ends_with("[用户消息]\nnow"));
+    }
+
+    #[test]
+    fn attach_turn_context_skips_empty_context_and_non_user_tail() {
+        let mut history = vec![ChatMessage::user("hi")];
+        attach_turn_context(&mut history, "  \n ");
+        assert_eq!(history[0].content, "hi");
+
+        let mut history = vec![ChatMessage::user("hi"), ChatMessage::assistant("a")];
+        attach_turn_context(&mut history, "## ctx");
+        assert_eq!(history[1].content, "a");
+        assert_eq!(history[0].content, "hi");
+    }
+
+    #[test]
+    fn channel_system_prompt_rebuilds_only_when_workspace_files_change() {
+        let ws = make_workspace();
+        let prompt = ChannelSystemPrompt::from_source(SystemPromptSource {
+            workspace_dir: ws.path().to_path_buf(),
+            model: "test-model".into(),
+            tool_descs: vec![("file_read".into(), "Read files".into())],
+            skills: Vec::new(),
+            identity: crate::config::IdentityConfig::default(),
+            bootstrap_max_chars: None,
+            native_tools: true,
+            skills_mode: crate::config::SkillsPromptInjectionMode::Compact,
+            suffix: "\n## Suffix\n".into(),
+        });
+
+        let first = prompt.current();
+        assert!(first.contains("Be helpful."));
+        assert!(first.ends_with("\n## Suffix\n"));
+        // Unchanged files: the very same cached prompt is returned.
+        assert!(Arc::ptr_eq(&first, &prompt.current()));
+
+        // An edited file shows up on the next message, no restart needed.
+        std::fs::write(
+            ws.path().join("SOUL.md"),
+            "# Soul\nSpeak like a pirate, always.",
+        )
+        .unwrap();
+        let second = prompt.current();
+        assert!(second.contains("Speak like a pirate, always."));
+        assert!(!second.contains("Be helpful."));
+
+        // A newly created MEMORY.md is picked up too.
+        std::fs::write(
+            ws.path().join("MEMORY.md"),
+            "# Memory\nzeroclaw_user likes tea.",
+        )
+        .unwrap();
+        assert!(prompt.current().contains("zeroclaw_user likes tea."));
+    }
+
+    #[test]
+    fn channel_system_prompt_fixed_never_changes() {
+        let prompt = ChannelSystemPrompt::fixed("fixed-prompt".into());
+        assert_eq!(prompt.current().as_str(), "fixed-prompt");
+        assert!(Arc::ptr_eq(&prompt.current(), &prompt.current()));
+    }
+
+    #[test]
+    fn build_runtime_static_section_lists_agents_sorted_and_no_cron_jobs() {
+        let mut config = crate::config::Config::default();
+        for name in ["zeta_worker", "alpha_worker"] {
+            config.agents.insert(
+                name.to_string(),
+                crate::config::DelegateAgentConfig {
+                    provider: Some("gemini".to_string()),
+                    model: Some("m".to_string()),
+                    system_prompt: None,
+                    api_key: None,
+                    temperature: None,
+                    max_depth: 1,
+                    agentic: false,
+                    allowed_tools: Vec::new(),
+                    max_iterations: 1,
+                    enabled: true,
+                    capabilities: Vec::new(),
+                    priority: 0,
+                },
+            );
+        }
+        let section = build_runtime_static_section(&config);
+        assert!(section.contains("**Configured Agents**: alpha_worker, zeta_worker"));
+        assert!(section.contains("## Capability Boundaries"));
+        assert!(!section.contains("Cron"));
+        assert!(!section.contains("GitHub MCP"));
     }
 
     #[test]
@@ -7069,13 +7387,14 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ChannelSystemPrompt::fixed("test-system-prompt".to_string())),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            history_last_active: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -7164,13 +7483,14 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(RecallMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ChannelSystemPrompt::fixed("test-system-prompt".to_string())),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            history_last_active: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -7234,6 +7554,175 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(!turns[0].content.contains("[Memory context]"));
     }
 
+    fn zc_capture_ctx(provider: Arc<HistoryCaptureProvider>) -> Arc<ChannelRuntimeContext> {
+        Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(HashMap::new()),
+            provider,
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new(ChannelSystemPrompt::fixed("test-system-prompt".to_string())),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            history_last_active: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            tts_config: crate::config::TtsConfig::default(),
+            chat_log_config: crate::config::ChatLogConfig::default(),
+            worker_model: None,
+            config: Arc::new(crate::config::Config::default()),
+            approval_manager: Arc::new(crate::approval::ApprovalManager::from_config(
+                &crate::config::AutonomyConfig {
+                    level: crate::security::AutonomyLevel::Full,
+                    ..Default::default()
+                },
+            )),
+        })
+    }
+
+    fn zc_message(id: &str, content: &str, timestamp: u64) -> traits::ChannelMessage {
+        traits::ChannelMessage {
+            id: id.to_string(),
+            sender: "zeroclaw_user".to_string(),
+            reply_target: "chat-1".to_string(),
+            content: content.to_string(),
+            channel: "test-channel".to_string(),
+            timestamp,
+            thread_ts: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_keeps_request_prefix_identical_across_messages() {
+        let provider_impl = Arc::new(HistoryCaptureProvider::default());
+        let ctx = zc_capture_ctx(provider_impl.clone());
+
+        process_channel_message(
+            ctx.clone(),
+            zc_message("m1", "first question", 1),
+            CancellationToken::new(),
+        )
+        .await;
+        process_channel_message(
+            ctx.clone(),
+            zc_message("m2", "second question", 2),
+            CancellationToken::new(),
+        )
+        .await;
+
+        let calls = provider_impl
+            .calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert_eq!(calls.len(), 2);
+        // System prompt: byte-identical, no per-message data in it.
+        assert_eq!(calls[0][0], calls[1][0]);
+        assert_eq!(calls[0][0].0, "system");
+        assert!(!calls[0][0].1.contains("## Current Date & Time"));
+        // Per-message context rides on the current user message only.
+        let first_user = &calls[0].last().unwrap().1;
+        assert!(first_user.contains("## Current Date & Time"));
+        assert!(first_user.ends_with("first question"));
+        // In the second request the earlier turn is the plain stored one, so
+        // everything before the new message is an unchanged prefix.
+        assert!(!calls[1][1].1.contains("## Current Date & Time"));
+        assert!(calls[1][1].1.ends_with("first question"));
+        assert_eq!(calls[1][2].0, "assistant");
+        assert!(calls[1][2].1.ends_with("response-1"));
+        let second_user = &calls[1].last().unwrap().1;
+        assert!(second_user.contains("## Current Date & Time"));
+        assert!(second_user.ends_with("second question"));
+        drop(calls);
+
+        let histories = ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let turns = histories.get("test-channel_zeroclaw_user").unwrap();
+        assert!(turns
+            .iter()
+            .all(|t| !t.content.contains("## Current Date & Time")));
+    }
+
+    #[test]
+    fn expire_idle_sender_history_drops_history_after_idle_ttl_only() {
+        let ctx = zc_capture_ctx(Arc::new(HistoryCaptureProvider::default()));
+        let key = "test-channel_zeroclaw_user";
+        let seed = |ctx: &ChannelRuntimeContext| {
+            ctx.conversation_histories.lock().unwrap().insert(
+                key.to_string(),
+                vec![ChatMessage::user("old"), ChatMessage::assistant("reply")],
+            );
+        };
+        let has_history = |ctx: &ChannelRuntimeContext| {
+            ctx.conversation_histories.lock().unwrap().contains_key(key)
+        };
+        let t0 = Instant::now();
+
+        // First message since startup (e.g. history restored from chat log): kept.
+        seed(&ctx);
+        assert!(!expire_idle_sender_history(&ctx, key, t0));
+        assert!(has_history(&ctx));
+
+        // Next message within the idle window: kept.
+        let t1 = t0 + Duration::from_secs(59 * 60);
+        assert!(!expire_idle_sender_history(&ctx, key, t1));
+        assert!(has_history(&ctx));
+
+        // Idle for a full TTL since the previous message: dropped.
+        let t2 = t1 + CHANNEL_HISTORY_IDLE_TTL;
+        assert!(expire_idle_sender_history(&ctx, key, t2));
+        assert!(!has_history(&ctx));
+
+        // The window restarts from the latest message; other senders untouched.
+        seed(&ctx);
+        ctx.conversation_histories
+            .lock()
+            .unwrap()
+            .insert("test-channel_other".into(), vec![ChatMessage::user("x")]);
+        assert!(!expire_idle_sender_history(
+            &ctx,
+            key,
+            t2 + Duration::from_secs(60)
+        ));
+        assert!(has_history(&ctx));
+        assert!(ctx
+            .conversation_histories
+            .lock()
+            .unwrap()
+            .contains_key("test-channel_other"));
+    }
+
+    #[test]
+    fn append_sender_turn_caps_history_at_max_channel_history() {
+        let ctx = zc_capture_ctx(Arc::new(HistoryCaptureProvider::default()));
+        for i in 0..(MAX_CHANNEL_HISTORY + 7) {
+            append_sender_turn(&ctx, "k", ChatMessage::user(format!("m{i}")));
+        }
+        let histories = ctx.conversation_histories.lock().unwrap();
+        let turns = histories.get("k").unwrap();
+        assert_eq!(turns.len(), MAX_CHANNEL_HISTORY);
+        assert_eq!(
+            turns.last().unwrap().content,
+            format!("m{}", MAX_CHANNEL_HISTORY + 6)
+        );
+    }
+
     #[tokio::test]
     async fn process_channel_message_telegram_keeps_system_instruction_at_top_only() {
         let channel_impl = Arc::new(TelegramRecordingChannel::default());
@@ -7260,13 +7749,14 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ChannelSystemPrompt::fixed("test-system-prompt".to_string())),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(histories)),
+            history_last_active: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -7825,13 +8315,16 @@ This is an example JSON object for profile settings."#;
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("You are a helpful assistant.".to_string()),
+            system_prompt: Arc::new(ChannelSystemPrompt::fixed(
+                "You are a helpful assistant.".to_string(),
+            )),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            history_last_active: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -7901,13 +8394,16 @@ This is an example JSON object for profile settings."#;
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("You are a helpful assistant.".to_string()),
+            system_prompt: Arc::new(ChannelSystemPrompt::fixed(
+                "You are a helpful assistant.".to_string(),
+            )),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            history_last_active: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,

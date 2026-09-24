@@ -254,6 +254,14 @@ struct GeminiUsageMetadata {
     prompt_token_count: Option<u64>,
     #[serde(default, rename = "candidatesTokenCount")]
     candidates_token_count: Option<u64>,
+    // elfClaw 2026-09-24: part of promptTokenCount served from Gemini's
+    // implicit prefix cache, and hidden thinking tokens (not included in
+    // candidatesTokenCount). Logged only — used to verify cache hits and the
+    // effect of reasoning_level.
+    #[serde(default, rename = "cachedContentTokenCount")]
+    cached_content_token_count: Option<u64>,
+    #[serde(default, rename = "thoughtsTokenCount")]
+    thoughts_token_count: Option<u64>,
 }
 
 /// Response envelope for the internal cloudcode-pa API.
@@ -1386,6 +1394,15 @@ impl GeminiProvider {
             anyhow::bail!("Gemini API error: {}", err.message);
         }
 
+        if let Some(u) = &result.usage_metadata {
+            crate::elfclaw_log::log_llm_token_breakdown(
+                "gemini",
+                model,
+                u.prompt_token_count,
+                u.cached_content_token_count,
+                u.thoughts_token_count,
+            );
+        }
         let usage = result.usage_metadata.map(|u| TokenUsage {
             input_tokens: u.prompt_token_count,
             output_tokens: u.candidates_token_count,
@@ -2537,6 +2554,20 @@ mod tests {
         let usage = resp.usage_metadata.unwrap();
         assert_eq!(usage.prompt_token_count, Some(120));
         assert_eq!(usage.candidates_token_count, Some(40));
+        assert_eq!(usage.cached_content_token_count, None);
+    }
+
+    #[test]
+    fn response_parses_cached_and_thought_token_counts() {
+        let json = r#"{
+            "candidates": [{"content": {"parts": [{"text": "Hello"}]}}],
+            "usageMetadata": {"promptTokenCount": 30000, "candidatesTokenCount": 16,
+                              "cachedContentTokenCount": 28000, "thoughtsTokenCount": 900}
+        }"#;
+        let resp: GenerateContentResponse = serde_json::from_str(json).unwrap();
+        let usage = resp.usage_metadata.unwrap();
+        assert_eq!(usage.cached_content_token_count, Some(28000));
+        assert_eq!(usage.thoughts_token_count, Some(900));
     }
 
     #[test]

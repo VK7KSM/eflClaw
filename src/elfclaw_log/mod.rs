@@ -192,6 +192,39 @@ pub fn log_agent_end(provider: &str, model: &str, duration_ms: u64, tokens: Opti
     });
 }
 
+/// elfClaw 2026-09-24: per-call prompt token breakdown — how much of the
+/// prompt was served from the provider's prefix cache and how many hidden
+/// thinking tokens were spent. Lets cache hits and reasoning_level effects be
+/// checked from the logs.
+pub fn log_llm_token_breakdown(
+    provider: &str,
+    model: &str,
+    prompt_tokens: Option<u64>,
+    cached_tokens: Option<u64>,
+    thoughts_tokens: Option<u64>,
+) {
+    log(LogEntry {
+        id: uuid::Uuid::new_v4().to_string(),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        level: LogLevel::Info,
+        category: LogCategory::LlmCall,
+        component: "provider".into(),
+        message: format!(
+            "LLM tokens: {provider}/{model} prompt={} cached={} thoughts={}",
+            prompt_tokens.unwrap_or(0),
+            cached_tokens.unwrap_or(0),
+            thoughts_tokens.unwrap_or(0)
+        ),
+        details: serde_json::json!({
+            "provider": provider,
+            "model": model,
+            "prompt_tokens": prompt_tokens,
+            "cached_tokens": cached_tokens,
+            "thoughts_tokens": thoughts_tokens,
+        }),
+    });
+}
+
 /// Log an error from any component.
 pub fn log_error(component: &str, message: &str, details: serde_json::Value) {
     log(LogEntry {
