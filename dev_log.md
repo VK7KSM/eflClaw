@@ -6154,9 +6154,9 @@ K6 上在群里说一句 hello，输入 50,182 token、耗时 20.3 秒。用 Gem
 
 ### 根因
 
-在 K6 上直接运行 cf-crawler-win-x64.exe（0.3.1），stdout 有两行：第一行是 pino 的 info 日志，第二行是 `{"success":true,...}` 结果，但**第二行末尾是字面的反斜杠加 n（`}}\n` 这两个字符），不是换行符**。cf-crawler 源码 `C:\Dev\cf-crawler\src\cli\index.ts` 第 113–133 行（scrape-page/crawl/login 等主要命令）写的是 `` `${JSON.stringify(result)}\n` ``；health 命令和报错路径（第 98、145 行）用的是正确的 `\n`。
+在 K6 上直接运行 cf-crawler-win-x64.exe（0.3.1），stdout 有两行：第一行是 pino 的 info 日志，第二行是 `{"success":true,...}` 结果，但**第二行末尾是字面的反斜杠加 n（`}}\n` 这两个字符），不是换行符**。cf-crawler 源码 `C:\Dev\cf-crawler\src\cli\index.ts` 第 113–133 行（scrape-page/crawl/login 等主要命令）写的是 `` `${JSON.stringify(result)}\n` ``；只有 help 命令和报错路径（第 98、145 行）用的是正确的 `\n`（**更正**：最初这里误写成"health 也用了正确换行"，实际 health 也有这个问题）。
 
-`src/tools/cf_crawler.rs` 原来按整行解析 JSON，多出来的这两个字符让结果行解析失败，于是**每一次成功的抓取**都被当成"找不到结果"报错。health 和报错能正常解析，所以之前手动测 health 时没发现；原来的单元测试用的是手写的"干净"输出，也没覆盖到。
+`src/tools/cf_crawler.rs` 原来按整行解析 JSON，多出来的这两个字符让结果行解析失败，于是**每一次成功的抓取**都被当成"找不到结果"报错。只有报错路径能正常解析，而之前手动验证时恰好没连上 Worker、走的是报错路径，所以没发现；原来的单元测试用的是手写的"干净"输出，也没覆盖到。
 
 另外，15:30 的任务跑了两次：05:32（悉尼时间 15:32）我部署新版本时重启了 daemon，打断了正在执行的任务，新进程启动后按补跑逻辑又执行了一次。以后部署要避开新闻时段。
 
@@ -6178,3 +6178,13 @@ K6 上在群里说一句 hello，输入 50,182 token、耗时 20.3 秒。用 Gem
 - linux.do 和 SCMP 的 feed 虽然抓取"成功"，但返回的内容很少（几百字节），可能是被反爬挡住，或者 feed 本身为空。worker 会把它们记为成功，不会触发封禁。
 - `http_request` 请求 SCMP 时返回 301，没有自动跟随跳转（这次是 web_scrape 失败后的备用路径才走到它）。
 - cf-crawler 源码里的字面 `\n` 应该在 cf-crawler 项目里修掉；elfClaw 这边的解析已经兼容，不修也能正常用。
+
+
+---
+
+## 2026-09-24 — cf-crawler 源码同步修复字面 `\n`
+
+- 应用户要求，在 cf-crawler 仓库（`C:\Dev\cf-crawler`）修复了根因：`src/cli/index.ts` 里 8 处 `\\n` 改为 `\n`，本地提交 `ead4483`（**尚未推送**）。只提交了这一个文件和 cf-crawler 的 dev_log，仓库里原有的未提交改动（`worker/wrangler.toml`、`worker/homework/`）没有动。
+- 验证：`npm run check` 通过；用源码（tsx）和重新打包的 `release/cf-crawler-win-x64.exe`（sha256 前缀 `74d39cf3`，旧的是 `ff5cc31f`，和 K6 上的一致）分别跑 scrape-page 和 health，每一行都是完整 JSON、以换行结尾，结果都是成功。
+- **更正**：上一条记录说"health 命令用的是正确的换行"，这是错的，health 也有同样的问题，只有 help 和报错路径是对的。`src/tools/cf_crawler.rs` 的注释已同步更正。
+- elfClaw 的解析（e8514db60）保持兼容，新旧 exe 都能用。新 exe 还没部署到 K6（K6 当时正在系统更新重启）。

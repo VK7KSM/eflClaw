@@ -98,8 +98,10 @@ async fn run_cf_crawler(
 /// newline (`src/cli/index.ts`: `` `${JSON.stringify(result)}\\n` ``), so a
 /// whole-line parse rejected every *successful* scrape and the tool reported
 /// "执行失败（退出码 Some(0)）" — the news worker then hit loop detection after
-/// four such "failures" in a row. `health` and the error path use a real
-/// newline, which is why those kept working.
+/// four such "failures" in a row. Only `help` and the error path used a real
+/// newline, so failures parsed fine and successes did not. Fixed at the source
+/// in cf-crawler commit `ead4483`; this parser stays tolerant so older exes
+/// keep working.
 fn parse_result_line(stdout: &str) -> Option<Value> {
     stdout.lines().rev().find_map(|line| {
         let v = serde_json::Deserializer::from_str(line.trim())
