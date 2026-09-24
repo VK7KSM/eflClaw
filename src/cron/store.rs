@@ -341,10 +341,17 @@ pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<
 
     if let Some(schedule) = patch.schedule {
         let schedule = apply_default_tz(config, schedule);
-        validate_schedule(&schedule, Utc::now())?;
-        job.schedule = schedule;
-        job.expression = schedule_cron_expression(&job.schedule).unwrap_or_default();
-        schedule_changed = true;
+        // elfClaw 2026-09-24: only an actual change may recompute next_run.
+        // Re-submitting the same schedule (every reconcile tick, or a
+        // same-name cron_add) used to reset next_run to "next occurrence
+        // after now" — if that landed between a job coming due and the
+        // scheduler's next poll, the due run was silently skipped.
+        if schedule != job.schedule {
+            validate_schedule(&schedule, Utc::now())?;
+            job.schedule = schedule;
+            job.expression = schedule_cron_expression(&job.schedule).unwrap_or_default();
+            schedule_changed = true;
+        }
     }
     if let Some(command) = patch.command {
         job.command = command;
@@ -1090,5 +1097,71 @@ mod tests {
         let last_output = stored.last_output.as_deref().unwrap_or_default();
         assert!(last_output.ends_with(TRUNCATED_OUTPUT_MARKER));
         assert!(last_output.len() <= MAX_CRON_OUTPUT_BYTES);
+    }
+
+    #[test]
+    fn resubmitting_the_same_schedule_keeps_a_due_next_run() {
+        // elfClaw 2026-09-24: an identical schedule patch used to reset
+        // next_run to the next occurrence after now, skipping a run that was
+        // due but not yet picked up by the scheduler.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let schedule = Schedule::Cron {
+            expr: "0 8 * * *".into(),
+            tz: None,
+        };
+        let job = add_agent_job(
+            &config,
+            Some("daily".into()),
+            schedule.clone(),
+            "p",
+            SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        let due = Utc::now() - ChronoDuration::seconds(5);
+        with_connection(&config, |conn| {
+            conn.execute(
+                "UPDATE cron_jobs SET next_run = ?1 WHERE id = ?2",
+                params![due.to_rfc3339(), job.id],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let same = update_job(
+            &config,
+            &job.id,
+            CronJobPatch {
+                schedule: Some(schedule),
+                ..CronJobPatch::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            same.next_run.timestamp(),
+            due.timestamp(),
+            "due run must not be skipped"
+        );
+
+        let changed = update_job(
+            &config,
+            &job.id,
+            CronJobPatch {
+                schedule: Some(Schedule::Cron {
+                    expr: "0 9 * * *".into(),
+                    tz: None,
+                }),
+                ..CronJobPatch::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            changed.next_run > Utc::now(),
+            "a real change still recomputes next_run"
+        );
     }
 }

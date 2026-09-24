@@ -5977,3 +5977,14 @@ Step 2 起 daemon 心跳不再把 HEARTBEAT.md 整份发给模型读，只由代
 ### 部署文件
 
 `资料/SOUL.md` 里"日程安排、待办、提醒 → 用 note_add 记事（带到期时间的会到点自动提醒）"现在是真的了，无需再改。
+
+---
+
+## 2026-09-24 — 修复：心跳对账每小时误报"更新任务"，且可能跳过已到点的任务
+
+做 Step 10 第二部分设计时发现的 Step 2 遗留 bug，单独提交：
+
+1. **每小时一条无用 Telegram 消息**：`heartbeat_decl::reconcile()` 对每个已存在的声明任务都重新提交一遍，并把它们全部记为"已更新"；daemon 只要报告非空就发 "[心跳对账] ~ 更新任务: …" 到 Telegram。按现在 7 个任务、`interval_minutes = 60`，部署后会每小时收到一条列出全部任务的消息（之前没部署所以没暴露）。修复：任务的类型/时间/指令/推送/子 agent 都没变就跳过，不写库、不报告。
+2. **可能跳过到点任务**：`store::update_job` 只要补丁里带了 schedule，不管变没变都按"现在之后的下一次"重算 `next_run`。如果重算恰好发生在任务到点、调度器下一次轮询（15 秒）之前，这次运行就被推到下一个周期——被静默跳过。同名 `cron_add` 重复提交也会触发。修复：只有 schedule 真的变了才重新校验和计算 `next_run`。
+
+测试：`reconcile_reports_nothing_when_declarations_are_unchanged`、`resubmitting_the_same_schedule_keeps_a_due_next_run`（后者手动把 next_run 设成 5 秒前，同样的 schedule 再提交后 next_run 必须不变；真改时间仍会重算）。两个都先临时去掉修复确认失败，恢复后通过。全量单元测试 4044 passed，失败全是基线。

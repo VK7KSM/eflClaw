@@ -188,6 +188,21 @@ pub fn reconcile(
         });
         let existed_before = existing.is_some();
 
+        // elfClaw 2026-09-24: skip jobs that already match their declaration.
+        // Re-submitting them every tick reported every task as "updated", and
+        // the daemon forwards any non-empty report to Telegram — i.e. an
+        // hourly "[心跳对账] ~ 更新任务" message listing every task.
+        if let Some(job) = &existing {
+            let unchanged = job.job_type == cron::JobType::Agent
+                && job.schedule == cron::apply_default_tz(config, decl.schedule.clone())
+                && job.prompt.as_deref() == Some(decl.prompt.as_str())
+                && job.delivery == decl.delivery.clone().unwrap_or_default()
+                && job.delegate_to == decl.delegate_to;
+            if unchanged {
+                continue;
+            }
+        }
+
         // add_agent_job's update path treats `delegate_to: None` as "leave
         // unchanged", so dropping delegate_to from a block would otherwise
         // keep delegating forever. Recreate the job in that case.
@@ -599,5 +614,19 @@ delegate_to = "news_fetcher"
         let report = reconcile(&config, &[], false).unwrap();
         assert!(report.removed.is_empty());
         assert_eq!(cron::list_jobs(&config).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn reconcile_reports_nothing_when_declarations_are_unchanged() {
+        // Every hourly tick used to report every task as "updated", which the
+        // daemon forwarded to Telegram.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let decls = vec![news_decl(None)];
+        reconcile(&config, &decls, true).unwrap();
+
+        let again = reconcile(&config, &decls, true).unwrap();
+        assert_eq!(again.total_changes(), 0, "{again:?}");
+        assert!(again.errors.is_empty());
     }
 }
