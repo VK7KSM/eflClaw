@@ -6028,3 +6028,47 @@ Step 9 的做法是"agent 直接编辑 HEARTBEAT_DATA.md"。审核时发现它�
 - `news_schedule`（4 个）、`news_report`（2 个）：从工具调用一直验证到定时任务的实际状态（同名更新不重复、改源后指令立即更新、违反规则时什么都不改、第三次失败后源从任务指令里消失、候选源去重和日期）。
 - **真实部署文件端到端（临时测试，已删除）**：读取真实 `资料/config.toml`、`HEARTBEAT.md`、`HEARTBEAT_DATA.toml`——配置校验通过；数据文件读出再写回完全一致；对账建出 7 个任务（6 个 `news:` + `heartbeat:新闻源搜索`），悉尼时间、子 agent、推送对象全部正确；重复对账零变化；生成的早报任务指令内容正确。
 - 全量：`cargo test --lib` 4065 passed，失败全是基线；集成测试 230/3（预置）；clippy 206（新代码零问题，包括新文件）。
+
+---
+
+## 2026-09-24 — K6 Workspace 实例全新部署 + 对话验收
+
+### 部署
+
+- 本机按 release profile 编译（基于 8fe812267），zeroclaw.exe 27.8MB，上传到 K6。
+- 旧目录 `C:\dev\elfClaw\ZeroClaw_Workspace` 先改名留作参照，验收通过后已**整个删除**；新实例只从旧实例带过来 `.secret_key`（config 里的加密值要靠它解密）、`workspace\tools\`（cf-crawler、github-mcp-server）、`workspace\skills\`（10 个技能，cf-crawler 换成新版）。数据库（jobs.db、brain.db、日志、skills.db 等）一律不带，由程序重建。
+- 计划任务：`elfClaw_Skynet` **禁用**（不是删除，需要时可重新启用）；`elfClaw_Workspace` 保留开机自启。
+- 配置文件来源：
+  - `config.toml`、`SOUL.md`、`HEARTBEAT.md`、`HEARTBEAT_DATA.toml`、`workers/news_fetcher.md` 取自 `资料/`；
+  - `USER.md`、`MEMORY.md`、`BOOTSTRAP.md` 取自旧 Workspace 原版；
+  - `AGENTS.md` 用资料版，另加入旧 K6 版里"开场读 TOOLS.md"的两处；
+  - `TOOLS.md`、`IDENTITY.md` 用旧 K6 版，改掉已不存在的工具条目。
+
+### 部署时发现并修掉的问题
+
+- **TOOLS.md 不是定时扫描任务**：它的"已安装 Skills"表第一列，是代码解析出的技能启用白名单（`src/skills/mod.rs` 的 `parse_allowed_from_tools_md`），系统里没有任何扫描技能库的定时任务。旧 jobs.db 里只有 22 个新闻任务（大量重复），旧 HEARTBEAT.md 也没有扫描任务。10 个技能和白名单一一对应。另外删掉了残留的 skills.db。
+- TOOLS.md / IDENTITY.md 里还在介绍已删除的 `shell`、`process`、`schedule`、`web_search`、各类改配置工具；cron_add 的参数写法也是旧的。已改为现有工具的正确用法（cron 按 name 去重，受管前缀不能删改，另外补上 note/news_schedule）。`scientific-tools` 技能标注为"只能参考"，因为现在没有运行 Python 的途径。
+- `skills/cf-crawler/SKILL.md` 和 `workers/news_fetcher.md` 用的是 `json_input` 写法（原本是 shell 时代的），改为原生工具的扁平参数写法。
+- `start_bot.vbs` 没有设置工作目录，config 里 MCP server 的相对路径 `workspace/tools/github-mcp-server.exe` 会找不到。已加上 `WshShell.CurrentDirectory`。
+- `config.toml` 的 `allowed_roots` 还是 K3 的 `D:\ZeroClaw_Workspace\homework`，改为 `[]`（homework 本来就在 workspace 里）。
+
+### 密钥核对（只验可用性，不输出明文；临时测试已删除）
+
+- Telegram bot_token：能解密，getMe 返回 200。
+- 网关 paired_tokens：能解密，存的是 SHA-256 哈希，只有原先配对过的设备能用。
+- Brave 搜索 key：返回 200。
+- Gemini 主 key：返回 200。
+
+### 对话验收（通过 `zeroclaw agent -m`，使用和 daemon 相同的配置与数据库）
+
+- daemon_state 显示各组件全部正常（telegram、email、xiaozhi、gateway、scheduler、heartbeat）；启动对账建出 7 个任务（6 个 `news:` 和 `heartbeat:新闻源搜索`）。
+- 人设对话正常。3.8/3.7-flash 返回 503，自动降级到 3.6-flash，单轮约 100 秒；每轮输入约 3.9 万 token。
+- `news_schedule list` 正确列出 6 个时段。
+- `note_add` 带 due_at 时建出 `note:<id>` 一次性任务，到点由代码直接发到 Telegram（Cron completed，不调用模型），发完任务自动删除。
+- 连续两次让它"每天晚上 8 点提醒我喝水"：第二次日志显示 `Cron dedup: updating existing message job`，最终只有 1 个任务。
+- "取消喝水提醒 + 把科技AI 时段改到 09:45"：同一轮里 cron_remove 删掉提醒；news_schedule 修改时段，走的是 `Cron dedup_update: news:科技AI`，没有新建任务；数据文件只改动了这一行。验收后已把时间恢复成 09:30（下次心跳对账时会同步任务）。
+
+### 遗留（不影响运行）
+
+- config 里 `[agents_ipc]`、`[economic]` 是本版本不认识的配置段，启动时会有 Unknown config 警告。
+- `api_keys` 为空，目前只有一个 Gemini key，没有多 key 轮换。
