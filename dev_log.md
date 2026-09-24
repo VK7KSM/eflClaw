@@ -6143,3 +6143,38 @@ K6 上在群里说一句 hello，输入 50,182 token、耗时 20.3 秒。用 Gem
   - 中文报错文案。
 - 变异验证：去掉"503 跳过同模型其他 key"那一行后，对应测试失败；恢复后通过。
 - 全量结果：`cargo test --lib` 4082 通过，10 个失败全部是已知基线；集成测试 230 通过、3 个失败（已知基线）；clippy 用 git blame 逐行核对，新增 0；fmt 只作用于本次改动的文件。
+
+---
+
+## 2026-09-24 — 修复 web_scrape 每次成功抓取都被当成失败（新闻任务触发循环检测）
+
+### 现象
+
+15:30 的"中国亚太"新闻任务把一段循环检测报错发到了 Telegram："web_scrape 连续失败 4 次"，并且"已达到工具调用上限（15 次）"。日志显示，每一次 `web_scrape` 都报"cf-crawler scrape-page 执行失败（退出码 Some(0)）"——程序正常退出了，却被判定为失败。
+
+### 根因
+
+在 K6 上直接运行 cf-crawler-win-x64.exe（0.3.1），stdout 有两行：第一行是 pino 的 info 日志，第二行是 `{"success":true,...}` 结果，但**第二行末尾是字面的反斜杠加 n（`}}\n` 这两个字符），不是换行符**。cf-crawler 源码 `C:\Dev\cf-crawler\src\cli\index.ts` 第 113–133 行（scrape-page/crawl/login 等主要命令）写的是 `` `${JSON.stringify(result)}\n` ``；health 命令和报错路径（第 98、145 行）用的是正确的 `\n`。
+
+`src/tools/cf_crawler.rs` 原来按整行解析 JSON，多出来的这两个字符让结果行解析失败，于是**每一次成功的抓取**都被当成"找不到结果"报错。health 和报错能正常解析，所以之前手动测 health 时没发现；原来的单元测试用的是手写的"干净"输出，也没覆盖到。
+
+另外，15:30 的任务跑了两次：05:32（悉尼时间 15:32）我部署新版本时重启了 daemon，打断了正在执行的任务，新进程启动后按补跑逻辑又执行了一次。以后部署要避开新闻时段。
+
+### 改动
+
+- `src/tools/cf_crawler.rs`：把解析抽成 `parse_result_line()`，每一行只用 `serde_json::Deserializer::into_iter` 取开头的第一个 JSON 值，后面多出来的字符忽略；其他逻辑不变（从最后一行往前找、带 `success`/`ok` 字段的才算结果）。
+
+### 验证
+
+- 新增 2 个测试：
+  - 用 K6 上抓到的真实输出格式（pino 日志行 + 末尾带字面 `\n` 的结果行）验证能解析出 `success:true`；
+  - 干净输出、只有日志行、非 JSON、空输出这几种情况照旧处理。
+- 变异验证：换回整行解析，第一个测试失败；恢复后通过。
+- 端到端（临时测试，已删除）：用 K6 上的真实 exe 和真实 Worker 通过 `WebScrapeTool` 抓 V2EX（拿到 14KB 内容）和 linux.do 的 RSS，都返回成功。
+- `cargo test --lib` 4084 通过，10 个失败全部是已知基线；clippy 新增 0。
+
+### 遗留（数据质量，不是这次的 bug）
+
+- linux.do 和 SCMP 的 feed 虽然抓取"成功"，但返回的内容很少（几百字节），可能是被反爬挡住，或者 feed 本身为空。worker 会把它们记为成功，不会触发封禁。
+- `http_request` 请求 SCMP 时返回 301，没有自动跟随跳转（这次是 web_scrape 失败后的备用路径才走到它）。
+- cf-crawler 源码里的字面 `\n` 应该在 cf-crawler 项目里修掉；elfClaw 这边的解析已经兼容，不修也能正常用。

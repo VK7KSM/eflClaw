@@ -68,23 +68,7 @@ async fn run_cf_crawler(
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    // cf-crawler's CLI always writes its final structured result as a JSON
-    // object on stdout — but on failure it first writes a pino logger line
-    // (`{"level":50,...,"msg":"command failed"}`) to stdout too (verified by
-    // running cf-crawler-win-x64.exe locally with no Worker reachable), so
-    // stdout can contain more than one JSON line. Scan from the last line
-    // backwards for the first one that looks like a result object (has a
-    // "success" or "ok" field — pino log lines never do).
-    let result_line = stdout.lines().rev().find_map(|line| {
-        let v: Value = serde_json::from_str(line.trim()).ok()?;
-        if v.get("success").is_some() || v.get("ok").is_some() {
-            Some(v)
-        } else {
-            None
-        }
-    });
-
-    match result_line {
+    match parse_result_line(&stdout) {
         Some(v) => Ok(v),
         None => {
             let detail = if stderr.trim().is_empty() {
@@ -98,6 +82,36 @@ async fn run_cf_crawler(
             );
         }
     }
+}
+
+/// Find cf-crawler's structured result in its stdout.
+///
+/// cf-crawler's CLI writes its final result as a JSON object on stdout, but
+/// it also writes pino logger lines (`{"level":30,...,"msg":"scrape-page
+/// completed"}`) to stdout, so stdout holds more than one JSON line. Scan from
+/// the last line backwards for the first one that looks like a result object
+/// (has a "success" or "ok" field — pino log lines never do).
+///
+/// elfClaw 2026-09-24: only the leading JSON value of each line is parsed and
+/// anything after it is ignored. cf-crawler 0.3.x ends the result line of
+/// scrape-page/crawl/login with a literal backslash + `n` instead of a
+/// newline (`src/cli/index.ts`: `` `${JSON.stringify(result)}\\n` ``), so a
+/// whole-line parse rejected every *successful* scrape and the tool reported
+/// "执行失败（退出码 Some(0)）" — the news worker then hit loop detection after
+/// four such "failures" in a row. `health` and the error path use a real
+/// newline, which is why those kept working.
+fn parse_result_line(stdout: &str) -> Option<Value> {
+    stdout.lines().rev().find_map(|line| {
+        let v = serde_json::Deserializer::from_str(line.trim())
+            .into_iter::<Value>()
+            .next()?
+            .ok()?;
+        if v.get("success").is_some() || v.get("ok").is_some() {
+            Some(v)
+        } else {
+            None
+        }
+    })
 }
 
 /// Convert a parsed cf-crawler JSON response into a ToolResult.
@@ -476,6 +490,40 @@ mod tests {
         let tool = WebHealthTool::new(test_security(dir.path().to_path_buf()));
         let err = tool.execute(json!({})).await.unwrap_err();
         assert!(err.to_string().contains("未安装"));
+    }
+
+    #[test]
+    fn parse_result_line_accepts_literal_backslash_n_after_json() {
+        // Exact shape captured from cf-crawler-win-x64.exe 0.3.1 on K6
+        // (scrape-page, exit code 0): pino info line, then the result line
+        // terminated by the two characters `\` `n`.
+        let stdout = concat!(
+            r#"{"level":30,"time":1790228889563,"pid":6184,"hostname":"K6","name":"cf-crawler","url":"https://www.v2ex.com/index.xml","strategy":"edge_fetch","msg":"scrape-page completed"}"#,
+            "\n",
+            r#"{"success":true,"strategy_used":"edge_fetch","final_url":"https://www.v2ex.com/index.xml","title":"V2EX","markdown":"line one\nline two","meta":{"retries":0,"cache_hit":false}}\n"#,
+        );
+        let v = parse_result_line(stdout).expect("result line should parse");
+        assert_eq!(v["success"], json!(true));
+        assert_eq!(v["title"], json!("V2EX"));
+        assert_eq!(v["markdown"], json!("line one\nline two"));
+        let result = result_from_json(v);
+        assert!(result.success);
+    }
+
+    #[test]
+    fn parse_result_line_still_handles_clean_output_and_ignores_log_lines() {
+        let stdout = concat!(
+            r#"{"level":50,"msg":"command failed"}"#,
+            "\n",
+            r#"{"success":false,"error":"ECONNREFUSED"}"#,
+            "\n",
+        );
+        let v = parse_result_line(stdout).unwrap();
+        assert_eq!(v["success"], json!(false));
+
+        assert!(parse_result_line(r#"{"level":30,"msg":"only a log line"}"#).is_none());
+        assert!(parse_result_line("not json at all").is_none());
+        assert!(parse_result_line("").is_none());
     }
 
     // elfClaw: local-only manual verification against the real exe. Ignored by
