@@ -5897,3 +5897,42 @@ src/agent/loop_/parsing.rs 的 map_tool_name_alias()：曾把 "shell" | "bash" |
 ### ⚠️ K6 手动同步
 
 清单同上一条（`config.toml`、`skills/cf-crawler/SKILL.toml`、`workers/news_fetcher.md`、`AGENTS.md`、`TOOLS.md`、`SOUL.md`），本次 `AGENTS.md`/`TOOLS.md`/`SOUL.md`/`config.toml` 内容又有更新，以本地最新版为准。
+
+---
+
+## 2026-09-24 — Step 9：HEARTBEAT.md 迁移到声明式格式 + 新闻源挪进 HEARTBEAT_DATA.md
+
+### 为什么必须做
+
+Step 2 起 daemon 心跳不再把 HEARTBEAT.md 整份发给模型读，只由代码 `heartbeat_decl::reconcile()` 解析 `heartbeat-task` 声明块。真实的 `资料/HEARTBEAT.md` 是纯文字（RSS 清单 + 给 news_fetcher 的自然语言指令），一个声明块都没有——不迁移的话，新版装到 K6 上**一条新闻都不会推送**。
+
+用户决定 K6 两个实例全新重装、旧数据全部不要，所以不需要清理旧 `jobs.db` 里 AI 以前建的 22 个（含 7 个重复）旧任务。
+
+### 代码改动（`src/cron/heartbeat_decl.rs`）
+
+- `HeartbeatTaskDecl` 新增可选字段 `delegate_to`，原样传给 `cron::add_agent_job`（该函数本来就支持）。调度器 `run_agent_job` 对设了 `delegate_to` 的任务直接以该子 agent 身份运行（用它的 `allowed_tools`/`max_iterations`），不经过主 agent 中转。
+- 校验 1：`delegate_to` 指定的 agent 不在 `[agents]` 里 → 报错并跳过。原因：调度器找不到 agent 配置时会让任务**带着全部工具**运行，等于悄悄放大权限。
+- 校验 2：从声明里删掉 `delegate_to` 时先删旧任务再重建。原因：`add_agent_job` 的同名更新补丁里 `None` 表示"不改"，否则旧任务会一直转交子 agent。
+- 新增 4 个测试：`parses_delegate_to_field`、`reconcile_passes_delegate_to_through_to_the_job`、`reconcile_skips_unknown_delegate_agent`、`reconcile_clears_delegate_to_when_removed_from_block`。后两个先临时去掉对应逻辑确认会失败，恢复后通过。
+
+### 部署文件（`资料/`，gitignore，旧版已备份到本机临时目录）
+
+- **`HEARTBEAT.md`（agent 只读）**：重写为 7 个声明块——06:30 早报综合、09:30 科技AI、12:30 军事无人机、15:30 中国亚太、18:30 无线电Maker、21:30 金融澳洲、每天 10:00/22:00 新闻源搜索；全部 `tz = "Australia/Sydney"`、`delegate_to = "news_fetcher"`、推送到 Telegram 495916105。每个任务的 prompt 只写本时段名和关注重点，通用规则（抓取流程、语言、突发、格式、去重）不再在每个 prompt 里重复，统一放在工作手册。文件里写死了「HEARTBEAT_DATA.md 约定」：只能有四节，各节谁改、能改什么（时段下可增删源，不能增删改名时段；封禁记录由 worker 维护；死源表只追加；候选源不会被抓取）。约定不做代码校验——没有代码解析 HEARTBEAT_DATA.md，写错不会导致程序报错。
+  - 注意：说明文字里不能出现 `<!-- heartbeat-task` 原样字符串，解析器会把它当成声明块开头（写第一版时踩到，已改写法）。
+- **`HEARTBEAT_DATA.md`（新建，agent 可改）**：四节——时段源清单（6 个时段的源原样搬过来，含早报的天气接口）、封禁/观察中的源（原 `homework/news/ban_list.md` 的职能）、已踢掉的死源（原 HEARTBEAT.md 的死源表）、候选新源（原 `资料/news_sources.md` 的候选源并入，去掉了已在时段清单里的重复项）。
+- **`workers/news_fetcher.md`**：第 1 步改为从 HEARTBEAT_DATA.md 读本时段的源、跳过已封禁的；新增第 6 步把失败的源写回 HEARTBEAT_DATA.md「封禁/观察中的源」；**最终回复就是推送内容**，不再调 `send_telegram`、不再写给主 agent 的执行报告（删掉"报告里列出每个源用了哪个工具"这条——没有主 agent 读报告了，这条已无意义；"禁止凭记忆生成新闻"等防幻觉规则保留）；写权限说明改为 `homework/` + HEARTBEAT_DATA.md。
+- **`AGENTS.md`**：委派规则改为"worker 返回的就是新闻消息，直接转给爸爸"；说明每天的定时新闻由 HEARTBEAT.md 定义，不要用 `cron_add` 再建一遍；要增减源改 HEARTBEAT_DATA.md，改时间告诉爸爸。
+- **`config.toml`**：`[agents.news_fetcher].allowed_tools` 去掉 `send_telegram`（调度器规定子 agent 的最终回复由系统推送，留着会重复推送），加上 `file_write`（**现存 bug**：手册一直要求写 `homework/news/日期.md` 去重，但从没有这个权限）。
+
+### 行为变化（需要用户知道）
+
+- 以前：主 agent 读完 worker 报告后再发一句"一句话评价"。现在没有这一步，推送的就是新闻本身；封禁源信息在新闻消息最后一行「⚠️ 源状态」里。
+
+### 验证
+
+- 临时测试（在 `heartbeat_decl.rs` 测试模块里，读取真实 `资料/config.toml` + `资料/HEARTBEAT.md`，跑完已删除）：配置 `validate()` 通过；解析出 7 个任务、零错误；对账建出 7 个任务、再对账零新增；每个任务的悉尼本地下次运行时间正确（06:30/09:30/12:30/15:30/18:30/21:30/10:00 或 22:00）、`delegate_to = news_fetcher`、推送到 telegram 495916105；每个时段在 HEARTBEAT_DATA.md 都有同名源清单。
+- `cargo test --lib`：4025 passed（+4 新测试），失败与基线相同（外加那个已知的偶发计时测试）；集成测试 230 passed / 3 failed（预置）；clippy 206，新改动行上无报错。
+
+### 全新部署到 K6 时要放进每个实例 `workspace\` 的文件
+
+`AGENTS.md`、`SOUL.md`、`TOOLS.md`、`USER.md`、`IDENTITY.md`、`MEMORY.md`、`HEARTBEAT.md`、`HEARTBEAT_DATA.md`、`workers/news_fetcher.md`、`skills/`（含 `cf-crawler/SKILL.toml`）、`tools/cf-crawler-win-x64.exe` 等；实例根目录放新编译的 `zeroclaw.exe` 和 `config.toml`。**不要再放** `news_sources.md`、`homework/news/ban_list.md`（已并入 HEARTBEAT_DATA.md）。具体部署步骤（含 `.secret_key` 与加密密钥的处理、两个实例配置差异、BOOTSTRAP.md 要不要放）部署前再和用户确认。

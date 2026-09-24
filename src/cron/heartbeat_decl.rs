@@ -33,6 +33,11 @@
 //! [`crate::cron::DeliveryConfig`] types the `cron_add` tool already accepts
 //! — same TOML shape as their JSON shape, just TOML instead of JSON.
 //!
+//! Optional `delegate_to = "<agent>"` runs the task directly as that
+//! `[agents.<agent>]` sub-agent (its own `allowed_tools`/`max_iterations`),
+//! skipping the main agent. The name must exist in config — the scheduler
+//! would otherwise fall back to running with every tool.
+//!
 //! Declared jobs are stored with their name prefixed `heartbeat:` (e.g.
 //! `heartbeat:早报综合`) so reconciliation can always tell a
 //! HEARTBEAT.md-managed job apart from one a user asked the chat agent to
@@ -62,6 +67,8 @@ pub struct HeartbeatTaskDecl {
     pub prompt: String,
     #[serde(default)]
     pub delivery: Option<DeliveryConfig>,
+    #[serde(default)]
+    pub delegate_to: Option<String>,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -157,13 +164,35 @@ pub fn reconcile(config: &Config, declared: &[HeartbeatTaskDecl]) -> Result<Reco
             }
         }
 
-        let existed_before = cron::list_jobs(config)
-            .ok()
-            .map(|jobs| {
-                jobs.iter()
-                    .any(|j| j.name.as_deref() == Some(managed_name.as_str()))
-            })
-            .unwrap_or(false);
+        if let Some(agent) = decl.delegate_to.as_deref() {
+            if !config.agents.contains_key(agent) {
+                report.errors.push(format!(
+                    "heartbeat-task '{}': delegate_to agent '{agent}' is not defined in [agents]; skipped",
+                    decl.name
+                ));
+                continue;
+            }
+        }
+
+        let existing = cron::list_jobs(config).ok().and_then(|jobs| {
+            jobs.into_iter()
+                .find(|j| j.name.as_deref() == Some(managed_name.as_str()))
+        });
+        let existed_before = existing.is_some();
+
+        // add_agent_job's update path treats `delegate_to: None` as "leave
+        // unchanged", so dropping delegate_to from a block would otherwise
+        // keep delegating forever. Recreate the job in that case.
+        if let Some(job) = &existing {
+            if job.delegate_to.is_some() && decl.delegate_to.is_none() {
+                if let Err(e) = cron::remove_job(config, &job.id) {
+                    report
+                        .errors
+                        .push(format!("heartbeat-task '{}': {e}", decl.name));
+                    continue;
+                }
+            }
+        }
 
         match cron::add_agent_job(
             config,
@@ -174,7 +203,7 @@ pub fn reconcile(config: &Config, declared: &[HeartbeatTaskDecl]) -> Result<Reco
             None,
             decl.delivery.clone(),
             false,
-            None,
+            decl.delegate_to.clone(),
         ) {
             Ok(_job) => {
                 if existed_before {
@@ -359,6 +388,7 @@ prompt = "Second"
             },
             prompt: "Summarize the news".into(),
             delivery: None,
+            delegate_to: None,
         }];
 
         let report = reconcile(&config, &decls).unwrap();
@@ -382,6 +412,7 @@ prompt = "Second"
             },
             prompt: "v1".into(),
             delivery: None,
+            delegate_to: None,
         }];
         reconcile(&config, &decls).unwrap();
 
@@ -393,6 +424,7 @@ prompt = "Second"
             },
             prompt: "v2".into(),
             delivery: None,
+            delegate_to: None,
         }];
         let report = reconcile(&config, &decls_v2).unwrap();
         assert_eq!(report.updated, vec!["morning-news"]);
@@ -420,6 +452,7 @@ prompt = "Second"
             },
             prompt: "temp".into(),
             delivery: None,
+            delegate_to: None,
         }];
         reconcile(&config, &decls).unwrap();
         assert_eq!(cron::list_jobs(&config).unwrap().len(), 1);
@@ -455,6 +488,77 @@ prompt = "Second"
         assert_eq!(cron::list_jobs(&config).unwrap().len(), 1);
     }
 
+    fn with_news_fetcher_agent(mut config: Config) -> Config {
+        let agent: crate::config::DelegateAgentConfig =
+            toml::from_str(r#"allowed_tools = ["file_read"]"#).unwrap();
+        config.agents.insert("news_fetcher".into(), agent);
+        config
+    }
+
+    fn news_decl(delegate_to: Option<&str>) -> HeartbeatTaskDecl {
+        HeartbeatTaskDecl {
+            name: "morning-news".into(),
+            schedule: Schedule::Cron {
+                expr: "30 6 * * *".into(),
+                tz: None,
+            },
+            prompt: "fetch".into(),
+            delivery: None,
+            delegate_to: delegate_to.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn parses_delegate_to_field() {
+        let content = r#"
+<!-- heartbeat-task
+name = "news"
+schedule = { kind = "cron", expr = "30 6 * * *" }
+prompt = "fetch"
+delegate_to = "news_fetcher"
+-->
+"#;
+        let (decls, errors) = parse_heartbeat_task_declarations(content);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(decls[0].delegate_to.as_deref(), Some("news_fetcher"));
+    }
+
+    #[tokio::test]
+    async fn reconcile_passes_delegate_to_through_to_the_job() {
+        let tmp = TempDir::new().unwrap();
+        let config = with_news_fetcher_agent(test_config(&tmp).await);
+
+        let report = reconcile(&config, &[news_decl(Some("news_fetcher"))]).unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        let jobs = cron::list_jobs(&config).unwrap();
+        assert_eq!(jobs[0].delegate_to.as_deref(), Some("news_fetcher"));
+    }
+
+    #[tokio::test]
+    async fn reconcile_skips_unknown_delegate_agent() {
+        // The scheduler runs an unknown delegate_to agent with *every* tool,
+        // so an undefined name must never reach the jobs table.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+
+        let report = reconcile(&config, &[news_decl(Some("no_such_agent"))]).unwrap();
+        assert!(report.created.is_empty());
+        assert!(report.errors.iter().any(|e| e.contains("no_such_agent")));
+        assert!(cron::list_jobs(&config).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn reconcile_clears_delegate_to_when_removed_from_block() {
+        let tmp = TempDir::new().unwrap();
+        let config = with_news_fetcher_agent(test_config(&tmp).await);
+        reconcile(&config, &[news_decl(Some("news_fetcher"))]).unwrap();
+
+        reconcile(&config, &[news_decl(None)]).unwrap();
+        let jobs = cron::list_jobs(&config).unwrap();
+        assert_eq!(jobs.len(), 1, "must not leave a duplicate behind");
+        assert_eq!(jobs[0].delegate_to, None);
+    }
+
     #[tokio::test]
     async fn reconcile_rejects_every_schedule_below_minimum_interval() {
         let tmp = TempDir::new().unwrap();
@@ -464,6 +568,7 @@ prompt = "Second"
             schedule: Schedule::Every { every_ms: 1_000 },
             prompt: "spam".into(),
             delivery: None,
+            delegate_to: None,
         }];
 
         let report = reconcile(&config, &decls).unwrap();

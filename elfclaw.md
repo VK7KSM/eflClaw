@@ -65,6 +65,10 @@ elfClaw 最大的优势——**运行几乎不占系统资源**——是三者�
      上述 5 个 `*_config`，外加 `switch_provider`（切换默认模型/提供商）、`manage_auth_profile`（切换账号
      配置）、`openclaw_migration`（合并外部配置）。只读的 `check_provider_quota`/`estimate_quota_cost` 保留。
      子 agent 工具（`delegate`/`subagent_spawn`）只接受 agent 名字，模型由配置决定，agent 选不了，无需改动。
+   **2026-09-24 完成 HEARTBEAT.md 迁移（Step 9）**：真实 `资料/HEARTBEAT.md` 改成 7 个 `heartbeat-task` 声明块
+   （6 个新闻时段 + 新闻源搜索），新闻源全部挪进 `资料/HEARTBEAT_DATA.md`；HEARTBEAT.md 里写死了
+   "HEARTBEAT_DATA.md 约定"（四节结构、各节谁改、能改什么）。约定**不做代码校验**：没有任何代码解析
+   HEARTBEAT_DATA.md，写错了最多影响某个时段抓哪些源，不会让程序报错——按"只拦会导致不稳定的"原则不需要。
 5. **审批不是安全边界，能力收窄才是。** 把危险能力从模型手里拿掉之后，大部分工具可以免审批；只留 `send_email` 这类真正对外的动作需要确认。
 6. **约束弱模型的 prompt，只在对应代码保证做好之后才删。** 不是先删 prompt 再补代码，是反过来。
 7. **不要教 AI"应该做什么"，而要让它做不了不该做的事。** 这条是前 6 条的总纲。
@@ -338,6 +342,26 @@ gemini-3.5-flash: key A → key B → ...
   **本轮所有步骤此前只跑了 `cargo test --lib`，集成测试（`tests/` 下 24 个）一直没跑过**。这次补跑：230 通过，
   3 个失败（`agent_loop_robustness` 的循环检测测试，期望旧版的报错行为，而 2026-03 起 elfClaw 改成返回友好提示
   文字——早于本轮、与本轮无关，未修）。
+
+- **Step 9（已完成，2026-09-24）**：HEARTBEAT.md 迁移到声明式格式（第 3 节第 4 条）。
+  - **为什么必须做**：Step 2 起心跳不再把 HEARTBEAT.md 发给模型读，只由代码解析声明块；而真实的 HEARTBEAT.md
+    是纯文字、一个声明块都没有——不迁移的话，新版装上后**一条新闻都不会推送**。
+  - **代码**：`heartbeat_decl.rs` 的声明格式新增可选字段 `delegate_to`，任务由调度器直接交给对应子 agent 执行
+    （跳过主 agent 中转，调度器注释里记录这能省约 5.5 万 token 和两次模型调用）。两道校验：agent 名不在
+    `[agents]` 里就报错跳过（否则调度器会让任务带着**全部工具**跑）；从声明里删掉 `delegate_to` 时重建任务
+    （否则更新补丁会保留旧值）。新增 4 个测试，后两个先去掉对应逻辑确认会失败。
+  - **部署文件**：`HEARTBEAT.md`（7 个任务：06:30 早报综合、09:30 科技AI、12:30 军事无人机、15:30 中国亚太、
+    18:30 无线电Maker、21:30 金融澳洲，每天 10:00/22:00 新闻源搜索；全部 `delegate_to = "news_fetcher"`，
+    推送到 Telegram 495916105）；新建 `HEARTBEAT_DATA.md`（时段源清单、封禁/观察中的源、已踢掉的死源、
+    候选新源——原 `news_sources.md` 的候选源并入这里，原 `homework/news/ban_list.md` 的封禁记录改写到这里）；
+    `workers/news_fetcher.md` 改为从 HEARTBEAT_DATA.md 读源、最终回复即推送内容、不再调 `send_telegram`；
+    `AGENTS.md` 委派规则同步；`config.toml` 里 `news_fetcher` 的工具去掉 `send_telegram`（留着会重复推送）、
+    加上 `file_write`（**现存 bug**：手册要求写新闻文件去重和记录封禁，但一直没有这个权限）。
+  - **行为变化**：以前主 agent 读完 worker 报告会再发一句"评价"，现在没有这一步了，推送的就是新闻本身；
+    封禁源信息放在新闻消息最后一行的「⚠️ 源状态」里。
+  - **验证**：临时测试直接读取真实 `资料/config.toml` 和 `资料/HEARTBEAT.md` 跑对账——配置通过校验，7 个任务
+    全部建出、零错误、重复对账不新增，每个任务的悉尼本地时间、子 agent、推送对象都正确，每个时段在
+    HEARTBEAT_DATA.md 都有对应源清单（测试已删除）。
 
 ## 11. 已发现、暂缓到对应 Step 修复的安全问题
 
