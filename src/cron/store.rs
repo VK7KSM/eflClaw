@@ -44,6 +44,18 @@ pub fn add_job(config: &Config, expression: &str, command: &str) -> Result<CronJ
 }
 
 // elfClaw: find an existing job by name for idempotent deduplication
+/// elfClaw 2026-09-24: serializes every "look up by name, then insert or
+/// update" sequence. Tool calls from one LLM response run in parallel, so two
+/// concurrent `cron_add` calls with the same name could both see "not found"
+/// and both insert — the root of "one request created several copies".
+/// Reentrant so a caller (e.g. the `cron_add` duplicate check) can hold it
+/// across its own check and the `add_*_job` call that locks it again.
+static JOB_WRITE_LOCK: parking_lot::ReentrantMutex<()> = parking_lot::const_reentrant_mutex(());
+
+pub fn job_write_lock() -> parking_lot::ReentrantMutexGuard<'static, ()> {
+    JOB_WRITE_LOCK.lock()
+}
+
 pub fn find_job_by_name(config: &Config, name: &str) -> Result<Option<CronJob>> {
     with_connection(config, |conn| {
         let mut stmt = conn.prepare(
@@ -73,6 +85,7 @@ pub fn add_agent_job(
     delete_after_run: bool,
     delegate_to: Option<String>,
 ) -> Result<CronJob> {
+    let _write_guard = job_write_lock();
     // elfClaw 2026-09-23: resolve a missing tz to config.cron.default_tz before
     // anything else touches `schedule` — the dedup-update branch below reuses
     // this same value, so both the create and update paths get the default
@@ -166,6 +179,7 @@ pub fn add_message_job(
     delivery: Option<DeliveryConfig>,
     delete_after_run: bool,
 ) -> Result<CronJob> {
+    let _write_guard = job_write_lock();
     let schedule = apply_default_tz(config, schedule);
 
     // elfClaw: idempotent dedup — if a job with the same name already exists, update it
@@ -284,6 +298,17 @@ pub fn remove_job(config: &Config, id: &str) -> Result<()> {
 
     println!("✅ Removed cron job {id}");
     Ok(())
+}
+
+/// Remove every job carrying exactly this name; returns how many were removed.
+/// elfClaw 2026-09-24: `remove_job` takes one id, so when duplicates existed
+/// the agent removed one and the others kept firing.
+pub fn remove_jobs_by_name(config: &Config, name: &str) -> Result<usize> {
+    let _write_guard = job_write_lock();
+    with_connection(config, |conn| {
+        conn.execute("DELETE FROM cron_jobs WHERE name = ?1", params![name])
+            .context("Failed to delete cron jobs by name")
+    })
 }
 
 pub fn due_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {

@@ -143,10 +143,18 @@ pub fn parse_heartbeat_task_declarations(content: &str) -> (Vec<HeartbeatTaskDec
 }
 
 /// Reconcile the cron jobs table against `declared`: create any missing
-/// job, update any that changed, and remove any `heartbeat:`-managed job
-/// that is no longer declared. Idempotent — safe to call on every heartbeat
-/// tick and at daemon startup.
-pub fn reconcile(config: &Config, declared: &[HeartbeatTaskDecl]) -> Result<ReconcileReport> {
+/// job, update any that changed, and (when `remove_stale`) remove any
+/// `heartbeat:`-managed job that is no longer declared. Idempotent — safe to
+/// call on every heartbeat tick and at daemon startup.
+///
+/// elfClaw 2026-09-24: callers pass `remove_stale = false` whenever the file
+/// had parse errors — an unparseable block has no name, so its job would
+/// otherwise look "no longer declared" and be deleted by a single typo.
+pub fn reconcile(
+    config: &Config,
+    declared: &[HeartbeatTaskDecl],
+    remove_stale: bool,
+) -> Result<ReconcileReport> {
     let mut report = ReconcileReport::default();
     let mut declared_managed_names: HashSet<String> = HashSet::new();
 
@@ -216,6 +224,10 @@ pub fn reconcile(config: &Config, declared: &[HeartbeatTaskDecl]) -> Result<Reco
                 .errors
                 .push(format!("heartbeat-task '{}': {e}", decl.name)),
         }
+    }
+
+    if !remove_stale {
+        return Ok(report);
     }
 
     let existing = cron::list_jobs(config).context("listing cron jobs during reconcile")?;
@@ -391,7 +403,7 @@ prompt = "Second"
             delegate_to: None,
         }];
 
-        let report = reconcile(&config, &decls).unwrap();
+        let report = reconcile(&config, &decls, true).unwrap();
         assert_eq!(report.created, vec!["morning-news"]);
         assert!(report.errors.is_empty());
 
@@ -414,7 +426,7 @@ prompt = "Second"
             delivery: None,
             delegate_to: None,
         }];
-        reconcile(&config, &decls).unwrap();
+        reconcile(&config, &decls, true).unwrap();
 
         let decls_v2 = vec![HeartbeatTaskDecl {
             name: "morning-news".into(),
@@ -426,7 +438,7 @@ prompt = "Second"
             delivery: None,
             delegate_to: None,
         }];
-        let report = reconcile(&config, &decls_v2).unwrap();
+        let report = reconcile(&config, &decls_v2, true).unwrap();
         assert_eq!(report.updated, vec!["morning-news"]);
         assert!(report.created.is_empty());
 
@@ -454,10 +466,10 @@ prompt = "Second"
             delivery: None,
             delegate_to: None,
         }];
-        reconcile(&config, &decls).unwrap();
+        reconcile(&config, &decls, true).unwrap();
         assert_eq!(cron::list_jobs(&config).unwrap().len(), 1);
 
-        let report = reconcile(&config, &[]).unwrap();
+        let report = reconcile(&config, &[], true).unwrap();
         assert_eq!(report.removed, vec!["heartbeat:temp-task"]);
         assert!(cron::list_jobs(&config).unwrap().is_empty());
     }
@@ -483,7 +495,7 @@ prompt = "Second"
         .unwrap();
 
         // Reconciling an empty declared set must not remove it.
-        let report = reconcile(&config, &[]).unwrap();
+        let report = reconcile(&config, &[], true).unwrap();
         assert!(report.removed.is_empty());
         assert_eq!(cron::list_jobs(&config).unwrap().len(), 1);
     }
@@ -528,7 +540,7 @@ delegate_to = "news_fetcher"
         let tmp = TempDir::new().unwrap();
         let config = with_news_fetcher_agent(test_config(&tmp).await);
 
-        let report = reconcile(&config, &[news_decl(Some("news_fetcher"))]).unwrap();
+        let report = reconcile(&config, &[news_decl(Some("news_fetcher"))], true).unwrap();
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         let jobs = cron::list_jobs(&config).unwrap();
         assert_eq!(jobs[0].delegate_to.as_deref(), Some("news_fetcher"));
@@ -541,7 +553,7 @@ delegate_to = "news_fetcher"
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
 
-        let report = reconcile(&config, &[news_decl(Some("no_such_agent"))]).unwrap();
+        let report = reconcile(&config, &[news_decl(Some("no_such_agent"))], true).unwrap();
         assert!(report.created.is_empty());
         assert!(report.errors.iter().any(|e| e.contains("no_such_agent")));
         assert!(cron::list_jobs(&config).unwrap().is_empty());
@@ -551,9 +563,9 @@ delegate_to = "news_fetcher"
     async fn reconcile_clears_delegate_to_when_removed_from_block() {
         let tmp = TempDir::new().unwrap();
         let config = with_news_fetcher_agent(test_config(&tmp).await);
-        reconcile(&config, &[news_decl(Some("news_fetcher"))]).unwrap();
+        reconcile(&config, &[news_decl(Some("news_fetcher"))], true).unwrap();
 
-        reconcile(&config, &[news_decl(None)]).unwrap();
+        reconcile(&config, &[news_decl(None)], true).unwrap();
         let jobs = cron::list_jobs(&config).unwrap();
         assert_eq!(jobs.len(), 1, "must not leave a duplicate behind");
         assert_eq!(jobs[0].delegate_to, None);
@@ -571,9 +583,21 @@ delegate_to = "news_fetcher"
             delegate_to: None,
         }];
 
-        let report = reconcile(&config, &decls).unwrap();
+        let report = reconcile(&config, &decls, true).unwrap();
         assert!(report.created.is_empty());
         assert!(report.errors.iter().any(|e| e.contains("below")));
         assert!(cron::list_jobs(&config).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn reconcile_without_remove_stale_keeps_undeclared_jobs() {
+        // A parse error in one block must not delete that block's job.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        reconcile(&config, &[news_decl(None)], true).unwrap();
+
+        let report = reconcile(&config, &[], false).unwrap();
+        assert!(report.removed.is_empty());
+        assert_eq!(cron::list_jobs(&config).unwrap().len(), 1);
     }
 }

@@ -5936,3 +5936,44 @@ Step 2 起 daemon 心跳不再把 HEARTBEAT.md 整份发给模型读，只由代
 ### 全新部署到 K6 时要放进每个实例 `workspace\` 的文件
 
 `AGENTS.md`、`SOUL.md`、`TOOLS.md`、`USER.md`、`IDENTITY.md`、`MEMORY.md`、`HEARTBEAT.md`、`HEARTBEAT_DATA.md`、`workers/news_fetcher.md`、`skills/`（含 `cf-crawler/SKILL.toml`）、`tools/cf-crawler-win-x64.exe` 等；实例根目录放新编译的 `zeroclaw.exe` 和 `config.toml`。**不要再放** `news_sources.md`、`homework/news/ban_list.md`（已并入 HEARTBEAT_DATA.md）。具体部署步骤（含 `.secret_key` 与加密密钥的处理、两个实例配置差异、BOOTSTRAP.md 要不要放）部署前再和用户确认。
+
+---
+
+## 2026-09-24 — Step 10（第一部分）：cron 与提醒加固——重复创建、漏删、提醒不触发
+
+### 背景
+
+用户问"主 agent 还能不能自己增删新闻推送和提醒 cron 任务"，并强调"最需要的就是这个功能，要能稳定运行，之前老是出错：创建了新的不删除旧的，或者一次性创建好几个，删除又只删 1 个"。调查代码后确认这些问题都还在，而且发现一个更严重的：
+
+- **`note_add` 设了到期时间根本不会提醒**：Step 3 我标了"✅ `note_add(due_at=...)` + `JobType::Message`"，实际只做了存储，没有任何代码在到期时发送；工具说明却告诉模型"设置后同时也是一个到期提醒"。
+- **重复任务的真实成因**：① `cron_add` 的名字是可选的，同名去重只在给了名字时才生效，模型不给名字或每次起的名字不同就会重复；② 同一次 LLM 回复里的多个工具调用会**并行执行**（`should_execute_tools_in_parallel`，免审批的工具都并行），两个并发的 `cron_add` 会同时判断"不存在"然后都插入——用线程+屏障的测试实测复现（无锁时 5 次里出现 1 次建出 2 个任务）。
+- **只删 1 个**：`cron_remove` 只能按 id 一次删一个。
+- **删了又回来**：`heartbeat:` 任务由 HEARTBEAT.md 定义，agent 用 `cron_remove` 删掉后下次对账会重建，工具却回复"删除成功"。
+- **一个块写错就丢任务**：HEARTBEAT.md 某个声明块解析失败时，它的任务因"不再被声明"而被对账删除。
+- **名字跨类型复用会把任务改坏**：用一个 agent 任务的名字去建纯文本提醒，store 的同名更新会把 agent 任务的指令替换成提醒文字，但任务类型仍是 agent。
+
+用户要求先审核方案、确认是否有更好的做法再动手；审核结论与方案见对话记录，这里只记第一部分（提醒与通用 cron）的实现。新闻时段的工具化是第二部分。
+
+### 改动
+
+- **`src/cron/store.rs`**：新增进程内可重入写锁 `job_write_lock()`（`parking_lot::ReentrantMutex`），`add_agent_job`/`add_message_job` 的"按名字查找 → 插入或更新"整段在锁内执行；可重入是为了让调用方（`cron_add` 的查重）能先持锁做检查，再调用同样会加锁的 `add_*`。新增 `remove_jobs_by_name()`：删除所有同名任务并返回删除数。
+- **`src/cron/mod.rs`**：导出上述函数和 `find_job_by_name`；新增 `MANAGED_NAME_PREFIXES`/`managed_by()`——`heartbeat:`（HEARTBEAT.md）、`news:`（news_schedule 工具，第二部分）、`note:`（note_add/note_done）这三类任务由代码维护。
+- **`cron_add`**：`name` 必填（schema 也改为必填，说明"名字就是任务的身份，同名即更新"）；拒绝保留前缀；持锁执行查重 `check_duplicates()`：同名但类型不同 → 拒绝；不同名但类型+时间+内容+子 agent 完全相同 → 拒绝并指出已有任务；同一时间有其他内容的任务 → 照常创建，在返回结果里附 `warnings` 列出它们。比较时间前先按默认时区补全，避免"写了 tz / 没写 tz"被当成两个时间。
+- **`cron_remove`**：新增 `name` 参数（推荐），删除所有同名任务；按名字或 id 碰到受管任务一律拒绝，并说明该用什么改。
+- **`cron_update`**：拒绝修改受管任务；改名时拒绝空名字、保留前缀、以及改成另一个任务正在用的名字（否则会造出同名重复）；改名检查在写锁内。
+- **`cron_list`**：受管任务多一个 `managed_by` 字段。
+- **`note_add`**：带 `due_at` 时真正创建提醒——一次性 Message 任务 `note:<记事id>`，到点由代码发送 "⏰ 提醒：…"，不经过模型；发送目标取当前对话（`CallerInfo` 的渠道+发送者），拿不到时用 `[heartbeat] target/to`；两者都没有 → 不保存并报错；提醒建不成（例如时间已过）→ 撤销刚存的记事并报错，保证模型不会误以为提醒已设好。工具说明改为"到点会由系统自动发提醒，不需要再调用 cron_add"。
+- **`note_done`**：标记完成时删除对应的 `note:<id>` 提醒任务。
+- **`heartbeat_decl::reconcile`**：新增参数 `remove_stale`；daemon 在 HEARTBEAT.md 有解析错误时传 `false`，本轮只新建/更新、不删除。
+
+### 测试（全部先写后跑；关键的都验证过"去掉修复会失败"）
+
+- `note_add`：到期真的建出 `note:<id>` 提醒任务（类型、内容、发送目标、`delete_after_run`、触发时间都核对）；提醒发回设置它的对话；时间已过 → 撤销记事；无发送目标 → 不保存；原有参数校验测试保留。`note_done`：完成后提醒任务被删除。
+- `cron_add`：必须有名字；三种保留前缀都被拒绝；同名两次只有一个任务且内容被更新；换名字重复创建同样任务被拒绝；显式写默认时区仍算同一时间；同时间不同内容成功但带 warnings；名字被其他类型占用时拒绝且原任务不被改动；**并行创建**：8 个系统线程用屏障同时起跑（一半同名、一半同内容不同名）→ 只有 1 个任务。无锁时 5 次里失败 1 次（出现 2 个任务），有锁时稳定通过——这个测试对竞态的捕捉是概率性的，但有锁时结果是确定的，不会误报。另外原有 11 个测试请求补了 `name`。
+- `cron_remove`：按名字一次删掉两个同名任务；按名字、按 id 都拒绝删除受管任务。`cron_update`：拒绝修改受管任务；拒绝改名到已有名字。
+- `heartbeat_decl`：`remove_stale=false` 时不删除未声明的任务。
+- 全量：`cargo test --lib` 4042 passed，失败的全是基线；集成测试 230/3（预置）；clippy 206，新改动行上无报错。
+
+### 部署文件
+
+`资料/SOUL.md` 里"日程安排、待办、提醒 → 用 note_add 记事（带到期时间的会到点自动提醒）"现在是真的了，无需再改。

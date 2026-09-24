@@ -39,6 +39,10 @@ struct CronJobListEntry<'a> {
     /// questions actually need.
     prompt_preview: Option<String>,
     last_output_preview: Option<String>,
+    /// Set for code-managed jobs (heartbeat:/news:/note:) — tells the model
+    /// which tool to use instead of cron_remove/cron_update.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    managed_by: Option<&'static str>,
 }
 
 fn preview(s: &str) -> String {
@@ -52,6 +56,7 @@ fn preview(s: &str) -> String {
 
 fn to_list_entry(job: &CronJob) -> CronJobListEntry<'_> {
     CronJobListEntry {
+        managed_by: job.name.as_deref().and_then(crate::cron::managed_by),
         id: &job.id,
         name: job.name.as_deref(),
         job_type: &job.job_type,

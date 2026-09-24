@@ -193,6 +193,7 @@ gemini-3.5-flash: key A → key B → ...
 1. **记事改成结构化记录**：内容 + 创建时间 + 到期时间（可空）+ 状态（未完成/已完成），不是自由格式的长 Markdown。✅ `src/memory/notes.rs`，独立 SQLite 文件 `notes.db`，不混进 embedding 的 `brain.db`。
 2. **每轮对话只注入"未完成"的记事**，每条都带日期，注入条数有上限——不再是"整份文件塞进 prompt"或"语义检索 top5"这两种极端。✅ `open_notes_for_prompt()`，上限 30 条。
 3. **提醒就是带到期时间的记事**，到点由代码直接发送（见第 6 节第 4 条），不依赖 LLM 判断。✅ `note_add(due_at=...)` + `JobType::Message`（Step 2）。
+   **更正（2026-09-24）**：Step 3 实际只做了存储，`note_add` 从未建出提醒任务，到期不会发送任何东西。Step 10 补上：带 `due_at` 时自动建一次性 Message 任务 `note:<id>`，`note_done` 时自动取消，建不成就撤销记事并报错。
 4. **关掉"每句聊天原文都自动存成记忆"**——这是记忆库被灌满对话噪音、把真正的记事挤出去的主因。聊天记录本来就有独立的日志系统，不需要再进记忆库。✅ `[memory].auto_save` 默认改为 `false`。
 5. embedding 调用失败时**照样把原文存下来**（不算向量），不能因为一次 429 就丢整条写入。✅ `sqlite.rs::store()` 降级为 `embedding=NULL`，不再 `?` 直接丢弃整次写入。
 6. 中文全文检索启用 trigram 分词（SQLite FTS5 默认的 unicode61 分词器对中文基本不起作用）。✅ `tokenize='trigram case_sensitive 0'` + 存量数据库自动迁移重建索引。
@@ -362,6 +363,14 @@ gemini-3.5-flash: key A → key B → ...
   - **验证**：临时测试直接读取真实 `资料/config.toml` 和 `资料/HEARTBEAT.md` 跑对账——配置通过校验，7 个任务
     全部建出、零错误、重复对账不新增，每个任务的悉尼本地时间、子 agent、推送对象都正确，每个时段在
     HEARTBEAT_DATA.md 都有对应源清单（测试已删除）。
+
+- **Step 10（第一部分已完成，2026-09-24）**：cron 与提醒加固（用户要求"主 agent 能稳定地增删提醒和新闻推送任务"）。
+  修复：`note_add` 到期不提醒；`cron_add` 名字必填 + 写锁内查重（实测复现了并行工具调用导致的重复创建）+ 完全相同的任务拒绝
+  + 同时间其他任务给出提醒；`cron_remove` 支持按名字删除全部同名任务；`heartbeat:`/`news:`/`note:` 受管任务不能被
+  `cron_remove`/`cron_update` 改动（以前删了会被对账重建，工具却回复成功）；`cron_update` 不能改名到已有名字；HEARTBEAT.md
+  有解析错误时对账不删除任务；名字跨任务类型复用会把 agent 任务改坏的问题。详见 dev_log.md。
+  **第二部分（待做）**：新闻时段改为 `news_schedule`/`news_report` 结构化工具 + 代码维护的 `HEARTBEAT_DATA.toml`，
+  取代让模型直接编辑数据文件（整文件重写易出错、worker 回写封禁记录会覆盖主 agent 刚做的修改、失败次数靠模型自己数）。
 
 ## 11. 已发现、暂缓到对应 Step 修复的安全问题
 

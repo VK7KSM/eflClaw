@@ -109,6 +109,64 @@ impl Tool for CronUpdateTool {
                 });
             }
         };
+        // elfClaw 2026-09-24: managed jobs are re-derived from their source of
+        // truth on the next sync, so a patch here would silently be undone.
+        let current = match cron::get_job(&self.config, job_id) {
+            Ok(job) => job,
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(e.to_string()),
+                });
+            }
+        };
+        if let Some(owner) = current.name.as_deref().and_then(cron::managed_by) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "'{}' is managed by {owner}; a change here would be overwritten. Change it through {owner} instead.",
+                    current.name.as_deref().unwrap_or_default()
+                )),
+            });
+        }
+
+        let _write_guard = cron::job_write_lock();
+        if let Some(new_name) = patch.name.as_deref() {
+            let new_name = new_name.trim();
+            if new_name.is_empty() {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some("A job name cannot be empty".to_string()),
+                });
+            }
+            if let Some(owner) = cron::managed_by(new_name) {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!(
+                        "Name '{new_name}' uses a reserved prefix managed by {owner}"
+                    )),
+                });
+            }
+            // Renaming onto another job's name would create exactly the
+            // same-name duplicates cron_add's name-based dedup prevents.
+            if let Ok(Some(other)) = cron::find_job_by_name(&self.config, new_name) {
+                if other.id != current.id {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!(
+                            "Another job (id {}) is already named '{new_name}'",
+                            other.id
+                        )),
+                    });
+                }
+            }
+        }
+
         if let Some(blocked) = self.enforce_mutation_allowed("cron_update") {
             return Ok(blocked);
         }
@@ -226,5 +284,55 @@ mod tests {
             .unwrap_or_default()
             .contains("Rate limit exceeded"));
         assert!(cron::get_job(&cfg, &job.id).unwrap().enabled);
+    }
+
+    // ── elfClaw 2026-09-24 ──
+
+    fn msg_job(cfg: &Config, name: &str) -> crate::cron::CronJob {
+        crate::cron::add_message_job(
+            cfg,
+            Some(name.into()),
+            crate::cron::Schedule::Cron {
+                expr: "0 8 * * *".into(),
+                tz: None,
+            },
+            "hi",
+            None,
+            false,
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn refuses_to_patch_managed_jobs() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let job = msg_job(&cfg, "news:科技AI");
+        let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg));
+        let result = tool
+            .execute(json!({"job_id": job.id, "patch": {"enabled": false}}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.unwrap_or_default().contains("news_schedule"));
+        assert!(cron::get_job(&cfg, &job.id).unwrap().enabled);
+    }
+
+    #[tokio::test]
+    async fn renaming_onto_another_jobs_name_is_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        msg_job(&cfg, "吃药提醒");
+        let other = msg_job(&cfg, "倒垃圾");
+        let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg));
+        let result = tool
+            .execute(json!({"job_id": other.id, "patch": {"name": "吃药提醒"}}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert_eq!(
+            cron::get_job(&cfg, &other.id).unwrap().name.as_deref(),
+            Some("倒垃圾")
+        );
     }
 }

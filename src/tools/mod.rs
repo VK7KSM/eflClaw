@@ -461,9 +461,9 @@ pub fn all_tools_with_runtime(
     match crate::memory::notes::NoteStore::open(workspace_dir) {
         Ok(store) => {
             let notes = Arc::new(store);
-            tool_arcs.push(Arc::new(NoteAddTool::new(notes.clone())));
+            tool_arcs.push(Arc::new(NoteAddTool::new(notes.clone(), config.clone())));
             tool_arcs.push(Arc::new(NoteListTool::new(notes.clone())));
-            tool_arcs.push(Arc::new(NoteDoneTool::new(notes)));
+            tool_arcs.push(Arc::new(NoteDoneTool::new(notes, config.clone())));
         }
         Err(e) => {
             tracing::warn!("Notes unavailable this run (failed to open notes.db): {e}");

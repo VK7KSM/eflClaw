@@ -154,7 +154,11 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
                 for err in &parse_errors {
                     tracing::warn!("HEARTBEAT.md parse error at startup: {err}");
                 }
-                match crate::cron::heartbeat_decl::reconcile(&config, &declared) {
+                match crate::cron::heartbeat_decl::reconcile(
+                    &config,
+                    &declared,
+                    parse_errors.is_empty(),
+                ) {
                     Ok(report) if report.total_changes() > 0 => {
                         tracing::info!(
                             created = report.created.len(),
@@ -385,7 +389,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
         // a model to misjudge. See `src/cron/heartbeat_decl.rs`.
         let (declared, parse_errors) =
             crate::cron::heartbeat_decl::parse_heartbeat_task_declarations(&content);
-        match crate::cron::heartbeat_decl::reconcile(&config, &declared) {
+        match crate::cron::heartbeat_decl::reconcile(&config, &declared, parse_errors.is_empty()) {
             Ok(report) => {
                 crate::health::mark_component_ok("heartbeat");
                 let mut messages: Vec<String> = report

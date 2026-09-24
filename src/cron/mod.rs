@@ -15,10 +15,32 @@ pub use schedule::{
 };
 #[allow(unused_imports)]
 pub use store::{
-    add_agent_job, add_job, add_message_job, due_jobs, get_job, list_jobs, list_runs,
-    record_last_run, record_run, remove_job, reschedule_after_run, update_job,
+    add_agent_job, add_job, add_message_job, due_jobs, find_job_by_name, get_job, job_write_lock,
+    list_jobs, list_runs, record_last_run, record_run, remove_job, remove_jobs_by_name,
+    reschedule_after_run, update_job,
 };
 pub use types::{CronJob, CronJobPatch, CronRun, DeliveryConfig, JobType, Schedule, SessionTarget};
+
+/// elfClaw 2026-09-24: jobs whose name starts with one of these prefixes are
+/// owned by code, not by the chat agent — each is re-derived from its source
+/// of truth, so a `cron_remove`/`cron_update` on them would silently come
+/// back (or be overwritten) on the next sync. Value = what to use instead.
+pub const MANAGED_NAME_PREFIXES: &[(&str, &str)] = &[
+    (
+        heartbeat_decl::MANAGED_NAME_PREFIX,
+        "HEARTBEAT.md（只有爸爸能改）",
+    ),
+    ("news:", "news_schedule 工具"),
+    ("note:", "note_add / note_done 工具"),
+];
+
+/// Returns who manages a job with this name, if it's a code-managed job.
+pub fn managed_by(name: &str) -> Option<&'static str> {
+    MANAGED_NAME_PREFIXES
+        .iter()
+        .find(|(prefix, _)| name.starts_with(prefix))
+        .map(|(_, owner)| *owner)
+}
 
 /// elfClaw 2026-09-23: CLI-only convenience wrapper for `zeroclaw cron add*`
 /// — creates an agent-type job from the CLI's plain `command` string (which

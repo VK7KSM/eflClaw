@@ -75,7 +75,10 @@ impl Tool for CronAddTool {
         json!({
             "type": "object",
             "properties": {
-                "name": { "type": "string" },
+                "name": {
+                    "type": "string",
+                    "description": "Required, short and stable (e.g. '吃药提醒'). The name is the job's identity: calling cron_add again with an existing name updates that job instead of creating a duplicate."
+                },
                 "schedule": {
                     "type": "object",
                     "description": "Schedule object: {kind:'cron',expr,tz?} recurring | {kind:'at',at} one-time | {kind:'every',every_ms} recurring interval"
@@ -109,7 +112,7 @@ impl Tool for CronAddTool {
                     "description": "Name of a configured sub-agent (from [agents.*]) to delegate this job to. When set, the job's prompt is automatically routed to that agent via the delegate tool instead of being executed by the main agent."
                 }
             },
-            "required": ["schedule"]
+            "required": ["name", "schedule"]
         })
     }
 
@@ -142,10 +145,33 @@ impl Tool for CronAddTool {
             }
         };
 
-        let name = args
-            .get("name")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string);
+        // elfClaw 2026-09-24: a name is required — it is the job's identity.
+        // Re-using a name updates that job; without names (or with a new name
+        // every time) the model kept creating duplicates of the same job.
+        let name = match args.get("name").and_then(serde_json::Value::as_str) {
+            Some(n) if !n.trim().is_empty() => n.trim().to_string(),
+            _ => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(
+                        "Missing 'name'. Every job needs a short, stable name (e.g. '吃药提醒'). \
+Calling cron_add again with the same name updates that job instead of creating a copy."
+                            .to_string(),
+                    ),
+                });
+            }
+        };
+        if let Some(owner) = cron::managed_by(&name) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "Name '{name}' uses a reserved prefix: such jobs are managed by {owner}, not cron_add."
+                )),
+            });
+        }
+        let name = Some(name);
 
         let job_type = match args.get("job_type").and_then(serde_json::Value::as_str) {
             Some("agent") => JobType::Agent,
@@ -182,6 +208,7 @@ impl Tool for CronAddTool {
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(default_delete_after_run);
 
+        let warnings: Vec<String>;
         let result = match job_type {
             JobType::Agent => {
                 let prompt = match args.get("prompt").and_then(serde_json::Value::as_str) {
@@ -278,6 +305,24 @@ For one-time reminders, use schedule.kind='at' with an RFC3339 timestamp."
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_owned);
 
+                let _write_guard = cron::job_write_lock();
+                match check_duplicates(
+                    &self.config,
+                    name.as_deref().unwrap_or_default(),
+                    &JobType::Agent,
+                    &schedule,
+                    prompt,
+                    delegate_to.as_deref(),
+                ) {
+                    Ok(w) => warnings = w,
+                    Err(e) => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some(e),
+                        })
+                    }
+                }
                 cron::add_agent_job(
                     &self.config,
                     name,
@@ -361,6 +406,24 @@ instead if you actually need the model to do something at fire time."
                     return Ok(blocked);
                 }
 
+                let _write_guard = cron::job_write_lock();
+                match check_duplicates(
+                    &self.config,
+                    name.as_deref().unwrap_or_default(),
+                    &JobType::Message,
+                    &schedule,
+                    message,
+                    None,
+                ) {
+                    Ok(w) => warnings = w,
+                    Err(e) => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some(e),
+                        })
+                    }
+                }
                 cron::add_message_job(
                     &self.config,
                     name,
@@ -373,18 +436,24 @@ instead if you actually need the model to do something at fire time."
         };
 
         match result {
-            Ok(job) => Ok(ToolResult {
-                success: true,
-                output: serde_json::to_string_pretty(&json!({
+            Ok(job) => {
+                let mut out = json!({
                     "id": job.id,
                     "name": job.name,
                     "job_type": job.job_type,
                     "schedule": job.schedule,
                     "next_run": job.next_run,
                     "enabled": job.enabled
-                }))?,
-                error: None,
-            }),
+                });
+                if !warnings.is_empty() {
+                    out["warnings"] = json!(warnings);
+                }
+                Ok(ToolResult {
+                    success: true,
+                    output: serde_json::to_string_pretty(&out)?,
+                    error: None,
+                })
+            }
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -392,6 +461,65 @@ instead if you actually need the model to do something at fire time."
             }),
         }
     }
+}
+
+/// elfClaw 2026-09-24: must be called while holding `cron::job_write_lock()`
+/// so the check and the following insert are atomic against parallel calls.
+///
+/// - Same name, different job type -> error (the store's name-based update
+///   would otherwise turn e.g. an agent job's prompt into reminder text while
+///   leaving it an agent job).
+/// - Different name but identical type + schedule + content (+ delegate) ->
+///   error: that's a retry/duplicate, not a new job.
+/// - Different name, same schedule, different content -> allowed, but
+///   returned as warnings so the model can spot an unintended near-duplicate.
+fn check_duplicates(
+    config: &Config,
+    name: &str,
+    job_type: &JobType,
+    schedule: &Schedule,
+    content: &str,
+    delegate_to: Option<&str>,
+) -> Result<Vec<String>, String> {
+    let jobs = cron::list_jobs(config).map_err(|e| e.to_string())?;
+    let schedule = cron::apply_default_tz(config, schedule.clone());
+    let mut warnings = Vec::new();
+    for job in &jobs {
+        let job_name = job.name.as_deref().unwrap_or("");
+        if job_name == name {
+            if &job.job_type != job_type {
+                return Err(format!(
+                    "Name '{name}' already belongs to a {:?} job (id {}). Pick another name, or cron_remove that job first.",
+                    job.job_type, job.id
+                ));
+            }
+            continue;
+        }
+        if job.schedule != schedule {
+            continue;
+        }
+        let same_content = &job.job_type == job_type
+            && job.prompt.as_deref().unwrap_or("").trim() == content.trim()
+            && job.delegate_to.as_deref() == delegate_to;
+        if same_content {
+            return Err(format!(
+                "An identical job already exists: '{job_name}' (id {}). Do not create it again; use cron_update to change it.",
+                job.id
+            ));
+        }
+        let preview: String = job
+            .prompt
+            .as_deref()
+            .unwrap_or("")
+            .chars()
+            .take(60)
+            .collect();
+        warnings.push(format!(
+            "'{job_name}' (id {}) fires at the same time: {preview}. If it is the same thing, cron_remove one of them.",
+            job.id
+        ));
+    }
+    Ok(warnings)
 }
 
 #[cfg(test)]
@@ -453,6 +581,7 @@ mod tests {
         let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
         let result = tool
             .execute(json!({
+                "name": "zeroclaw_test_job_1",
                 "schedule": { "kind": "at", "at": (chrono::Utc::now() + chrono::Duration::minutes(10)).to_rfc3339() },
                 "job_type": "message",
                 "message": "no delivery"
@@ -471,6 +600,7 @@ mod tests {
         let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
         let result = tool
             .execute(json!({
+                "name": "zeroclaw_test_job_2",
                 "schedule": { "kind": "at", "at": (chrono::Utc::now() + chrono::Duration::minutes(10)).to_rfc3339() },
                 "job_type": "message",
                 "delivery": { "mode": "announce", "channel": "telegram", "to": "123" }
@@ -489,6 +619,7 @@ mod tests {
         let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
         let result = tool
             .execute(json!({
+                "name": "zeroclaw_test_job_3",
                 "schedule": { "kind": "cron", "expr": "0 9 * * *" },
                 "job_type": "message",
                 "message": "daily reminder",
@@ -519,6 +650,7 @@ mod tests {
 
         let result = tool
             .execute(json!({
+                "name": "zeroclaw_test_job_4",
                 "schedule": { "kind": "at", "at": "2099-01-01T00:00:00Z" },
                 "job_type": "message",
                 "message": "reminder",
@@ -548,6 +680,7 @@ mod tests {
 
         let result = tool
             .execute(json!({
+                "name": "zeroclaw_test_job_5",
                 "schedule": { "kind": "cron", "expr": "*/5 * * * *" },
                 "job_type": "agent",
                 "prompt": "do the thing",
@@ -572,6 +705,7 @@ mod tests {
 
         let result = tool
             .execute(json!({
+                "name": "zeroclaw_test_job_6",
                 "schedule": { "kind": "every", "every_ms": 0 },
                 "job_type": "message",
                 "message": "reminder",
@@ -596,6 +730,7 @@ mod tests {
 
         let result = tool
             .execute(json!({
+                "name": "zeroclaw_test_job_7",
                 "schedule": { "kind": "cron", "expr": "*/5 * * * *" },
                 "job_type": "agent"
             }))
@@ -676,6 +811,7 @@ mod tests {
 
         let result = tool
             .execute(json!({
+                "name": "zeroclaw_test_job_8",
                 "schedule": { "kind": "every", "every_ms": 300000 },
                 "job_type": "agent",
                 "prompt": "Send me a recurring status update"
@@ -698,6 +834,7 @@ mod tests {
 
         let result = tool
             .execute(json!({
+                "name": "zeroclaw_test_job_9",
                 "schedule": { "kind": "cron", "expr": "*/5 * * * *" },
                 "job_type": "agent",
                 "prompt": "Send recurring reminders"
@@ -720,6 +857,7 @@ mod tests {
 
         let result = tool
             .execute(json!({
+                "name": "zeroclaw_test_job_10",
                 "schedule": { "kind": "every", "every_ms": 60000 },
                 "job_type": "agent",
                 "prompt": "Send me updates frequently",
@@ -743,6 +881,7 @@ mod tests {
 
         let result = tool
             .execute(json!({
+                "name": "zeroclaw_test_job_11",
                 "schedule": { "kind": "every", "every_ms": 300000 },
                 "job_type": "agent",
                 "prompt": "Share a heartbeat summary",
@@ -753,5 +892,258 @@ mod tests {
 
         assert!(result.success, "{:?}", result.error);
         assert!(result.output.contains("next_run"));
+    }
+
+    // ── elfClaw 2026-09-24: duplicate-prevention behaviour ──
+
+    #[tokio::test]
+    async fn requires_a_name() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
+        let result = tool
+            .execute(json!({
+                "job_type": "message",
+                "schedule": { "kind": "cron", "expr": "0 8 * * *" },
+                "message": "hi",
+                "recurring_confirmed": true,
+                "delivery": { "mode": "announce", "channel": "telegram", "to": "zeroclaw_user" }
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.unwrap_or_default().contains("Missing 'name'"));
+        assert!(cron::list_jobs(&cfg).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn rejects_reserved_name_prefixes() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
+        for name in ["heartbeat:x", "news:x", "note:x"] {
+            let result = tool
+                .execute(json!({
+                    "name": name,
+                    "job_type": "message",
+                    "schedule": { "kind": "cron", "expr": "0 8 * * *" },
+                    "message": "hi",
+                    "recurring_confirmed": true,
+                    "delivery": { "mode": "announce", "channel": "telegram", "to": "zeroclaw_user" }
+                }))
+                .await
+                .unwrap();
+            assert!(!result.success, "{name} must be rejected");
+        }
+        assert!(cron::list_jobs(&cfg).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn same_name_twice_updates_instead_of_duplicating() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
+        let first = tool
+            .execute(json!({
+                "name": "吃药提醒",
+                "job_type": "message",
+                "schedule": { "kind": "cron", "expr": "0 8 * * *" },
+                "message": "吃药",
+                "recurring_confirmed": true,
+                "delivery": { "mode": "announce", "channel": "telegram", "to": "zeroclaw_user" }
+            }))
+            .await
+            .unwrap();
+        assert!(first.success, "{:?}", first.error);
+        let second = tool
+            .execute(json!({
+                "name": "吃药提醒",
+                "job_type": "message",
+                "schedule": { "kind": "cron", "expr": "0 9 * * *" },
+                "message": "吃药了",
+                "recurring_confirmed": true,
+                "delivery": { "mode": "announce", "channel": "telegram", "to": "zeroclaw_user" }
+            }))
+            .await
+            .unwrap();
+        assert!(second.success, "{:?}", second.error);
+        let jobs = cron::list_jobs(&cfg).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].prompt.as_deref(), Some("吃药了"));
+    }
+
+    #[tokio::test]
+    async fn identical_job_under_a_new_name_is_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
+        tool.execute(json!({
+            "name": "吃药提醒",
+            "job_type": "message",
+            "schedule": { "kind": "cron", "expr": "0 8 * * *" },
+            "message": "吃药",
+            "recurring_confirmed": true,
+            "delivery": { "mode": "announce", "channel": "telegram", "to": "zeroclaw_user" }
+        }))
+        .await
+        .unwrap();
+        let again = tool
+            .execute(json!({
+                "name": "每天吃药",
+                "job_type": "message",
+                "schedule": { "kind": "cron", "expr": "0 8 * * *" },
+                "message": "吃药",
+                "recurring_confirmed": true,
+                "delivery": { "mode": "announce", "channel": "telegram", "to": "zeroclaw_user" }
+            }))
+            .await
+            .unwrap();
+        assert!(!again.success);
+        assert!(again.error.unwrap_or_default().contains("吃药提醒"));
+        assert_eq!(cron::list_jobs(&cfg).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn explicit_default_tz_counts_as_the_same_schedule() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
+        tool.execute(json!({
+            "name": "吃药提醒",
+            "job_type": "message",
+            "schedule": { "kind": "cron", "expr": "0 8 * * *" },
+            "message": "吃药",
+            "recurring_confirmed": true,
+            "delivery": { "mode": "announce", "channel": "telegram", "to": "zeroclaw_user" }
+        }))
+        .await
+        .unwrap();
+        let mut again = json!({
+            "name": "每天吃药",
+            "job_type": "message",
+            "schedule": { "kind": "cron", "expr": "0 8 * * *" },
+            "message": "吃药",
+            "recurring_confirmed": true,
+            "delivery": { "mode": "announce", "channel": "telegram", "to": "zeroclaw_user" }
+        });
+        again["schedule"]["tz"] = json!("Australia/Sydney");
+        let result = tool.execute(again).await.unwrap();
+        assert!(
+            !result.success,
+            "tz omitted vs. explicit default tz is still a duplicate"
+        );
+    }
+
+    #[tokio::test]
+    async fn same_time_different_content_is_allowed_with_a_warning() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
+        tool.execute(json!({
+            "name": "吃药提醒",
+            "job_type": "message",
+            "schedule": { "kind": "cron", "expr": "0 8 * * *" },
+            "message": "吃药",
+            "recurring_confirmed": true,
+            "delivery": { "mode": "announce", "channel": "telegram", "to": "zeroclaw_user" }
+        }))
+        .await
+        .unwrap();
+        let other = tool
+            .execute(json!({
+                "name": "倒垃圾",
+                "job_type": "message",
+                "schedule": { "kind": "cron", "expr": "0 8 * * *" },
+                "message": "倒垃圾",
+                "recurring_confirmed": true,
+                "delivery": { "mode": "announce", "channel": "telegram", "to": "zeroclaw_user" }
+            }))
+            .await
+            .unwrap();
+        assert!(other.success, "{:?}", other.error);
+        assert!(other.output.contains("warnings"));
+        assert!(other.output.contains("吃药提醒"));
+        assert_eq!(cron::list_jobs(&cfg).unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn name_owned_by_other_job_type_is_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
+        cron::add_agent_job(
+            &cfg,
+            Some("每日任务".into()),
+            Schedule::Cron {
+                expr: "0 8 * * *".into(),
+                tz: None,
+            },
+            "do work",
+            crate::cron::SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        let result = tool
+            .execute(json!({
+                "name": "每日任务",
+                "job_type": "message",
+                "schedule": { "kind": "cron", "expr": "0 9 * * *" },
+                "message": "hi",
+                "recurring_confirmed": true,
+                "delivery": { "mode": "announce", "channel": "telegram", "to": "zeroclaw_user" }
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        let job = &cron::list_jobs(&cfg).unwrap()[0];
+        assert_eq!(job.job_type, JobType::Agent);
+        assert_eq!(
+            job.prompt.as_deref(),
+            Some("do work"),
+            "agent job must be untouched"
+        );
+    }
+
+    #[test]
+    fn parallel_calls_in_one_turn_create_a_single_job() {
+        // Tool calls from one LLM response run concurrently. Same name must
+        // collapse to one job; same content under different names too.
+        // OS threads + a barrier so all calls really start at the same time.
+        let tmp = TempDir::new().unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let cfg = rt.block_on(test_config(&tmp));
+        let tool = Arc::new(CronAddTool::new(cfg.clone(), test_security(&cfg)));
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let tool = tool.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let name = if i % 2 == 0 {
+                        "吃药提醒".to_string()
+                    } else {
+                        format!("吃药提醒{i}")
+                    };
+                    let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+                    barrier.wait();
+                    rt.block_on(tool.execute(json!({
+                        "name": name,
+                        "job_type": "message",
+                        "schedule": { "kind": "cron", "expr": "0 8 * * *" },
+                        "message": "吃药",
+                        "recurring_confirmed": true,
+                        "delivery": { "mode": "announce", "channel": "telegram", "to": "zeroclaw_user" }
+                    })))
+                    .unwrap()
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(cron::list_jobs(&cfg).unwrap().len(), 1);
     }
 }
