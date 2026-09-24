@@ -314,6 +314,22 @@ pub struct AllProvidersRateLimitedError {
     pub details: String,
 }
 
+/// elfClaw 2026-09-24: returned by `ReliableProvider` when the whole
+/// model/key/provider fallback chain failed and not every attempt was a 429
+/// (otherwise it is `AllProvidersRateLimitedError`). `summary` is a short
+/// per-model tally such as `gemini-3.8-flash 503×3；gemini-3.6-flash 503×3`
+/// for the user-facing message — the full attempt log (`details`) is far
+/// longer than the 200-char sanitized error text and used to be cut off after
+/// the first attempt, which made a complete fallback look like "only one model
+/// was tried".
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("All providers/models failed. Attempts:\n{details}")]
+pub struct AllProvidersFailedError {
+    pub attempt_count: usize,
+    pub summary: String,
+    pub details: String,
+}
+
 /// Provider capabilities declaration.
 ///
 /// Describes what features a provider supports, enabling intelligent

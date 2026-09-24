@@ -1329,11 +1329,22 @@ fn append_sender_turn(ctx: &ChannelRuntimeContext, sender_key: &str, turn: ChatM
 /// dump. Any other failure (a real bug, auth error, network error) shows
 /// `safe_error` — the already-sanitized text — never the raw `e`, which may
 /// embed unsanitized upstream text.
+///
+/// elfClaw 2026-09-24: an `AllProvidersFailedError` (the chain was exhausted
+/// with at least one non-429 failure, e.g. every model returned 503) gets a
+/// Chinese message with the per-model tally, instead of the English attempt
+/// log cut off at 200 characters after the first attempt.
 fn user_facing_llm_error_message(e: &anyhow::Error, safe_error: &str) -> String {
     if e.downcast_ref::<providers::AllProvidersRateLimitedError>()
         .is_some()
     {
         "⚠️ 今天的额度用完了，明天再试，或者检查一下 API key 配置。".to_string()
+    } else if let Some(all_failed) = e.downcast_ref::<providers::AllProvidersFailedError>() {
+        format!(
+            "⚠️ 模型暂时都不可用，已经按顺序换了所有备用模型，共试了 {} 次：{}。\n\
+             503 表示 Gemini 服务器繁忙，一般过一会儿就好，请稍后再发一次。",
+            all_failed.attempt_count, all_failed.summary
+        )
     } else {
         format!("⚠️ Error: {safe_error}")
     }
@@ -4662,6 +4673,22 @@ mod tests {
         assert!(shown.contains("今天的额度用完了"));
         // The raw attempt log must not leak into the friendly message.
         assert!(!shown.contains("provider=p1"));
+    }
+
+    #[test]
+    fn user_facing_llm_error_message_explains_exhausted_fallback_chain_in_chinese() {
+        let err: anyhow::Error = providers::AllProvidersFailedError {
+            attempt_count: 12,
+            summary: "gemini-3.8-flash 503×3；gemini-3.7-flash 503×3".to_string(),
+            details: "provider=gemini model=gemini-3.8-flash attempt 1/3: retryable".to_string(),
+        }
+        .into();
+        let shown = user_facing_llm_error_message(&err, "should not appear");
+        assert!(shown.contains("共试了 12 次"));
+        assert!(shown.contains("gemini-3.8-flash 503×3；gemini-3.7-flash 503×3"));
+        assert!(!shown.contains("should not appear"));
+        // The full attempt log stays available for logs via Display.
+        assert!(err.to_string().starts_with("All providers/models failed"));
     }
 
     #[test]

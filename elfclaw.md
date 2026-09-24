@@ -163,7 +163,12 @@ gemini-3.5-flash: key A → key B → ...
 
 **还没做**（按影响排序，后续步骤补）：
 
-1. **503（模型过载）目前还是会把一个模型的所有 key 都试一遍才换模型**，没有做"503 直接跳过剩余 key、换模型"的优化。不是正确性问题（迟早会换到下一个模型），只是慢——每个耗尽的 key 上还要等一次退避。
+1. ~~503（模型过载）目前还是会把一个模型的所有 key 都试一遍才换模型~~ **已修复，2026-09-24**：实际情况比这里写的更糟——同一个 key+模型要重试 3 次（每次至少等 5 秒），然后才轮到下一个。K6 实测：4 个模型同时 503 时，要 71 秒才报错；3.8 和 3.7 在 503、3.6 正常时，要 26 秒才出结果。报错文字又被截断到 200 字符，只剩第一次尝试，看起来像"只试了一个模型"。
+   改成按轮尝试（`ReliableProvider::call_with_failover`，四个 chat 方法共用，替换掉原来复制了四份的三层循环）：
+   - 尝试顺序是"模型 → key"，每一轮每个条目试一次，失败就直接试下一个；某个模型报 503 时，这一轮里跳过它剩下的 key；整轮都失败才退避，进入下一轮（最多 `provider_retries + 1` 轮，总尝试次数不变）；非临时错误的条目在后面几轮直接跳过。
+   - 能不能重试优先看真实 HTTP 状态码（`http_status`，只认 `API error (<code>` 这个前缀）；只有拿不到状态码时，才用原来的"报错文字里找数字/关键词"做兜底判断。
+   - 每次失败都写一条 `LLM attempt failed: provider/model pass n/N status=… reason=…` 日志。
+   - 整条链都失败时返回 `AllProvidersFailedError`，带按模型汇总的次数（如 `gemini-3.8-flash 503×3；gemini-3.6-flash 503×3`），渠道层据此给用户发中文说明。
 2. ~~"整条池子都耗尽"目前只会抛一个聚合错误~~ **已修复，2026-09-23**：`src/providers/traits.rs` 新增结构化错误
    `AllProvidersRateLimitedError`（`thiserror` 派生，和已有的 `ProviderCapabilityError` 同一模式）。
    `src/providers/reliable.rs` 新增共享的 `finalize_all_failed(failures, all_rate_limited)`：`chat_with_system`/

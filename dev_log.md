@@ -6109,3 +6109,37 @@ K6 上在群里说一句 hello，输入 50,182 token、耗时 20.3 秒。用 Gem
   - 历史上限 20 条；
   - Gemini 用量能解析出缓存和思考 token 数。
 - 全量结果：`cargo test --lib` 4074 通过，10 个失败全部是已知基线；集成测试 230 通过、3 个失败（已知基线）；clippy 用逐行 git blame 核对，新增问题为 0（顺手把改到的 3 处 `push_str(&format!)` 换成了 `writeln!`）；fmt 只作用于本次改动的 3 个文件。
+
+
+---
+
+## 2026-09-24 — 模型降级改为按轮尝试，503 直接换模型，失败有完整记录
+
+### 起因
+
+验收时第一条消息在 71 秒后报错，Telegram 上只显示 "gemini-3.8-flash attempt 1/3 … 503"，看起来像没有换模型。按耗时推算，其实 4 个模型都试过了：原来的逻辑是同一个模型重试 3 次、每次至少等 5 秒，然后才换下一个，4 个模型共 12 次，约 70 秒。汇总报错在发出前被截断到 200 字符，所以只剩第一次尝试。第四条消息慢（26 秒）也是同一个原因：3.8 和 3.7 各自白白重试了 3 次。
+
+### 改动
+
+- **`src/providers/reliable.rs`**
+  - 新增 `call_with_failover`，替换 `chat_with_system`/`chat_with_history`/`chat_with_tools`/`chat` 里复制了四份的三层循环。先把尝试顺序排成一个列表（模型 → key → provider 专属的模型映射），每轮每个条目试一次，失败就直接试下一个；503 时本轮跳过该模型剩下的 key（按 elfclaw.md §5.2，503 与 key 无关）；整轮失败才退避进入下一轮；非临时错误的条目在后面几轮跳过。总尝试次数不变，还是 `provider_retries + 1` 轮。
+  - 新增 `http_status`：只认 `"<provider> API error (<code>"` 前缀或 reqwest 的状态码。`is_non_retryable` 在拿到状态码时只按状态码判断，避免 503 的报错正文里出现 4xx 数字，或 "model" 加 "invalid"/"unknown" 之类的词，就被误判为不可重试。
+  - `finalize_all_failed` 返回新的 `AllProvidersFailedError`（显示文字仍以 "All providers/models failed. Attempts:" 开头），并带上 `summarize_attempts` 生成的按模型汇总。
+- **`src/providers/traits.rs` / `mod.rs`**：新增并导出 `AllProvidersFailedError { attempt_count, summary, details }`。
+- **`src/elfclaw_log/mod.rs`**：新增 `log_provider_attempt_failure`，每次失败记一条 Warn 日志（模型、第几轮、状态码、原因、耗时、简短错误）。
+- **`src/channels/mod.rs`**：`user_facing_llm_error_message` 遇到 `AllProvidersFailedError` 时发中文说明，写明共试了几次、每个模型各返回了什么状态码。
+
+### 测试
+
+- 改了 2 个旧测试的预期：原来断言"主条目重试到用完才换备用"（`falls_back_after_retries_exhausted` 改名为 `falls_back_to_next_entry_before_retrying_failed_one`，以及 `chat_with_history_falls_back`），现在主条目只调用 1 次。
+- 新增：
+  - 每轮每个模型试一次，第二轮成功（调用顺序 a,b,c,a,b）；
+  - 400 的条目在后面几轮跳过，汇总为 `m-a 400×1；m-b 500×3`；
+  - 503 时不等待、直接换模型；
+  - 503 跳过同模型的其他 key，每分钟 429 则会换同模型的下一个 key；
+  - `http_status` 只认前缀；
+  - 正文带误导内容的 503 仍可重试；
+  - 汇总按首次出现的顺序排列；
+  - 中文报错文案。
+- 变异验证：去掉"503 跳过同模型其他 key"那一行后，对应测试失败；恢复后通过。
+- 全量结果：`cargo test --lib` 4082 通过，10 个失败全部是已知基线；集成测试 230 通过、3 个失败（已知基线）；clippy 用 git blame 逐行核对，新增 0；fmt 只作用于本次改动的文件。

@@ -225,6 +225,43 @@ pub fn log_llm_token_breakdown(
     });
 }
 
+/// elfClaw 2026-09-24: one failed provider attempt inside the failover chain
+/// (`ReliableProvider`). Written for every attempt so a request that ends in
+/// "all models failed" can be reconstructed from the log afterwards.
+#[allow(clippy::too_many_arguments)]
+pub fn log_provider_attempt_failure(
+    provider: &str,
+    model: &str,
+    pass: u32,
+    passes: u32,
+    status: Option<u16>,
+    reason: &str,
+    elapsed_ms: u64,
+    error: &str,
+) {
+    log(LogEntry {
+        id: uuid::Uuid::new_v4().to_string(),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        level: LogLevel::Warn,
+        category: LogCategory::LlmCall,
+        component: "provider".into(),
+        message: format!(
+            "LLM attempt failed: {provider}/{model} pass {pass}/{passes} status={} reason={reason} ({elapsed_ms}ms)",
+            status.map_or_else(|| "-".to_string(), |s| s.to_string())
+        ),
+        details: serde_json::json!({
+            "provider": provider,
+            "model": model,
+            "pass": pass,
+            "passes": passes,
+            "status": status,
+            "reason": reason,
+            "elapsed_ms": elapsed_ms,
+            "error": error,
+        }),
+    });
+}
+
 /// Log an error from any component.
 pub fn log_error(component: &str, message: &str, details: serde_json::Value) {
     log(LogEntry {
