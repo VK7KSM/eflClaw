@@ -6616,3 +6616,13 @@ K6 上在群里说一句 hello，输入 50,182 token、耗时 20.3 秒。用 Gem
   - 第 3 轮发现：新闻报道被误标为风险信号、名字为"未说明"的记录，已通过提示词和代码修正。
 - 按用户要求，把第 2 轮的推送通过 elfClaw 自己的 `deliver_to_channel` 发到 Telegram 预览（用临时测试发送）。本地 `资料/config.toml` 里 telegram 的 token 是加密的，用的是 `[tts]` 一节的明文 token（同一个 bot），只在内存中替换，没有改任何文件。
 - 额度：测试期间 key 1–3 的 gemini-3.5-flash 当日额度用完（K6 日志显示生产也受影响，key 4–6 正常），07:00 UTC 重置后继续测试。
+
+## 2026-09-25 — 部署到 K6（会展推送 + 成人产业推送 + TinyFish）
+
+- 17:30 的晚报是改版后第一次正式运行：16 秒，输出 6539 字。gemini-3.5-flash 返回 503 后自动换到 3.5-flash-lite，模型只调用了一次。
+- 部署前对比 K6 与本地：
+  - config.toml 完全一致；
+  - HEARTBEAT.md 只差这次新增的说明；
+  - HEARTBEAT_DATA.toml 在晚报后被程序重写过，按内容比较只多出两个新时段，源状态和候选源都一致。
+- K6 设置了用户级环境变量 `MONID_API_KEY`（和 `CF_CRAWLER_TOKEN` 的设法相同）：key 通过临时文件传过去，写入后就删掉了，过程中没有打印。
+- 17:44 替换 exe、HEARTBEAT.md、HEARTBEAT_DATA.toml（保留 `.prev` 备份），然后重启。日志显示自动建好了 `news:会展`（明天 09:00）和 `news:成人产业`（明天 14:00），没有告警。
