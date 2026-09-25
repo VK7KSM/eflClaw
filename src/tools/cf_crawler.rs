@@ -253,8 +253,19 @@ fn result_from_json(v: Value) -> ToolResult {
 /// handling, browser-rate-limit retry and challenge-page check as `web_scrape`.
 /// Returns the parsed cf-crawler result on success.
 pub(crate) async fn scrape_listing(security: &SecurityPolicy, url: &str) -> anyhow::Result<Value> {
-    let args =
-        json!({"url": url, "goal": "latest article list", "mode": "listing", "strategy": "auto"});
+    scrape_page(security, url, "latest article list", "listing", "auto").await
+}
+
+/// Same as `scrape_listing` with an explicit goal / mode / strategy — the
+/// expo pipeline renders JavaScript-built calendars with `edge_browser`.
+pub(crate) async fn scrape_page(
+    security: &SecurityPolicy,
+    url: &str,
+    goal: &str,
+    mode: &str,
+    strategy: &str,
+) -> anyhow::Result<Value> {
+    let args = json!({"url": url, "goal": goal, "mode": mode, "strategy": strategy});
     let result =
         run_with_browser_retry(security, "scrape-page", &args, SCRAPE_TIMEOUT_SECS).await?;
     if !result.success {

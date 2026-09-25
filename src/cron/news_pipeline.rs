@@ -23,7 +23,7 @@
 //! 6. per-source fetch results feed the existing failure/ban counters.
 
 use crate::config::Config;
-use crate::cron::news::{self, NewsRules, Slot, Source, SourceResult};
+use crate::cron::news::{self, NewsRules, Slot, SlotKind, Source, SourceResult};
 use crate::providers::{self, Provider, ProviderRuntimeOptions};
 use crate::security::SecurityPolicy;
 use anyhow::{Context, Result};
@@ -83,7 +83,7 @@ pub struct Item {
     pub official: bool,
 }
 
-fn host_of(url: &str) -> String {
+pub(super) fn host_of(url: &str) -> String {
     reqwest::Url::parse(url)
         .ok()
         .and_then(|u| {
@@ -144,7 +144,7 @@ pub fn title_key(title: &str) -> String {
 }
 
 /// Decode the HTML/XML entities that appear in feeds and Telegram pages.
-fn decode_entities(s: &str) -> String {
+pub(super) fn decode_entities(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
     while let Some(amp) = rest.find('&') {
@@ -190,7 +190,7 @@ fn decode_entities(s: &str) -> String {
 }
 
 /// Tags → spaces, entities decoded, whitespace collapsed, cut to `max` chars.
-fn plain_text(html: &str, max: usize) -> String {
+pub(super) fn plain_text(html: &str, max: usize) -> String {
     let no_tags = regex_replace_tags(html);
     let decoded = decode_entities(&no_tags);
     let collapsed = decoded.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -535,7 +535,7 @@ fn kind_of(url: &str) -> Kind {
     Kind::Auto
 }
 
-fn display_name(src: &Source) -> String {
+pub(super) fn display_name(src: &Source) -> String {
     if !src.name.trim().is_empty() {
         return src.name.trim().to_string();
     }
@@ -550,7 +550,7 @@ fn looks_like_feed(body: &str) -> bool {
     head.contains("<rss") || head.contains("<feed") || head.contains("<rdf:rdf")
 }
 
-async fn get_text(client: &reqwest::Client, url: &str) -> Result<String> {
+pub(super) async fn get_text(client: &reqwest::Client, url: &str) -> Result<String> {
     let resp = client
         .get(url)
         .send()
@@ -1026,7 +1026,7 @@ pub fn fallback_picks(candidates: &[Item], max_items: usize) -> Vec<Chosen> {
     chosen
 }
 
-async fn ask_model(config: &Config, request: &str) -> Result<String> {
+pub(super) async fn ask_model(config: &Config, system: &str, request: &str) -> Result<String> {
     let provider_name = config.default_provider.as_deref().unwrap_or("gemini");
     let options = ProviderRuntimeOptions {
         zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
@@ -1048,7 +1048,7 @@ async fn ask_model(config: &Config, request: &str) -> Result<String> {
         .or(config.default_model.as_deref())
         .unwrap_or("gemini-3.5-flash");
     provider
-        .chat_with_system(Some(SELECT_SYSTEM), request, model, 0.3)
+        .chat_with_system(Some(system), request, model, 0.3)
         .await
 }
 
@@ -1127,14 +1127,14 @@ pub fn render(
 
 // ── the job ──────────────────────────────────────────────────────────────
 
-fn http_client() -> Result<reqwest::Client> {
+pub(super) fn http_client() -> Result<reqwest::Client> {
     Ok(reqwest::Client::builder()
         .user_agent(USER_AGENT)
         .timeout(Duration::from_secs(FETCH_TIMEOUT_SECS))
         .build()?)
 }
 
-fn local_time_label(rules: &NewsRules, now: DateTime<Utc>) -> String {
+pub(super) fn local_time_label(rules: &NewsRules, now: DateTime<Utc>) -> String {
     const WEEKDAYS: [&str; 7] = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"];
     match rules.tz.parse::<chrono_tz::Tz>() {
         Ok(tz) => {
@@ -1151,7 +1151,7 @@ fn local_time_label(rules: &NewsRules, now: DateTime<Utc>) -> String {
     }
 }
 
-/// Run one news push. Returns the message to deliver.
+/// Run one slot push. Returns the message to deliver.
 pub async fn run_slot(config: &Config, slot_name: &str) -> Result<String> {
     let rules = news::load_rules(config)?;
     let data = news::load_data(config)?;
@@ -1169,6 +1169,24 @@ pub async fn run_slot(config: &Config, slot_name: &str) -> Result<String> {
         !sources.is_empty(),
         "时段 '{slot_name}' 没有可用的新闻源（都被封禁了）"
     );
+    match slot.kind {
+        SlotKind::News => run_news(config, &rules, &slot, sources).await,
+        SlotKind::Expo => {
+            Box::pin(crate::cron::expo_pipeline::run(
+                config, &rules, &slot, sources,
+            ))
+            .await
+        }
+    }
+}
+
+async fn run_news(
+    config: &Config,
+    rules: &NewsRules,
+    slot: &Slot,
+    sources: Vec<Source>,
+) -> Result<String> {
+    let slot_name = slot.name.as_str();
     let max_items = slot.max_items.unwrap_or(DEFAULT_MAX_ITEMS).max(1);
     let now = Utc::now();
     let client = http_client()?;
@@ -1251,8 +1269,8 @@ pub async fn run_slot(config: &Config, slot_name: &str) -> Result<String> {
     let (chosen, model_ok) = if candidates.is_empty() {
         (Vec::new(), true)
     } else {
-        let request = build_request(&slot, &candidates, max_items, now);
-        match ask_model(config, &request).await {
+        let request = build_request(slot, &candidates, max_items, now);
+        match ask_model(config, SELECT_SYSTEM, &request).await {
             Ok(answer) => match parse_picks(&answer, candidates.len(), max_items) {
                 Some(picks) => (picks, true),
                 None => {
@@ -1275,8 +1293,8 @@ pub async fn run_slot(config: &Config, slot_name: &str) -> Result<String> {
 
     // 6. source health (failure counting / bans) — by code, not by a report.
     let stamp = now.to_rfc3339();
-    let outcome = news::update_data(config, &rules, |d| {
-        Ok(news::record_results(d, &rules, &results, &stamp))
+    let outcome = news::update_data(config, rules, |d| {
+        Ok(news::record_results(d, rules, &results, &stamp))
     });
     let mut footer = String::new();
     if !failed.is_empty() {
@@ -1306,8 +1324,8 @@ pub async fn run_slot(config: &Config, slot_name: &str) -> Result<String> {
     let picked: Vec<&Item> = chosen.iter().map(|c| &candidates[c.index]).collect();
     record_pushed(&history, &picked, slot_name, now)?;
     Ok(render(
-        &slot,
-        &local_time_label(&rules, now),
+        slot,
+        &local_time_label(rules, now),
         quotes.as_deref(),
         &candidates,
         &chosen,

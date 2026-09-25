@@ -6511,3 +6511,58 @@ K6 上在群里说一句 hello，输入 50,182 token、耗时 20.3 秒。用 Gem
 - 展会推送（09:00）和成人产业推送（14:00），按 memory `news_redesign_decisions.md`。
 - cf-crawler Worker 的 `/v1/crawl` 仍然坏着（任务创建后拿不到任务编号），需要重新部署 Worker，要用户提供新的 Cloudflare API token。
 - 可选：把 Google 新闻的跳转链接解析成原文链接（现在的链接很长，但能打开）。
+
+---
+
+## 2026-09-25 — cf-crawler Worker `/v1/crawl` 修复（cf-crawler 仓库 ea3dbed）
+
+- **原因**：Cloudflare 的 `/crawl` 接口在创建任务时改了返回格式：原来是 `{result:{id}}`，现在直接返回 `{result:"<任务ID>"}`。Worker 仍按旧格式读取，拿到的任务编号是空的。
+- **改动**：`worker/src/index.ts` 两种格式都能识别；版本号改为 0.3.2，已部署。用的 Cloudflare token 是 memory 里原有的，现在仍然有效，不需要用户另给新 token。
+- **验证**：抓 example.com 返回 ok、200。Locanto、Sammyboy 用这个接口同样被挡（403），这两个站暂时放弃。
+
+## 2026-09-25 — 会展推送（每天 09:00，程序主导）
+
+用户要求（见 memory `news_redesign_decisions.md`）：每天推送悉尼、墨尔本、布里斯班、黄金海岸、阿德莱德 2 个月内的各类专业展，包括成人展。每个展会在首次发现、开展前约一个月、开展前一周各通知一次，并写出门票价格和免费拿票的办法。
+
+### 改动
+
+- `src/cron/news.rs`：
+  - `Slot` 新增 `kind` 字段（`news` 或 `expo`，不写即 news，旧数据文件照常可用）；
+  - `Source` 新增 `browser` 字段（为 true 时通过 cf-crawler 浏览器渲染抓取）。
+- `src/cron/news_pipeline.rs`：
+  - `run_slot` 按 `kind` 分派，原来的新闻逻辑移到 `run_news`；
+  - `ask_model` 改为接收 system 提示词；
+  - 几个抓取和文本工具函数改为 `pub(super)`，供会展流水线复用。
+- `src/cron/expo_pipeline.rs`（新文件），流程：
+  1. 抓取所有来源。页面里的 schema.org Event 结构化数据（如 Eventbrite）由代码解析；其他页面去掉脚本和样式后转成纯文字。
+  2. 模型调用一次，从材料中挑出展会、归类、读出日期。代码负责核对：
+     - 城市必须是 5 个之一，类别必须在 14 类白名单里；
+     - 60 天窗口，持续超过 21 天的不收；
+     - 结构化条目的日期、场馆、链接以结构化数据为准；
+     - 从文字中找到的展会，链接取页面里文字最接近展名的那个链接，找不到就用来源页。
+  3. 与 `state/expo.db` 合并：同城、开幕日相差不超过 1 天、名称相近，算同一个展会。
+  4. 还没查过票价的展会（每天最多 12 个），代码抓它自己的页面，模型再调用一次，写出票价和免费入场办法。页面没写的，不编造价格。
+  5. 由代码决定当天发哪些通知：新发现、一个月后开展、一周内开展。已经错过的节点不补发。
+  6. 来源失败次数计入原有的封禁机制。
+- `src/tools/cf_crawler.rs`：新增 `scrape_page(security, url, goal, mode, strategy)`；`scrape_listing` 改为调用它。
+- `资料/HEARTBEAT_DATA.toml`（不入库）：新增"会展"时段，19 个来源：
+  - Eventbrite 5 个城市的 `/expos/` 分类；
+  - EventsEye 澳洲列表前 2 页（覆盖未来 60 天）；
+  - ICC Sydney、MCEC（浏览器渲染）、墨尔本 Showgrounds、BCEC、GCCEC、阿德莱德 Showground；
+  - Sexpo、Supanova、SMASH!、PAX、澳洲博彩展、Security Expo。
+- 悉尼 Showground 的活动页只有活动名、没有日期，暂不接入。
+
+### 验证
+
+- 新增单测 12 个：
+  - JSON-LD 解析（嵌套、`&amp;`、价格区间、免费、缺日期的跳过）；
+  - 链接解析和匹配；页面文字去掉脚本；
+  - 同一展会判断（改写的名称算同一个，不同城市、不同周不算）；
+  - 三次通知节奏，以及晚发现时跳过已过的节点；
+  - 模型答案校验：日期和链接取自数据、城市、窗口、长期展览、错误编号、类别白名单；
+  - 日期显示；排版；数据库读写。
+  - `cargo test --lib -- cron:: tools::news tools::cf_crawler` 130 个全部通过；clippy 在改动文件上没有新增告警（cf_crawler.rs 里两处 `#[ignore]` 缺少原因说明，是原来就有的）。
+- **真实端到端**（临时测试，已删除；真实来源、真实 Gemini）：
+  - 第一版提示词：91–97 秒，发现 69 个展会，混进了大量 Eventbrite 上的社区小活动，例如老年人博览会、餐厅里的旅游特卖、公司门店里的设备演示；
+  - 收紧类别并由代码丢弃白名单以外的类别后：33 个，都是专业展和消费展，例如 PAX、悉尼家居展、Supanova 布里斯班和阿德莱德两场、悉尼电动车展、MRO 航空维修展、AusRAIL、IMARC、All-Energy。
+  - 第一天全部算"新发现"，所以消息较长；之后每天只推新发现和到期提醒。

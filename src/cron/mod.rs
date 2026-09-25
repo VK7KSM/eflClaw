@@ -1,6 +1,7 @@
 use crate::config::Config;
 use anyhow::{bail, Result};
 
+pub mod expo_pipeline;
 pub mod heartbeat_decl;
 pub mod news;
 pub mod news_pipeline;

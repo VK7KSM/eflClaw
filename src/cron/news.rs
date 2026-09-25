@@ -76,11 +76,30 @@ pub struct NewsData {
     pub candidates: Vec<Candidate>,
 }
 
+/// elfClaw 2026-09-25: what a slot pushes. Absent in the data file = news.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SlotKind {
+    /// Headlines picked from feeds / channels (`news_pipeline`).
+    #[default]
+    News,
+    /// Upcoming expos with a 3-notice schedule (`expo_pipeline`).
+    Expo,
+}
+
+impl SlotKind {
+    fn is_news(&self) -> bool {
+        *self == SlotKind::News
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Slot {
     pub name: String,
     pub time: String,
+    #[serde(default, skip_serializing_if = "SlotKind::is_news")]
+    pub kind: SlotKind,
     #[serde(default)]
     pub focus: String,
     /// elfClaw 2026-09-25: prepend the code-generated market quotes block.
@@ -106,6 +125,10 @@ pub struct Source {
     /// (case-insensitive). For high-volume feeds such as market squawks.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub filter: Vec<String>,
+    /// The page only has its content after JavaScript runs: fetch it with
+    /// cf-crawler's browser instead of a plain HTTP request (expo slots).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub browser: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
