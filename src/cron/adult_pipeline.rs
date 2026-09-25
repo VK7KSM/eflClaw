@@ -56,6 +56,11 @@ const REPORT_RECENT: usize = 50;
 const FETCH_CONCURRENCY: usize = 4;
 /// New profile pages read per directory source per run.
 const MAX_PROFILES: usize = 10;
+/// New profile pages read per run across all sources. Without this, nine
+/// sources with a `profile_pattern` could add 90 pages to the same prompt —
+/// which is how the first K6 run reached 130k tokens in one call. Pages left
+/// out today are not marked as read, so they are picked up on later runs.
+const MAX_PROFILES_PER_RUN: usize = 30;
 /// A profile page is read again after this many days (prices change).
 const PROFILE_REFRESH_DAYS: i64 = 30;
 const REPORT_PATH: &str = "intel/adult-industry.md";
@@ -660,6 +665,15 @@ fn pick_profiles(
         }
         if !urls.is_empty() {
             out.push((i, urls));
+        }
+    }
+    // Spread the run budget over the sources that have something new, so one
+    // busy board cannot use it all up.
+    let wanted: usize = out.iter().map(|(_, u)| u.len()).sum();
+    if wanted > MAX_PROFILES_PER_RUN && !out.is_empty() {
+        let share = (MAX_PROFILES_PER_RUN / out.len()).max(1);
+        for (_, urls) in &mut out {
+            urls.truncate(share);
         }
     }
     Ok(out)
@@ -1337,6 +1351,29 @@ mod tests {
             anchors: Vec::new(),
             events: Vec::new(),
         }
+    }
+
+    #[test]
+    fn profile_budget_is_shared_across_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open_db(dir.path()).unwrap();
+        // Every source offers more profiles than the whole-run budget allows.
+        let pages: Vec<Page> = (0..6)
+            .map(|i| {
+                let host = format!("https://s{i}.example.com");
+                let mut page = page(&format!("{host}/"), Vec::new());
+                page.src.profile_pattern = format!("^{host}/p/");
+                page.anchors = (0..20)
+                    .map(|n| (format!("profile {n}"), format!("{host}/p/{n}")))
+                    .collect();
+                page
+            })
+            .collect();
+        let picked = pick_profiles(&conn, &pages, Utc::now()).unwrap();
+        let total: usize = picked.iter().map(|(_, u)| u.len()).sum();
+        assert!(total <= MAX_PROFILES_PER_RUN, "{total} profiles in one run");
+        assert_eq!(picked.len(), pages.len(), "every source gets a share");
+        assert!(picked.iter().all(|(_, u)| !u.is_empty()));
     }
 
     #[test]
