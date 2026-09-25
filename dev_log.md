@@ -6415,3 +6415,22 @@ K6 上在群里说一句 hello，输入 50,182 token、耗时 20.3 秒。用 Gem
 
 1. `edge_browser` 拿到的其实是 Cloudflare 验证页（标题"请稍候…"，`anti_bot_signals` 里有 `challenge_marker`，正文为 0），却返回 `success: true`。所以被挡住的抓取会被当成成功，之前 linux.do、SCMP"成功但只有几百字节"很可能就是这个原因。
 2. Worker 的 `/v1/crawl`（Cloudflare 的 crawl REST 接口，auto 模式的第三道防线）三次全部返回 500 "crawl job created but no job ID returned"，这道防线目前实际不可用。
+
+### 补充调研（同日）：成人产业缺口 + 展会信息来源
+
+**成人产业补充**
+- Punter Planet 按州分了评价区：新州、维州、昆州、西澳、南澳、首都领地、塔州、北领地，另有 Escort Guide、Advertisers News，路径是 `/forums/forum/<id>-<名称>/`。
+- 香港：`sex141.com` 会跳转到 `141go161.com`（"香港一樓一服務網站｜囡囡資料庫"），可以直接访问。
+- 新加坡：`chiongster.com`（夜生活指南，KTV、按摩、俱乐部，有价格）可以直接访问。Sammyboy 仍然被 Cloudflare 挡住。
+- 马来西亚、韩国、澳洲的妓院和按摩店目录还没找到可用的来源；从论坛首页挖外链几乎没有收获（首页只有站内链接）。
+
+**展会信息来源**
+- **Eventbrite**（最好用）：页面里有 schema.org Event JSON-LD，一页 20 个活动，其中 15 个在未来 75 天内，名称、日期、地点可以精确解析。
+- **EventsEye 澳洲专业展列表**：格式规整，每条是"展名 | 简介 | 频率 | 城市 | 场馆 | 日期（MM/DD/YYYY）| 天数"。
+- **会展中心日程**：
+  - ICC Sydney、BCEC 布里斯班、阿德莱德展览中心的正文格式都是"活动名 | 日期"，可以解析，但混着演唱会等，要先分类；
+  - MCEC、黄金海岸 GCCEC、悉尼 Showground 的日程疑似由前端 JS 加载，要用浏览器渲染或找它们的数据接口；
+  - Adelaide Convention Centre 的 whats-on 页面返回 404。
+- **展会官网**都能访问：Supanova、SMASH!、PAX Australia、Australasian Gaming Expo、Avalon 航展、Land Forces、Indo Pacific Maritime、Security Exhibition。
+- **不可用**：10times（Cloudflare 拦截）、expodatabase（域名解析失败）。
+- **成人展**：原 Sexpo 公司已清盘，`sexpo.com.au` 域名解析失败；新品牌 SexEx Adult Lifestyle Expo（`sexpo.net.au`）2026 年 2 月 6–8 日在墨尔本 MCEC；Sexpo 珀斯、悉尼 2026 年 9 月 18–20 日，门票在 Fever、Eventbrite 销售。
