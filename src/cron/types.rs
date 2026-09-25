@@ -13,6 +13,13 @@ pub enum JobType {
     /// doesn't cost any of the daily Gemini budget. This is what
     /// `cron_add(job_type="message")` produces; see elfclaw.md §6.4.
     Message,
+    /// elfClaw 2026-09-25: a daily news push run by code
+    /// (`cron::news_pipeline`): fetch every source of the slot named in
+    /// `prompt`, filter, de-duplicate, add market quotes, and ask the model
+    /// once to select and summarise. No agent tool loop, so it cannot run out
+    /// of iterations, and every link in the output comes from the fetched
+    /// item itself rather than from model-written text.
+    News,
 }
 
 impl From<JobType> for &'static str {
@@ -20,6 +27,7 @@ impl From<JobType> for &'static str {
         match value {
             JobType::Agent => "agent",
             JobType::Message => "message",
+            JobType::News => "news",
         }
     }
 }
@@ -31,8 +39,9 @@ impl TryFrom<&str> for JobType {
         match value.to_lowercase().as_str() {
             "agent" => Ok(JobType::Agent),
             "message" => Ok(JobType::Message),
+            "news" => Ok(JobType::News),
             _ => Err(format!(
-                "Invalid job type '{}'. Expected one of: 'agent', 'message'",
+                "Invalid job type '{}'. Expected one of: 'agent', 'message', 'news'",
                 value
             )),
         }

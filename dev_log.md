@@ -6434,3 +6434,80 @@ K6 上在群里说一句 hello，输入 50,182 token、耗时 20.3 秒。用 Gem
 - **展会官网**都能访问：Supanova、SMASH!、PAX Australia、Australasian Gaming Expo、Avalon 航展、Land Forces、Indo Pacific Maritime、Security Exhibition。
 - **不可用**：10times（Cloudflare 拦截）、expodatabase（域名解析失败）。
 - **成人展**：原 Sexpo 公司已清盘，`sexpo.com.au` 域名解析失败；新品牌 SexEx Adult Lifestyle Expo（`sexpo.net.au`）2026 年 2 月 6–8 日在墨尔本 MCEC；Sexpo 珀斯、悉尼 2026 年 9 月 18–20 日，门票在 Fever、Eventbrite 销售。
+
+---
+
+## 2026-09-25 — 新闻推送改为程序主导（抓取、过滤、去重、行情由程序完成，模型只调用一次）
+
+### 为什么
+
+旧流程是给新闻子 agent 一份网址清单，让它一轮一轮调用工具去抓：每次推送要调用模型 8–15 次，经常撞上 15 轮上限，模型会改动链接，内容也只限于它抓到的那几个站。用户决定先改流程，再调整推送时间和条数（见 memory `news_redesign_decisions.md`）。
+
+### 改动
+
+- **`src/cron/types.rs` / `store.rs` / `mod.rs`**：
+  - 新增 `JobType::News`（持久化值 "news"），任务的 prompt 只存时段名；
+  - `add_message_job` 和新的 `add_news_job` 共用 `add_text_job`：同名同类型的任务直接更新；同名但类型不同的（例如旧的 Agent 新闻任务）先删掉再新建，不会出现两个同名任务。
+- **`src/cron/scheduler.rs`**：`JobType::News` 调用 `news_pipeline::run_slot`，返回的文字照常由 `deliver_if_configured` 发送。
+- **新模块 `src/cron/news_pipeline.rs`**：
+  1. **抓取**：并发抓取时段里所有可用来源，按网址识别类型：
+     - `t.me/…` → 频道网页预览；
+     - `gamma-api.polymarket.com` → 24 小时赔率变动至少 8 个百分点、成交至少 2 万美元的市场；
+     - `hn.algolia.com` → Hacker News；
+     - 其他：先直接请求，内容是 RSS、Atom 或 RDF 就按 feed 解析（用 quick-xml），否则交给 cf-crawler 按列表模式抓取。
+  2. **过滤**：每个来源按 `filter` 关键词过滤、只保留 36 小时内的内容、最多取最新 12 条。
+  3. **去重**：各来源的条目先交错排列（保证每个来源都有机会进入候选），再做跨来源去重和历史去重。历史记录在本地 `state/news_history.db`：14 天内推送过的，按链接（去掉 utm 等跟踪参数和 www）或标题相同即算重复；候选最多 160 条。
+  4. **行情**（`quotes = true` 的时段）：Yahoo chart API 取 12 个品种、中国银行美元牌价，全部由程序排版，模型碰不到数字。
+  5. **模型只调用一次**（用 worker_model，走现有的多 key 和模型降级链），只返回 `{id, category, title, summary}`，**链接由程序按 id 从原始条目取**。系统提示写明：只能从候选里选、不准编造、不要加密货币新闻；中共党政媒体（域名名单由程序识别，标"官方口径"）是宣传不是新闻，只有透露政策动向时才可以选，而且要说明是官方说法。模型不可用或返回无法解析时，按来源轮流取最新条目、用原文标题照样推送。
+  6. **来源健康度**由程序直接调用 `news::record_results` 记录（连续失败 3 次封禁；浏览器限流不算失败），推送末尾列出这次没抓到的来源和新封禁的来源。
+- **`src/cron/news.rs`**：
+  - `Slot` 新增 `quotes`、`max_items`（默认 20）字段，`Source` 新增 `name`（显示名）、`filter`（关键词）字段，都是可选的，旧数据文件照样能读；
+  - `render_prompt` 改为 `usable_sources`；
+  - 对账时生成 `JobType::News` 任务。
+- **`src/tools/cf_crawler.rs`**：
+  - 拿到的是 Cloudflare 验证页时（带 `challenge_marker`、正文少于 500 字、条目不超过 1 个），cf-crawler 说"成功"也判为失败；
+  - 新增 `scrape_listing()` 供新闻管线使用。
+- **`src/tools/cron_add.rs`**：不允许用 cron_add 创建 News 任务（这类任务只由新闻对账生成）。
+
+### 部署文件
+
+- **`HEARTBEAT_DATA.toml`**：以 K6 当前文件为基础重建，只替换时段部分：
+  - 早报 07:00（带行情，13 个来源）、午报 12:30（14 个）、晚报 17:30（带行情，8 个）、夜报 21:30（带行情，14 个）；
+  - 来源包括：
+    - Telegram：Kyiv Independent、WarTranslated、Serhii Flash、DeepState、竹新社、美国之音、香港自由新闻、FinancialJuice、Walter Bloomberg，其中后两个按市场关键词过滤；
+    - Google 新闻：澳洲、美国、台湾、香港头条，以及中国、无人机与电子战、军用机器人、AI、亚太安全、澳洲财经、支付、悉尼等搜索；
+    - 原有的国防类 RSS、BBC、Al Jazeera、ABC、TechCrunch AI、Import AI、PYMNTS、无线电站点、Hackaday、Techmeme；
+    - Hacker News、Simon Willison、Polymarket 地缘政治和国际。
+  - 候选源 23 个、死源 9 个保留；3 条对应已移除来源的失败记录清掉。
+- **`HEARTBEAT.md`**：
+  - 说明文字改成新流程；`max_sources_per_slot` 从 8 改为 20；
+  - "新闻源搜索"改为每天 10:00 一次，指令精简到 6 次工具调用以内：随机挑 2 个类别，找 Telegram 频道、独立作者、专业论坛这类出消息快的来源，不再排除个人博客，不读数据文件、不逐个验证，只登记为候选。
+- `news_report` 的 kind 说明改为 "RSS / Telegram / 网页"。
+
+### 验证
+
+- 新增单测 15 个：
+  - RSS（含 CDATA、实体、pubDate、`<source>`）、Atom（取 alternate 链接）的解析；
+  - Telegram 网页解析；Polymarket 过滤；url_key、title_key；去重（历史和跨来源）；
+  - 按来源的关键词和时效过滤；模型答案解析（校验 id、容忍 ``` 代码块）；兜底按来源轮流且跳过官方口径；
+  - 排版时链接来自原始条目；行情解析和排版；历史库读写；来源类型识别；
+  - `&` 后面紧跟中文时不会 panic（原写法按字节截取有这个隐患）；
+  - Cloudflare 验证页判为失败。
+- 3 个旧测试原来断言"任务指令里带来源网址"，改为断言数据文件里的可用来源和 News 任务类型。
+- **真实端到端**（临时测试，已删除；真实来源、真实 Gemini，每个时段调用 1 次模型）：
+
+  | 时段 | 耗时 | 条数 | 消息长度 |
+  |---|---|---|---|
+  | 早报 | 34 秒 | 20 | 5927 字 |
+  | 午报 | 45 秒 | 17 | 4459 字 |
+  | 晚报 | 31 秒 | 20 | 5723 字 |
+  | 夜报 | 24 秒 | 14 | 2441 字（历史去重滤掉了之前测试推过的内容） |
+
+  所有来源都抓取成功，行情 12 个品种加中行牌价齐全。超过 4096 字的由 Telegram 渠道自动拆分发送。
+- 全量：`cargo test --lib` 4118 通过，10 个失败全部是已知基线；集成测试 230 通过、3 个失败（已知基线）；clippy 新增 0。注意 git blame 核对不覆盖未加入 git 的新文件，这次靠改动前后逐文件计数，找到并修掉了新文件里的 2 处问题。
+
+### 待办（下一阶段）
+
+- 展会推送（09:00）和成人产业推送（14:00），按 memory `news_redesign_decisions.md`。
+- cf-crawler Worker 的 `/v1/crawl` 仍然坏着（任务创建后拿不到任务编号），需要重新部署 Worker，要用户提供新的 Cloudflare API token。
+- 可选：把 Google 新闻的跳转链接解析成原文链接（现在的链接很长，但能打开）。

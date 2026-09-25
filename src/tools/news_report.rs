@@ -66,7 +66,7 @@ impl Tool for NewsReportTool {
                         "properties": {
                             "name": { "type": "string" },
                             "category": { "type": "string" },
-                            "kind": { "type": "string", "description": "RSS 或 网页" },
+                            "kind": { "type": "string", "description": "RSS / Telegram / 网页" },
                             "url": { "type": "string" },
                             "note": { "type": "string" }
                         },
@@ -230,11 +230,11 @@ ban_after_failures = 3
                 Some(vec![
                     news::Source {
                         url: "https://a.example.com".into(),
-                        note: String::new(),
+                        ..news::Source::default()
                     },
                     news::Source {
                         url: "https://b.example.com".into(),
-                        note: String::new(),
+                        ..news::Source::default()
                     },
                 ]),
             )
@@ -254,13 +254,13 @@ ban_after_failures = 3
         }
         let r = tool.execute(report).await.unwrap();
         assert!(r.output.contains("新封禁"));
-        let prompt = crate::cron::find_job_by_name(&config, "news:科技")
-            .unwrap()
-            .unwrap()
-            .prompt
-            .unwrap();
-        assert!(!prompt.contains("https://a.example.com"));
-        assert!(prompt.contains("https://b.example.com"));
+        // The banned source is no longer fetched at push time.
+        let data = news::load_data(&config).unwrap();
+        let usable: Vec<&str> = news::usable_sources(&data.slots[0], &data)
+            .iter()
+            .map(|s| s.url.as_str())
+            .collect();
+        assert_eq!(usable, vec!["https://b.example.com"]);
     }
 
     #[tokio::test]

@@ -16,7 +16,7 @@
 
 use crate::config::Config;
 use crate::cron::heartbeat_decl::ReconcileReport;
-use crate::cron::{self, DeliveryConfig, JobType, Schedule, SessionTarget};
+use crate::cron::{self, DeliveryConfig, JobType, Schedule};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -33,7 +33,8 @@ const DATA_FILE_HEADER: &str = "\
 # HEARTBEAT_DATA.toml — 新闻推送数据\n\
 #\n\
 # 本文件由程序维护：agent 通过 news_schedule（时段、新闻源）和 news_report\n\
-# （抓取结果、候选新源）两个工具修改，不要让 agent 用 file_write 直接改。\n\
+# （候选新源）两个工具修改，不要让 agent 用 file_write 直接改。新闻由程序按\n\
+# 这里的时段和新闻源抓取、过滤、去重，模型只负责挑选和写中文摘要。\n\
 # 推送对象、执行的子 agent、静默时段和数量上限在 HEARTBEAT.md 的 news-rules 里。\n\
 # 爸爸可以直接手改，改完下次心跳或下次工具调用时生效（格式错了会在 Telegram 报错，\n\
 # 已有的新闻任务不会被删）。\n\n";
@@ -75,23 +76,36 @@ pub struct NewsData {
     pub candidates: Vec<Candidate>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Slot {
     pub name: String,
     pub time: String,
     #[serde(default)]
     pub focus: String,
+    /// elfClaw 2026-09-25: prepend the code-generated market quotes block.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub quotes: bool,
+    /// Items per push; `None` = `news_pipeline::DEFAULT_MAX_ITEMS`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_items: Option<usize>,
     #[serde(default)]
     pub sources: Vec<Source>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Source {
     pub url: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub note: String,
+    /// Display name in the push ("Kyiv Independent"); empty = the host name.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    /// Keep only items whose title/text contains one of these words
+    /// (case-insensitive). For high-volume feeds such as market squawks.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub filter: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -301,38 +315,12 @@ fn slot_schedule(slot: &Slot, rules: &NewsRules) -> Schedule {
     }
 }
 
-/// The worker's task text, rendered by code from the slot's current data.
-/// Banned sources are left out here, so the worker never has to check.
-/// Returns `None` when no usable source is left.
-fn render_prompt(slot: &Slot, data: &NewsData) -> Option<String> {
-    let sources: Vec<String> = slot
-        .sources
+/// Sources of `slot` that are not banned — what `news_pipeline` fetches.
+pub fn usable_sources<'a>(slot: &'a Slot, data: &NewsData) -> Vec<&'a Source> {
+    slot.sources
         .iter()
         .filter(|s| !is_banned(data, &s.url))
-        .map(|s| {
-            if s.note.is_empty() {
-                format!("- {}", s.url)
-            } else {
-                format!("- {}（{}）", s.url, s.note)
-            }
-        })
-        .collect();
-    if sources.is_empty() {
-        return None;
-    }
-    let focus = if slot.focus.trim().is_empty() {
-        String::new()
-    } else {
-        format!("\n本时段重点：{}", slot.focus.trim())
-    };
-    Some(format!(
-        "先读 workers/news_fetcher.md 获取工作手册，严格按手册流程执行。\n\
-本次时段名：{}\n\
-新闻源（系统已剔除封禁的源）：\n{}{focus}\n\
-全部抓完后，用 news_report 工具一次性上报每个源的抓取结果。",
-        slot.name,
-        sources.join("\n")
-    ))
+        .collect()
 }
 
 pub fn job_name(slot_name: &str) -> String {
@@ -403,36 +391,34 @@ pub fn reconcile(config: &Config) -> Result<ReconcileReport> {
             report.errors.push(format!("{e:#}"));
             continue;
         }
-        let Some(prompt) = render_prompt(slot, &data) else {
+        if usable_sources(slot, &data).is_empty() {
             report.errors.push(format!(
                 "时段 '{}' 的新闻源都已被封禁，这个时段暂停推送",
                 slot.name
             ));
             continue;
-        };
+        }
         let schedule = slot_schedule(slot, &rules);
 
+        // elfClaw 2026-09-25: news slots are code-run `JobType::News` jobs;
+        // the prompt only carries the slot name (sources are read fresh from
+        // the data file at fire time, so a source change needs no job update).
         let existing = cron::find_job_by_name(config, &name)?;
         if let Some(job) = &existing {
-            let unchanged = job.job_type == JobType::Agent
+            let unchanged = job.job_type == JobType::News
                 && job.schedule == schedule
-                && job.prompt.as_deref() == Some(prompt.as_str())
-                && job.delivery == rules.delivery
-                && job.delegate_to.as_deref() == Some(rules.agent.as_str());
+                && job.prompt.as_deref() == Some(slot.name.as_str())
+                && job.delivery == rules.delivery;
             if unchanged {
                 continue;
             }
         }
-        match cron::add_agent_job(
+        match cron::add_news_job(
             config,
             Some(name),
             schedule,
-            &prompt,
-            SessionTarget::Isolated,
-            None,
+            &slot.name,
             Some(rules.delivery.clone()),
-            false,
-            Some(rules.agent.clone()),
         ) {
             Ok(_) if existing.is_some() => report.updated.push(slot.name.clone()),
             Ok(_) => report.created.push(slot.name.clone()),
@@ -499,6 +485,7 @@ pub fn set_slot(
         time: time.to_string(),
         focus: focus.unwrap_or_default().to_string(),
         sources,
+        ..Slot::default()
     });
     Ok(true)
 }
@@ -521,6 +508,7 @@ pub fn add_source(data: &mut NewsData, slot: &str, url: &str, note: &str) -> Res
     target.sources.push(Source {
         url: url.to_string(),
         note: note.to_string(),
+        ..Source::default()
     });
     // A candidate that has been put to use is no longer a candidate.
     data.candidates.retain(|c| c.url != url);
@@ -759,16 +747,17 @@ ban_after_failures = 3
                 .iter()
                 .map(|u| Source {
                     url: (*u).into(),
-                    note: String::new(),
+                    ..Source::default()
                 })
                 .collect(),
+            ..Slot::default()
         }
     }
 
     fn src(url: &str) -> Source {
         Source {
             url: url.into(),
-            note: String::new(),
+            ..Source::default()
         }
     }
 
@@ -927,13 +916,10 @@ ban_after_failures = 3
             .iter()
             .find(|j| j.name.as_deref() == Some("news:早报"))
             .unwrap();
-        assert_eq!(job.delegate_to.as_deref(), Some("news_fetcher"));
+        assert_eq!(job.job_type, JobType::News);
         assert_eq!(job.delivery.to.as_deref(), Some("zeroclaw_user"));
         assert_eq!(job.schedule, sydney("30 6 * * *"));
-        let prompt = job.prompt.as_deref().unwrap();
-        assert!(prompt.contains("本次时段名：早报"));
-        assert!(prompt.contains("https://a.example.com"));
-        assert!(prompt.contains("news_report"));
+        assert_eq!(job.prompt.as_deref(), Some("早报"));
 
         let again = reconcile(&config).unwrap();
         assert_eq!(again.total_changes(), 0, "{again:?}");
@@ -991,9 +977,12 @@ ban_after_failures = 3
         };
         save_data(&config, &data).unwrap();
         reconcile(&config).unwrap();
-        let prompt = news_jobs(&config)[0].prompt.clone().unwrap();
-        assert!(!prompt.contains("b.example.com"));
-        assert!(prompt.contains("c.example.com"));
+        let usable: Vec<&str> = usable_sources(&data.slots[0], &data)
+            .iter()
+            .map(|s| s.url.as_str())
+            .collect();
+        assert_eq!(usable, vec!["https://c.example.com"]);
+        assert_eq!(news_jobs(&config).len(), 1);
 
         data.source_status
             .push(status("https://c.example.com", true));

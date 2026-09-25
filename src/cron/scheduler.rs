@@ -79,6 +79,14 @@ async fn execute_job_with_retry(
             // can fail on a 429/503 — this always succeeds. `deliver_if_configured`
             // (called by `persist_job_result`) is what actually sends it.
             JobType::Message => (true, job.prompt.clone().unwrap_or_default()),
+            // elfClaw 2026-09-25: code-run news push, see cron::news_pipeline.
+            JobType::News => {
+                let slot = job.prompt.clone().unwrap_or_default();
+                match Box::pin(crate::cron::news_pipeline::run_slot(config, &slot)).await {
+                    Ok(text) => (true, text),
+                    Err(e) => (false, format!("news push '{slot}' failed: {e:#}")),
+                }
+            }
         };
         last_output = output;
 

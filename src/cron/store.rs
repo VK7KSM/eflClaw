@@ -179,22 +179,64 @@ pub fn add_message_job(
     delivery: Option<DeliveryConfig>,
     delete_after_run: bool,
 ) -> Result<CronJob> {
+    add_text_job(
+        config,
+        name,
+        schedule,
+        message,
+        delivery,
+        delete_after_run,
+        JobType::Message,
+    )
+}
+
+/// elfClaw 2026-09-25: a `JobType::News` job — `slot` (the news slot name)
+/// is stored as the prompt and read by `cron::news_pipeline` at fire time.
+pub fn add_news_job(
+    config: &Config,
+    name: Option<String>,
+    schedule: Schedule,
+    slot: &str,
+    delivery: Option<DeliveryConfig>,
+) -> Result<CronJob> {
+    add_text_job(config, name, schedule, slot, delivery, false, JobType::News)
+}
+
+/// Shared by the prompt-only job types (`Message`, `News`): same-name
+/// de-duplication, then insert.
+fn add_text_job(
+    config: &Config,
+    name: Option<String>,
+    schedule: Schedule,
+    message: &str,
+    delivery: Option<DeliveryConfig>,
+    delete_after_run: bool,
+    job_type: JobType,
+) -> Result<CronJob> {
+    let type_str: &'static str = job_type.clone().into();
     let _write_guard = job_write_lock();
     let schedule = apply_default_tz(config, schedule);
 
     // elfClaw: idempotent dedup — if a job with the same name already exists, update it
     if let Some(ref job_name) = name {
-        if let Ok(Some(existing)) = find_job_by_name(config, job_name) {
+        let found = find_job_by_name(config, job_name).ok().flatten();
+        if let Some(stale) = found.as_ref().filter(|job| job.job_type != job_type) {
+            // Same name, different kind of job (e.g. an old agent-run news
+            // slot becoming a code-run one): replace it, never keep both.
+            remove_job(config, &stale.id)?;
+        }
+        if let Some(existing) = found.filter(|job| job.job_type == job_type) {
             tracing::info!(
                 job_id = %existing.id,
                 name = %job_name,
-                "Cron dedup: updating existing message job instead of creating duplicate"
+                job_type = type_str,
+                "Cron dedup: updating existing job instead of creating duplicate"
             );
             crate::elfclaw_log::log_cron_event(
                 &existing.id,
                 job_name,
                 "dedup_update",
-                serde_json::json!({"action": "updated existing message job"}),
+                serde_json::json!({"action": format!("updated existing {type_str} job")}),
             );
             let patch = CronJobPatch {
                 schedule: Some(schedule),
@@ -220,7 +262,7 @@ pub fn add_message_job(
             "INSERT INTO cron_jobs (
                 id, expression, command, schedule, job_type, prompt, name, session_target, model,
                 enabled, delivery, delete_after_run, created_at, next_run
-             ) VALUES (?1, ?2, '', ?3, 'message', ?4, ?5, 'isolated', NULL, 1, ?6, ?7, ?8, ?9)",
+             ) VALUES (?1, ?2, '', ?3, ?10, ?4, ?5, 'isolated', NULL, 1, ?6, ?7, ?8, ?9)",
             params![
                 id,
                 expression,
@@ -231,9 +273,10 @@ pub fn add_message_job(
                 if delete_after_run { 1 } else { 0 },
                 now.to_rfc3339(),
                 next_run.to_rfc3339(),
+                type_str,
             ],
         )
-        .context("Failed to insert cron message job")?;
+        .with_context(|| format!("Failed to insert cron {type_str} job"))?;
         Ok(())
     })?;
 
@@ -242,7 +285,7 @@ pub fn add_message_job(
             &id,
             job_name,
             "created",
-            serde_json::json!({"type": "message"}),
+            serde_json::json!({"type": type_str}),
         );
     }
 

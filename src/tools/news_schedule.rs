@@ -261,7 +261,9 @@ ban_after_failures = 3
         let job = crate::cron::find_job_by_name(&config, "news:早报")
             .unwrap()
             .unwrap();
-        assert!(job.prompt.unwrap().contains("https://a.example.com"));
+        // Code-run news job: the prompt only names the slot.
+        assert_eq!(job.job_type, crate::cron::JobType::News);
+        assert_eq!(job.prompt.as_deref(), Some("早报"));
 
         let r = run(
             &tool,
@@ -322,15 +324,12 @@ ban_after_failures = 3
         )
         .await;
         assert!(added.success, "{:?}", added.error);
-        let prompt = crate::cron::find_job_by_name(&config, "news:科技")
-            .unwrap()
-            .unwrap()
-            .prompt
-            .unwrap();
-        assert!(
-            prompt.contains("https://b.example.com"),
-            "prompt re-rendered right away"
-        );
+        // Sources are read from the data file at push time.
+        let data = news::load_data(&config).unwrap();
+        assert!(data.slots[0]
+            .sources
+            .iter()
+            .any(|s| s.url == "https://b.example.com"));
 
         let removed = run(
             &tool,

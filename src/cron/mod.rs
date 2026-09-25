@@ -3,6 +3,7 @@ use anyhow::{bail, Result};
 
 pub mod heartbeat_decl;
 pub mod news;
+pub mod news_pipeline;
 mod schedule;
 mod store;
 mod types;
@@ -16,9 +17,9 @@ pub use schedule::{
 };
 #[allow(unused_imports)]
 pub use store::{
-    add_agent_job, add_job, add_message_job, due_jobs, find_job_by_name, get_job, job_write_lock,
-    list_jobs, list_runs, record_last_run, record_run, remove_job, remove_jobs_by_name,
-    reschedule_after_run, update_job,
+    add_agent_job, add_job, add_message_job, add_news_job, due_jobs, find_job_by_name, get_job,
+    job_write_lock, list_jobs, list_runs, record_last_run, record_run, remove_job,
+    remove_jobs_by_name, reschedule_after_run, update_job,
 };
 pub use types::{CronJob, CronJobPatch, CronRun, DeliveryConfig, JobType, Schedule, SessionTarget};
 

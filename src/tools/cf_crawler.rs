@@ -198,16 +198,44 @@ async fn run_with_browser_retry(
     }
 }
 
+/// Shown when a "successful" fetch only returned a bot-check page.
+const CHALLENGE_PAGE_ERROR: &str = "被网站的 Cloudflare 人机验证页挡住了，没有拿到正文\
+     （这不是网站失效，换 strategy 或稍后再试）。";
+
+/// elfClaw 2026-09-25: cf-crawler 0.3.x reports `success: true` when the
+/// browser only reached a Cloudflare challenge page ("Just a moment…" /
+/// "请稍候…"): `anti_bot_signals` contains `challenge_marker` and there is
+/// (almost) no content. Seen on locanto.com.au, escortsandbabes.com.au,
+/// sammyboy.com — and it is why some news sources "succeeded" with a few
+/// hundred bytes. Such a result is a failure.
+fn is_challenge_page(v: &Value) -> bool {
+    let challenged = v
+        .get("anti_bot_signals")
+        .and_then(Value::as_array)
+        .is_some_and(|s| s.iter().any(|x| x.as_str() == Some("challenge_marker")));
+    let content = v
+        .get("markdown")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .len();
+    let items = v.get("items").and_then(Value::as_array).map_or(0, Vec::len);
+    challenged && content < 500 && items <= 1
+}
+
 /// Convert a parsed cf-crawler JSON response into a ToolResult.
 /// `health` uses an `ok` field; every other command uses `success`.
 fn result_from_json(v: Value) -> ToolResult {
-    let success = v
-        .get("success")
-        .and_then(Value::as_bool)
-        .or_else(|| v.get("ok").and_then(Value::as_bool))
-        .unwrap_or(false);
+    let challenge = is_challenge_page(&v);
+    let success = !challenge
+        && v.get("success")
+            .and_then(Value::as_bool)
+            .or_else(|| v.get("ok").and_then(Value::as_bool))
+            .unwrap_or(false);
     let error = if success {
         None
+    } else if challenge {
+        Some(CHALLENGE_PAGE_ERROR.to_string())
     } else {
         v.get("error")
             .and_then(Value::as_str)
@@ -218,6 +246,26 @@ fn result_from_json(v: Value) -> ToolResult {
         output: v.to_string(),
         error,
     }
+}
+
+/// elfClaw 2026-09-25: listing scrape for the code-run news pipeline
+/// (`cron::news_pipeline`), for sources without a feed. Same process
+/// handling, browser-rate-limit retry and challenge-page check as `web_scrape`.
+/// Returns the parsed cf-crawler result on success.
+pub(crate) async fn scrape_listing(security: &SecurityPolicy, url: &str) -> anyhow::Result<Value> {
+    let args =
+        json!({"url": url, "goal": "latest article list", "mode": "listing", "strategy": "auto"});
+    let result =
+        run_with_browser_retry(security, "scrape-page", &args, SCRAPE_TIMEOUT_SECS).await?;
+    if !result.success {
+        anyhow::bail!(
+            "{}",
+            result
+                .error
+                .unwrap_or_else(|| "cf-crawler 抓取失败".to_string())
+        );
+    }
+    Ok(serde_json::from_str(&result.output)?)
 }
 
 // ── web_health ───────────────────────────────────────────────────────────────
@@ -629,6 +677,22 @@ mod tests {
             "ok": false,
             "error": "Error: Unable to create new browser: code: 429: message: Rate limit exceeded"
         })));
+    }
+
+    #[test]
+    fn challenge_page_is_a_failure_even_when_cf_crawler_says_success() {
+        // Real shape from locanto.com.au via edge_browser, 2026-09-25.
+        let blocked = json!({"success": true, "strategy_used": "edge_browser", "title": "请稍候…",
+                             "markdown": "", "items": [], "anti_bot_signals": ["challenge_marker"]});
+        let result = result_from_json(blocked);
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("人机验证"));
+
+        // A real page that merely mentions a challenge marker keeps its success.
+        let fine = json!({"success": true, "markdown": "x".repeat(2000),
+                          "items": [{"title": "a"}, {"title": "b"}],
+                          "anti_bot_signals": ["challenge_marker"]});
+        assert!(result_from_json(fine).success);
     }
 
     #[test]

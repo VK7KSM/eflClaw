@@ -335,6 +335,14 @@ For one-time reminders, use schedule.kind='at' with an RFC3339 timestamp."
                     delegate_to,
                 )
             }
+            // News jobs are created only by the news slot reconciler.
+            JobType::News => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some("news jobs are managed by news_schedule, not cron_add".to_string()),
+                });
+            }
             JobType::Message => {
                 let message = match args.get("message").and_then(serde_json::Value::as_str) {
                     Some(message) if !message.trim().is_empty() => message,
