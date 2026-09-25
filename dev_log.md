@@ -6359,3 +6359,59 @@ K6 上在群里说一句 hello，输入 50,182 token、耗时 20.3 秒。用 Gem
   - 缺少 key 的提示指向配置位置，其他错误带原因；
   - 原有的"转写关闭""未授权发送者"两个测试改成断言 `NotVoice`。
 - 全量：`cargo test --lib` 4103 通过，10 个失败全部是已知基线；集成测试 230 通过、3 个失败（已知基线）；clippy 新增 0（`handle_unauthorized_message` 原有的 large_futures 警告，在挪动的那一处按建议加了 `Box::pin`）。
+
+---
+
+## 2026-09-25 — 新闻与情报来源调研（只调研，未改代码）
+
+用户反馈：推送内容重复，而且全是 BBC 这类大机构，抓不到独立作者、社交平台、预测市场上的最新消息。用户的决定记在 memory `news_redesign_decisions.md`：先改流程，再调整推送时间和条数。
+
+### 找到的原因
+
+1. `heartbeat:新闻源搜索` 的指令写着"只要权威媒体或专业平台，排除 Reddit、个人博客"；
+2. `web_search_tool` 调用 Brave 普通网页搜索，没有带 `freshness` 时效参数；
+3. 这个任务搜的是"机构的 RSS 地址"，答案本来就固定，所以越搜越重复；
+4. 另外，该任务要求的步骤远超 15 轮：09-25 10:00 那次用了 15 次成功调用加 10 次失败尝试，输入 53 万 token，结果一个源都没登记上。
+
+### 实测可用（均为免费）
+
+- **行情**：Yahoo Finance chart API 的 12 个品种（CL=F、BZ=F、GC=F、SI=F、^GSPC、^IXIC、^DJI、^AXJO、EURUSD=X、AUDUSD=X、CNY=X、BTC-USD）每个约 1 秒，分钟级；中国银行外汇牌价 `boc.cn/sourcedb/whpj/`（美元行：现汇买入、现钞买入、现汇卖出、现钞卖出、中行折算价、发布时间）；CoinGecko。Stooq 不可用。
+- **快讯**：
+  - Google 新闻 RSS（`when:1h`，数据约 2 分钟新）；
+  - Polymarket gamma API，按 `tag_slug`（geopolitics/politics/world）筛选，用 `oneDayPriceChange` 找赔率大幅变动的事件；
+  - Kalshi、Manifold；
+  - Reddit RSS（JSON 接口返回 403）；
+  - Hacker News Algolia、Techmeme；
+  - Bluesky 指定账号时间线（全站搜索需要登录）、Mastodon。
+- **Telegram 公开频道**（`t.me/s/` 网页预览，不用登录）：
+  - 英文：@KyivIndependent_official、@wartranslated；乌克兰语：@operativnoZSU、@Tsaplienko、@DeepStateUA；**@serhii_flash**（无线电/电子战专家）；
+  - 中文：@tnews365（竹新社）、@voachinese；英文香港：@hongkongfp；
+  - 金融：@financialjuice、@WalterBloomberg、@marketfeed（后两个量极大，要先由程序过滤）；
+  - 科技：@hacker_news_feed。
+  - 很多频道名已被占用或被挂羊头（例如 @wsjchinese 是赌场广告，@inmediahk 是色情广告），必须实测。
+  - 澳洲新闻、业余无线电在 Telegram 上找不到能用的频道。
+- **不可用**：
+  - X/Twitter 所有免费路线（官方 API 每条 0.005 美元，twitterapi.io 每 1000 条 0.15 美元，用户决定不接）；
+  - GDELT 从本机访问一直返回 429；
+  - Gemini Live 模型用于 Telegram 语音条反而更慢（另见当天语音测试记录）。
+
+### 成人产业来源（澳洲 + 亚洲）
+
+- **能直接抓，且有结构化数据**：
+  - Scarlet Blue：`/escort/<名字>` 资料页，有价格、评价、认证标记、区域，首页有约 110 个资料链接；
+  - RealBabes：`/escorts/<州>/<区>/<名字>`，有价格、认证、区域；
+  - Punter Planet：论坛的评价区和按州分类的广告商新闻；
+  - 日本 City Heaven：按地区列出店铺，有价格、口碑、出勤信息；
+  - 台湾 PTT 性版：需要带 `over18=1` cookie，有心得和新闻标签，更新量小；
+  - 泰国 Stickman Bangkok（周专栏）、Pattaya Addicts。
+- **行业组织、法规、行业媒体**：Scarlet Alliance、Vixen、Respect QLD、昆士兰司法部、维州 Consumer Affairs、XBIZ（有 RSS）、AVN、Future of Sex。
+- **需要浏览器渲染**：Private Girls（列表由前端 JS 生成）。
+- **进不去**：
+  - Locanto 成人区、Escorts and Babes、新加坡 Sammyboy：Cloudflare 强验证，浏览器模式也进不去；
+  - 日本 fuzoku.jp、dto.jp：疑似只允许日本 IP；
+  - adultlook、cracker 等一批网站：域名不存在或服务出错。
+
+### 发现的 cf-crawler 问题（待修）
+
+1. `edge_browser` 拿到的其实是 Cloudflare 验证页（标题"请稍候…"，`anti_bot_signals` 里有 `challenge_marker`，正文为 0），却返回 `success: true`。所以被挡住的抓取会被当成成功，之前 linux.do、SCMP"成功但只有几百字节"很可能就是这个原因。
+2. Worker 的 `/v1/crawl`（Cloudflare 的 crawl REST 接口，auto 模式的第三道防线）三次全部返回 500 "crawl job created but no job ID returned"，这道防线目前实际不可用。
