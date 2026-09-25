@@ -38,6 +38,11 @@ use std::path::Path;
 
 /// Text of one directory page handed to the model at most.
 const DIRECTORY_TEXT_CHARS: usize = 12_000;
+/// Characters of page text per model call. Measured 2026-09-25 on K6: with
+/// every directory source reachable, one call carried ~130k tokens, the
+/// provider fell back to a smaller model and the answer came back unusable.
+/// Pages are split into calls of roughly this size instead.
+const MODEL_CHARS_PER_CALL: usize = 30_000;
 /// Statistics and the report cover records seen within this many days.
 const STATS_DAYS: i64 = 30;
 /// New records shown in the push at most.
@@ -399,11 +404,33 @@ pub(super) fn resolve_extracted(answer: &str, pages: &[Page]) -> Option<(Vec<Lis
     Some((listings, flags))
 }
 
-fn build_request(pages: &[Page], today: &str) -> String {
+fn build_request(pages: &[Page], offset: usize, today: &str) -> String {
     let mut out = format!("今天是 {today}。下面是各站点的公开内容：\n");
     for (i, page) in pages.iter().enumerate() {
         let text = crate::util::truncate_with_ellipsis(&page.text, DIRECTORY_TEXT_CHARS);
-        let _ = write!(out, "\n[S{i}] {}（{}）\n{text}\n", page.name, page.src.url);
+        let n = offset + i;
+        let _ = write!(out, "\n[S{n}] {}（{}）\n{text}\n", page.name, page.src.url);
+    }
+    out
+}
+
+/// Split the pages into groups whose text stays under `MODEL_CHARS_PER_CALL`.
+/// A single page larger than the budget gets its own group rather than being
+/// dropped. Returns `(offset, pages)` per group.
+fn batches(pages: &[Page]) -> Vec<(usize, &[Page])> {
+    let mut out = Vec::new();
+    let (mut start, mut chars) = (0usize, 0usize);
+    for (i, page) in pages.iter().enumerate() {
+        let len = page.text.chars().count().min(DIRECTORY_TEXT_CHARS);
+        if i > start && chars + len > MODEL_CHARS_PER_CALL {
+            out.push((start, &pages[start..i]));
+            start = i;
+            chars = 0;
+        }
+        chars += len;
+    }
+    if start < pages.len() {
+        out.push((start, &pages[start..]));
     }
     out
 }
@@ -1099,24 +1126,36 @@ async fn run_market(
     let profile_urls: Vec<String> = profiles.iter().map(|p| p.src.url.clone()).collect();
     pages.extend(profiles);
 
-    let mut model_ok = true;
-    let (listings, flags) = if pages.is_empty() {
-        (Vec::new(), Vec::new())
-    } else {
-        let request = build_request(&pages, &now.format("%Y-%m-%d").to_string());
+    // One model call per batch of pages, so a day with every source reachable
+    // does not turn into a single oversized request.
+    let today = now.format("%Y-%m-%d").to_string();
+    let groups = batches(&pages);
+    let (mut listings, mut flags) = (Vec::new(), Vec::new());
+    let (mut calls_ok, mut calls) = (0usize, 0usize);
+    for (offset, group) in groups {
+        calls += 1;
+        let request = build_request(group, offset, &today);
         match ask_model(config, EXTRACT_SYSTEM, &request).await {
-            Ok(answer) => resolve_extracted(&answer, &pages).unwrap_or_else(|| {
-                tracing::warn!(slot = %slot.name, "adult intel model answer unusable");
-                model_ok = false;
-                (Vec::new(), Vec::new())
-            }),
-            Err(e) => {
-                tracing::warn!(slot = %slot.name, "adult intel model call failed: {e:#}");
-                model_ok = false;
-                (Vec::new(), Vec::new())
-            }
+            Ok(answer) => match resolve_extracted(&answer, &pages) {
+                Some((mut l, mut f)) => {
+                    calls_ok += 1;
+                    listings.append(&mut l);
+                    flags.append(&mut f);
+                }
+                None => tracing::warn!(
+                    slot = %slot.name,
+                    offset,
+                    "adult intel model answer unusable"
+                ),
+            },
+            Err(e) => tracing::warn!(
+                slot = %slot.name,
+                offset,
+                "adult intel model call failed: {e:#}"
+            ),
         }
-    };
+    }
+    let model_ok = calls == 0 || calls_ok > 0;
 
     let conn = open_db(&config.workspace_dir)?;
     if model_ok {
@@ -1283,6 +1322,74 @@ mod tests {
         assert_eq!(
             to_simplified("墨爾本、凱恩斯、臺北"),
             "墨尔本、凯恩斯、台北"
+        );
+    }
+
+    fn sized_page(url: &str, chars: usize) -> Page {
+        Page {
+            src: Source {
+                url: url.into(),
+                directory: true,
+                ..Source::default()
+            },
+            name: url.into(),
+            text: "x".repeat(chars),
+            anchors: Vec::new(),
+            events: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn batches_keep_each_model_call_under_the_budget() {
+        let per_call = MODEL_CHARS_PER_CALL / DIRECTORY_TEXT_CHARS;
+        let count = per_call * 2 + 1;
+        let pages: Vec<Page> = (0..count)
+            .map(|i| sized_page(&format!("https://s{i}.example.com/"), DIRECTORY_TEXT_CHARS))
+            .collect();
+        let groups = batches(&pages);
+        assert_eq!(groups.len(), 3, "full call, full call, remainder");
+        for (_, group) in &groups {
+            let chars: usize = group.iter().map(|p| p.text.chars().count()).sum();
+            assert!(chars <= MODEL_CHARS_PER_CALL, "{chars} over budget");
+        }
+        // Every page appears exactly once, and the offsets index into `pages`.
+        let total: usize = groups.iter().map(|(_, g)| g.len()).sum();
+        assert_eq!(total, pages.len());
+        for (offset, group) in &groups {
+            assert_eq!(group[0].src.url, pages[*offset].src.url);
+        }
+    }
+
+    #[test]
+    fn oversized_pages_count_as_their_truncated_length() {
+        // `build_request` truncates each page to DIRECTORY_TEXT_CHARS, so a
+        // huge page costs that much and no more — one past a full call splits.
+        let count = MODEL_CHARS_PER_CALL / DIRECTORY_TEXT_CHARS + 1;
+        let pages: Vec<Page> = (0..count)
+            .map(|i| sized_page(&format!("https://big{i}.example.com/"), 90_000))
+            .collect();
+        let groups = batches(&pages);
+        assert_eq!(
+            groups.len(),
+            2,
+            "a huge page costs only its truncated length"
+        );
+        assert_eq!(groups[1].0, count - 1);
+        // Small pages ride along in one call.
+        let small: Vec<Page> = (0..4)
+            .map(|i| sized_page(&format!("https://s{i}.example.com/"), 500))
+            .collect();
+        assert_eq!(batches(&small).len(), 1);
+        assert!(batches(&[]).is_empty());
+    }
+
+    #[test]
+    fn build_request_numbers_pages_from_the_batch_offset() {
+        let pages = vec![sized_page("https://a.example.com/", 10)];
+        let req = build_request(&pages, 7, "2026-09-25");
+        assert!(
+            req.contains("[S7]"),
+            "offset is used so S<n> maps back to `pages`"
         );
     }
 
