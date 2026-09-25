@@ -1,6 +1,7 @@
 use crate::config::Config;
 use anyhow::{bail, Result};
 
+pub mod adult_pipeline;
 pub mod expo_pipeline;
 pub mod heartbeat_decl;
 pub mod news;
@@ -10,6 +11,7 @@ mod store;
 mod types;
 
 pub mod scheduler;
+pub mod tinyfish;
 
 #[allow(unused_imports)]
 pub use schedule::{

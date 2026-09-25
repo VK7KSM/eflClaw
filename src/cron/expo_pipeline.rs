@@ -21,10 +21,11 @@
 use crate::config::Config;
 use crate::cron::news::{self, NewsRules, Slot, Source, SourceResult};
 use crate::cron::news_pipeline::{
-    ask_model, decode_entities, display_name, get_text, http_client, local_time_label, plain_text,
+    ask_model, decode_entities, display_name, get_text, http_client, local_time_label,
+    looks_like_feed, parse_feed, plain_text,
 };
 use crate::security::SecurityPolicy;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{Datelike, NaiveDate, Utc};
 use futures_util::stream::{self, StreamExt};
 use serde::Deserialize;
@@ -44,6 +45,8 @@ const DETAIL_TEXT_CHARS: usize = 4_000;
 /// Expos whose ticket info is looked up per run (one detail page each).
 const MAX_ENRICH: usize = 12;
 const FETCH_CONCURRENCY: usize = 5;
+/// Venue calendars and ad boards can be slow (141go161.com took 30 s+).
+const PAGE_TIMEOUT_SECS: u64 = 60;
 /// Rows are kept this long after the expo ended, then deleted.
 const KEEP_DAYS_AFTER_END: i64 = 30;
 /// A page with this many structured events needs no text extraction.
@@ -294,21 +297,52 @@ pub fn best_anchor(anchors: &[(String, String)], name: &str) -> Option<String> {
         .map(|(_, url)| url.clone())
 }
 
-struct Page {
-    src: Source,
-    name: String,
-    text: String,
-    anchors: Vec<(String, String)>,
-    events: Vec<LdEvent>,
+pub(super) struct Page {
+    pub(super) src: Source,
+    pub(super) name: String,
+    pub(super) text: String,
+    pub(super) anchors: Vec<(String, String)>,
+    pub(super) events: Vec<LdEvent>,
 }
 
-async fn fetch_page(
+async fn get_page(client: &reqwest::Client, url: &str) -> Result<String> {
+    let resp = client
+        .get(url)
+        .timeout(std::time::Duration::from_secs(PAGE_TIMEOUT_SECS))
+        .send()
+        .await
+        .with_context(|| format!("请求 {url} 失败"))?;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        anyhow::bail!("HTTP {}", status.as_u16());
+    }
+    Ok(body)
+}
+
+pub(super) async fn fetch_page(
     client: &reqwest::Client,
     security: &SecurityPolicy,
     src: Source,
 ) -> Result<Page> {
     let name = display_name(&src);
-    let (text, anchors, events) = if src.browser {
+    let (text, anchors, events) = if src.tinyfish {
+        let page = crate::cron::tinyfish::fetch(client, std::slice::from_ref(&src.url))
+            .await?
+            .pop()
+            .context("TinyFish 没有返回结果")?
+            .map_err(|e| anyhow::anyhow!(e))?;
+        let anchors = page
+            .links
+            .iter()
+            .map(|l| (crate::cron::tinyfish::slug_text(l), l.clone()))
+            .collect();
+        (
+            crate::util::truncate_with_ellipsis(&page.text, PAGE_TEXT_CHARS),
+            anchors,
+            Vec::new(),
+        )
+    } else if src.browser {
         let v = crate::tools::cf_crawler::scrape_page(
             security,
             &src.url,
@@ -347,7 +381,7 @@ async fn fetch_page(
         );
         (text, anchors, Vec::new())
     } else {
-        let body = get_text(client, &src.url).await?;
+        let body = get_page(client, &src.url).await?;
         let base = reqwest::Url::parse(&src.url)?;
         let events = parse_ld_events(&body, &base);
         let text = if events.len() >= STRUCTURED_ENOUGH {
@@ -355,7 +389,16 @@ async fn fetch_page(
         } else {
             page_text(&body, PAGE_TEXT_CHARS)
         };
-        (text, parse_anchors(&body, &base), events)
+        // A feed's entries link with <link>, not <a>: use them as anchors.
+        let anchors = if looks_like_feed(&body) {
+            parse_feed(&body, "")
+                .into_iter()
+                .map(|it| (it.title, it.link))
+                .collect()
+        } else {
+            parse_anchors(&body, &base)
+        };
+        (text, anchors, events)
     };
     anyhow::ensure!(
         !events.is_empty() || text.chars().count() >= 200,

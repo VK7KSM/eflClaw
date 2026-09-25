@@ -85,6 +85,9 @@ pub enum SlotKind {
     News,
     /// Upcoming expos with a 3-notice schedule (`expo_pipeline`).
     Expo,
+    /// Adult-industry news plus listing intel from directory pages
+    /// (`adult_pipeline`).
+    Adult,
 }
 
 impl SlotKind {
@@ -129,6 +132,18 @@ pub struct Source {
     /// cf-crawler's browser instead of a plain HTTP request (expo slots).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub browser: bool,
+    /// Adult slots: a directory / review page whose ads and reviews are
+    /// extracted into the local intel database instead of pushed as news.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub directory: bool,
+    /// Fetch through TinyFish (Monid) — for sites whose bot checks stop both
+    /// plain HTTP and cf-crawler (expo / adult slots).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub tinyfish: bool,
+    /// Directory sources: regex matching the profile-page links on the page;
+    /// new profiles are fetched and read as well (adult slots).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub profile_pattern: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

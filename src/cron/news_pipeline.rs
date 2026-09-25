@@ -545,7 +545,7 @@ pub(super) fn display_name(src: &Source) -> String {
     }
 }
 
-fn looks_like_feed(body: &str) -> bool {
+pub(super) fn looks_like_feed(body: &str) -> bool {
     let head: String = body.chars().take(600).collect::<String>().to_lowercase();
     head.contains("<rss") || head.contains("<feed") || head.contains("<rdf:rdf")
 }
@@ -1170,9 +1170,15 @@ pub async fn run_slot(config: &Config, slot_name: &str) -> Result<String> {
         "时段 '{slot_name}' 没有可用的新闻源（都被封禁了）"
     );
     match slot.kind {
-        SlotKind::News => run_news(config, &rules, &slot, sources).await,
+        SlotKind::News => run_news(config, &rules, &slot, sources, SELECT_SYSTEM).await,
         SlotKind::Expo => {
             Box::pin(crate::cron::expo_pipeline::run(
+                config, &rules, &slot, sources,
+            ))
+            .await
+        }
+        SlotKind::Adult => {
+            Box::pin(crate::cron::adult_pipeline::run(
                 config, &rules, &slot, sources,
             ))
             .await
@@ -1180,11 +1186,13 @@ pub async fn run_slot(config: &Config, slot_name: &str) -> Result<String> {
     }
 }
 
-async fn run_news(
+/// The headline push; `system` is the editor prompt (news or adult industry).
+pub(super) async fn run_news(
     config: &Config,
     rules: &NewsRules,
     slot: &Slot,
     sources: Vec<Source>,
+    system: &str,
 ) -> Result<String> {
     let slot_name = slot.name.as_str();
     let max_items = slot.max_items.unwrap_or(DEFAULT_MAX_ITEMS).max(1);
@@ -1270,7 +1278,7 @@ async fn run_news(
         (Vec::new(), true)
     } else {
         let request = build_request(slot, &candidates, max_items, now);
-        match ask_model(config, SELECT_SYSTEM, &request).await {
+        match ask_model(config, system, &request).await {
             Ok(answer) => match parse_picks(&answer, candidates.len(), max_items) {
                 Some(picks) => (picks, true),
                 None => {

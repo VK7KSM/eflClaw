@@ -6566,3 +6566,53 @@ K6 上在群里说一句 hello，输入 50,182 token、耗时 20.3 秒。用 Gem
   - 第一版提示词：91–97 秒，发现 69 个展会，混进了大量 Eventbrite 上的社区小活动，例如老年人博览会、餐厅里的旅游特卖、公司门店里的设备演示；
   - 收紧类别并由代码丢弃白名单以外的类别后：33 个，都是专业展和消费展，例如 PAX、悉尼家居展、Supanova 布里斯班和阿德莱德两场、悉尼电动车展、MRO 航空维修展、AusRAIL、IMARC、All-Energy。
   - 第一天全部算"新发现"，所以消息较长；之后每天只推新发现和到期提醒。
+
+## 2026-09-25 — 成人产业推送（每天 14:00）+ TinyFish 抓取
+
+用户要求（memory `news_redesign_decisions.md`）：把澳洲和亚洲成人产业当作正规行业来研究，每天推送行业动态。广告、价格、评价整理进本地库和文档，用于分析整个行业，并识别真假。约定的边界：不追查真实身份；有未成年、强迫、贩运迹象的只做标记，不作为资源收录。
+
+### 改动
+
+- `src/cron/news.rs`：
+  - `SlotKind` 新增 `Adult`；
+  - `Source` 新增 `directory`（广告板或评价区）、`tinyfish`（改用 TinyFish 抓取）、`profile_pattern`（资料页链接的正则）。
+- `src/cron/news_pipeline.rs`：`run_news` 增加 system 提示词参数，成人时段复用它来生成行业动态；`looks_like_feed` 改为 `pub(super)`。
+- `src/cron/adult_pipeline.rs`（新文件）：
+  - 行业动态走 `run_news`，用 `ADULT_SELECT_SYSTEM`。提示词说明这是受监管行业的研究简报，要求客观、不说教、不复述露骨描写；
+  - 市场观察：
+    1. 抓取目录页；有 `profile_pattern` 的，再抓 30 天内没读过的资料页，每个来源最多 10 个；
+    2. 模型调用一次，把每条广告或评价整理成记录；
+    3. 代码逐项核对：白名单、繁体转简体、价格必须有币种、占位名称丢弃、链接取自页面；
+    4. 代码再过滤一遍电话、@账号、邮箱、网址、"微信: xxx" 这类联系方式；
+    5. 存入 `state/adult_intel.db` 的 `listings`、`flags`、`profiles_read` 三张表；
+    6. 代码计算每小时价格的中位数、最低、最高，重写 `workspace/intel/adult-industry.md`。
+  - 风险信号只进 `flags` 表，在推送中单独列出并附上举报建议。
+- `src/cron/tinyfish.rs`（新文件）：通过 Monid 网关调用 TinyFish fetch（免费），每次最多 10 个网址；遇到异步运行会轮询结果。key 从环境变量 `MONID_API_KEY` 读取，只发往固定的 Monid 地址，不写日志。
+- `src/cron/expo_pipeline.rs`：
+  - `fetch_page` 支持 `tinyfish` 来源；
+  - 订阅源页面改用条目自己的链接（之前退回成订阅源地址）；
+  - 页面请求超时改为 60 秒（141go161 实测要 8–40 秒）。
+- `资料/HEARTBEAT_DATA.toml`（不入库）："成人产业"时段 14:00，14 个来源：
+  - Google 新闻 7 组搜索（澳洲、法规、成人科技、香港、台湾、日本、东南亚与韩国）；
+  - Future of Sex、Stickman；
+  - 目录类：Scarlet Blue（TinyFish + 资料页）、風俗じゃぱん（TinyFish）、141go161、PTT 性版、City Heaven（浏览器渲染）。
+
+### 来源实测
+
+- **TinyFish 能进**：Scarlet Blue（首页有 110 个资料链接，资料页里有城市、服务方式、价格表）、fuzoku.jp（日本全国店铺）、Punter Planet 首页。
+- **TinyFish 也进不去**：RealBabes（403）、Locanto、Escorts and Babes、Sammyboy（bot_blocked）、City Heaven（403）。
+- **要登录才能看**：Punter Planet 的评价区，需要注册账号。
+- **不收录**：Private Girls 的资料页没有价格，只有电话，而且全站只有 4 份资料，其中还有测试账号。
+
+### 验证
+
+- 新增单测：
+  - `adult_pipeline` 7 个：联系方式过滤、字段核对与链接来源、繁体、价格统计、数据库新增与刷新、推送排版、本地汇总；
+  - `tinyfish` 2 个：结果按请求顺序对应、错误信息、用链接末段生成文字。
+- **真实端到端**（真实来源、Gemini、TinyFish），三轮：
+  1. 行业动态分类合理、措辞中性，模型没有拒绝；
+  2. 发现一条评价复述了露骨内容、繁体字导致评价倾向匹配不上，已修；
+  3. 新增 18 条，悉尼独立从业者每小时中位价 AUD 750（600–1500，8 个样本），布里斯班 AUD 900，墨尔本 AUD 1200。
+  - 第 3 轮发现：新闻报道被误标为风险信号、名字为"未说明"的记录，已通过提示词和代码修正。
+- 按用户要求，把第 2 轮的推送通过 elfClaw 自己的 `deliver_to_channel` 发到 Telegram 预览（用临时测试发送）。本地 `资料/config.toml` 里 telegram 的 token 是加密的，用的是 `[tts]` 一节的明文 token（同一个 bot），只在内存中替换，没有改任何文件。
+- 额度：测试期间 key 1–3 的 gemini-3.5-flash 当日额度用完（K6 日志显示生产也受影响，key 4–6 正常），07:00 UTC 重置后继续测试。
