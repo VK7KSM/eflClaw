@@ -52,6 +52,7 @@ pub mod hardware_memory_map;
 pub mod hardware_memory_read;
 pub mod http_request;
 pub mod image_info;
+pub mod local_browser;
 pub mod mcp_client;
 pub mod mcp_protocol;
 pub mod mcp_tool;

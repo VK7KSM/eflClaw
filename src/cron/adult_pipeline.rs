@@ -42,6 +42,8 @@ const DIRECTORY_TEXT_CHARS: usize = 12_000;
 const STATS_DAYS: i64 = 30;
 /// New records shown in the push at most.
 const MAX_EXAMPLES: usize = 8;
+/// Western listings shown per push — a comparison baseline, not the subject.
+const MAX_WESTERN_EXAMPLES: usize = 3;
 /// Price-statistics rows shown in the push at most.
 const MAX_STAT_ROWS: usize = 6;
 /// Records listed at the end of the local report.
@@ -63,6 +65,9 @@ pub const KINDS: &[&str] = &[
     "其他",
 ];
 pub const SENTIMENTS: &[&str] = &["好评", "中评", "差评"];
+/// Who the listing is for. The owner is Chinese and reads the Chinese/Asian
+/// side as the market; Western listings are kept as a comparison baseline.
+pub const ETHNICITIES: &[&str] = &["华人", "亚裔", "西人", "其他"];
 pub const CREDIBILITY: &[&str] = &["可信", "存疑", "疑似虚假"];
 pub const FLAGS: &[&str] = &["未成年迹象", "强迫迹象", "贩运迹象"];
 /// "Names" the model writes when the material has none.
@@ -88,6 +93,8 @@ const EXTRACT_SYSTEM: &str = "你是成人服务行业的市场分析员，为�
 - src：材料编号，例如 S0\n\
 - name：广告上的艺名或店名（原文）\n\
 - kind：独立、经纪、妓院、按摩店、工作室、夜店KTV、其他 之一\n\
+- ethnicity：华人、亚裔、西人、其他 之一。中文广告、写明中国/台湾/香港/大陆或用中文艺名的算华人；\
+日本、韩国、泰国、越南等亚洲其他地区算亚裔；欧美白人、拉丁裔算西人；看不出就填其他\n\
 - region：城市或地区，用中文，例如 悉尼、墨尔本、香港、台北、东京、曼谷\n\
 - price：原文价格的简述，例如「1小时 AUD 350」「HKD 800/次」，没有就填空字符串\n\
 - price_hour：换算成每小时的价格数字（原币种），无法判断填 0\n\
@@ -106,7 +113,7 @@ const EXTRACT_SYSTEM: &str = "你是成人服务行业的市场分析员，为�
 3. 有未成年迹象（自称学生、未满 18 岁、年龄描述明显偏小）、被强迫或被控制迹象、人口贩运迹象\
 （证件被扣、背债、不能自由离开）的内容，不要写成记录，改写进 flags：{\"src\":\"S0\",\"name\":\"…\",\
 \"flag\":\"未成年迹象/强迫迹象/贩运迹象 之一\",\"reason\":\"不超过 40 字\"}。「00后」这类出生年代说法本身不算未成年迹象。\n\
-4. 只输出 JSON，不要其他文字：{\"listings\":[{\"src\":\"S0\",\"name\":\"…\",\"kind\":\"…\",\"region\":\"…\",\
+4. 只输出 JSON，不要其他文字：{\"listings\":[{\"src\":\"S0\",\"name\":\"…\",\"kind\":\"…\",\"ethnicity\":\"…\",\"region\":\"…\",\
 \"price\":\"…\",\"price_hour\":0,\"currency\":\"…\",\"verified\":\"…\",\"review\":\"…\",\"sentiment\":\"…\",\
 \"credibility\":\"…\",\"credibility_reason\":\"…\"}],\"flags\":[]}";
 
@@ -118,6 +125,7 @@ pub struct Listing {
     pub site: String,
     pub name: String,
     pub kind: String,
+    pub ethnicity: String,
     pub region: String,
     pub price: String,
     pub price_hour: Option<f64>,
@@ -148,6 +156,8 @@ struct RawListing {
     name: String,
     #[serde(default)]
     kind: String,
+    #[serde(default)]
+    ethnicity: String,
     #[serde(default)]
     region: String,
     #[serde(default)]
@@ -323,6 +333,7 @@ pub(super) fn resolve_extracted(answer: &str, pages: &[Page]) -> Option<(Vec<Lis
             .filter(|p| *p > 0.0 && *p < 10_000_000.0 && !currency.is_empty());
         let region = to_simplified(&clean(&r.region, 20));
         let kind = one_of(&r.kind, KINDS);
+        let ethnicity = one_of(&r.ethnicity, ETHNICITIES);
         let verified = one_of(&r.verified, &["是", "否"]);
         let review = clean(&r.review, 80);
         listings.push(Listing {
@@ -333,6 +344,11 @@ pub(super) fn resolve_extracted(answer: &str, pages: &[Page]) -> Option<(Vec<Lis
                 "其他".into()
             } else {
                 kind
+            },
+            ethnicity: if ethnicity.is_empty() {
+                "其他".into()
+            } else {
+                ethnicity
             },
             region: if region.is_empty() {
                 "未知".into()
@@ -403,6 +419,7 @@ fn open_db(workspace: &Path) -> Result<rusqlite::Connection> {
              region TEXT NOT NULL,
              review TEXT NOT NULL DEFAULT '',
              kind TEXT NOT NULL DEFAULT '',
+             ethnicity TEXT NOT NULL DEFAULT '',
              price TEXT NOT NULL DEFAULT '',
              price_hour REAL,
              currency TEXT NOT NULL DEFAULT '',
@@ -448,7 +465,7 @@ fn upsert_listing(conn: &rusqlite::Connection, l: &Listing, stamp: &str) -> Resu
             conn.execute(
                 "UPDATE listings SET kind = ?2, price = ?3, price_hour = ?4, currency = ?5,
                         verified = ?6, sentiment = ?7, credibility = ?8, credibility_reason = ?9,
-                        url = ?10, last_seen = ?11
+                        url = ?10, last_seen = ?11, ethnicity = ?12
                  WHERE id = ?1",
                 rusqlite::params![
                     id,
@@ -461,7 +478,8 @@ fn upsert_listing(conn: &rusqlite::Connection, l: &Listing, stamp: &str) -> Resu
                     l.credibility,
                     l.credibility_reason,
                     l.url,
-                    stamp
+                    stamp,
+                    l.ethnicity
                 ],
             )?;
             Ok(false)
@@ -469,8 +487,9 @@ fn upsert_listing(conn: &rusqlite::Connection, l: &Listing, stamp: &str) -> Resu
         None => {
             conn.execute(
                 "INSERT INTO listings (site, name, region, review, kind, price, price_hour, currency,
-                        verified, sentiment, credibility, credibility_reason, url, first_seen, last_seen)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14)",
+                        verified, sentiment, credibility, credibility_reason, url, first_seen, last_seen,
+                        ethnicity)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14, ?15)",
                 rusqlite::params![
                     l.site,
                     l.name,
@@ -485,7 +504,8 @@ fn upsert_listing(conn: &rusqlite::Connection, l: &Listing, stamp: &str) -> Resu
                     l.credibility,
                     l.credibility_reason,
                     l.url,
-                    stamp
+                    stamp,
+                    l.ethnicity
                 ],
             )?;
             Ok(true)
@@ -518,7 +538,7 @@ pub(super) struct StoredListing {
 fn recent_listings(conn: &rusqlite::Connection, since: &str) -> Result<Vec<StoredListing>> {
     let mut stmt = conn.prepare(
         "SELECT site, name, kind, region, price, price_hour, currency, verified, review, sentiment,
-                credibility, credibility_reason, url, first_seen
+                credibility, credibility_reason, url, first_seen, ethnicity
          FROM listings WHERE last_seen >= ?1 ORDER BY first_seen DESC, id DESC",
     )?;
     let rows = stmt.query_map([since], |r| {
@@ -537,6 +557,7 @@ fn recent_listings(conn: &rusqlite::Connection, since: &str) -> Result<Vec<Store
                 credibility: r.get(10)?,
                 credibility_reason: r.get(11)?,
                 url: r.get(12)?,
+                ethnicity: r.get(14)?,
             },
             first_seen: r.get(13)?,
         })
@@ -637,7 +658,19 @@ async fn fetch_profiles(
     let mut out = Vec::new();
     for (i, urls) in targets {
         let parent = &pages[i];
-        if parent.src.tinyfish {
+        if parent.src.local_browser {
+            match crate::tools::local_browser::fetch(security, &urls).await {
+                Ok(results) => {
+                    for r in results.into_iter().flatten() {
+                        let text = crate::cron::expo_pipeline::page_text(&r.html, 12_000);
+                        out.push(profile_page(parent, r.url, &text));
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(source = %parent.src.url, "profile fetch failed: {e:#}");
+                }
+            }
+        } else if parent.src.tinyfish {
             match crate::cron::tinyfish::fetch(client, &urls).await {
                 Ok(results) => {
                     for r in results.into_iter().flatten() {
@@ -668,6 +701,7 @@ async fn fetch_profiles(
 #[derive(Debug, Clone, PartialEq)]
 pub struct PriceStat {
     pub region: String,
+    pub ethnicity: String,
     pub kind: String,
     pub currency: String,
     pub count: usize,
@@ -676,20 +710,27 @@ pub struct PriceStat {
     pub max: f64,
 }
 
-/// Hourly price statistics per (region, kind, currency), most samples first.
+/// Hourly price statistics per (region, ethnicity, kind, currency), most
+/// samples first. Ethnicity is part of the key so the Chinese/Asian market and
+/// the Western baseline are never averaged together.
 pub fn price_stats(listings: &[&Listing]) -> Vec<PriceStat> {
-    let mut groups: BTreeMap<(String, String, String), Vec<f64>> = BTreeMap::new();
+    let mut groups: BTreeMap<(String, String, String, String), Vec<f64>> = BTreeMap::new();
     for l in listings {
         if let Some(p) = l.price_hour {
             groups
-                .entry((l.region.clone(), l.kind.clone(), l.currency.clone()))
+                .entry((
+                    l.region.clone(),
+                    l.ethnicity.clone(),
+                    l.kind.clone(),
+                    l.currency.clone(),
+                ))
                 .or_default()
                 .push(p);
         }
     }
     let mut stats: Vec<PriceStat> = groups
         .into_iter()
-        .map(|((region, kind, currency), mut prices)| {
+        .map(|((region, ethnicity, kind, currency), mut prices)| {
             prices.sort_by(f64::total_cmp);
             let n = prices.len();
             let median = if n % 2 == 1 {
@@ -699,6 +740,7 @@ pub fn price_stats(listings: &[&Listing]) -> Vec<PriceStat> {
             };
             PriceStat {
                 region,
+                ethnicity,
                 kind,
                 currency,
                 count: n,
@@ -735,13 +777,14 @@ pub(super) fn render_report(
         flags.len()
     );
     out.push_str(
-        "\n## 每小时价格（按地区和类型）\n\n| 地区 | 类型 | 币种 | 样本 | 中位数 | 最低 | 最高 |\n|---|---|---|---|---|---|---|\n",
+        "\n## 每小时价格（按地区、族裔和类型）\n\n| 地区 | 族裔 | 类型 | 币种 | 样本 | 中位数 | 最低 | 最高 |\n|---|---|---|---|---|---|---|---|\n",
     );
     for s in price_stats(&all) {
         let _ = writeln!(
             out,
-            "| {} | {} | {} | {} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {} | {} | {} | {} |",
             md_cell(&s.region),
+            md_cell(&s.ethnicity),
             md_cell(&s.kind),
             s.currency,
             s.count,
@@ -793,7 +836,7 @@ pub(super) fn render_report(
     }
     let _ = write!(
         out,
-        "\n## 最近收录（{REPORT_RECENT} 条）\n\n| 首次发现 | 地区 | 类型 | 名称 | 价格 | 认证 | 评价 | 真实性 | 站点 | 链接 |\n|---|---|---|---|---|---|---|---|---|---|\n"
+        "\n## 最近收录（{REPORT_RECENT} 条）\n\n| 首次发现 | 地区 | 族裔 | 类型 | 名称 | 价格 | 认证 | 评价 | 真实性 | 站点 | 链接 |\n|---|---|---|---|---|---|---|---|---|---|---|\n"
     );
     for v in listings.iter().take(REPORT_RECENT) {
         let l = &v.listing;
@@ -804,9 +847,10 @@ pub(super) fn render_report(
         };
         let _ = writeln!(
             out,
-            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
             v.first_seen.get(..10).unwrap_or(&v.first_seen),
             md_cell(&l.region),
+            md_cell(&l.ethnicity),
             md_cell(&l.kind),
             md_cell(&l.name),
             md_cell(&l.price),
@@ -821,6 +865,43 @@ pub(super) fn render_report(
 }
 
 // ── push section ─────────────────────────────────────────────────────────
+
+/// Reviews first (they carry the most signal), then plain ads.
+fn render_examples(out: &mut String, group: &[&Listing], cap: usize) {
+    let mut examples: Vec<&Listing> = group
+        .iter()
+        .copied()
+        .filter(|l| !l.review.is_empty())
+        .collect();
+    examples.extend(group.iter().copied().filter(|l| l.review.is_empty()));
+    for l in examples.into_iter().take(cap) {
+        let mut parts = vec![format!("{} · {}", l.region, l.kind)];
+        if !l.price.is_empty() {
+            parts.push(l.price.clone());
+        }
+        if l.verified == "是" {
+            parts.push("已认证".into());
+        }
+        if !l.review.is_empty() {
+            let label = if l.sentiment.is_empty() {
+                "评价"
+            } else {
+                l.sentiment.as_str()
+            };
+            parts.push(format!("{label}：{}", l.review));
+        }
+        if !l.credibility.is_empty() && l.credibility != "可信" {
+            parts.push(format!("真实性{}", l.credibility));
+        }
+        let _ = writeln!(
+            out,
+            "• [{}]({}) — {}",
+            l.name.replace('[', "(").replace(']', ")"),
+            l.url,
+            parts.join(" · ")
+        );
+    }
+}
 
 pub fn render_market(
     new_listings: &[Listing],
@@ -848,8 +929,9 @@ pub fn render_market(
         };
         let _ = writeln!(
             out,
-            "• {} · {}：{} 条，每小时中位价 {} {}{range}",
+            "• {} · {} · {}：{} 条，每小时中位价 {} {}{range}",
             s.region,
+            s.ethnicity,
             s.kind,
             s.count,
             s.currency,
@@ -880,40 +962,21 @@ pub fn render_market(
             "• 真实性：疑似虚假 {fake} 条、存疑 {doubtful} 条（理由见本地汇总）"
         );
     }
-    let mut examples: Vec<&Listing> = new_listings
-        .iter()
-        .filter(|l| !l.review.is_empty())
-        .collect();
-    examples.extend(new_listings.iter().filter(|l| l.review.is_empty()));
-    if !examples.is_empty() {
-        out.push_str("新收录：\n");
-    }
-    for l in examples.into_iter().take(MAX_EXAMPLES) {
-        let mut parts = vec![format!("{} · {}", l.region, l.kind)];
-        if !l.price.is_empty() {
-            parts.push(l.price.clone());
+    // Chinese / Asian listings are the market being followed; Western ones
+    // ride along as a price and service baseline, capped much lower.
+    let western = |l: &&Listing| l.ethnicity == "西人";
+    let asian: Vec<&Listing> = new_listings.iter().filter(|l| !western(l)).collect();
+    let west: Vec<&Listing> = new_listings.iter().filter(western).collect();
+    for (group, heading, cap) in [
+        (asian, "新收录（华人/亚裔）：", MAX_EXAMPLES),
+        (west, "西人（对比参考）：", MAX_WESTERN_EXAMPLES),
+    ] {
+        if group.is_empty() {
+            continue;
         }
-        if l.verified == "是" {
-            parts.push("已认证".into());
-        }
-        if !l.review.is_empty() {
-            let label = if l.sentiment.is_empty() {
-                "评价"
-            } else {
-                l.sentiment.as_str()
-            };
-            parts.push(format!("{label}：{}", l.review));
-        }
-        if !l.credibility.is_empty() && l.credibility != "可信" {
-            parts.push(format!("真实性{}", l.credibility));
-        }
-        let _ = writeln!(
-            out,
-            "• [{}]({}) — {}",
-            l.name.replace('[', "(").replace(']', ")"),
-            l.url,
-            parts.join(" · ")
-        );
+        out.push_str(heading);
+        out.push('\n');
+        render_examples(&mut out, &group, cap);
     }
     if !new_flags.is_empty() {
         let _ = writeln!(
@@ -1128,6 +1191,7 @@ mod tests {
             site: "board.example.com".into(),
             name: format!("{region}-{kind}-{price:?}"),
             kind: kind.into(),
+            ethnicity: "华人".into(),
             region: region.into(),
             currency: currency.into(),
             price_hour: price,
@@ -1164,7 +1228,7 @@ mod tests {
         )];
         let answer = r#"```json
 {"listings":[
- {"src":"S0","name":"台灣靚模Lily","kind":"工作室","region":"香港","price":"HKD 800/次 微信: lily888",
+ {"src":"S0","name":"台灣靚模Lily","kind":"工作室","ethnicity":"華人","region":"香港","price":"HKD 800/次 微信: lily888",
   "price_hour":"800","currency":"hkd","verified":"是","review":"","sentiment":"好评",
   "credibility":"存疑","credibility_reason":"价格远低于行情","url":"https://evil.example.com"},
  {"src":"S0","name":"小淇","kind":"未知类型","region":"","price":"","price_hour":500,"currency":"",
@@ -1186,10 +1250,12 @@ mod tests {
         assert_eq!(a.price, "HKD 800/次");
         assert_eq!((a.price_hour, a.currency.as_str()), (Some(800.0), "HKD"));
         assert_eq!(a.verified, "是");
+        assert_eq!(a.ethnicity, "华人", "traditional 華人 normalises");
         assert_eq!(a.sentiment, "", "an ad has no sentiment");
         assert_eq!(a.credibility, "存疑");
         let b = &listings[1];
         assert_eq!(b.kind, "其他");
+        assert_eq!(b.ethnicity, "其他", "missing ethnicity falls back");
         assert_eq!(b.region, "未知");
         assert_eq!(
             b.price_hour, None,
@@ -1231,12 +1297,13 @@ mod tests {
         assert_eq!(
             (
                 stats[0].region.as_str(),
+                stats[0].ethnicity.as_str(),
                 stats[0].count,
                 stats[0].median,
                 stats[0].min,
                 stats[0].max
             ),
-            ("悉尼", 3, 350.0, 300.0, 500.0)
+            ("悉尼", "华人", 3, 350.0, 300.0, 500.0)
         );
         assert_eq!((stats[1].count, stats[1].median), (2, 700.0));
     }
@@ -1293,12 +1360,23 @@ mod tests {
         let recent: Vec<&Listing> = new.iter().collect();
         let text = render_market(&new, &flags, &recent, true);
         assert!(text.contains("今天新增 2 条（广告 1、评价 1）"));
-        assert!(text.contains("• 香港 · 工作室：2 条，每小时中位价 HKD 700（600–800）"));
+        assert!(text.contains("• 香港 · 华人 · 工作室：2 条，每小时中位价 HKD 700（600–800）"));
         assert!(text.contains("好评 1 · 中评 0 · 差评 0"));
         assert!(text.contains("疑似虚假 1 条"));
+        assert!(text.contains("新收录（华人/亚裔）："));
         assert!(text.contains(
             "• [小淇](https://board.example.com/r/1) — 香港 · 工作室 · 好评：真人与照片相符"
         ));
+        let mut west = listing("悉尼", "独立", "AUD", Some(900.0));
+        west.name = "Lola".into();
+        west.ethnicity = "西人".into();
+        let mixed = vec![review, west];
+        let refs: Vec<&Listing> = mixed.iter().collect();
+        let both = render_market(&mixed, &[], &refs, true);
+        let asian_at = both.find("新收录（华人/亚裔）：").unwrap();
+        let west_at = both.find("西人（对比参考）：").unwrap();
+        assert!(asian_at < west_at, "Chinese/Asian listings come first");
+        assert!(both.contains("• [Lola]"));
         assert!(text.contains("• 未成年迹象：[學生妹](https://board.example.com/a/9) — 自称中学生"));
         assert!(!text.contains("模型这次没有整理出"));
         assert!(render_market(&[], &[], &[], false).contains("模型这次没有整理出"));
@@ -1326,7 +1404,7 @@ mod tests {
             "2026-09-25T04:00:00+00:00".into(),
         )];
         let md = render_report(&rows, &flags, "09-25 14:00");
-        assert!(md.contains("| 悉尼 | 独立 | AUD | 1 | 350 | 350 | 350 |"));
+        assert!(md.contains("| 悉尼 | 华人 | 独立 | AUD | 1 | 350 | 350 | 350 |"));
         assert!(md.contains("- 存疑：悉尼-独立-Some(350.0)（悉尼，board.example.com）重复刊登"));
         assert!(md.contains("- 贩运迹象：n（s）证件被扣 — u · 首次发现 2026-09-25"));
         assert!(

@@ -326,7 +326,22 @@ pub(super) async fn fetch_page(
     src: Source,
 ) -> Result<Page> {
     let name = display_name(&src);
-    let (text, anchors, events) = if src.tinyfish {
+    let (text, anchors, events) = if src.local_browser {
+        let page = crate::tools::local_browser::fetch(security, std::slice::from_ref(&src.url))
+            .await?
+            .pop()
+            .context("本地浏览器没有返回结果")?
+            .map_err(|e| anyhow::anyhow!(e))?;
+        let base =
+            reqwest::Url::parse(&page.final_url).or_else(|_| reqwest::Url::parse(&src.url))?;
+        let events = parse_ld_events(&page.html, &base);
+        let text = if events.len() >= STRUCTURED_ENOUGH {
+            String::new()
+        } else {
+            page_text(&page.html, PAGE_TEXT_CHARS)
+        };
+        (text, parse_anchors(&page.html, &base), events)
+    } else if src.tinyfish {
         let page = crate::cron::tinyfish::fetch(client, std::slice::from_ref(&src.url))
             .await?
             .pop()

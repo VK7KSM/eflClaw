@@ -140,6 +140,11 @@ pub struct Source {
     /// plain HTTP and cf-crawler (expo / adult slots).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub tinyfish: bool,
+    /// Fetch with the machine's own Chrome (`tools/local-browser`), reusing a
+    /// profile whose checks the owner cleared by hand. For pages that are
+    /// built by JavaScript or that refuse every headless client.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub local_browser: bool,
     /// Directory sources: regex matching the profile-page links on the page;
     /// new profiles are fetched and read as well (adult slots).
     #[serde(default, skip_serializing_if = "String::is_empty")]

@@ -6626,3 +6626,64 @@ K6 上在群里说一句 hello，输入 50,182 token、耗时 20.3 秒。用 Gem
   - HEARTBEAT_DATA.toml 在晚报后被程序重写过，按内容比较只多出两个新时段，源状态和候选源都一致。
 - K6 设置了用户级环境变量 `MONID_API_KEY`（和 `CF_CRAWLER_TOKEN` 的设法相同）：key 通过临时文件传过去，写入后就删掉了，过程中没有打印。
 - 17:44 替换 exe、HEARTBEAT.md、HEARTBEAT_DATA.toml（保留 `.prev` 备份），然后重启。日志显示自动建好了 `news:会展`（明天 09:00）和 `news:成人产业`（明天 14:00），没有告警。
+
+---
+
+## 2026-09-25 — 本地真实浏览器抓取（`local_browser`）+ 成人推送按族裔分组
+
+### 为什么
+
+用户指出成人产业推送不合格：抓不到真正的信息源，推的全是警方和政府新闻，没有华人从业者信息，还推了一堆西人资料。用户要求解决 Cloudflare 人机识别问题，并指出"流量本身就是在我电脑上浏览的，被拦了我自己登陆一下"。
+
+### Cloudflare 的事实（实测，不是推测）
+
+- Cloudflare 官方 FAQ 写明：**Browser Rendering 的请求一律被 Cloudflare 自己标记为机器人流量**，还会带上 `cf-biso-request-id` 等标识头。所以"用 CF 浏览器过 CF 验证"这条路从设计上就不通。
+- 明确不做：指纹伪装补丁（stealth/undetected 类）、TLS 指纹冒充、住宅代理轮换、打码平台。
+- 重测后发现之前的"被挡"名单判断错了：
+  - RealBabes：robots.txt 是 `User-agent:* Disallow:`（全站允许），从 K6 普通 curl 返回 200（含分城市列表页 361KB）。之前的"403"是没跟随 301 重定向。
+  - Scarlet Blue：K6 直连 200。
+  - City Heaven：提供官方 sitemap（`sitemap_index.xml`），可直接读取。
+  - 百事通：robots 允许，直连 200。
+
+### 分层实测结果（同一台 K6、同一个 IP）
+
+| 方式 | Locanto | EAB | City Heaven | RealBabes | Sammyboy |
+|---|---|---|---|---|---|
+| 普通 HTTP | 挡 | 挡 | 挡 | **200** | 挡 |
+| 无头 Chrome | 挡 | 挡 | 挡 | 挡 | 挡 |
+| 有头 Chrome（本机测试） | **200** | **200** | **200** | 挡 | 挡 |
+| 有头 Chrome（K6，Playwright 驱动） | 挡 | 挡 | **200** | 挡 | 挡 |
+| 人工手动打开（K6 桌面） | 通 | 通 | 通 | 通 | **过不去** |
+
+结论：差别在于 Playwright 驱动的 Chrome 带自动化标志（`navigator.webdriver`）。把这个标志藏起来正属于上面声明不做的那类改动，因此不做。
+
+**最终抓不到的三个站**：Locanto、Escorts and Babes（自动化必被拦，sitemap 也 403）、Sammyboy（人工都过不去）。
+
+### 改动
+
+- `cf-crawler/browser/`（新目录，不打进 exe）：
+  - `index.mjs`：用本机已装的 Chrome，持久化配置文件；`fetch` 子命令抓页面返回 HTML，`login` 子命令打开可见窗口让机主手动过验证/登录，会话存进配置文件供后续复用。
+  - 默认有头（实测无头必被拒），窗口移到屏幕外，避免在 K6 桌面弹窗。遇到验证页只等浏览器自己走完，等不到就返回 `challenge` 放弃，不做任何破解。
+  - 依赖只有 `playwright-core`（14MB，复用系统 Chrome，不下载浏览器）。
+- `src/tools/local_browser.rs`（新文件）：spawn `node index.mjs fetch`，stdin 传 JSON、stdout 按行读结果；信号量限制同时只跑一个浏览器（一个配置文件不能被两个 Chrome 同时占用）；3 个单测。
+- `src/cron/news.rs`：`Source` 新增 `local_browser` 字段。
+- `src/cron/expo_pipeline.rs`：`fetch_page` 增加 `local_browser` 分支，返回的 HTML 直接走已有的 `parse_ld_events` / `page_text` / `parse_anchors`。
+- `src/cron/adult_pipeline.rs`：
+  - 资料页抓取支持 `local_browser` 来源；
+  - **新增 `ethnicity` 字段**（华人/亚裔/西人/其他），进入提示词、校验、数据库、价格统计的分组键；
+  - 推送分两组：**新收录（华人/亚裔）** 最多 8 条在前，**西人（对比参考）** 最多 3 条在后；
+  - 本地汇总的价格表和收录表都加了族裔列，华人市场和西人基准不再混在一起平均。
+
+### K6 部署
+
+- `workspace/tools/local-browser/` 已部署并 `npm install`。
+- 新建交互式计划任务 `elfClaw_BrowserLogin`（`/it /ru elfRadio`）——SSH 启动的 GUI 窗口到不了控制台桌面，必须用跑在登录会话里的计划任务。
+- 机主在 K6 桌面逐个标签页完成了人机验证，除 Sammyboy 外其它站都是直接打开的。
+
+### 浏览器资源（本机实测，只统计新启动的进程树）
+
+启动 0.36 秒；空载 484 MB / 10 进程；开 3 个页面峰值 1052 MB / 14 进程；`taskkill /T` 后 2.8 秒归零。K6 总内存 7.9 GB、空闲 4.2 GB。按需启动、用完杀掉，不常驻。
+
+### 验证
+
+`cargo test --lib -- cron:: tools::` 931 通过、3 失败（image_info / screenshot 符号链接测试，属已知基线）；clippy 在改动文件上无新增告警（cf_crawler.rs 两处 `#[ignore]` 缺原因说明是原有的）。
