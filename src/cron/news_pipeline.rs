@@ -502,6 +502,100 @@ fn parse_listing(v: &Value, source: &str) -> Vec<Item> {
         .collect()
 }
 
+/// Sections of a news site that are never a story.
+const NON_ARTICLE_PATH: &[&str] = &[
+    "/tag/",
+    "/tags/",
+    "/topic/",
+    "/topics/",
+    "/category/",
+    "/categories/",
+    "/author/",
+    "/authors/",
+    "/subscribe",
+    "/subscription",
+    "/notices/",
+    "/feedback",
+    "/account",
+    "/login",
+    "/signin",
+    "/register",
+    "/newsletter",
+    "/privacy",
+    "/terms",
+    "/contact",
+    "/about",
+    "/help",
+    "/search",
+    "/video/",
+    "/podcast",
+    "/live-blog",
+    "/saved-stories",
+];
+
+/// True when a URL path looks like an article rather than a section page.
+///
+/// Every news site builds article URLs from a headline slug, often with a date
+/// or a numeric id: `/business/companies/rba-holds-rates/news-story/9f3c…`,
+/// `/news/articles/2026-09-25/oil-slips-as-opec-meets`. Section and navigation
+/// links are short: `/business`, `/nation/politics`. Requiring a multi-word
+/// slug in the last segment separates the two without a per-site rule.
+pub fn looks_like_article_path(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    let path = parsed.path().to_lowercase();
+    if NON_ARTICLE_PATH.iter().any(|p| path.contains(p)) {
+        return false;
+    }
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    if segments.len() < 2 {
+        return false;
+    }
+    // The slug is usually last, but some sites end with an id segment. Three
+    // words is the line: section paths are one or two (`/nation/indigenous`,
+    // `/business/economics`), headline slugs are three or more.
+    segments.iter().rev().take(2).any(|segment| {
+        let words = segment.split(['-', '_']).filter(|w| !w.is_empty()).count();
+        let digits = segment.chars().filter(char::is_ascii_digit).count();
+        words >= 3 || digits >= 8
+    })
+}
+
+/// Links on an HTML page that read like headlines, as undated items.
+///
+/// Used for sources that are a web page rather than a feed. Only links on the
+/// source's own host, whose path looks like an article and whose anchor text
+/// reads like a headline, are kept — otherwise a homepage's navigation bar
+/// would fill the whole source quota.
+pub fn parse_page_links(html: &str, base_url: &str, source: &str) -> Vec<Item> {
+    let Ok(base) = reqwest::Url::parse(base_url) else {
+        return Vec::new();
+    };
+    let host = host_of(base_url);
+    let mut out: Vec<Item> = Vec::new();
+    for (title, link) in crate::cron::expo_pipeline::parse_anchors(html, &base) {
+        // A headline is a sentence fragment, not a label.
+        let words = title.split_whitespace().count();
+        let long_enough = title.chars().count() >= 20 && words >= 4;
+        if !long_enough || host_of(&link) != host || !looks_like_article_path(&link) {
+            continue;
+        }
+        if out.iter().any(|it| it.link == link || it.title == title) {
+            continue;
+        }
+        out.push(Item {
+            source: source.to_string(),
+            official: is_official(&link),
+            title,
+            link,
+            published: None,
+            text: String::new(),
+        });
+    }
+    out
+}
+
 // ── fetching ─────────────────────────────────────────────────────────────
 
 enum Kind {
@@ -571,6 +665,44 @@ async fn fetch_source(
     now: DateTime<Utc>,
 ) -> Result<Vec<Item>> {
     let name = display_name(src);
+    // elfClaw 2026-09-25: a page that only exists after JavaScript runs, or
+    // that refuses plain HTTP, is fetched the same way the expo and adult
+    // slots fetch theirs.
+    if src.local_browser {
+        let page = crate::tools::local_browser::fetch(security, std::slice::from_ref(&src.url))
+            .await?
+            .pop()
+            .context("本地浏览器没有返回结果")?
+            .map_err(|e| anyhow::anyhow!(e))?;
+        return Ok(if looks_like_feed(&page.html) {
+            parse_feed(&page.html, &name)
+        } else {
+            parse_page_links(&page.html, &page.final_url, &name)
+        });
+    }
+    if src.tinyfish {
+        let page = crate::cron::tinyfish::fetch(client, std::slice::from_ref(&src.url))
+            .await?
+            .pop()
+            .context("TinyFish 没有返回结果")?
+            .map_err(|e| anyhow::anyhow!(e))?;
+        // TinyFish returns Markdown plus the page's links.
+        let items: Vec<Item> = page
+            .links
+            .iter()
+            .map(|l| (crate::cron::tinyfish::slug_text(l), l.clone()))
+            .filter(|(t, l)| t.chars().count() >= 12 && host_of(l) == host_of(&src.url))
+            .map(|(title, link)| Item {
+                source: name.clone(),
+                official: is_official(&link),
+                title,
+                link,
+                published: None,
+                text: String::new(),
+            })
+            .collect();
+        return Ok(items);
+    }
     match kind_of(&src.url) {
         Kind::Telegram(channel) => {
             let html = get_text(client, &format!("https://t.me/s/{channel}")).await?;
@@ -587,19 +719,26 @@ async fn fetch_source(
             let json: Value = serde_json::from_str(&get_text(client, &src.url).await?)?;
             Ok(parse_hn(&json, &name))
         }
-        Kind::Auto => {
-            let body = get_text(client, &src.url).await;
-            match body {
-                Ok(body) if looks_like_feed(&body) => Ok(parse_feed(&body, &name)),
-                // Not a feed (or plain HTTP was refused): let cf-crawler
-                // extract the article list, with its anti-bot fallbacks.
-                _ => {
+        Kind::Auto => match get_text(client, &src.url).await {
+            Ok(body) if looks_like_feed(&body) => Ok(parse_feed(&body, &name)),
+            // A plain news page: read the headlines out of it directly.
+            Ok(body) => {
+                let items = parse_page_links(&body, &src.url, &name);
+                if items.is_empty() {
+                    // Probably built by JavaScript — cf-crawler renders it.
                     let listing =
                         crate::tools::cf_crawler::scrape_listing(security, &src.url).await?;
                     Ok(parse_listing(&listing, &name))
+                } else {
+                    Ok(items)
                 }
             }
-        }
+            // Plain HTTP was refused: cf-crawler has the anti-bot fallbacks.
+            Err(_) => {
+                let listing = crate::tools::cf_crawler::scrape_listing(security, &src.url).await?;
+                Ok(parse_listing(&listing, &name))
+            }
+        },
     }
 }
 
@@ -1389,6 +1528,57 @@ mod tests {
         assert_eq!(items[0].title, "Atom post");
         assert_eq!(items[0].link, "https://b.example.com/p");
         assert_eq!(items[0].text, "Short");
+    }
+
+    #[test]
+    fn looks_like_article_path_separates_stories_from_sections() {
+        // Real shapes seen on the sources in use (measured 2026-09-25).
+        for url in [
+            "https://www.theaustralian.com.au/business/rba-urged-to-expose-labors-spending/news-story/1b8e14a0f6754d02",
+            "https://www.bloomberg.com/news/articles/2026-09-25/japan-regulator-is-boosting-scrutiny",
+            "https://news.example.com/news/rba-holds-cash-rate-steady",
+        ] {
+            assert!(looks_like_article_path(url), "should be an article: {url}");
+        }
+        for url in [
+            "https://www.theaustralian.com.au/business",
+            "https://www.theaustralian.com.au/nation/indigenous",
+            "https://www.bloomberg.com/subscription",
+            "https://www.theaustralian.com.au/saved-stories",
+            "https://news.example.com/topic/markets-and-economy-daily",
+            "https://news.example.com/",
+            "not a url",
+        ] {
+            assert!(
+                !looks_like_article_path(url),
+                "should not be an article: {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_page_links_keeps_headlines_on_the_source_host() {
+        let html = concat!(
+            r#"<a href="/news/rba-holds-cash-rate-steady">RBA holds the cash rate steady</a>"#,
+            r#"<a href="/news/rba-holds-cash-rate-steady">RBA holds the cash rate steady</a>"#,
+            r#"<a href="/about">About</a>"#,
+            r#"<a href="https://twitter.com/x">Follow us on Twitter for updates</a>"#,
+            r#"<a href="https://news.example.com/a/asx-closes-lower">ASX closes lower as miners slide</a>"#,
+        );
+        let items = parse_page_links(html, "https://news.example.com/markets", "示例财经");
+        assert_eq!(
+            items.len(),
+            2,
+            "duplicates, short text and off-host links are dropped"
+        );
+        assert_eq!(items[0].title, "RBA holds the cash rate steady");
+        assert_eq!(
+            items[0].link,
+            "https://news.example.com/news/rba-holds-cash-rate-steady"
+        );
+        assert_eq!(items[0].source, "示例财经");
+        assert!(items[0].published.is_none());
+        assert!(items.iter().all(|i| !i.official));
     }
 
     #[test]

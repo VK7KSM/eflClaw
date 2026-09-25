@@ -45,8 +45,8 @@ const DETAIL_TEXT_CHARS: usize = 4_000;
 /// Expos whose ticket info is looked up per run (one detail page each).
 const MAX_ENRICH: usize = 12;
 const FETCH_CONCURRENCY: usize = 5;
-/// Venue calendars and ad boards can be slow (141go161.com took 30 s+).
-const PAGE_TIMEOUT_SECS: u64 = 60;
+/// Venue calendars and ad boards can be slow (141go161.com has taken 40 s+).
+const PAGE_TIMEOUT_SECS: u64 = 90;
 /// Rows are kept this long after the expo ended, then deleted.
 const KEEP_DAYS_AFTER_END: i64 = 30;
 /// A page with this many structured events needs no text extraction.

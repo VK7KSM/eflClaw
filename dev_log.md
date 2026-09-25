@@ -6638,7 +6638,7 @@ K6 上在群里说一句 hello，输入 50,182 token、耗时 20.3 秒。用 Gem
 ### Cloudflare 的事实（实测，不是推测）
 
 - Cloudflare 官方 FAQ 写明：**Browser Rendering 的请求一律被 Cloudflare 自己标记为机器人流量**，还会带上 `cf-biso-request-id` 等标识头。所以"用 CF 浏览器过 CF 验证"这条路从设计上就不通。
-- 明确不做：指纹伪装补丁（stealth/undetected 类）、TLS 指纹冒充、住宅代理轮换、打码平台。
+- 明确不做：TLS 指纹冒充、住宅代理轮换、打码平台。
 - 重测后发现之前的"被挡"名单判断错了：
   - RealBabes：robots.txt 是 `User-agent:* Disallow:`（全站允许），从 K6 普通 curl 返回 200（含分城市列表页 361KB）。之前的"403"是没跟随 301 重定向。
   - Scarlet Blue：K6 直连 200。
@@ -6655,7 +6655,7 @@ K6 上在群里说一句 hello，输入 50,182 token、耗时 20.3 秒。用 Gem
 | 有头 Chrome（K6，Playwright 驱动） | 挡 | 挡 | **200** | 挡 | 挡 |
 | 人工手动打开（K6 桌面） | 通 | 通 | 通 | 通 | **过不去** |
 
-结论：差别在于 Playwright 驱动的 Chrome 带自动化标志（`navigator.webdriver`）。把这个标志藏起来正属于上面声明不做的那类改动，因此不做。
+结论：差别在于 Playwright 驱动的 Chrome 带自动化标志（`navigator.webdriver`）。
 
 **最终抓不到的三个站**：Locanto、Escorts and Babes（自动化必被拦，sitemap 也 403）、Sammyboy（人工都过不去）。
 
@@ -6687,3 +6687,79 @@ K6 上在群里说一句 hello，输入 50,182 token、耗时 20.3 秒。用 Gem
 ### 验证
 
 `cargo test --lib -- cron:: tools::` 931 通过、3 失败（image_info / screenshot 符号链接测试，属已知基线）；clippy 在改动文件上无新增告警（cf_crawler.rs 两处 `#[ignore]` 缺原因说明是原有的）。
+
+---
+
+## 2026-09-25 — 本地浏览器反检测改造（隐藏自动化痕迹 + 真人节奏）
+
+### 为什么
+
+机主要求把 Playwright 驱动的 Chrome 的自动化痕迹彻底隐藏、尽量模拟真人抓取，不想每次都手动过人机验证。**这明确反转了本文件上一条目里"不藏 `navigator.webdriver`、不做 stealth"的设计决定**（相关声明已按机主要求从上一条目删除）。
+
+### 关键判断：用真实 Chrome，就别照搬 Python stealth 教程
+
+参考教程是 Python + `playwright-stealth`，但本项目 helper 是 Node（`playwright-core`）。而且我们用的是**本机真实有头 Chrome**，教程里 stealth 库要补的 `window.chrome`、`navigator.plugins`、`permissions.query`、UA、WebGL vendor、codecs —— 真 Chrome 本来就是真的，补了反而会制造新破绽（典型：改了 JS 里的 `navigator.languages` 却不改 HTTP `Accept-Language` 头，两者不一致=新的自动化特征）。所以：
+- **不引入** Python，也**不引入** Node 版 stealth 库（`playwright-extra` 等），零新依赖。
+- 第 2 层只补真正的破绽 `navigator.webdriver`，其余一律不动。
+
+### 改动（`cf-crawler/browser/index.mjs`，源在 `C:\Dev\cf-crawler`）
+
+- **第 1 层 · 启动参数**：`launch()` 加 `ignoreDefaultArgs: ["--enable-automation"]`（去掉"受自动测试软件控制"标志）+ args 加 `--disable-blink-features=AutomationControlled`。这一层就能干掉提示条和 `navigator.webdriver`。**没加** `--no-sandbox`（教程有，但 Windows 桌面不需要且降低安全性）。
+- **第 2 层 · 注入脚本**：`ctx.addInitScript()` 在每页文档加载前把 `navigator.webdriver` getter 抹成 `undefined`，作为第 1 层的双保险。因为是真 Chrome，其它指纹一概不碰。
+- **第 3 层 · 真人节奏（纯本地代码，无大模型）**：新增 `humanize(page)` 用 `page.mouse.move/wheel` + `Math.random()` 做随机鼠标移动、滚动、不均匀停顿；在 `grab()` 里导航后、判断验证前调用（有些 JS 挑战盯真人交互）。best-effort，失败即忽略，最坏每页 +~4s，在超时预算内。
+- 头注释同步改写，记录本次反转；仍**不做**：TLS 指纹冒充、代理轮换、打码/自动破解验证。
+
+### 仍然的边界
+
+指纹硬化只降低被弹验证的概率，不保证 0（还看 IP 信誉、TLS/JA3、行为）。对仍会挑战的站点，正解仍是已有的 `login` 模式：机主手动过一次，会话存进持久 profile 后复用——即"每个站点点一次，不是每次点"。
+
+### 验证
+
+- `node --check browser/index.mjs` 通过。
+- 本机实跑 `node index.mjs fetch`（data URL 回读）：`navigator.webdriver = undefined`（改前为 `true`）、UA 不含 `HeadlessChrome`、`ok=true`，第 3 层 humanize 运行未报错。
+- Rust 侧（`local_browser.rs`）未改动，无需重跑 cargo。
+
+### 部署状态
+
+**尚未部署到 K6**——scp 覆盖生产文件被自动模式拦为"生产部署"，等机主授权后再推 `C:\dev\elfClaw\ZeroClaw_Workspace\workspace\tools\local-browser\index.mjs`（会先备份原文件）。zeroclaw 每次抓取新起 node 进程，部署后无需重启，下次定时抓取自动生效。
+
+---
+
+## 2026-09-25 — 换源清单 + 新闻时段复用浏览器抓取
+
+用户要求：换掉成人产业的源清单，并让其它新闻时段也复用本地浏览器抓取。
+
+### 新闻流水线接入新抓取方式
+
+- `fetch_source` 新增两个前置分支：`local_browser`（本机 Chrome）和 `tinyfish`，与会展、成人时段用同一套方式。
+- 新增 `parse_page_links`：把普通网页的链接解析成新闻条目。**第一版只按"同域名 + 文字≥12字"过滤，结果全是导航栏**（澳洲人报 155 条里全是"Read Today's Paper""Indigenous affairs"这种，彭博只有 4 条法律声明）。
+- 因此新增 `looks_like_article_path`：按链接形态区分文章页和栏目页——文章链接的最后一段是标题 slug（三个词以上）或带 8 位以上数字 ID，栏目链接只有一两个词（`/nation/indigenous`、`/business/economics`）；另有一份栏目路径黑名单（`/tag/`、`/author/`、`/subscribe` 等）。标题要求 ≥20 字且 ≥4 个词。
+  - 修正后：澳洲人报 76 条、彭博 41 条，全是真实头条。
+- `Kind::Auto` 分支改进：普通网页抓到正文后直接用 `parse_page_links` 解析，解析不出才退回 cf-crawler 渲染。南华早报 32 条、日经亚洲 60 条，都不再需要 cf-crawler。
+
+### 源清单
+
+**成人产业（18 源，全部重来）**
+- 华人从业者广告（主体）：百事通悉尼/墨尔本/布里斯班 × 成人服务、私钟援交共 6 个分类，每个都配了 `profile_pattern` 抓详情页。实测条目数 64–715 不等。
+- 亚洲：香港 141 一楼一、City Heaven 东京（`local_browser`）、PTT 性版。
+- 西人（对比参考）：RealBabes 悉尼/墨尔本、Scarlet Blue。
+- 行业动态改为只要科技、金融、平台、产品四类 Google 新闻搜索 + Future of Sex + Stickman，并加了排除词挡掉导购软文（`-VPN -"best of" -"top 10"`）。**删掉了原来全部的警方执法、政府法规类搜索。**
+
+**新闻时段新增**
+- 早报：南华早报·中国（普通请求）
+- 晚报：澳洲人报·财经、彭博·市场（两者普通请求都是 403，浏览器可读）
+- 夜报：日经亚洲（普通请求）
+- 路透测下来浏览器也进不去（401），不收录。
+
+### 提示词修正
+
+- 评价字段原来写"不描写身体和具体性行为"，模型照样复述广告原文（"奶大且晃动自然""抽插有力"）。改成**只能从固定清单里挑**：是否守时、环境卫生、沟通态度、真人与照片是否相符、时长是否足量、是否临时加价、是否安全、性价比，并明确说"那些是广告词，写了等于没写"。
+- 选稿提示词增加：跳过导购软文和 SEO 水文，以及警方扫黄、个案判决这类社会新闻。
+
+### 实测
+
+- **成人产业**：85 秒。价格数据按族裔分组，例如悉尼亚裔按摩店 AUD 130（100–160）、悉尼华人独立 AUD 375、墨尔本亚裔妓院 AUD 235、**悉尼西人按摩店 AUD 220 对比亚裔 AUD 130**。评价改进后不再有广告词复述。
+- **晚报**：93 秒、20 条，其中 6 条来自新的浏览器源（彭博的日本 AI 数据中心融资审查、ANZ 裁员，澳洲人报的美国借贷成本）。
+- 页面超时从 60 秒提到 90 秒（141go161 实测偶尔要 40 秒以上）。
+- RealBabes、Scarlet Blue 从开发机返回 403（本机 IP 因反复测试被限），**从 K6 用 curl 均为 200**，生产环境不受影响。
+- `cargo test --lib` 4144 通过、10 失败（已知基线）；clippy 改动文件无新增告警。
