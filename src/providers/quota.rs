@@ -235,8 +235,15 @@ pub fn today(now: DateTime<Utc>) -> Vec<ModelUsage> {
 
 /// Render the note. Split from `summary_line` so it can be checked without
 /// touching the process-wide store.
+///
+/// Every number is spelled out, because a bare "remaining" figure says nothing
+/// on its own: a model whose ceiling has been observed shows `used/total` plus
+/// how that total was derived, one whose ceiling is still unknown shows the
+/// count and says so, and models that were not called at all are listed too —
+/// otherwise there is no way to tell "untouched" from "not tracked".
 fn render_summary(
     usage: &[ModelUsage],
+    configured: &[String],
     keys: usize,
     now: DateTime<Utc>,
     tz: &str,
@@ -245,36 +252,65 @@ fn render_summary(
         return None;
     }
     let keys = keys.max(1);
-    let parts: Vec<String> = usage
-        .iter()
-        .take(MAX_MODELS_SHOWN)
-        .map(|u| {
-            let name = u.model.strip_prefix("gemini-").unwrap_or(&u.model);
-            match u.remaining(keys) {
-                Some(left) => format!("{name} 剩约 {left}（已用 {}）", u.calls),
-                None => format!("{name} 已用 {}", u.calls),
-            }
-        })
-        .collect();
-    let mut line = format!("🔑 {}", parts.join(" ｜ "));
-    let exhausted: usize = usage.iter().map(|u| u.keys_exhausted).sum();
-    if exhausted > 0 {
-        let _ = std::fmt::Write::write_fmt(
-            &mut line,
-            format_args!(" · {exhausted}/{keys} 个 key 已用完"),
+    let short = |m: &str| m.strip_prefix("gemini-").unwrap_or(m).to_string();
+    let mut lines = vec![match reset_label(now, tz) {
+        Some(reset) => format!("🔑 今日用量（{reset} 重置）"),
+        None => "🔑 今日用量".to_string(),
+    }];
+
+    for u in usage.iter().filter(|u| u.observed_limit.is_some()) {
+        let Some(limit) = u.observed_limit else {
+            continue;
+        };
+        let total = limit * i64::try_from(keys).unwrap_or(1);
+        let mut line = format!(
+            "• {} {}/约 {total}（{keys} 个 key × 单 key 约 {limit}）",
+            short(&u.model),
+            u.calls
         );
+        if u.keys_exhausted > 0 {
+            let _ = std::fmt::Write::write_fmt(
+                &mut line,
+                format_args!("，{} 个 key 已用完", u.keys_exhausted),
+            );
+        }
+        lines.push(line);
     }
-    if let Some(reset) = reset_label(now, tz) {
-        let _ = std::fmt::Write::write_fmt(&mut line, format_args!(" · {reset} 重置"));
+
+    let unknown: Vec<String> = usage
+        .iter()
+        .filter(|u| u.observed_limit.is_none())
+        .map(|u| format!("{} {}", short(&u.model), u.calls))
+        .collect();
+    if !unknown.is_empty() {
+        lines.push(format!(
+            "• {}（还没有 key 触顶，上限未知）",
+            unknown.join("、")
+        ));
     }
-    Some(line)
+
+    let used: std::collections::HashSet<&str> = usage.iter().map(|u| u.model.as_str()).collect();
+    let unused: Vec<String> = configured
+        .iter()
+        .filter(|m| !used.contains(m.as_str()))
+        .map(|m| short(m))
+        .collect();
+    if !unused.is_empty() {
+        lines.push(format!("• 今天没用到：{}", unused.join("、")));
+    }
+    Some(lines.join("\n"))
 }
 
-/// The one-line quota note appended to every push. `keys` is how many API
-/// keys are configured, `tz` the reader's timezone. Returns `None` before any
-/// call has been recorded today.
-pub fn summary_line(now: DateTime<Utc>, keys: usize, tz: &str) -> Option<String> {
-    render_summary(&today(now), keys, now, tz)
+/// The quota note appended to every push. `keys` is how many API keys are
+/// configured, `configured` the models elfClaw might call, `tz` the reader's
+/// timezone. Returns `None` before any call has been recorded today.
+pub fn summary_line(
+    now: DateTime<Utc>,
+    keys: usize,
+    configured: &[String],
+    tz: &str,
+) -> Option<String> {
+    render_summary(&today(now), configured, keys, now, tz)
 }
 
 // ── model availability ───────────────────────────────────────────────────
@@ -460,39 +496,84 @@ mod tests {
         assert_eq!(u.remaining(6), Some(40));
     }
 
-    #[test]
-    fn summary_line_reads_plainly_and_hides_the_quota_timezone() {
-        let now = at("2026-09-26T02:00:00Z");
-        let usage = vec![ModelUsage {
-            model: "gemini-3.5-flash".into(),
-            calls: 4,
-            keys_seen: 1,
-            keys_exhausted: 1,
-            observed_limit: Some(4),
-        }];
-        let line = render_summary(&usage, 6, now, "Australia/Sydney").unwrap();
-        assert!(line.contains("3.5-flash 剩约 20（已用 4）"), "{line}");
-        assert!(line.contains(" · 1/6 个 key 已用完"), "{line}");
-        assert!(line.contains(" · 17:00 重置"), "{line}");
-        assert!(
-            !line.contains("太平洋") && !line.contains("Pacific"),
-            "{line}"
-        );
+    fn models(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| (*s).to_string()).collect()
     }
 
     #[test]
-    fn an_unknown_limit_still_reports_what_was_used() {
-        let now = at("2026-09-26T02:00:00Z");
+    fn a_known_ceiling_shows_used_total_and_how_the_total_was_derived() {
         let usage = vec![ModelUsage {
-            model: "gemini-3.6-flash".into(),
-            calls: 7,
-            keys_seen: 2,
-            keys_exhausted: 0,
-            observed_limit: None,
+            model: "gemini-3.5-flash".into(),
+            calls: 180,
+            keys_seen: 6,
+            keys_exhausted: 1,
+            observed_limit: Some(100),
         }];
-        let line = render_summary(&usage, 6, now, "Australia/Sydney").unwrap();
-        assert!(line.contains("3.6-flash 已用 7"), "{line}");
-        assert!(!line.contains("个 key 已用完"), "{line}");
+        let configured = models(&["gemini-3.5-flash", "gemini-3.8-flash"]);
+        let out = render_summary(
+            &usage,
+            &configured,
+            6,
+            at("2026-09-26T02:00:00Z"),
+            "Australia/Sydney",
+        )
+        .unwrap();
+        assert!(out.contains("🔑 今日用量（17:00 重置）"), "{out}");
+        assert!(
+            out.contains("• 3.5-flash 180/约 600（6 个 key × 单 key 约 100），1 个 key 已用完"),
+            "{out}"
+        );
+        // Models that exist in config but were not called are still accounted for.
+        assert!(out.contains("• 今天没用到：3.8-flash"), "{out}");
+        // The quota timezone is an implementation detail, never shown.
+        assert!(!out.contains("太平洋") && !out.contains("Pacific"), "{out}");
+    }
+
+    #[test]
+    fn an_unknown_ceiling_says_so_instead_of_showing_a_bare_number() {
+        let usage = vec![
+            ModelUsage {
+                model: "gemini-3.6-flash".into(),
+                calls: 2,
+                keys_seen: 1,
+                keys_exhausted: 0,
+                observed_limit: None,
+            },
+            ModelUsage {
+                model: "gemini-3.5-flash-lite".into(),
+                calls: 87,
+                keys_seen: 3,
+                keys_exhausted: 0,
+                observed_limit: None,
+            },
+        ];
+        let out = render_summary(
+            &usage,
+            &models(&["gemini-3.6-flash", "gemini-3.5-flash-lite"]),
+            6,
+            at("2026-09-26T02:00:00Z"),
+            "Australia/Sydney",
+        )
+        .unwrap();
+        assert!(
+            out.contains("• 3.6-flash 2、3.5-flash-lite 87（还没有 key 触顶，上限未知）"),
+            "{out}"
+        );
+        assert!(!out.contains("今天没用到"), "{out}");
+        assert!(!out.contains("已用完"), "{out}");
+    }
+
+    #[test]
+    fn no_calls_today_means_no_note_at_all() {
+        let configured = models(&["gemini-3.5-flash"]);
+        assert!(render_summary(
+            &[],
+            &configured,
+            6,
+            at("2026-09-26T02:00:00Z"),
+            "Australia/Sydney"
+        )
+        .is_none());
     }
 
     #[test]
@@ -527,11 +608,5 @@ mod tests {
             None,
             "a new day checks again"
         );
-    }
-
-    #[test]
-    fn no_calls_today_means_no_line() {
-        let now = at("2026-09-26T02:00:00Z");
-        assert!(render_summary(&[], 6, now, "Australia/Sydney").is_none());
     }
 }

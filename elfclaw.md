@@ -526,6 +526,55 @@ gemini-3.5-flash: key A → key B → ...
 - 抓不到的站：Locanto、Escorts and Babes（自动化必被拦）、Sammyboy（人工也过不去）。
 
 
+## 17. 模型额度统计（2026-09-26）
+
+每次推送结尾带一行，6 个时段都带：
+
+```
+🔑 3.5-flash 剩约 420（已用 180） ｜ 3.6-flash 已用 12 · 2/6 个 key 已用完 · 17:00 重置
+```
+
+### 为什么只能本地算
+
+**Gemini 没有查询剩余额度的接口。** 实测 `ListModels` 只返回模型元数据
+（`inputTokenLimit`、`supportedGenerationMethods` 等），没有任何配额字段。
+Google Cloud 的 Service Usage API 能查配额，但要 OAuth + GCP 项目，光有 API key 不行，
+而且查的是上限不是已用量。
+
+所以用本地计数：`state/quota.db` 记每个配额日、每个 key、每个模型的调用次数。零成本，不占额度。
+
+### 上限是自学习的，不硬编码
+
+Google 会改免费额度的数字，写死就会过时。做法是：某个 key + 模型当天**第一次因每日配额 429**
+时，此前成功的次数就是观测到的日上限，跨 key 取最大值。每分钟限流的 429 不算。
+
+第一天还没有任何 key 用完时显示"已用 N"，不显示剩余；用完过一次之后就有估算值了。
+
+### 配额日按太平洋时间，显示按本地时间
+
+Google 的免费额度在**太平洋时间午夜**重置，所以计数按太平洋日期分组。
+但这个对爸爸没意义，**推送里只显示悉尼时间的重置点**（`17:00 重置`），不出现时区名词。
+
+### key 数量自动算
+
+`config.api_key` 加上 `reliability.api_keys` 里的非空项。加 key 不用改代码。
+
+### 一个曾经的统计缺口
+
+`src/providers/gemini.rs` 记 token 用量时把 provider 名硬编码成 `"gemini"`，
+而多 key 的标签（`gemini#2`…）在外层 `ReliableProvider` 手里。所以成功的调用
+**不知道用的是哪个 key**，只有失败记录带标签。现在由 `ReliableProvider` 在成功时
+用自己的标签记账，绕过了这个问题，没有改 provider 内部。
+
+### 模型下线检测
+
+Gemini 的地址是 `https://generativelanguage.googleapis.com/v1beta/models/{模型名}:generateContent`，
+**换模型只换路径里的模型名，代码不用动**，config 改个字符串即可。
+
+每个配额日查一次 `ListModels`（结果缓存），配置里用到但 API 不再列出的模型会在推送里告警。
+**不做自动切换**：新模型的速度、质量、免费额度都不一样，静默切换会让推送质量下降而爸爸不知道。
+
+
 ## 13. 代码语言约束
 
 **全部用 Rust 实现，不引入 Python 等其他语言的运行时依赖。** 之前分析阶段用 Python 脚本做过一次性的数据分析（读 K6 拷回来的 SQLite/日志、测 Gemini key），那些是本地一次性工具，不进入 elfClaw 代码库；正式功能代码一律 Rust。

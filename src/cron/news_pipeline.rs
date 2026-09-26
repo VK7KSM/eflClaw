@@ -1345,7 +1345,9 @@ fn with_quota_note(config: &Config, rules: &NewsRules, mut text: String) -> Stri
         .iter()
         .filter(|k| !k.trim().is_empty())
         .count();
-    if let Some(note) = crate::providers::quota::summary_line(Utc::now(), keys, &rules.tz) {
+    let models = crate::providers::quota::configured_models(config);
+    if let Some(note) = crate::providers::quota::summary_line(Utc::now(), keys, &models, &rules.tz)
+    {
         if !text.ends_with('\n') {
             text.push('\n');
         }

@@ -142,6 +142,33 @@ async fn process_due_jobs(
     }
 }
 
+/// A job firing later than this after its due time is worth telling the
+/// reader about: a catch-up run's content is stale relative to its slot.
+const LATE_RUN_THRESHOLD_MINUTES: i64 = 10;
+
+/// How late this run is, in whole minutes, once past the threshold.
+///
+/// `due_jobs` selects everything with `next_run <= now`, so a job whose time
+/// passed while the daemon was down is caught up on the next poll rather than
+/// skipped — but silently, and a "07:00 morning report" delivered at 11:00
+/// reads as if nothing happened.
+fn late_by_minutes(due: DateTime<Utc>, now: DateTime<Utc>) -> Option<i64> {
+    let minutes = (now - due).num_minutes();
+    (minutes >= LATE_RUN_THRESHOLD_MINUTES).then_some(minutes)
+}
+
+/// The note prepended to a catch-up run's output.
+fn late_run_notice(minutes: i64) -> String {
+    if minutes >= 120 {
+        format!(
+            "⏰ 本次推送迟了约 {} 小时（elfClaw 在计划时间没有运行）\n",
+            minutes / 60
+        )
+    } else {
+        format!("⏰ 本次推送迟了约 {minutes} 分钟（elfClaw 在计划时间没有运行）\n")
+    }
+}
+
 async fn execute_and_persist_job(
     config: &Config,
     security: &SecurityPolicy,
@@ -161,7 +188,14 @@ async fn execute_and_persist_job(
     );
 
     let started_at = Utc::now();
-    let (success, output) = Box::pin(execute_job_with_retry(config, security, job)).await;
+    let late = late_by_minutes(job.next_run, started_at);
+    if let Some(minutes) = late {
+        tracing::warn!(job = %job_name, late_minutes = minutes, "Cron job ran late");
+    }
+    let (success, mut output) = Box::pin(execute_job_with_retry(config, security, job)).await;
+    if let (Some(minutes), true) = (late, success) {
+        output.insert_str(0, &late_run_notice(minutes));
+    }
     let finished_at = Utc::now();
     let duration_ms = (finished_at - started_at).num_milliseconds().max(0) as u64;
     let success = persist_job_result(config, job, success, &output, started_at, finished_at).await;
@@ -642,6 +676,36 @@ mod tests {
         assert!(!success);
         assert!(output.contains("blocked by security policy"));
         assert!(output.contains("rate limit exceeded"));
+    }
+
+    #[test]
+    fn on_time_runs_get_no_notice() {
+        let due = DateTime::parse_from_rfc3339("2026-09-26T21:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        // The scheduler polls every few seconds, so a small lag is normal.
+        assert_eq!(late_by_minutes(due, due), None);
+        assert_eq!(
+            late_by_minutes(due, due + chrono::Duration::minutes(9)),
+            None
+        );
+        // A job that somehow runs early is not "late" either.
+        assert_eq!(late_by_minutes(due, due - chrono::Duration::hours(1)), None);
+    }
+
+    #[test]
+    fn a_catch_up_run_says_how_late_it_is() {
+        let due = DateTime::parse_from_rfc3339("2026-09-26T21:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(
+            late_by_minutes(due, due + chrono::Duration::minutes(25)),
+            Some(25)
+        );
+        assert!(late_run_notice(25).contains("迟了约 25 分钟"));
+        // Past two hours the minute count stops being readable.
+        assert!(late_run_notice(245).contains("迟了约 4 小时"));
+        assert!(late_run_notice(25).ends_with('\n'), "sits on its own line");
     }
 
     #[tokio::test]
