@@ -18,8 +18,9 @@
 //!    from the model;
 //! 5. one model call returns only `{id, category, title, summary}` per chosen
 //!    item; the link of each item is taken from the fetched item by id, so
-//!    the model cannot alter or invent links. If the model is unavailable the
-//!    push still goes out with the newest items' original titles;
+//!    the model cannot alter or invent links. If the model cannot be reached
+//!    or its answer cannot be read, a short notice goes out instead — raw,
+//!    untranslated headlines are noise, not a fallback;
 //! 6. per-source fetch results feed the existing failure/ban counters.
 
 use crate::config::Config;
@@ -1106,6 +1107,10 @@ fn build_request(slot: &Slot, candidates: &[Item], max_items: usize, now: DateTi
 }
 
 /// Parse the model's JSON answer; tolerant of code fences and prose around it.
+///
+/// `Some(vec![])` means the model answered properly and judged that nothing
+/// was worth pushing — a normal outcome on a quiet slot. Only `None` means the
+/// answer could not be read, which is the case the caller treats as a failure.
 pub fn parse_picks(answer: &str, candidates: usize, max_items: usize) -> Option<Vec<Chosen>> {
     let start = answer.find('{')?;
     let end = answer.rfind('}')?;
@@ -1123,46 +1128,20 @@ pub fn parse_picks(answer: &str, candidates: usize, max_items: usize) -> Option<
         })
         .take(max_items)
         .collect();
-    (!chosen.is_empty()).then_some(chosen)
+    Some(chosen)
 }
 
-/// Used when the model is unavailable: newest items, round-robin across
-/// sources so one busy feed cannot fill the push, original titles.
-pub fn fallback_picks(candidates: &[Item], max_items: usize) -> Vec<Chosen> {
-    let mut by_source: Vec<(String, Vec<usize>)> = Vec::new();
-    for (i, it) in candidates.iter().enumerate() {
-        if it.official {
-            continue;
-        }
-        match by_source.iter_mut().find(|(s, _)| *s == it.source) {
-            Some((_, v)) => v.push(i),
-            None => by_source.push((it.source.clone(), vec![i])),
-        }
-    }
-    let mut chosen = Vec::new();
-    let mut round = 0;
-    while chosen.len() < max_items {
-        let mut added = false;
-        for (source, list) in &by_source {
-            if let Some(&i) = list.get(round) {
-                chosen.push(Chosen {
-                    index: i,
-                    category: source.clone(),
-                    title: candidates[i].title.clone(),
-                    summary: String::new(),
-                });
-                added = true;
-                if chosen.len() == max_items {
-                    break;
-                }
-            }
-        }
-        if !added {
-            break;
-        }
-        round += 1;
-    }
-    chosen
+/// Shown instead of a push when the model could not be reached or its answer
+/// could not be read.
+///
+/// An earlier version fell back to dumping the newest headlines as they came
+/// off the wire. That reads as noise: the titles are whatever language the
+/// source wrote them in, there are no summaries, and they group by source
+/// rather than by topic. A short, honest line is worth more.
+fn model_unavailable_notice(candidates: usize) -> String {
+    format!(
+        "⚠️ 本时段没有生成：抓到了 {candidates} 条候选，但模型没有返回可用的挑选结果\n         （额度用尽或服务繁忙）。下一时段会再试。"
+    )
 }
 
 pub(super) async fn ask_model(config: &Config, system: &str, request: &str) -> Result<String> {
@@ -1170,7 +1149,11 @@ pub(super) async fn ask_model(config: &Config, system: &str, request: &str) -> R
     let options = ProviderRuntimeOptions {
         zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
         secrets_encrypt: config.secrets.encrypt,
-        reasoning_level: config.provider.reasoning_level,
+        // These calls pick from a list and fill in a fixed JSON shape; they do
+        // not need the chat model's reasoning budget. Measured 2026-09-26: a
+        // 夜报 selection spent 3827 thinking tokens and came back with an empty
+        // `items` array, which the push then reported as "model unavailable".
+        reasoning_level: Some(0),
         ..ProviderRuntimeOptions::default()
     };
     let provider: Box<dyn Provider> = providers::create_resilient_provider_with_options(
@@ -1208,7 +1191,19 @@ pub fn render(
 ) -> String {
     let mut out = format!("📰 **{}** | {local_time}\n", slot.name);
     if !model_ok {
-        out.push_str("⚠️ 模型暂时不可用，以下为按时间挑选的原文标题\n");
+        // Quotes still go out — they come from the data, not the model — but
+        // there is no item list to render.
+        if let Some(q) = quotes {
+            out.push('\n');
+            out.push_str(q);
+        }
+        out.push('\n');
+        out.push_str(&model_unavailable_notice(candidates.len()));
+        if !footer.is_empty() {
+            out.push('\n');
+            out.push_str(footer);
+        }
+        return out;
     }
     if let Some(q) = quotes {
         out.push('\n');
@@ -1443,31 +1438,31 @@ pub(super) async fn run_news(
     let mut candidates = dedupe(interleaved, &pushed_urls, &pushed_titles);
     candidates.truncate(MAX_CANDIDATES);
 
-    // 5. one model call; deterministic fallback.
-    let (chosen, model_ok) = if candidates.is_empty() {
-        (Vec::new(), true)
-    } else {
+    // 5. one model call. An unreadable answer means no push, not a raw dump.
+    let mut chosen = Vec::new();
+    let mut model_ok = true;
+    if !candidates.is_empty() {
         let request = build_request(slot, &candidates, max_items, now);
         match ask_model(config, system, &request).await {
             Ok(answer) => match parse_picks(&answer, candidates.len(), max_items) {
-                Some(picks) => (picks, true),
+                Some(picks) => chosen = picks,
                 None => {
+                    // Log what came back — an empty reply and a malformed one
+                    // need different fixes, and the answer is gone otherwise.
                     tracing::warn!(
                         slot = slot_name,
-                        "news model answer unusable; using fallback"
+                        answer = %crate::util::truncate_with_ellipsis(answer.trim(), 200),
+                        "news model answer could not be read"
                     );
-                    (fallback_picks(&candidates, max_items), false)
+                    model_ok = false;
                 }
             },
             Err(e) => {
-                tracing::warn!(
-                    slot = slot_name,
-                    "news model call failed: {e:#}; using fallback"
-                );
-                (fallback_picks(&candidates, max_items), false)
+                tracing::warn!(slot = slot_name, "news model call failed: {e:#}");
+                model_ok = false;
             }
         }
-    };
+    }
 
     // 6. source health (failure counting / bans) — by code, not by a report.
     let stamp = now.to_rfc3339();
@@ -1728,26 +1723,61 @@ mod tests {
             picks.iter().map(|p| p.index).collect::<Vec<_>>(),
             vec![1, 0]
         );
+        // Not JSON at all: the answer cannot be read.
         assert!(parse_picks("sorry, cannot help", 3, 10).is_none());
-        assert!(parse_picks("{\"items\":[{\"id\":7}]}", 3, 10).is_none());
+        // Readable, but every id was out of range — a valid empty selection.
+        assert_eq!(
+            parse_picks("{\"items\":[{\"id\":7}]}", 3, 10),
+            Some(Vec::new())
+        );
+        // The model legitimately picking nothing is not a failure either;
+        // treating it as one is what made a quiet slot dump raw headlines.
+        assert_eq!(parse_picks("{\"items\":[]}", 3, 10), Some(Vec::new()));
     }
 
     #[test]
-    fn fallback_round_robins_sources_and_skips_official_media() {
-        let mut c = vec![
-            item("A", "a1", "https://a.example.com/1"),
-            item("A", "a2", "https://a.example.com/2"),
-            item("B", "b1", "https://b.example.com/1"),
+    fn an_unreadable_answer_sends_a_notice_not_a_pile_of_raw_headlines() {
+        let slot = Slot {
+            name: "夜报".into(),
+            ..Slot::default()
+        };
+        let candidates = vec![
+            item(
+                "A",
+                "Some English headline nobody translated",
+                "https://a.example.com/1",
+            ),
+            item("B", "另一條繁體標題", "https://b.example.com/1"),
         ];
-        c.push(Item {
-            official: true,
-            ..item("X", "propaganda", "https://news.cn/1")
-        });
-        let picks = fallback_picks(&c, 3);
-        assert_eq!(
-            picks.iter().map(|p| p.index).collect::<Vec<_>>(),
-            vec![0, 2, 1]
+        let out = render(
+            &slot,
+            "09-26 周六 21:30",
+            Some("📈 **行情**\nWTI原油 92.41\n"),
+            &candidates,
+            &[],
+            false,
+            "",
         );
+        // The reader is told what happened, in one line.
+        assert!(out.contains("模型没有返回可用的挑选结果"), "{out}");
+        assert!(out.contains("抓到了 2 条候选"), "{out}");
+        // Quotes come from the data, not the model, so they still go out.
+        assert!(out.contains("WTI原油 92.41"), "{out}");
+        // None of the untranslated candidate titles are dumped into the push.
+        assert!(!out.contains("Some English headline"), "{out}");
+        assert!(!out.contains("另一條繁體標題"), "{out}");
+    }
+
+    #[test]
+    fn an_empty_selection_is_reported_as_a_quiet_slot_not_a_failure() {
+        let slot = Slot {
+            name: "夜报".into(),
+            ..Slot::default()
+        };
+        let candidates = vec![item("A", "headline", "https://a.example.com/1")];
+        let out = render(&slot, "t", None, &candidates, &[], true, "");
+        assert!(out.contains("本时段没有新的内容"), "{out}");
+        assert!(!out.contains("模型没有返回"), "{out}");
     }
 
     #[test]

@@ -27,6 +27,14 @@ const QUOTA_TZ: chrono_tz::Tz = chrono_tz::America::Los_Angeles;
 const KEEP_DAYS: u64 = 14;
 /// Models listed in the summary line, busiest first.
 const MAX_MODELS_SHOWN: usize = 3;
+/// An observed ceiling below this is not believed.
+///
+/// The count only means "the daily limit" if that key started the day unused.
+/// It usually has not: counting begins mid-day when elfClaw is deployed, and
+/// the same keys may be used elsewhere. Measured 2026-09-26: a key that was
+/// already spent ran out after 2 calls, which turned into "6 个 key × 单 key
+/// 约 2" in the push — a confidently wrong number is worse than none.
+const MIN_CREDIBLE_LIMIT: i64 = 20;
 
 static STORE: LazyLock<RwLock<Option<Arc<QuotaStore>>>> = LazyLock::new(|| RwLock::new(None));
 
@@ -159,7 +167,10 @@ impl QuotaStore {
                 calls: r.get(1)?,
                 keys_seen: usize::try_from(r.get::<_, i64>(2)?).unwrap_or(0),
                 keys_exhausted: usize::try_from(r.get::<_, i64>(3)?).unwrap_or(0),
-                observed_limit: r.get(4)?,
+                // Below the credibility floor, report no ceiling at all.
+                observed_limit: r
+                    .get::<_, Option<i64>>(4)?
+                    .filter(|c| *c >= MIN_CREDIBLE_LIMIT),
             })
         });
         rows.map(|r| r.filter_map(std::result::Result::ok).collect())
@@ -258,35 +269,29 @@ fn render_summary(
         None => "🔑 今日用量".to_string(),
     }];
 
-    for u in usage.iter().filter(|u| u.observed_limit.is_some()) {
-        let Some(limit) = u.observed_limit else {
-            continue;
-        };
-        let total = limit * i64::try_from(keys).unwrap_or(1);
-        let mut line = format!(
-            "• {} {}/约 {total}（{keys} 个 key × 单 key 约 {limit}）",
-            short(&u.model),
-            u.calls
-        );
-        if u.keys_exhausted > 0 {
+    for u in usage.iter().take(MAX_MODELS_SHOWN) {
+        let mut line = format!("• {} 已用 {} 次", short(&u.model), u.calls);
+        if let Some(limit) = u.observed_limit {
+            let total = limit * i64::try_from(keys).unwrap_or(1);
             let _ = std::fmt::Write::write_fmt(
                 &mut line,
-                format_args!("，{} 个 key 已用完", u.keys_exhausted),
+                format_args!(" / 约 {total}（{keys} 个 key × 单 key 约 {limit}）"),
             );
         }
+        // How many keys still work is the part that is always true, whether or
+        // not a ceiling has been established.
+        let _ = std::fmt::Write::write_fmt(
+            &mut line,
+            format_args!(
+                "，{}",
+                if u.keys_exhausted == 0 {
+                    format!("{keys} 个 key 都还能用")
+                } else {
+                    format!("{keys} 个 key 中 {} 个已用完", u.keys_exhausted)
+                }
+            ),
+        );
         lines.push(line);
-    }
-
-    let unknown: Vec<String> = usage
-        .iter()
-        .filter(|u| u.observed_limit.is_none())
-        .map(|u| format!("{} {}", short(&u.model), u.calls))
-        .collect();
-    if !unknown.is_empty() {
-        lines.push(format!(
-            "• {}（还没有 key 触顶，上限未知）",
-            unknown.join("、")
-        ));
     }
 
     let used: std::collections::HashSet<&str> = usage.iter().map(|u| u.model.as_str()).collect();
@@ -461,6 +466,24 @@ mod tests {
     }
 
     #[test]
+    fn a_ceiling_learned_from_an_already_spent_key_is_discarded() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_in(&dir);
+        let now = at("2026-09-26T02:00:00Z");
+        // Counting started mid-day: this key had almost nothing left, so its
+        // two calls say nothing about the real daily limit.
+        store.record_call("gemini", "m", now);
+        store.record_call("gemini", "m", now);
+        store.record_exhausted("gemini", "m", now);
+
+        let u = &store.today(now)[0];
+        assert_eq!(u.observed_limit, None, "2 is not a credible daily limit");
+        assert_eq!(u.remaining(6), None, "so no total is offered");
+        // What is still true: this key is done for the day.
+        assert_eq!(u.keys_exhausted, 1);
+    }
+
+    #[test]
     fn a_later_pacific_day_starts_from_zero() {
         let dir = tempfile::tempdir().unwrap();
         let store = store_in(&dir);
@@ -478,22 +501,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = store_in(&dir);
         let now = at("2026-09-26T02:00:00Z");
-        for _ in 0..5 {
+        let low = usize::try_from(MIN_CREDIBLE_LIMIT).unwrap_or(20) + 5;
+        for _ in 0..low {
             store.record_call("gemini", "m", now);
         }
         store.record_exhausted("gemini", "m", now);
         // A second key that got further raises the estimate.
-        for _ in 0..9 {
+        for _ in 0..(low + 10) {
             store.record_call("gemini#2", "m", now);
         }
         store.record_exhausted("gemini#2", "m", now);
 
         let u = &store.today(now)[0];
-        assert_eq!(u.observed_limit, Some(9), "largest seen wins");
-        assert_eq!((u.calls, u.keys_exhausted), (14, 2));
-        // Two keys at 9 each = 18 budget, 14 used.
-        assert_eq!(u.remaining(2), Some(4));
-        assert_eq!(u.remaining(6), Some(40));
+        let expected = MIN_CREDIBLE_LIMIT + 15;
+        assert_eq!(u.observed_limit, Some(expected), "largest seen wins");
+        assert_eq!(u.keys_exhausted, 2);
+        assert_eq!(u.remaining(2), Some(expected * 2 - u.calls));
     }
 
     fn models(names: &[&str]) -> Vec<String> {
@@ -520,7 +543,9 @@ mod tests {
         .unwrap();
         assert!(out.contains("🔑 今日用量（17:00 重置）"), "{out}");
         assert!(
-            out.contains("• 3.5-flash 180/约 600（6 个 key × 单 key 约 100），1 个 key 已用完"),
+            out.contains(
+                "• 3.5-flash 已用 180 次 / 约 600（6 个 key × 单 key 约 100），6 个 key 中 1 个已用完"
+            ),
             "{out}"
         );
         // Models that exist in config but were not called are still accounted for.
@@ -555,12 +580,18 @@ mod tests {
             "Australia/Sydney",
         )
         .unwrap();
+        // No ceiling yet, so no invented total — but the reader still learns
+        // that every key is available.
         assert!(
-            out.contains("• 3.6-flash 2、3.5-flash-lite 87（还没有 key 触顶，上限未知）"),
+            out.contains("• 3.6-flash 已用 2 次，6 个 key 都还能用"),
             "{out}"
         );
+        assert!(
+            out.contains("• 3.5-flash-lite 已用 87 次，6 个 key 都还能用"),
+            "{out}"
+        );
+        assert!(!out.contains("约"), "no fabricated denominator: {out}");
         assert!(!out.contains("今天没用到"), "{out}");
-        assert!(!out.contains("已用完"), "{out}");
     }
 
     #[test]
