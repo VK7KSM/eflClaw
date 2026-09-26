@@ -1308,7 +1308,7 @@ pub async fn run_slot(config: &Config, slot_name: &str) -> Result<String> {
         !sources.is_empty(),
         "时段 '{slot_name}' 没有可用的新闻源（都被封禁了）"
     );
-    match slot.kind {
+    let text = match slot.kind {
         SlotKind::News => run_news(config, &rules, &slot, sources, SELECT_SYSTEM).await,
         SlotKind::Expo => {
             Box::pin(crate::cron::expo_pipeline::run(
@@ -1322,7 +1322,36 @@ pub async fn run_slot(config: &Config, slot_name: &str) -> Result<String> {
             ))
             .await
         }
+    }?;
+    let mut text = with_quota_note(config, &rules, text);
+    // Once a day, say so if a model elfClaw is configured to call has been
+    // retired — the endpoint never changes, only the name, so it is a config
+    // edit rather than a code change.
+    if let Some(warning) = crate::providers::quota::retired_model_warning(config, Utc::now()).await
+    {
+        text.push('\n');
+        text.push_str(&warning);
     }
+    Ok(text)
+}
+
+/// Append today's model-usage note. Every slot gets it, so one place adds it
+/// rather than each pipeline's own renderer.
+fn with_quota_note(config: &Config, rules: &NewsRules, mut text: String) -> String {
+    // The primary key plus every extra one in `reliability.api_keys`.
+    let keys = 1 + config
+        .reliability
+        .api_keys
+        .iter()
+        .filter(|k| !k.trim().is_empty())
+        .count();
+    if let Some(note) = crate::providers::quota::summary_line(Utc::now(), keys, &rules.tz) {
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(&note);
+    }
+    text
 }
 
 /// The headline push; `system` is the editor prompt (news or adult industry).

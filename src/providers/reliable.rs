@@ -559,6 +559,7 @@ impl ReliableProvider {
                 let started = Instant::now();
                 match call(provider, sent_model).await {
                     Ok(resp) => {
+                        crate::providers::quota::record_call(provider_name, sent_model);
                         self.cooldowns
                             .lock()
                             .remove(&(provider_name.to_string(), sent_model.to_string()));
@@ -581,6 +582,11 @@ impl ReliableProvider {
                         let failure_reason = failure_reason(rate_limited, non_retryable);
                         let error_detail = compact_error_detail(&e);
                         let status = http_status(&e);
+                        if is_gemini_daily_quota_exhausted(&e.to_string().to_lowercase()) {
+                            // The calls this key made today become the observed
+                            // daily limit — nothing hardcodes Google's numbers.
+                            crate::providers::quota::record_exhausted(provider_name, sent_model);
+                        }
                         if let Some(cooldown) = quota_cooldown(&e, chrono::Utc::now()) {
                             tracing::info!(
                                 provider = provider_name,

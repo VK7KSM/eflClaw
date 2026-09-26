@@ -28,6 +28,7 @@ pub mod ollama;
 pub mod openai;
 pub mod openai_codex;
 pub mod openrouter;
+pub mod quota;
 pub mod quota_adapter;
 pub mod quota_cli;
 pub mod quota_types;

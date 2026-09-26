@@ -6802,3 +6802,57 @@ K6 上一切正常反而触发了它。
 
 **补的上限**：新增 `MAX_PROFILES_PER_RUN = 30`，按有新资料页的源平分配额，用不完的不标记为已读、
 下次再抓。冷启动最坏情况从约 6 次调用降到 2 次；稳态下 30 天内读过的资料页会跳过，只抓新出现的。
+
+---
+
+## 2026-09-26 — 推送末尾显示模型额度 + 模型下线检测
+
+用户要求：每次推送结尾显示剩余额度，6 个时段都带，重置时间按悉尼时间显示、不要解释时区。
+
+### 先查清的三件事
+
+1. **Gemini 没有查询额度的接口**。实测 `ListModels` 返回 61 个模型，字段只有
+   `name / version / displayName / description / inputTokenLimit / outputTokenLimit /
+   supportedGenerationMethods / temperature / thinking`，**没有任何配额字段**。
+   Google Cloud 的 Service Usage API 能查配额上限，但要 OAuth + GCP 项目，光有 API key 不行，
+   而且查的是上限不是已用量。**结论：只能本地计数，零成本、不占额度。**
+2. **成功的调用没有记录用了哪个 key**。`src/providers/gemini.rs:1402` 把 provider 名硬编码成
+   `"gemini"`，多 key 的标签（`gemini#2`…）在外层 `ReliableProvider` 手里，内层不知道自己是谁。
+   所以之前只能统计失败、统计不了各 key 的用量。
+3. **换模型不需要改代码**。Gemini 的地址是
+   `https://generativelanguage.googleapis.com/v1beta/models/{模型名}:generateContent`，
+   换模型只是换路径里的模型名，config 改个字符串即可。
+
+### 改动
+
+- `src/providers/quota.rs`（新文件）：
+  - `state/quota.db` 两张表：`usage`（按配额日 × key × 模型计数）、`observed_limit`（每模型观测到的日上限）。
+  - **上限自学习**，不硬编码 Google 的数字（他们会改）：某个 key + 模型当天首次因**每日配额**
+    429 时，此前成功的次数就是观测到的上限，跨 key 取最大值。只有每日配额 429 才记，
+    每分钟限流的 429 不记（复用已有的 `is_gemini_daily_quota_exhausted`）。
+  - **配额日按太平洋时间分组**（Google 的重置边界），但**对外只显示读者本地时间**，
+    不出现"太平洋"字样。悉尼看到的是 `17:00 重置`。
+  - `store()` 之外所有逻辑都是 `QuotaStore` 的方法或纯函数，测试各用各的临时库，
+    不碰进程级全局（第一版测试因共用全局互相污染，已重构）。
+- `src/providers/reliable.rs`：成功时用自己的 key 标签记一条 `record_call`；
+  每日配额 429 时 `record_exhausted`。不动 provider 内部。
+- `src/cron/news_pipeline.rs`：`run_slot` 统一在末尾追加，一处覆盖全部 6 个时段。
+  key 数量从 `config.api_key` + `reliability.api_keys` 自动算。
+- **模型下线检测**：每个配额日最多查一次 `ListModels`（结果缓存进 `model_check` 表），
+  配置里用到但 API 不再列出的模型会在推送里告警。**不做自动切换**——新模型的速度、质量、
+  免费额度都不一样，静默切换会让推送质量下降而用户不知道。
+
+### 实测（真实配置）
+
+```
+🔑 3.5-flash 剩约 0（已用 330） ｜ 3.6-flash 已用 2 · 1/6 个 key 已用完 · 17:00 重置
+```
+
+- 自动识别出 6 个 key、5 个会被调用的模型（3.6 / 3.5-flash / 3.5-flash-lite / 3.7 / 3.8），**全部在线**。
+- 模型下线检查首次 0.9 秒，同一配额日内第二次走缓存 0.000 秒。
+- 之前报的"配置里有两个下线模型"是**误报**：`gemini-2.0-flash` 在成本价格表里、
+  `gemini-3-flash` 在注释里，都不在调用路径上。
+
+### 验证
+
+`cargo test --lib` 4158 通过、10 失败（已知基线）；clippy 在改动文件上无新增告警。

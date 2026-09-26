@@ -930,6 +930,7 @@ async fn main() -> Result<()> {
     }
     observability::runtime_trace::init_from_config(&config.observability, &config.workspace_dir);
     crate::elfclaw_log::init(&config.workspace_dir); // elfClaw: init SQLite log database
+    crate::providers::quota::init(&config.workspace_dir); // elfClaw: free-tier usage accounting
     if config.security.otp.enabled {
         let config_dir = config
             .config_path
