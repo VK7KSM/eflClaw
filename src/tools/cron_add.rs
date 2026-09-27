@@ -335,7 +335,14 @@ For one-time reminders, use schedule.kind='at' with an RFC3339 timestamp."
                     delegate_to,
                 )
             }
-            // News jobs are created only by the news slot reconciler.
+            // News and local jobs are created only by their reconcilers.
+            JobType::Local => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some("local jobs are managed by LOCAL.toml, not cron_add".to_string()),
+                });
+            }
             JobType::News => {
                 return Ok(ToolResult {
                     success: false,

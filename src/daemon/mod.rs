@@ -193,6 +193,8 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
             }
             Err(e) => tracing::warn!("Startup news-slot reconcile failed: {e}"),
         }
+        // elfClaw 2026-09-27: local weather / school-run / alert jobs.
+        log_local_reconcile(&config, "Startup");
     }
 
     // elfClaw: ensure skills.db is initialized from skills_index.json on first run
@@ -416,6 +418,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
         // on the same tick; the news_schedule tool also reconciles right after
         // each change, so this mainly picks up hand edits.
         let news_report = crate::cron::news::reconcile(&config);
+        log_local_reconcile(&config, "Heartbeat");
         match (heartbeat_report, news_report) {
             (Ok(hb), Ok(news)) => {
                 crate::health::mark_component_ok("heartbeat");
@@ -614,6 +617,24 @@ fn has_supervised_channels(config: &Config) -> bool {
         .channels_except_webhook()
         .iter()
         .any(|(_, ok)| *ok)
+}
+
+/// Sync the `local:` jobs with `workspace/LOCAL.toml` and log the outcome.
+fn log_local_reconcile(config: &Config, when: &str) {
+    match crate::cron::local::reconcile(config) {
+        Ok(report) => {
+            for name in &report.created {
+                tracing::info!("{when} local reconcile: created/updated {name}");
+            }
+            for name in &report.removed {
+                tracing::info!("{when} local reconcile: removed {name}");
+            }
+            for err in &report.errors {
+                tracing::warn!("{when} local reconcile: {err}");
+            }
+        }
+        Err(e) => tracing::warn!("{when} local reconcile failed: {e:#}"),
+    }
 }
 
 #[cfg(test)]

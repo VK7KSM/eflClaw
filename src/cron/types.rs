@@ -20,6 +20,10 @@ pub enum JobType {
     /// of iterations, and every link in the output comes from the fetched
     /// item itself rather than from model-written text.
     News,
+    /// elfClaw 2026-09-27: a local job run by code (`cron::local`): `prompt`
+    /// names the task — "commute" (school-day weather and route push) or
+    /// "alerts" (the five-minute emergency poll). No model call at all.
+    Local,
 }
 
 impl From<JobType> for &'static str {
@@ -28,6 +32,7 @@ impl From<JobType> for &'static str {
             JobType::Agent => "agent",
             JobType::Message => "message",
             JobType::News => "news",
+            JobType::Local => "local",
         }
     }
 }
@@ -40,8 +45,9 @@ impl TryFrom<&str> for JobType {
             "agent" => Ok(JobType::Agent),
             "message" => Ok(JobType::Message),
             "news" => Ok(JobType::News),
+            "local" => Ok(JobType::Local),
             _ => Err(format!(
-                "Invalid job type '{}'. Expected one of: 'agent', 'message', 'news'",
+                "Invalid job type '{}'. Expected one of: 'agent', 'message', 'news', 'local'",
                 value
             )),
         }

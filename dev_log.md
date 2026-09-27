@@ -6953,3 +6953,69 @@ K6 上一切正常反而触发了它。
 ```
 
 有可信上限才给分母，没有就只报次数和 key 状态，不编造。
+
+## 2026-09-27 — 早间送校路况 + 紧急警报（`src/cron/local/`，全程不调模型）
+
+### 需求
+
+- 上学日 08:15 推一条：今天天气 + 08:25 出发两条送校路线各要多久、推荐走哪条、路上有没有事故。
+- 随时推紧急警报：强风/雷暴/冰雹提前几个小时提醒（附天线处理建议：检查风绳或放倒），
+  附近重大交通事件、山火。P1（BOM 强雷暴/恶劣天气预警、山火紧急警告）半夜也推。
+- 原则：能用程序做的绝不调模型。这两个任务**一次模型调用都没有**。
+
+### 数据源（全部实测可用）
+
+| 用途 | 来源 | key |
+|------|------|-----|
+| 天气预报、官方预警 | BOM app API `api.weather.bom.gov.au/v1/locations/{geohash}/…` | 不要 |
+| 冰雹/雷暴补充 | Open-Meteo（weather_code 95/96/99） | 不要 |
+| 交通事件 | TfNSW Open Data `api.transport.nsw.gov.au/v1/live/hazards/incident/open`，失败或没 token 时用 livetraffic.com 同款 JSON | `TFNSW_API_KEY`（可选） |
+| 山火 | NSW RFS `majorIncidents.json` | 不要 |
+| 路线用时预测 | TomTom Calculate Route（`departAt` 按出发时刻预测，途经点强制走指定路线） | `TOMTOM_API_KEY`（免费 2500 次/天） |
+| 公共假日 | date.nager.at（每年查一次，缓存） | 不要 |
+
+TfNSW 官方接口实测：事故 48 条、施工 283 条、洪水 10 条，字段和网站版完全一致，所以一个解析器两用。
+
+### 文件
+
+- `src/cron/local/feeds.rs` — 各数据源的纯解析函数和 URL 拼接，无网络、可单测。
+- `src/cron/local/mod.rs` — `LOCAL.toml` 配置（`deny_unknown_fields` + 校验）、上学日判断
+  （工作日 ∩ 学期内 ∩ 非公共假日）、`state/alerts.db`、按配置自动建/删两个定时任务、
+  `fetch_incidents()`（TfNSW 优先，网站版兜底）。
+- `src/cron/local/alerts.rs` — 每 5 分钟跑一次，但各源有自己的节奏（BOM 预警 5 分钟、预报 30、交通 5、山火 15）。
+  每条警报有 key + 等级，**只有等级升高才再推**；静默时段只推 P1，P2 不标记已推、静默结束后照常推。
+  没有新情况返回 `NO_REPLY`，调度器不发消息。
+- `src/cron/local/commute.rs` — 两条路线的 TomTom 用时 + 近 20 个上学日中位数作"平时"，
+  相差不到 `tie_minutes` 就推荐首选路线（不经过另一所学校门口的那条）。
+- 接线：`JobType::Local`（types/store/scheduler）、`cron_add` 拒绝手工建 local 任务、
+  daemon 启动和每次心跳都 reconcile。调度器对轮询型任务不加"迟跑提醒"，`NO_REPLY` 也不加。
+
+### 配置
+
+`workspace/LOCAL.toml`（含住址坐标，**不进 git**，模板在 `资料/LOCAL.toml`）。
+删掉文件即关闭两个任务；文件写错时报错但不动现有任务。
+
+### 实测（2026-09-27 周日，临时跳过上学日判断）
+
+```
+🚸 送校路况 | 09-27 周日 15:48
+🌤 今天阵雨，最高 17°C，降雨概率 95%（4–6 mm），最大阵风 39 km/h，紫外线 7
+🚗 08:25 出发去学校
+✅ 推荐 走 路线A：约 14 分钟
+    走 路线B：约 15 分钟 · 经过另一所学校
+```
+
+警报在真实阈值下为 `NO_REPLY`（当天无预警）；把阈值临时放宽后能正确产出阵风提醒和重大交通事件，
+据此把"约 0 小时后"改成"一小时内"，"重大事故"改成"重大交通事件"（抢修施工也会被标成重大）。
+
+测试数据里的坐标整体北移 0.1°、路名换成 Alpha/Beta Road 等代号，真实位置只在 LOCAL.toml 里。
+
+### 验证
+
+- `cargo test --lib`：4191 通过，11 失败 = 已知 10 个 + 已知偶发的 `message_dispatch_processes_messages_in_parallel`。
+- `cargo test --no-fail-fast --test '*'`：只有已知的 3 个 `loop_detection_*`。
+- clippy：新模块零告警；改动文件里报出的都是原有行（git blame 核对）。
+
+### 暂缓
+
+新闻类紧急事件（恐袭、枪击）：打算用 ABC 悉尼 RSS + 关键词在程序里筛，只对候选调模型。

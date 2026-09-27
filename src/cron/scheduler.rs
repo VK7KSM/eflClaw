@@ -87,6 +87,13 @@ async fn execute_job_with_retry(
                     Err(e) => (false, format!("news push '{slot}' failed: {e:#}")),
                 }
             }
+            JobType::Local => {
+                let task = job.prompt.clone().unwrap_or_default();
+                match Box::pin(crate::cron::local::run(config, &task)).await {
+                    Ok(text) => (true, text),
+                    Err(e) => (false, format!("local job '{task}' failed: {e:#}")),
+                }
+            }
         };
         last_output = output;
 
@@ -188,13 +195,20 @@ async fn execute_and_persist_job(
     );
 
     let started_at = Utc::now();
-    let late = late_by_minutes(job.next_run, started_at);
+    let is_poll = job.job_type == JobType::Local && job.prompt.as_deref() == Some("alerts");
+    let late = if is_poll {
+        None
+    } else {
+        late_by_minutes(job.next_run, started_at)
+    };
     if let Some(minutes) = late {
         tracing::warn!(job = %job_name, late_minutes = minutes, "Cron job ran late");
     }
     let (success, mut output) = Box::pin(execute_job_with_retry(config, security, job)).await;
     if let (Some(minutes), true) = (late, success) {
-        output.insert_str(0, &late_run_notice(minutes));
+        if !is_no_reply_sentinel(&output) {
+            output.insert_str(0, &late_run_notice(minutes));
+        }
     }
     let finished_at = Utc::now();
     let duration_ms = (finished_at - started_at).num_milliseconds().max(0) as u64;

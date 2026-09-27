@@ -202,6 +202,26 @@ pub fn add_news_job(
     add_text_job(config, name, schedule, slot, delivery, false, JobType::News)
 }
 
+/// elfClaw 2026-09-27: a code-run local job (`cron::local`); `task` is
+/// "commute" or "alerts".
+pub fn add_local_job(
+    config: &Config,
+    name: Option<String>,
+    schedule: Schedule,
+    task: &str,
+    delivery: Option<DeliveryConfig>,
+) -> Result<CronJob> {
+    add_text_job(
+        config,
+        name,
+        schedule,
+        task,
+        delivery,
+        false,
+        JobType::Local,
+    )
+}
+
 /// Shared by the prompt-only job types (`Message`, `News`): same-name
 /// de-duplication, then insert.
 fn add_text_job(

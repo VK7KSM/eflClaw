@@ -575,6 +575,24 @@ Gemini 的地址是 `https://generativelanguage.googleapis.com/v1beta/models/{�
 **不做自动切换**：新模型的速度、质量、免费额度都不一样，静默切换会让推送质量下降而爸爸不知道。
 
 
+## 18. 送校路况与紧急警报（2026-09-27）
+
+两个定时任务由 `workspace/LOCAL.toml` 驱动，代码在 `src/cron/local/`，**全程不调用模型**：
+
+| 任务 | 时间 | 内容 |
+|------|------|------|
+| `local:早间路况` | 周一到周五 `commute.time`，非上学日自动不发 | 今日天气、两条路线按出发时刻的预测用时、推荐路线、路线上的事故 |
+| `local:紧急警报` | 每 5 分钟检查，无新情况不发 | BOM 预警、强风/雷暴/冰雹预报（附天线建议）、附近重大交通事件、山火 |
+
+- **LOCAL.toml 含住址坐标，只放 workspace，不进 git。** 模板在 `资料/LOCAL.toml`。
+  删掉文件即关闭两个任务；文件写错时只报错，不动已有任务。
+- **学期日期每年底照 education.nsw.gov.au 补下一年**；公共假日程序自动查。
+- 环境变量（K6 用户级，和 `MONID_API_KEY` 一样）：
+  - `TOMTOM_API_KEY` — 路线用时，没有它路况推送只剩天气和事故，并提示缺 key。
+  - `TFNSW_API_KEY` — 交通事件官方接口；没有或失败时自动改用 livetraffic.com 的同款数据。
+- 优先级：P1（BOM 强雷暴/恶劣天气预警、山火紧急警告）静默时段也推；P2 在 `quiet_start`–`quiet_end` 之间暂缓。
+- 同一事件只有等级升高才重推，状态在 `state/alerts.db`，14 天自动清理。
+
 ## 13. 代码语言约束
 
 **全部用 Rust 实现，不引入 Python 等其他语言的运行时依赖。** 之前分析阶段用 Python 脚本做过一次性的数据分析（读 K6 拷回来的 SQLite/日志、测 Gemini key），那些是本地一次性工具，不进入 elfClaw 代码库；正式功能代码一律 Rust。
