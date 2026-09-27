@@ -577,12 +577,12 @@ Gemini 的地址是 `https://generativelanguage.googleapis.com/v1beta/models/{�
 
 ## 18. 送校路况与紧急警报（2026-09-27）
 
-两个定时任务由 `workspace/LOCAL.toml` 驱动，代码在 `src/cron/local/`，**全程不调用模型**：
+两个定时任务由 `workspace/LOCAL.toml` 驱动，代码在 `src/cron/local/`，**只有突发新闻的判断调用模型**：
 
 | 任务 | 时间 | 内容 |
 |------|------|------|
 | `local:早间路况` | 周一到周五 `commute.time`，非上学日自动不发 | 今日天气、两条路线按出发时刻的预测用时、推荐路线、路线上的事故 |
-| `local:紧急警报` | 每 5 分钟检查，无新情况不发 | BOM 预警、强风/雷暴/冰雹预报（附天线建议）、附近重大交通事件、山火 |
+| `local:紧急警报` | 每 5 分钟检查，无新情况不发 | BOM 预警、强风/雷暴/冰雹预报（附天线建议）、附近重大交通事件、山火、突发新闻（恐袭、枪击、持刀、爆炸、围困） |
 
 - **LOCAL.toml 含住址坐标，只放 workspace，不进 git。** 模板在 `资料/LOCAL.toml`。
   删掉文件即关闭两个任务；文件写错时只报错，不动已有任务。
@@ -592,6 +592,9 @@ Gemini 的地址是 `https://generativelanguage.googleapis.com/v1beta/models/{�
   - `TFNSW_API_KEY` — 交通事件官方接口；没有或失败时自动改用 livetraffic.com 的同款数据。
 - 优先级：P1（BOM 强雷暴/恶劣天气预警、山火紧急警告）静默时段也推；P2 在 `quiet_start`–`quiet_end` 之间暂缓。
 - 同一事件只有等级升高才重推，状态在 `state/alerts.db`，14 天自动清理。
+- 突发新闻（`breaking.rs`）：程序抓 7NEWS 悉尼、ABC、SMH、Google News，按时间、危险词、地名筛；
+  **筛出候选才调一次模型**判断等级、合并重复、写中文说明。`[alerts].nearby_suburbs` 列家周边的区：
+  这些区里已结束的暴力事件推 P2；悉尼其他地方只有仍在进行的危险才推（P1）。模型失败时下一轮重判，不倾倒英文标题。
 
 ## 13. 代码语言约束
 

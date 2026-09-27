@@ -7,14 +7,18 @@
 //!   now (TomTom live traffic, when a key is set) with incidents on each route;
 //! - `local:紧急警报` — every five minutes: official BOM warnings, forecast
 //!   gusts / storms / hail against the antenna thresholds, major crashes
-//!   nearby and on the school run, and RFS fires nearby. Nothing new → the
-//!   job returns `NO_REPLY` and nothing is sent.
+//!   nearby and on the school run, RFS fires nearby, and breaking news of
+//!   attacks and violence (see `breaking`). Nothing new → the job returns
+//!   `NO_REPLY` and nothing is sent.
 //!
-//! No model call anywhere: every decision is a rule and every message is a
-//! template. The home and school coordinates are personal data, which is why
-//! they live in the workspace file and never in code.
+//! Every decision is a rule and every message is a template, with one
+//! exception: breaking-news headlines that pass the code's keyword filter
+//! are judged by the model (is it a live danger, is it a repeat). The home
+//! and school coordinates are personal data, which is why they live in the
+//! workspace file and never in code.
 
 pub mod alerts;
+pub mod breaking;
 pub mod commute;
 pub mod feeds;
 
@@ -124,6 +128,11 @@ pub struct Alerts {
     /// An incident counts as "on the school run" when it is on a route road
     /// and within this distance of home, school or a route waypoint.
     pub route_corridor_km: f64,
+    /// Suburbs around home, as news headlines spell them. Violence here is
+    /// worth a message even when it is over; elsewhere in Sydney only a live
+    /// danger is.
+    #[serde(default)]
+    pub nearby_suburbs: Vec<String>,
 }
 
 pub fn data_path(config: &Config) -> PathBuf {
@@ -243,6 +252,7 @@ pub(crate) fn open_state(workspace: &Path) -> Result<rusqlite::Connection> {
              dates TEXT NOT NULL
          );",
     )?;
+    breaking::ensure_tables(&conn)?;
     Ok(conn)
 }
 

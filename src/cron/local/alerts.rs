@@ -1,4 +1,5 @@
-//! Emergency alerts, polled every five minutes. Pure rules, no model.
+//! Emergency alerts, polled every five minutes. Rules only, except for the
+//! breaking-news judgement.
 //!
 //! - BOM official warnings for the home location — severe thunderstorm and
 //!   severe weather warnings are P1 (sent even in the quiet hours);
@@ -7,7 +8,9 @@
 //!   before the weather;
 //! - LiveTraffic: a crash marked major near home, or a crash on a school-run
 //!   road during the school run — P2;
-//! - RFS: a fire nearby at Watch and Act (P2) or Emergency Warning (P1).
+//! - RFS: a fire nearby at Watch and Act (P2) or Emergency Warning (P1);
+//! - breaking news of attacks and violence, judged by the model only after a
+//!   code-side keyword filter (see `breaking`).
 //!
 //! Each alert has a key and a level; it is sent once, and again only if its
 //! level rises (a Watch and Act fire becoming an Emergency Warning). A P2 alert
@@ -35,6 +38,7 @@ const CADENCE: &[(&str, i64)] = &[
     ("forecast", 30),
     ("traffic", 5),
     ("rfs", 15),
+    ("news", 5),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -467,6 +471,18 @@ pub async fn run(config: &Config, local: &LocalConfig) -> Result<String> {
     } else {
         None
     };
+    // `false` when the model was needed and failed: "news" then stays due and
+    // the same headlines are judged on the next poll.
+    let news_ok = if want("news") {
+        super::breaking::poll(config, local, &client, now)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!("breaking-news poll failed: {e:#}");
+                false
+            })
+    } else {
+        false
+    };
     let today = now.with_timezone(&local.tz()).date_naive();
     let holidays = if traffic.is_some() {
         super::holidays(
@@ -524,6 +540,11 @@ pub async fn run(config: &Config, local: &LocalConfig) -> Result<String> {
         fetched.push("rfs");
         candidates.extend(fire_alerts(&feeds::parse_rfs(v), local));
     }
+    if news_ok {
+        fetched.push("news");
+    }
+    // Every poll: judged events may have waited out the quiet hours.
+    candidates.extend(super::breaking::pending_alerts(&conn, now)?);
 
     let stamp = now.to_rfc3339();
     for source in fetched {
