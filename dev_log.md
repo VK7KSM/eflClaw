@@ -7100,3 +7100,9 @@ TfNSW 官方接口实测：事故 48 条、施工 283 条、洪水 10 条，字�
 
 部署 K6（9-28 23:16）：新 exe 上线、LOCAL.toml 已同步。核对 jobs.db：`local:早间路况` 投递到两个 ID，
 6 个新闻时段和 `local:紧急警报` 仍只发一个 ID。下次早间推送：悉尼 9-29 08:15。
+
+## 2026-09-29 — 紧急警报也发给两个账号
+
+- `src/cron/local/mod.rs`：`[alerts]` 新增可选 `send_to`，和 `[commute].send_to` 同样的写法与校验；
+  `commute_delivery` 改名为 `local_delivery`，两个任务共用。新闻推送仍只发一个人。
+- `资料/LOCAL.toml` 填好两个 ID（同早间推送）；`elfclaw.md` 同步说明。

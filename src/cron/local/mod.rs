@@ -84,7 +84,7 @@ pub struct Commute {
     /// "Clearly quicker" means by at least this many minutes.
     pub tie_minutes: i64,
     /// Chat IDs that get this push, on the news pushes' channel. Empty: the
-    /// news pushes' recipient only. The alerts job always goes to that one.
+    /// news pushes' recipient only.
     #[serde(default)]
     pub send_to: Vec<String>,
     #[serde(rename = "route")]
@@ -137,6 +137,9 @@ pub struct Alerts {
     /// danger is.
     #[serde(default)]
     pub nearby_suburbs: Vec<String>,
+    /// Chat IDs that get the alerts, as `commute.send_to`.
+    #[serde(default)]
+    pub send_to: Vec<String>,
 }
 
 pub fn data_path(config: &Config) -> PathBuf {
@@ -180,13 +183,13 @@ fn validate(l: &LocalConfig) -> Result<()> {
             l.commute.prefer
         );
     }
-    if let Some(bad) = l
-        .commute
-        .send_to
-        .iter()
-        .find(|t| t.trim().is_empty() || t.contains(','))
-    {
-        bail!("{DATA_FILE}: commute.send_to 里的 '{bad}' 不是有效的聊天 ID");
+    for (name, list) in [
+        ("commute.send_to", &l.commute.send_to),
+        ("alerts.send_to", &l.alerts.send_to),
+    ] {
+        if let Some(bad) = list.iter().find(|t| t.trim().is_empty() || t.contains(',')) {
+            bail!("{DATA_FILE}: {name} 里的 '{bad}' 不是有效的聊天 ID");
+        }
     }
     if l.home.bom_geohash.trim().len() < 6 {
         bail!("{DATA_FILE}: home.bom_geohash 需要至少 6 位（BOM 地点编号）");
@@ -351,9 +354,9 @@ pub struct ReconcileReport {
     pub errors: Vec<String>,
 }
 
-/// The morning push goes to `send_to` when set (the scheduler delivers a
+/// A local job goes to its `send_to` list when set (the scheduler delivers a
 /// comma-separated `to` to each target), otherwise where the news goes.
-fn commute_delivery(news: &cron::DeliveryConfig, send_to: &[String]) -> cron::DeliveryConfig {
+fn local_delivery(news: &cron::DeliveryConfig, send_to: &[String]) -> cron::DeliveryConfig {
     let targets: Vec<&str> = send_to
         .iter()
         .map(|t| t.trim())
@@ -409,7 +412,8 @@ pub fn reconcile(config: &Config) -> Result<ReconcileReport> {
             return Ok(report);
         }
     };
-    let commute_delivery = commute_delivery(&delivery, &local.commute.send_to);
+    let commute_delivery = local_delivery(&delivery, &local.commute.send_to);
+    let alerts_delivery = local_delivery(&delivery, &local.alerts.send_to);
     let tz = Some(local.timezone.clone());
     let wanted = [
         (
@@ -428,7 +432,7 @@ pub fn reconcile(config: &Config) -> Result<ReconcileReport> {
                 expr: format!("*/{ALERTS_EVERY_MINUTES} * * * *"),
                 tz,
             },
-            delivery,
+            alerts_delivery,
         ),
     ];
     for (name, task, schedule, delivery) in wanted {
@@ -573,18 +577,18 @@ route_corridor_km = 2
     }
 
     #[test]
-    fn commute_push_goes_to_every_listed_chat() {
+    fn local_pushes_go_to_every_listed_chat() {
         let news = cron::DeliveryConfig {
             mode: "announce".into(),
             channel: Some("telegram".into()),
             to: Some("100".into()),
             best_effort: true,
         };
-        let d = commute_delivery(&news, &[" 100 ".into(), "200".into()]);
+        let d = local_delivery(&news, &[" 100 ".into(), "200".into()]);
         assert_eq!(d.to.as_deref(), Some("100,200"));
         assert_eq!(d.channel.as_deref(), Some("telegram"));
         assert_eq!(
-            commute_delivery(&news, &[]),
+            local_delivery(&news, &[]),
             news,
             "empty list: news recipient"
         );
@@ -592,6 +596,9 @@ route_corridor_km = 2
         let mut l = sample();
         l.commute.send_to = vec!["100,200".into()];
         assert!(validate(&l).is_err(), "one ID per entry");
+        let mut l = sample();
+        l.alerts.send_to = vec![" ".into()];
+        assert!(validate(&l).is_err(), "no blank IDs");
     }
 
     #[test]
