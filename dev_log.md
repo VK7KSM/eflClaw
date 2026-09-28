@@ -7097,3 +7097,6 @@ TfNSW 官方接口实测：事故 48 条、施工 283 条、洪水 10 条，字�
 - `src/cron/scheduler.rs`：`deliver_if_configured` 把 `to` 按逗号拆开逐个发送，全部发完后才报告第一个错误，
   一个人发送失败不影响另一个人。原来只有单个 ID 的任务行为不变。
 - `资料/LOCAL.toml` 填好两个 ID（K6 上同步）；`elfclaw.md` 补说明。
+
+部署 K6（9-28 23:16）：新 exe 上线、LOCAL.toml 已同步。核对 jobs.db：`local:早间路况` 投递到两个 ID，
+6 个新闻时段和 `local:紧急警报` 仍只发一个 ID。下次早间推送：悉尼 9-29 08:15。
