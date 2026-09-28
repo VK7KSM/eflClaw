@@ -2,7 +2,7 @@
 //!
 //! Two code-run jobs, registered from `workspace/LOCAL.toml`:
 //!
-//! - `local:早间路况` — school days at the configured time: today's weather,
+//! - `local:早间路况` — every day at the configured time: today's weather,
 //!   the school-run hour, and which of the configured routes is quicker right
 //!   now (TomTom live traffic, when a key is set) with incidents on each route;
 //! - `local:紧急警报` — every five minutes: official BOM warnings, forecast
@@ -339,9 +339,11 @@ pub struct ReconcileReport {
     pub errors: Vec<String>,
 }
 
-fn weekday_cron(hhmm: &str) -> Option<String> {
+/// Every day, holidays included (the user's call, 2026-09-28): the weather
+/// matters on any day, and the route times are still worth a glance.
+fn daily_cron(hhmm: &str) -> Option<String> {
     let m = crate::config::parse_hhmm(hhmm)?;
-    Some(format!("{} {} * * 1-5", m % 60, m / 60))
+    Some(format!("{} {} * * *", m % 60, m / 60))
 }
 
 /// Create, update or remove the `local:` jobs to match `LOCAL.toml`. No file
@@ -384,7 +386,7 @@ pub fn reconcile(config: &Config) -> Result<ReconcileReport> {
             COMMUTE_JOB,
             "commute",
             Schedule::Cron {
-                expr: weekday_cron(&local.commute.time).unwrap_or_else(|| "15 8 * * 1-5".into()),
+                expr: daily_cron(&local.commute.time).unwrap_or_else(|| "15 8 * * *".into()),
                 tz: tz.clone(),
             },
         ),
@@ -539,8 +541,8 @@ route_corridor_km = 2
     }
 
     #[test]
-    fn the_commute_job_runs_on_weekdays_at_the_configured_time() {
-        assert_eq!(weekday_cron("08:15").as_deref(), Some("15 8 * * 1-5"));
-        assert_eq!(weekday_cron("bad"), None);
+    fn the_commute_job_runs_every_day_at_the_configured_time() {
+        assert_eq!(daily_cron("08:15").as_deref(), Some("15 8 * * *"));
+        assert_eq!(daily_cron("bad"), None);
     }
 }

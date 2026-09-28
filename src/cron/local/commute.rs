@@ -1,13 +1,15 @@
-//! The school-day morning push: today's weather, the school-run hour, and
-//! which configured route is quicker right now. Pure rules, no model.
+//! The morning push, every day: today's weather, the school-run hour, and
+//! which configured route is quicker right now. Pure rules, no model. On days
+//! without school it is headed "天气与路况" instead of "送校路况".
 //!
 //! Travel times come from TomTom with live traffic (key in `TOMTOM_API_KEY`),
 //! each route forced through its own waypoints and predicted for the departure
-//! time. Without a key the push still lists incidents on each route. Every
-//! day's times are kept, so the push can say how today compares with usual.
+//! time. Without a key the push still lists incidents on each route. School
+//! days' times are kept, so the push can say how today compares with usual
+//! (weekend and holiday traffic would pull that baseline down).
 
 use super::feeds::{self, DayForecast, HourForecast, Incident, RouteEta};
-use super::{open_state, LocalConfig, NO_REPLY, TOMTOM_KEY_ENV};
+use super::{open_state, LocalConfig, TOMTOM_KEY_ENV};
 use crate::config::Config;
 use anyhow::Result;
 use chrono::{DateTime, Datelike, NaiveDate, TimeZone, Timelike, Utc};
@@ -144,10 +146,16 @@ pub fn render(
     school_run: Option<String>,
     routes: &[RouteReport<'_>],
     have_key: bool,
+    school_day: bool,
 ) -> String {
     let l = now.with_timezone(&local.tz());
+    let title = if school_day {
+        "🚸 **送校路况**"
+    } else {
+        "🌅 **天气与路况**"
+    };
     let mut out = format!(
-        "🚸 **送校路况** | {} {} {}\n",
+        "{title} | {} {} {}\n",
         l.format("%m-%d"),
         WEEKDAYS[l.weekday().num_days_from_monday() as usize],
         l.format("%H:%M")
@@ -238,9 +246,7 @@ pub async fn run(config: &Config, local: &LocalConfig) -> Result<String> {
     let today = now.with_timezone(&tz).date_naive();
     let client = crate::cron::news_pipeline::http_client()?;
     let holidays = super::holidays(&config.workspace_dir, &client, today.year()).await;
-    if !local.is_school_day(today, &holidays) {
-        return Ok(NO_REPLY.to_string());
-    }
+    let school_day = local.is_school_day(today, &holidays);
     let gh = &local.home.bom_geohash[..6.min(local.home.bom_geohash.len())];
     let daily = get_json(&client, &feeds::bom_url(gh, "forecasts/daily"))
         .await
@@ -293,7 +299,7 @@ pub async fn run(config: &Config, local: &LocalConfig) -> Result<String> {
             )?
             .filter_map(std::result::Result::ok)
             .collect();
-        if let Some(e) = &eta {
+        if let Some(e) = eta.as_ref().filter(|_| school_day) {
             conn.execute(
                 "INSERT OR REPLACE INTO commute_history (day, route, seconds) VALUES (?1, ?2, ?3)",
                 rusqlite::params![day, r.name, e.seconds],
@@ -314,7 +320,9 @@ pub async fn run(config: &Config, local: &LocalConfig) -> Result<String> {
         .as_ref()
         .map(|d| weather_line(d, max_gust_today(&hourly, local, today)));
     let school_run = school_run_line(&hourly, local, today);
-    Ok(render(local, now, weather, school_run, &reports, have_key))
+    Ok(render(
+        local, now, weather, school_run, &reports, have_key, school_day,
+    ))
 }
 
 #[cfg(test)]
@@ -439,6 +447,7 @@ mod tests {
             Some("☔ 8 点到 9 点降雨概率 70%，记得带伞".into()),
             &routes,
             true,
+            true,
         );
         assert!(
             out.starts_with("🚸 **送校路况** | 10-13 周二 08:15"),
@@ -468,7 +477,19 @@ mod tests {
             usual: None,
             incidents: vec![],
         }];
-        let out = render(&l, at("2026-10-12T21:15:00Z"), None, None, &routes, false);
+        let out = render(
+            &l,
+            at("2026-10-12T21:15:00Z"),
+            None,
+            None,
+            &routes,
+            false,
+            false,
+        );
+        assert!(
+            out.starts_with("🌅 **天气与路况** | 10-13 周二 08:15"),
+            "days without school get their own title: {out}"
+        );
         assert!(out.contains("还没配置 TomTom key"), "{out}");
         assert!(
             !out.contains("✅"),
