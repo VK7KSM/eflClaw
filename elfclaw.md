@@ -587,6 +587,7 @@ Gemini 的地址是 `https://generativelanguage.googleapis.com/v1beta/models/{�
 - **LOCAL.toml 含住址坐标，只放 workspace，不进 git。** 模板在 `资料/LOCAL.toml`。
   删掉文件即关闭两个任务；文件写错时只报错，不动已有任务。
 - **学期日期每年底照 education.nsw.gov.au 补下一年**；公共假日程序自动查。
+- `[commute].send_to`：早间推送的接收人列表（Telegram 数字聊天 ID）。调度器把 `delivery.to` 里逗号分隔的多个目标逐个发送，一个失败不影响其他人。紧急警报和新闻仍只发新闻推送的接收人。
 - 环境变量（K6 用户级，和 `MONID_API_KEY` 一样）：
   - `TOMTOM_API_KEY` — 路线用时，没有它路况推送只剩天气和事故，并提示缺 key。
   - `TFNSW_API_KEY` — 交通事件官方接口；没有或失败时自动改用 livetraffic.com 的同款数据。

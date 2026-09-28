@@ -513,21 +513,30 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
         .channel
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("delivery.channel is required for announce mode"))?;
-    let target = delivery
+    let targets = delivery
         .to
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("delivery.to is required for announce mode"))?;
 
-    // elfClaw: log delivery attempt so terminal user can trace cron → channel flow
-    tracing::info!(
-        job_id = %job.id,
-        channel = %channel,
-        target = %target,
-        output_len = output.len(),
-        "Cron delivery: attempting announce to channel"
-    );
-
-    deliver_announcement(config, channel, target, output).await
+    // elfClaw 2026-09-29: `to` may list several targets, comma-separated (the
+    // morning weather push goes to two people). Every target is tried; the
+    // first failure is reported after the rest have been sent.
+    let mut first_err = None;
+    for target in targets.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+        // elfClaw: log delivery attempt so terminal user can trace cron → channel flow
+        tracing::info!(
+            job_id = %job.id,
+            channel = %channel,
+            target = %target,
+            output_len = output.len(),
+            "Cron delivery: attempting announce to channel"
+        );
+        if let Err(e) = deliver_announcement(config, channel, target, output).await {
+            tracing::warn!(job_id = %job.id, target = %target, "Cron delivery failed: {e:#}");
+            first_err.get_or_insert(e);
+        }
+    }
+    first_err.map_or(Ok(()), Err)
 }
 
 pub(crate) async fn deliver_announcement(

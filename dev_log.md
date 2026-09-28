@@ -7085,3 +7085,15 @@ TfNSW 官方接口实测：事故 48 条、施工 283 条、洪水 10 条，字�
 
 部署 K6（9-28 22:40）：新 exe 已上线，`local:早间路况` 调度已变为 `15 8 * * *`，
 下次运行 2026-09-28T22:15Z = 悉尼 9-29 08:15。
+
+## 2026-09-29 — 早间天气与路况同时发给两个账号
+
+用户要求：早间推送发给用户本人和家人两个 Telegram 账号，其他推送仍只发用户本人。
+
+- Telegram 机器人只能按数字聊天 ID 发消息，不能按 @用户名。第二个账号的 ID 从 K6 日志
+  （`Channel incoming` 的 sender → target）查到；对方已和机器人私聊过，所以能收到。ID 只写在 LOCAL.toml 里。
+- `src/cron/local/mod.rs`：`[commute]` 新增可选 `send_to`（聊天 ID 列表，校验不能为空、不能含逗号）。
+  reconcile 时早间任务的 `delivery.to` 写成逗号分隔的多个 ID，渠道沿用新闻推送的；警报任务不变。
+- `src/cron/scheduler.rs`：`deliver_if_configured` 把 `to` 按逗号拆开逐个发送，全部发完后才报告第一个错误，
+  一个人发送失败不影响另一个人。原来只有单个 ID 的任务行为不变。
+- `资料/LOCAL.toml` 填好两个 ID（K6 上同步）；`elfclaw.md` 补说明。

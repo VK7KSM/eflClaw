@@ -83,6 +83,10 @@ pub struct Commute {
     pub prefer: String,
     /// "Clearly quicker" means by at least this many minutes.
     pub tie_minutes: i64,
+    /// Chat IDs that get this push, on the news pushes' channel. Empty: the
+    /// news pushes' recipient only. The alerts job always goes to that one.
+    #[serde(default)]
+    pub send_to: Vec<String>,
     #[serde(rename = "route")]
     pub routes: Vec<Route>,
 }
@@ -175,6 +179,14 @@ fn validate(l: &LocalConfig) -> Result<()> {
             "{DATA_FILE}: commute.prefer '{}' 不是任何一条路线的名字",
             l.commute.prefer
         );
+    }
+    if let Some(bad) = l
+        .commute
+        .send_to
+        .iter()
+        .find(|t| t.trim().is_empty() || t.contains(','))
+    {
+        bail!("{DATA_FILE}: commute.send_to 里的 '{bad}' 不是有效的聊天 ID");
     }
     if l.home.bom_geohash.trim().len() < 6 {
         bail!("{DATA_FILE}: home.bom_geohash 需要至少 6 位（BOM 地点编号）");
@@ -339,6 +351,23 @@ pub struct ReconcileReport {
     pub errors: Vec<String>,
 }
 
+/// The morning push goes to `send_to` when set (the scheduler delivers a
+/// comma-separated `to` to each target), otherwise where the news goes.
+fn commute_delivery(news: &cron::DeliveryConfig, send_to: &[String]) -> cron::DeliveryConfig {
+    let targets: Vec<&str> = send_to
+        .iter()
+        .map(|t| t.trim())
+        .filter(|t| !t.is_empty())
+        .collect();
+    if targets.is_empty() {
+        return news.clone();
+    }
+    cron::DeliveryConfig {
+        to: Some(targets.join(",")),
+        ..news.clone()
+    }
+}
+
 /// Every day, holidays included (the user's call, 2026-09-28): the weather
 /// matters on any day, and the route times are still worth a glance.
 fn daily_cron(hhmm: &str) -> Option<String> {
@@ -380,6 +409,7 @@ pub fn reconcile(config: &Config) -> Result<ReconcileReport> {
             return Ok(report);
         }
     };
+    let commute_delivery = commute_delivery(&delivery, &local.commute.send_to);
     let tz = Some(local.timezone.clone());
     let wanted = [
         (
@@ -389,6 +419,7 @@ pub fn reconcile(config: &Config) -> Result<ReconcileReport> {
                 expr: daily_cron(&local.commute.time).unwrap_or_else(|| "15 8 * * *".into()),
                 tz: tz.clone(),
             },
+            commute_delivery,
         ),
         (
             ALERTS_JOB,
@@ -397,9 +428,10 @@ pub fn reconcile(config: &Config) -> Result<ReconcileReport> {
                 expr: format!("*/{ALERTS_EVERY_MINUTES} * * * *"),
                 tz,
             },
+            delivery,
         ),
     ];
-    for (name, task, schedule) in wanted {
+    for (name, task, schedule, delivery) in wanted {
         if let Some(job) = cron::find_job_by_name(config, name)? {
             let same = job.job_type == JobType::Local
                 && job.schedule == schedule
@@ -538,6 +570,28 @@ route_corridor_km = 2
             toml::from_str::<LocalConfig>(&SAMPLE.replace("[alerts]", "[alerts]\nextra = 1"))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn commute_push_goes_to_every_listed_chat() {
+        let news = cron::DeliveryConfig {
+            mode: "announce".into(),
+            channel: Some("telegram".into()),
+            to: Some("100".into()),
+            best_effort: true,
+        };
+        let d = commute_delivery(&news, &[" 100 ".into(), "200".into()]);
+        assert_eq!(d.to.as_deref(), Some("100,200"));
+        assert_eq!(d.channel.as_deref(), Some("telegram"));
+        assert_eq!(
+            commute_delivery(&news, &[]),
+            news,
+            "empty list: news recipient"
+        );
+
+        let mut l = sample();
+        l.commute.send_to = vec!["100,200".into()];
+        assert!(validate(&l).is_err(), "one ID per entry");
     }
 
     #[test]
