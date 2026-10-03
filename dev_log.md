@@ -7109,3 +7109,30 @@ TfNSW 官方接口实测：事故 48 条、施工 283 条、洪水 10 条，字�
 
 部署 K6（9-28 23:51）：核对 jobs.db，`local:早间路况` 和 `local:紧急警报` 都投递到两个 ID，
 6 个新闻时段和 heartbeat 任务仍只发一个 ID。
+
+## 2026-10-03 — 生产环境从 K6 迁到 K5
+
+用户要求：关闭 K6 上的 elfClaw 并移除开机自启，把整个实例和依赖迁到 K5 的 `C:\K5-DEV`，设开机自启；
+以后所有相关开发都在 K5 上运行。（代码无改动，只有部署。）
+
+### K6（已退役）
+- 删除计划任务 elfClaw_Watchdog、elfClaw_Workspace，以及之前人机验证留下的 elfClaw_BrowserFetch / elfClaw_BrowserLogin；
+  删除前导出 XML 到 `C:\dev\elfClaw\tmp\task_backup`。进程已结束。elfClaw_Skynet 本来就是禁用状态，未动。
+- 实例文件原样保留在 `C:\dev\elfClaw\ZeroClaw_Workspace` 作备份。
+
+### K5（当前生产）
+- 实例 `C:\K5-DEV\elfClaw\ZeroClaw_Workspace`（整个目录 tar 打包迁移，约 900 MB，压缩后 302 MB，MD5 校验一致），
+  另有 `watchdog.ps1`、`deploy_exe.ps1`，路径都已改成 K5 的。
+- 用户环境变量 5 个（CF_CRAWLER_ENDPOINT/TOKEN、MONID、TOMTOM、TFNSW）从 K6 复制，过程中不显示内容，临时文件已删。
+- 计划任务（用户 K5\k5、交互式会话）：elfClaw_Workspace（登录时启动）、elfClaw_Watchdog（每 5 分钟）。
+  K5 已设开机自动登录，所以开机即运行。
+- 依赖：Node v24、Chrome 已装；config.toml 里没有绝对路径，不用改。
+
+### 验证
+- 17:01 启动，daemon_state：telegram、email、xiaozhi 渠道和网关、心跳、调度器全部 ok。
+- 紧急警报每 5 分钟正常运行，5 个数据源都在抓；各新闻时段 next_run 正确（10-04 起夏令时已自动换算）。
+- 本地浏览器：澳洲人报、彭博、City Heaven、Scarlet Blue 直接能抓；**RealBabes 返回 403**——Chrome 的
+  Cloudflare 通行 cookie 按机器加密，换机器失效，需要用户在 K5 桌面重新人机验证一次（已弹出验证窗口）。
+
+### 踩坑
+- SSH 会话里 `$env:USERDOMAIN` 是 WORKGROUP，用它注册计划任务会报 "No mapping between account names"，要用 `$env:COMPUTERNAME`。
