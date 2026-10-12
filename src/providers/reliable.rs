@@ -404,7 +404,8 @@ fn until_next_pacific_midnight(now: chrono::DateTime<chrono::Utc>) -> Duration {
 /// model only; any failure rests it (see `proxy_rest`) and the request moves
 /// on to the official keys at once — its errors say nothing about the
 /// official API, so they neither mark a model overloaded nor touch the
-/// official quota records.
+/// official quota records (its successful calls are counted under its own
+/// label, see `quota`).
 pub const GEMINI_PROXY_PROVIDER: &str = "gemini-proxy";
 
 /// How long the proxy is left alone after a failure. Antigravity Tools
@@ -582,9 +583,9 @@ impl ReliableProvider {
                 let started = Instant::now();
                 match call(provider, sent_model).await {
                     Ok(resp) => {
-                        if provider_name != GEMINI_PROXY_PROVIDER {
-                            crate::providers::quota::record_call(provider_name, sent_model);
-                        }
+                        // Proxy calls are counted too, under their own label;
+                        // the quota note lists them apart from the official keys.
+                        crate::providers::quota::record_call(provider_name, sent_model);
                         self.cooldowns
                             .lock()
                             .remove(&(provider_name.to_string(), sent_model.to_string()));

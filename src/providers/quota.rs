@@ -156,12 +156,12 @@ impl QuotaStore {
                     COUNT(*),
                     SUM(CASE WHEN u.exhausted_at IS NOT NULL THEN 1 ELSE 0 END),
                     (SELECT calls FROM observed_limit o WHERE o.model = u.model)
-             FROM usage u WHERE u.day = ?1
+             FROM usage u WHERE u.day = ?1 AND u.label != ?2
              GROUP BY u.model ORDER BY SUM(u.calls) DESC",
         ) else {
             return Vec::new();
         };
-        let rows = stmt.query_map([quota_day(now)], |r| {
+        let rows = stmt.query_map(rusqlite::params![quota_day(now), PROXY_LABEL], |r| {
             Ok(ModelUsage {
                 model: r.get(0)?,
                 calls: r.get(1)?,
@@ -176,7 +176,27 @@ impl QuotaStore {
         rows.map(|r| r.filter_map(std::result::Result::ok).collect())
             .unwrap_or_default()
     }
+
+    /// Today's calls through the Gemini proxy, per model, busiest first.
+    fn proxy_today(&self, now: DateTime<Utc>) -> Vec<(String, i64)> {
+        let conn = self.conn.lock();
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT model, SUM(calls) FROM usage WHERE day = ?1 AND label = ?2
+             GROUP BY model ORDER BY SUM(calls) DESC",
+        ) else {
+            return Vec::new();
+        };
+        let rows = stmt.query_map(rusqlite::params![quota_day(now), PROXY_LABEL], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        });
+        rows.map(|r| r.filter_map(std::result::Result::ok).collect())
+            .unwrap_or_default()
+    }
 }
+
+/// Label the Gemini proxy's calls are recorded under. It has no daily quota
+/// of Google's, so it is counted but kept out of the official figures.
+const PROXY_LABEL: &str = crate::providers::reliable::GEMINI_PROXY_PROVIDER;
 
 fn store() -> Option<Arc<QuotaStore>> {
     STORE
@@ -244,6 +264,11 @@ pub fn today(now: DateTime<Utc>) -> Vec<ModelUsage> {
     store().map(|s| s.today(now)).unwrap_or_default()
 }
 
+/// Today's calls through the Gemini proxy, per model.
+pub fn proxy_today(now: DateTime<Utc>) -> Vec<(String, i64)> {
+    store().map(|s| s.proxy_today(now)).unwrap_or_default()
+}
+
 /// Render the note. Split from `summary_line` so it can be checked without
 /// touching the process-wide store.
 ///
@@ -254,23 +279,34 @@ pub fn today(now: DateTime<Utc>) -> Vec<ModelUsage> {
 /// otherwise there is no way to tell "untouched" from "not tracked".
 fn render_summary(
     usage: &[ModelUsage],
+    proxy: &[(String, i64)],
     configured: &[String],
     keys: usize,
     now: DateTime<Utc>,
     tz: &str,
 ) -> Option<String> {
-    if usage.is_empty() {
+    if usage.is_empty() && proxy.is_empty() {
         return None;
     }
     let keys = keys.max(1);
     let short = |m: &str| m.strip_prefix("gemini-").unwrap_or(m).to_string();
+    // With proxy calls in the note, say which lines the reset time is about:
+    // it is Google's daily quota, the proxy runs on limits of its own.
+    let (reset_what, official) = if proxy.is_empty() {
+        ("", "")
+    } else {
+        ("官方额度 ", "官方 ")
+    };
     let mut lines = vec![match reset_label(now, tz) {
-        Some(reset) => format!("🔑 今日用量（{reset} 重置）"),
+        Some(reset) => format!("🔑 今日用量（{reset_what}{reset} 重置）"),
         None => "🔑 今日用量".to_string(),
     }];
 
+    for (model, calls) in proxy.iter().take(MAX_MODELS_SHOWN) {
+        lines.push(format!("• 反代 {} 已用 {calls} 次", short(model)));
+    }
     for u in usage.iter().take(MAX_MODELS_SHOWN) {
-        let mut line = format!("• {} 已用 {} 次", short(&u.model), u.calls);
+        let mut line = format!("• {official}{} 已用 {} 次", short(&u.model), u.calls);
         if let Some(limit) = u.observed_limit {
             let total = limit * i64::try_from(keys).unwrap_or(1);
             let _ = std::fmt::Write::write_fmt(
@@ -294,7 +330,11 @@ fn render_summary(
         lines.push(line);
     }
 
-    let used: std::collections::HashSet<&str> = usage.iter().map(|u| u.model.as_str()).collect();
+    let used: std::collections::HashSet<&str> = usage
+        .iter()
+        .map(|u| u.model.as_str())
+        .chain(proxy.iter().map(|(m, _)| m.as_str()))
+        .collect();
     let unused: Vec<String> = configured
         .iter()
         .filter(|m| !used.contains(m.as_str()))
@@ -315,7 +355,7 @@ pub fn summary_line(
     configured: &[String],
     tz: &str,
 ) -> Option<String> {
-    render_summary(&today(now), configured, keys, now, tz)
+    render_summary(&today(now), &proxy_today(now), configured, keys, now, tz)
 }
 
 // ── model availability ───────────────────────────────────────────────────
@@ -535,6 +575,7 @@ mod tests {
         let configured = models(&["gemini-3.5-flash", "gemini-3.8-flash"]);
         let out = render_summary(
             &usage,
+            &[],
             &configured,
             6,
             at("2026-09-26T02:00:00Z"),
@@ -574,6 +615,7 @@ mod tests {
         ];
         let out = render_summary(
             &usage,
+            &[],
             &models(&["gemini-3.6-flash", "gemini-3.5-flash-lite"]),
             6,
             at("2026-09-26T02:00:00Z"),
@@ -595,9 +637,57 @@ mod tests {
     }
 
     #[test]
+    fn proxy_calls_are_listed_apart_from_the_official_quota() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_in(&dir);
+        let now = at("2026-09-26T02:00:00Z");
+        for _ in 0..12 {
+            store.record_call(PROXY_LABEL, "gemini-3.8-flash", now);
+        }
+        store.record_call("gemini", "gemini-3.6-flash", now);
+        let usage = store.today(now);
+        assert_eq!(
+            usage.len(),
+            1,
+            "proxy calls stay out of the official figures"
+        );
+        assert_eq!(usage[0].model, "gemini-3.6-flash");
+        let proxy = store.proxy_today(now);
+        assert_eq!(proxy, vec![("gemini-3.8-flash".to_string(), 12)]);
+
+        let out = render_summary(
+            &usage,
+            &proxy,
+            &models(&[
+                "gemini-3.8-flash",
+                "gemini-3.6-flash",
+                "gemini-3.5-flash-lite",
+            ]),
+            6,
+            now,
+            "Australia/Sydney",
+        )
+        .unwrap();
+        assert!(out.contains("🔑 今日用量（官方额度 17:00 重置）"), "{out}");
+        assert!(out.contains("• 反代 3.8-flash 已用 12 次"), "{out}");
+        assert!(
+            out.contains("• 官方 3.6-flash 已用 1 次，6 个 key 都还能用"),
+            "{out}"
+        );
+        // Used through the proxy is still used.
+        assert!(out.contains("• 今天没用到：3.5-flash-lite"), "{out}");
+        assert!(!out.contains("没用到：3.8"), "{out}");
+
+        // Proxy only, nothing official yet: still a note.
+        let only = render_summary(&[], &proxy, &[], 6, now, "Australia/Sydney").unwrap();
+        assert!(only.contains("• 反代 3.8-flash 已用 12 次"), "{only}");
+    }
+
+    #[test]
     fn no_calls_today_means_no_note_at_all() {
         let configured = models(&["gemini-3.5-flash"]);
         assert!(render_summary(
+            &[],
             &[],
             &configured,
             6,

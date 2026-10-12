@@ -7191,3 +7191,16 @@ TfNSW 官方接口实测：事故 48 条、施工 283 条、洪水 10 条，字�
 - 反代开机自启：K5 的 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 新增 `Antigravity Tools`
   → `%LOCALAPPDATA%\Antigravity Tools\antigravity-tools.exe`。K5 开机自动登录，所以开机后程序会启动；
   反代服务在程序里已设为随程序启动（`proxy.auto_start = true`）。
+
+## 2026-10-12 — 推送末尾的额度行同时显示反代调用次数
+
+用户反馈：补发的午报额度行写着"今天没用到：3.8-flash"，其实 3.8 是经反代用的，容易误解。
+
+- `src/providers/reliable.rs`：反代成功的调用也记账，标签为 `gemini-proxy`。
+- `src/providers/quota.rs`：
+  - 官方统计（`today()`）排除 `gemini-proxy` 标签，官方额度的推算不受影响；
+  - 新增 `proxy_today()`，按模型统计反代当天的调用次数；
+  - 有反代调用时，额度行写成"官方额度 18:00 重置"，反代单独一行：`• 反代 3.8-flash 已用 N 次`，官方各行加"官方"前缀；
+  - "今天没用到"不再列出经反代用过的模型。没有反代调用时，显示和以前完全一样。
+- 单测：反代调用不进官方统计、分开显示、只有反代调用时也出额度行。
+- 计数从部署之后开始，今天部署前经反代的调用没有记录。
