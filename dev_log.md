@@ -7181,3 +7181,13 @@ TfNSW 官方接口实测：事故 48 条、施工 283 条、洪水 10 条，字�
   计划任务启动的进程可能拿到的是登录时的环境快照，看不到之后新设的变量。
 - 验证：在 K5 上用 `zeroclaw agent -m` 实测，反代日志记录到 `/v1beta/models/gemini-3.8-flash:generateContent`，
   状态 200，反代按 `gemini-3.8-flash-low` 执行，4.6 秒完成。
+
+### 补发午报 + 反代开机自启（10-12 13:35）
+
+- 补发午报：把 `news:午报` 的 next_run 改为当前时间，由常驻 daemon 按正式流程执行（反代 → Telegram 投递）。
+  结果 22 条，无"没有生成"提示。反代日志 13:36 有对应的 `/v1beta/.../gemini-3.8-flash:generateContent` 200（14.8 秒）；
+  13:30 还有一条 daemon 自己发起的反代请求，证明常驻进程已经拿到 `GEMINI_PROXY_API_KEY`。
+- 额度行显示"今天没用到：3.8-flash"：因为反代调用不计入官方额度统计，这是预期的。
+- 反代开机自启：K5 的 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 新增 `Antigravity Tools`
+  → `%LOCALAPPDATA%\Antigravity Tools\antigravity-tools.exe`。K5 开机自动登录，所以开机后程序会启动；
+  反代服务在程序里已设为随程序启动（`proxy.auto_start = true`）。
