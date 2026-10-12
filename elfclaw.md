@@ -597,6 +597,17 @@ Gemini 的地址是 `https://generativelanguage.googleapis.com/v1beta/models/{�
   **筛出候选才调一次模型**判断等级、合并重复、写中文说明。`[alerts].nearby_suburbs` 列家周边的区：
   这些区里已结束的暴力事件推 P2；悉尼其他地方只有仍在进行的危险才推（P1）。模型失败时下一轮重判，不倾倒英文标题。
 
+## 19. 模型来源：K5 本机反代优先，官方 API 备份（2026-10-12）
+
+- K5 上的 Antigravity Tools 反代（`http://127.0.0.1:8045`，桌面程序）提供 Gemini 原生接口。
+  `config.toml` 的 `[reliability] gemini_proxy_url = "http://127.0.0.1:8045"`，key 放在 K5 用户环境变量 `GEMINI_PROXY_API_KEY`。
+- 调用顺序：**反代上的请求模型（3.8 Flash）→ 官方 6 个 key 的同一模型 → 官方的降级模型**。反代只用于请求的那个模型。
+- 反代出任何错（限流、没开、超时）都立刻改走官方 API，并让反代休息（按它报的 `Wait N s`，否则 10 分钟，最长 6 小时）。
+- 思考级别：`[provider] reasoning_level = 1`（low）；新闻挑选等任务用 0，3.8 不支持 minimal，实际也是 low。
+- **反代账号池和直播（塔台转写、弹幕审核）共用**，elfClaw 用量大会挤占直播额度——用户已知情。
+- 反代是桌面程序，K5 重启后要登录桌面并打开它才可用；没开时 elfClaw 自动只用官方 API。
+- 推送末尾的额度行只统计官方 API，反代的调用不计入。
+
 ## 13. 代码语言约束
 
 **全部用 Rust 实现，不引入 Python 等其他语言的运行时依赖。** 之前分析阶段用 Python 脚本做过一次性的数据分析（读 K6 拷回来的 SQLite/日志、测 Gemini key），那些是本地一次性工具，不进入 elfClaw 代码库；正式功能代码一律 Rust。

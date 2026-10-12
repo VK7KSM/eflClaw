@@ -7136,3 +7136,35 @@ TfNSW 官方接口实测：事故 48 条、施工 283 条、洪水 10 条，字�
 
 ### 踩坑
 - SSH 会话里 `$env:USERDOMAIN` 是 WORKGROUP，用它注册计划任务会报 "No mapping between account names"，要用 `$env:COMPUTERNAME`。
+
+## 2026-10-12 — 新闻没生成的原因 + 改用 K5 本机 Antigravity 反代（3.8 Flash，low）为首选模型
+
+### 今天早报、午报没生成的原因
+
+- 早报（07:00）、午报（12:30）都是：主模型 `gemini-3.5-flash`（10-08 起 Google 已把它转发给 3.6）报 503"繁忙"
+  → 降级到 `gemini-3.5-flash-lite` → Flash-Lite 有回答，但**解析失败**，推送显示"模型没有返回可用的挑选结果"。
+- 本地用同样的候选连跑 Flash-Lite 10 次，2 次失败，抓到原始回答：同一条结果里 `"id"` 和 `"category"` 各写了两遍。
+  serde 反序列化到结构体时遇到重复字段直接报错，整份回答作废。
+- 修复：`news_pipeline::parse_picks` 和 `local/breaking::parse_answer` 先解析成 `serde_json::Value`
+  （重复键保留最后一个，不报错）再转结构体。加了重复键的单测。
+
+### 反代接入（用户要求：反代的 Gemini 3.8 Flash 优先、low 思考级别，官方 API 直连作备份）
+
+- K5 上的 Antigravity Tools（`127.0.0.1:8045`，桌面程序，key 在其 `gui_config.json`）实测：
+  Gemini 原生接口 `/v1beta/models/gemini-3.8-flash:generateContent` + `x-goog-api-key` 头 + `thinkingLevel: low`
+  正常（2 秒左右），和 elfClaw 现有请求格式完全兼容，所以直接复用 `GeminiProvider`，只换地址。
+- `src/config/schema.rs`：`[reliability]` 新增可选 `gemini_proxy_url`；key 从环境变量 `GEMINI_PROXY_API_KEY` 读，
+  缺 URL 或 key 时完全不启用，行为与之前一致。
+- `src/providers/gemini.rs`：`GeminiProvider::with_endpoint(base)`，API key 请求改发到该地址（自动补 `/v1beta`）。
+- `src/providers/mod.rs`：主 provider 是 gemini 且配置齐全时，在调用链最前面插入 `gemini-proxy` 条目。
+- `src/providers/reliable.rs`：
+  - 反代**只用于调用方请求的那个模型**（降级到 3.6、Flash-Lite 时只走官方 key），避免和直播抢额度时连环占用；
+  - 反代任何失败都**不算"模型过载"**，直接轮到同模型的官方 key；并让反代休息：
+    报文里有 `Wait N s`（反代账号池限流时会给）就按它，否则 10 分钟，最长 6 小时；
+  - 反代的调用不记入官方额度统计（推送末尾的额度行只反映官方 API）。
+- 单测：反代 503 后走同模型的官方 key、休息期内跳过反代、反代不参与降级模型、Wait 秒数解析、自定义地址拼接。
+
+### 验证
+
+- `cargo test --lib`：4201 通过，10 失败 = 已知基线；集成测试只有已知 3 个。
+- clippy：改动的 6 个文件告警数与改动前完全相同。

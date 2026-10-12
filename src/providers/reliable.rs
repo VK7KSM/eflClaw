@@ -399,6 +399,26 @@ fn until_next_pacific_midnight(now: chrono::DateTime<chrono::Utc>) -> Duration {
 // gives operators a complete diagnostic trail; each attempt is also written to
 // the elfClaw log as it happens.
 
+/// elfClaw 2026-10-12: chain entry name of the Gemini-compatible proxy
+/// (`reliability.gemini_proxy_url`). It is tried first, for the requested
+/// model only; any failure rests it (see `proxy_rest`) and the request moves
+/// on to the official keys at once — its errors say nothing about the
+/// official API, so they neither mark a model overloaded nor touch the
+/// official quota records.
+pub const GEMINI_PROXY_PROVIDER: &str = "gemini-proxy";
+
+/// How long the proxy is left alone after a failure. Antigravity Tools
+/// reports how long its accounts are limited ("... Wait 62033s"); otherwise
+/// ten minutes. Capped at six hours.
+fn proxy_rest(err: &anyhow::Error) -> Duration {
+    let msg = err.to_string();
+    let waited = msg.find("Wait ").map(|i| &msg[i + 5..]).and_then(|rest| {
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        digits.parse::<u64>().ok()
+    });
+    Duration::from_secs(waited.unwrap_or(600).clamp(60, 6 * 3600))
+}
+
 /// Provider wrapper with retry, fallback, and model failover. Multi-key
 /// rotation is not handled here — see the module-level note above.
 pub struct ReliableProvider {
@@ -518,6 +538,9 @@ impl ReliableProvider {
         let mut entries: Vec<(&'a str, &'a dyn Provider, &'a str)> = Vec::new();
         for current_model in self.model_chain(model) {
             for (provider_index, (provider_name, provider)) in self.providers.iter().enumerate() {
+                if provider_name == GEMINI_PROXY_PROVIDER && current_model != model {
+                    continue;
+                }
                 for sent_model in
                     self.provider_model_chain(current_model, provider_name, provider_index == 0)
                 {
@@ -559,7 +582,9 @@ impl ReliableProvider {
                 let started = Instant::now();
                 match call(provider, sent_model).await {
                     Ok(resp) => {
-                        crate::providers::quota::record_call(provider_name, sent_model);
+                        if provider_name != GEMINI_PROXY_PROVIDER {
+                            crate::providers::quota::record_call(provider_name, sent_model);
+                        }
                         self.cooldowns
                             .lock()
                             .remove(&(provider_name.to_string(), sent_model.to_string()));
@@ -573,6 +598,43 @@ impl ReliableProvider {
                             );
                         }
                         return Ok(resp);
+                    }
+                    Err(e) if provider_name == GEMINI_PROXY_PROVIDER => {
+                        let rest = proxy_rest(&e);
+                        let error_detail = compact_error_detail(&e);
+                        let status = http_status(&e);
+                        tracing::warn!(
+                            model = sent_model,
+                            rest_secs = rest.as_secs(),
+                            error = %error_detail,
+                            "Gemini proxy failed; using the official API"
+                        );
+                        self.cooldowns.lock().insert(
+                            (provider_name.to_string(), sent_model.to_string()),
+                            Instant::now() + rest,
+                        );
+                        skipped[index] = true;
+                        all_rate_limited = all_rate_limited && is_rate_limited(&e);
+                        push_failure(
+                            &mut failures,
+                            provider_name,
+                            sent_model,
+                            pass + 1,
+                            passes,
+                            "proxy_rested",
+                            &error_detail,
+                        );
+                        tallies.push((sent_model.to_string(), attempt_label(status)));
+                        crate::elfclaw_log::log_provider_attempt_failure(
+                            provider_name,
+                            sent_model,
+                            pass + 1,
+                            passes,
+                            status,
+                            "proxy_rested",
+                            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                            &error_detail,
+                        );
                     }
                     Err(e) => {
                         let non_retryable_rate_limit = is_non_retryable_rate_limit(&e);
@@ -2328,6 +2390,118 @@ mod tests {
         assert_eq!(*mock.seen.lock(), vec!["m-a", "m-b"]);
         // No 5s overload backoff before trying the next model.
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn proxy_failure_moves_to_official_keys_of_the_same_model_and_rests() {
+        let proxy = Arc::new(ScriptedModelMock {
+            script: [(
+                "m-a",
+                vec![Err(
+                    "Gemini API error (503 Service Unavailable): All accounts limited. Wait 7200s",
+                )],
+            )]
+            .into_iter()
+            .collect(),
+            seen: parking_lot::Mutex::new(Vec::new()),
+        });
+        let key_a = Arc::new(ScriptedModelMock {
+            script: [("m-a", vec![Ok("m-a via key a"), Ok("again")])]
+                .into_iter()
+                .collect(),
+            seen: parking_lot::Mutex::new(Vec::new()),
+        });
+        let mut fallbacks = HashMap::new();
+        fallbacks.insert("m-a".to_string(), vec!["m-b".to_string()]);
+        let provider = ReliableProvider::new(
+            vec![
+                (
+                    GEMINI_PROXY_PROVIDER.into(),
+                    Box::new(proxy.clone()) as Box<dyn Provider>,
+                ),
+                (
+                    "gemini".into(),
+                    Box::new(key_a.clone()) as Box<dyn Provider>,
+                ),
+            ],
+            2,
+            1,
+        )
+        .with_model_fallbacks(fallbacks);
+
+        // A proxy 503 is not the model being overloaded: the official key of
+        // the same model is next, not the fallback model.
+        let result = provider.simple_chat("hi", "m-a", 0.0).await.unwrap();
+        assert_eq!(result, "m-a via key a");
+        assert_eq!(*proxy.seen.lock(), vec!["m-a"]);
+        assert_eq!(*key_a.seen.lock(), vec!["m-a"]);
+
+        // Rested for the time it named: the next request skips it.
+        let result = provider.simple_chat("hi", "m-a", 0.0).await.unwrap();
+        assert_eq!(result, "again");
+        assert_eq!(proxy.seen.lock().len(), 1, "proxy is resting");
+    }
+
+    #[tokio::test]
+    async fn proxy_is_used_for_the_requested_model_only() {
+        let proxy = Arc::new(ScriptedModelMock {
+            script: [("m-b", vec![Ok("unused")])].into_iter().collect(),
+            seen: parking_lot::Mutex::new(Vec::new()),
+        });
+        let key_a = Arc::new(ScriptedModelMock {
+            script: [
+                (
+                    "m-a",
+                    vec![Err(
+                        "Gemini API error (503 Service Unavailable): model overloaded",
+                    )],
+                ),
+                ("m-b", vec![Ok("m-b via key a")]),
+            ]
+            .into_iter()
+            .collect(),
+            seen: parking_lot::Mutex::new(Vec::new()),
+        });
+        let proxy_dead = Arc::new(ScriptedModelMock {
+            script: [(
+                "m-a",
+                vec![Err("error sending request: connection refused")],
+            )]
+            .into_iter()
+            .collect(),
+            seen: parking_lot::Mutex::new(Vec::new()),
+        });
+        let mut fallbacks = HashMap::new();
+        fallbacks.insert("m-a".to_string(), vec!["m-b".to_string()]);
+        let provider = ReliableProvider::new(
+            vec![
+                (
+                    GEMINI_PROXY_PROVIDER.into(),
+                    Box::new(proxy_dead.clone()) as Box<dyn Provider>,
+                ),
+                (
+                    "gemini".into(),
+                    Box::new(key_a.clone()) as Box<dyn Provider>,
+                ),
+            ],
+            2,
+            1,
+        )
+        .with_model_fallbacks(fallbacks);
+        let result = provider.simple_chat("hi", "m-a", 0.0).await.unwrap();
+        assert_eq!(result, "m-b via key a");
+        assert_eq!(*proxy_dead.seen.lock(), vec!["m-a"], "never asked for m-b");
+        assert!(proxy.seen.lock().is_empty());
+    }
+
+    #[test]
+    fn proxy_rest_follows_the_wait_it_reports() {
+        let wait = anyhow::anyhow!("503: 【网关调度受限】 All accounts limited. Wait 62033s");
+        assert_eq!(proxy_rest(&wait), Duration::from_secs(6 * 3600), "capped");
+        let short = anyhow::anyhow!("All accounts limited. Wait 900s");
+        assert_eq!(proxy_rest(&short), Duration::from_secs(900));
+        let other = anyhow::anyhow!("connection refused");
+        assert_eq!(proxy_rest(&other), Duration::from_secs(600));
     }
 
     #[tokio::test]

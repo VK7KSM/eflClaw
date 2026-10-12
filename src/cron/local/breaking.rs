@@ -228,7 +228,9 @@ pub fn parse_answer(
 ) -> Option<Vec<Judged>> {
     let start = answer.find('{')?;
     let end = answer.rfind('}')?;
-    let parsed: Answer = serde_json::from_str(answer.get(start..=end)?).ok()?;
+    // Via `Value`, so a key the model repeats does not void the answer.
+    let value: serde_json::Value = serde_json::from_str(answer.get(start..=end)?).ok()?;
+    let parsed: Answer = serde_json::from_value(value).ok()?;
     let mut out = Vec::new();
     for e in parsed.events {
         let level = match e.level.trim().to_ascii_uppercase().as_str() {

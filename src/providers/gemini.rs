@@ -28,6 +28,9 @@ pub struct GeminiProvider {
     auth_profile_override: Option<String>,
     // elfClaw: 0-4 thinking intensity → model-specific thinkingConfig injection
     thinking_level: Option<u8>,
+    /// elfClaw 2026-10-12: replaces the public `.../v1beta` base for API-key
+    /// auth (a local Gemini-compatible proxy). `None`: the official API.
+    endpoint: Option<String>,
 }
 
 /// Mutable OAuth token state — supports runtime refresh for long-lived processes.
@@ -598,6 +601,7 @@ impl GeminiProvider {
             auth_service: None,
             auth_profile_override: None,
             thinking_level: None,
+            endpoint: None,
         }
     }
 
@@ -674,7 +678,20 @@ impl GeminiProvider {
             },
             auth_profile_override: profile_override,
             thinking_level: reasoning_level,
+            endpoint: None,
         }
+    }
+
+    /// Send API-key requests to `base` (e.g. `http://127.0.0.1:8045`) instead
+    /// of the public API. `/v1beta` is appended when missing.
+    pub fn with_endpoint(mut self, base: &str) -> Self {
+        let base = base.trim().trim_end_matches('/');
+        self.endpoint = Some(if base.ends_with("/v1beta") {
+            base.to_string()
+        } else {
+            format!("{base}/v1beta")
+        });
+        self
     }
 
     fn normalize_non_empty(value: &str) -> Option<String> {
@@ -928,6 +945,14 @@ impl GeminiProvider {
     /// "400 Bad Request: API key not valid" errors.
     /// See: https://github.com/google-gemini/gemini-cli/issues/19200
     fn build_generate_content_url(model: &str, auth: &GeminiAuth) -> String {
+        Self::build_generate_content_url_at(model, auth, None)
+    }
+
+    fn build_generate_content_url_at(
+        model: &str,
+        auth: &GeminiAuth,
+        endpoint: Option<&str>,
+    ) -> String {
         match auth {
             GeminiAuth::OAuthToken(_) | GeminiAuth::ManagedOAuth => {
                 // OAuth tokens are scoped for the internal Code Assist API.
@@ -936,7 +961,8 @@ impl GeminiProvider {
             }
             _ => {
                 let model_name = Self::format_model_name(model);
-                format!("{PUBLIC_API_ENDPOINT}/{model_name}:generateContent")
+                let base = endpoint.unwrap_or(PUBLIC_API_ENDPOINT);
+                format!("{base}/{model_name}:generateContent")
             }
         }
     }
@@ -1262,7 +1288,7 @@ impl GeminiProvider {
             tool_config,
         };
 
-        let url = Self::build_generate_content_url(model, auth);
+        let url = Self::build_generate_content_url_at(model, auth, self.endpoint.as_deref());
 
         let mut response = self
             .build_generate_content_request(
@@ -1802,6 +1828,7 @@ mod tests {
             auth_service: None,
             auth_profile_override: None,
             thinking_level: None,
+            endpoint: None,
         }
     }
 
@@ -2602,6 +2629,31 @@ mod tests {
     }
 
     /// Validates that warmup() for ManagedOAuth requires auth_service.
+    #[test]
+    fn endpoint_override_replaces_the_public_base_for_api_keys() {
+        let auth = GeminiAuth::ExplicitKey("k".into());
+        let at = |base: &str| {
+            let p = test_provider(Some(GeminiAuth::ExplicitKey("k".into()))).with_endpoint(base);
+            GeminiProvider::build_generate_content_url_at(
+                "gemini-3.8-flash",
+                &auth,
+                p.endpoint.as_deref(),
+            )
+        };
+        assert_eq!(
+            at("http://127.0.0.1:8045"),
+            "http://127.0.0.1:8045/v1beta/models/gemini-3.8-flash:generateContent"
+        );
+        assert_eq!(
+            at("http://127.0.0.1:8045/v1beta/"),
+            "http://127.0.0.1:8045/v1beta/models/gemini-3.8-flash:generateContent"
+        );
+        assert!(
+            GeminiProvider::build_generate_content_url("gemini-3.8-flash", &auth)
+                .starts_with("https://generativelanguage.googleapis.com/v1beta/")
+        );
+    }
+
     #[tokio::test]
     async fn warmup_managed_oauth_requires_auth_service() {
         let provider = GeminiProvider {
@@ -2612,6 +2664,7 @@ mod tests {
             auth_service: None, // Missing auth_service
             auth_profile_override: None,
             thinking_level: None,
+            endpoint: None,
         };
 
         let result = provider.warmup().await;

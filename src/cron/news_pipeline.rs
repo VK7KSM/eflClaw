@@ -1114,7 +1114,12 @@ fn build_request(slot: &Slot, candidates: &[Item], max_items: usize, now: DateTi
 pub fn parse_picks(answer: &str, candidates: usize, max_items: usize) -> Option<Vec<Chosen>> {
     let start = answer.find('{')?;
     let end = answer.rfind('}')?;
-    let picks: Picks = serde_json::from_str(answer.get(start..=end)?).ok()?;
+    // Via `Value`: a repeated key there keeps the last one, where a struct
+    // rejects the whole answer. Flash-Lite does repeat keys now and then
+    // (measured 2026-10-12: 2 of 10 早报 answers had `"id"` and `"category"`
+    // twice in one item, and the push said "model unavailable").
+    let value: serde_json::Value = serde_json::from_str(answer.get(start..=end)?).ok()?;
+    let picks: Picks = serde_json::from_value(value).ok()?;
     let mut seen = HashSet::new();
     let chosen: Vec<Chosen> = picks
         .items
@@ -1733,6 +1738,10 @@ mod tests {
         // The model legitimately picking nothing is not a failure either;
         // treating it as one is what made a quiet slot dump raw headlines.
         assert_eq!(parse_picks("{\"items\":[]}", 3, 10), Some(Vec::new()));
+        let repeated = "```json\n{\"items\":[{\"id\":1,\"category\":\"国际\",\"id\":1,\"category\":\"国际\",\"title\":\"T\",\"summary\":\"S\"}]}\n```";
+        let picks = parse_picks(repeated, 3, 10).expect("repeated keys are readable");
+        assert_eq!(picks.len(), 1);
+        assert_eq!(picks[0].index, 1);
     }
 
     #[test]
