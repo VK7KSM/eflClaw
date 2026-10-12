@@ -7168,3 +7168,16 @@ TfNSW 官方接口实测：事故 48 条、施工 283 条、洪水 10 条，字�
 
 - `cargo test --lib`：4201 通过，10 失败 = 已知基线；集成测试只有已知 3 个。
 - clippy：改动的 6 个文件告警数与改动前完全相同。
+
+### 部署 K5（10-12 13:16）
+
+- K5 用户环境变量新增 `GEMINI_PROXY_API_KEY`（在 K5 本机从反代配置读取并写入，未经网络、未显示）。
+- `config.toml`（改前备份为 `config.toml.before-proxy`）：
+  - `default_model` / `summary_model` / `worker_model` 都改为 `gemini-3.8-flash`；
+  - `reasoning_level` 2 → 1（low）；
+  - `[reliability] gemini_proxy_url = "http://127.0.0.1:8045"`；
+  - 降级链改为 `"gemini-3.8-flash" = ["gemini-3.6-flash", "gemini-3.5-flash-lite"]`，删掉指向已转发模型的旧链。
+- `start_bot.vbs`：启动时从注册表现读全部 6 个密钥类环境变量（原来只读 cf-crawler 两个）。
+  计划任务启动的进程可能拿到的是登录时的环境快照，看不到之后新设的变量。
+- 验证：在 K5 上用 `zeroclaw agent -m` 实测，反代日志记录到 `/v1beta/models/gemini-3.8-flash:generateContent`，
+  状态 200，反代按 `gemini-3.8-flash-low` 执行，4.6 秒完成。
