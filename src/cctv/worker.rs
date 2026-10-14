@@ -1,0 +1,583 @@
+//! The long-poll loop: cctv-server events → Telegram (and, for the highest
+//! alarms, the phone line). Push rules decided with the owner:
+//!
+//! - level 3: always, with sound; level 2: always, silent 23:00–06:30;
+//!   level 1: not pushed, counted in the morning summary; recoveries silent;
+//! - first the text + snapshot at once, the clip as a reply once it is ready;
+//! - a later rise in level is pushed again; a description arriving later
+//!   edits the caption; an AI downgrade to level 1 is noted on the caption;
+//! - cctv-server unreachable for 3 minutes is itself a highest alarm.
+
+use super::alarm::{self, AlarmLine, ACK_PREFIX};
+use super::api::{CctvApi, Event};
+use super::format;
+use super::store::{Pushed, Sent, Store};
+use super::tg::{Bot, SendOpts};
+use anyhow::{Context, Result};
+use chrono::{DateTime, Duration as ChronoDuration, Timelike, Utc};
+use chrono_tz::Tz;
+use std::fmt::Write as _;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+const WAIT_SECS: u64 = 25;
+const DOWN_AFTER: Duration = Duration::from_secs(180);
+const SUMMARY_PAGES: usize = 30;
+
+pub struct Ctx {
+    pub api: CctvApi,
+    pub bot: Bot,
+    pub chats: Vec<String>,
+    pub tz: Tz,
+    /// Minutes after midnight.
+    pub quiet: (u32, u32),
+    pub summary_at: u32,
+    /// The phone line for the highest alarms (`None`: Telegram only).
+    pub alarm: Option<Arc<AlarmLine>>,
+}
+
+impl Ctx {
+    fn now_minutes(&self, now: DateTime<Utc>) -> u32 {
+        let l = now.with_timezone(&self.tz);
+        l.hour() * 60 + l.minute()
+    }
+
+    pub fn is_quiet(&self, now: DateTime<Utc>) -> bool {
+        let m = self.now_minutes(now);
+        let (start, end) = self.quiet;
+        if start <= end {
+            (start..end).contains(&m)
+        } else {
+            m >= start || m < end
+        }
+    }
+}
+
+/// Does this event call for the phone (user's rule)?
+pub fn needs_phone(e: &Event) -> bool {
+    (e.kind == "alarm" && e.intrusion_confirmed)
+        || (e.kind == "system"
+            && e.cause.as_deref() == Some("Device offline")
+            && e.offline_cameras.is_some_and(|n| n >= 2))
+}
+
+pub async fn run(ctx: Arc<Ctx>, store: Store) -> Result<()> {
+    let mut cursor: Option<i64> = store.get("cursor")?.and_then(|c| c.parse().ok());
+    let mut failing_since: Option<Instant> = None;
+    let mut down_notice: Vec<Sent> = Vec::new();
+    let mut last_prune = Instant::now();
+    tracing::info!(?cursor, "CCTV worker started");
+    loop {
+        if let Err(e) = morning_summary(&ctx, &store).await {
+            tracing::warn!("CCTV morning summary failed: {e:#}");
+        }
+        if last_prune.elapsed() > Duration::from_secs(6 * 3600) {
+            let _ = store.prune();
+            last_prune = Instant::now();
+        }
+        match ctx.api.stream(cursor, WAIT_SECS).await {
+            Ok(page) => {
+                if failing_since.take().is_some() && !down_notice.is_empty() {
+                    let text = "✅ 监控服务已恢复连接";
+                    for s in down_notice.drain(..) {
+                        let opts = SendOpts {
+                            silent: true,
+                            parent: Some(s.message_id),
+                            button: None,
+                        };
+                        let _ = ctx.bot.send_text(&s.chat, text, &opts).await;
+                    }
+                }
+                let Some(c) = cursor else {
+                    cursor = Some(page.cursor);
+                    store.set("cursor", &page.cursor.to_string())?;
+                    continue;
+                };
+                if page.gap {
+                    broadcast(
+                        &ctx,
+                        "⚠️ 监控事件有中断（elfClaw 离线太久），中间部分事件没有推送。",
+                        true,
+                    )
+                    .await;
+                }
+                for e in page.events {
+                    if let Err(err) = handle(&ctx, &store, e).await {
+                        tracing::warn!("CCTV event not handled: {err:#}");
+                    }
+                }
+                if page.cursor != c {
+                    cursor = Some(page.cursor);
+                    store.set("cursor", &page.cursor.to_string())?;
+                }
+            }
+            Err(e) => {
+                let since = *failing_since.get_or_insert_with(Instant::now);
+                tracing::warn!("CCTV stream failed: {e:#}");
+                if since.elapsed() >= DOWN_AFTER && down_notice.is_empty() {
+                    down_notice = monitoring_down(&ctx).await;
+                }
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        }
+    }
+}
+
+async fn broadcast(ctx: &Ctx, text: &str, silent: bool) -> Vec<Sent> {
+    let mut sent = Vec::new();
+    for chat in &ctx.chats {
+        let opts = SendOpts {
+            silent,
+            parent: None,
+            button: None,
+        };
+        match ctx.bot.send_text(chat, text, &opts).await {
+            Ok(id) => sent.push(Sent {
+                chat: chat.clone(),
+                message_id: id,
+                is_photo: false,
+                caption: text.to_string(),
+            }),
+            Err(e) => tracing::warn!("CCTV notice not delivered: {e:#}"),
+        }
+    }
+    sent
+}
+
+/// cctv-server unreachable: every camera is effectively down — a highest alarm.
+async fn monitoring_down(ctx: &Ctx) -> Vec<Sent> {
+    let key = format!("down{}", Utc::now().timestamp());
+    let data = format!("{ACK_PREFIX}{key}");
+    let text = "🚨 监控服务连不上已超过 3 分钟（所有摄像头都看不到了）";
+    let button = ctx.alarm.as_ref().map(|_| ("✅ 已看到", data.as_str()));
+    let mut sent = Vec::new();
+    for chat in &ctx.chats {
+        let opts = SendOpts {
+            silent: false,
+            parent: None,
+            button,
+        };
+        match ctx.bot.send_text(chat, text, &opts).await {
+            Ok(id) => sent.push(Sent {
+                chat: chat.clone(),
+                message_id: id,
+                is_photo: false,
+                caption: text.into(),
+            }),
+            Err(e) => tracing::warn!("CCTV down notice not delivered: {e:#}"),
+        }
+    }
+    if let Some(line) = &ctx.alarm {
+        alarm::start(
+            line.clone(),
+            key,
+            "监控服务连不上，所有摄像头都看不到了".into(),
+            sent.clone(),
+        );
+    }
+    sent
+}
+
+async fn handle(ctx: &Ctx, store: &Store, e: Event) -> Result<()> {
+    match e.kind.as_str() {
+        "alarm" | "system" | "recovery" => handle_event(ctx, store, &e).await,
+        "clip_ready" => {
+            if let Some(job) = e.job_id.as_deref() {
+                deliver_job_clip(ctx, store, job, &e);
+            } else if let Some(id) = e.event_id {
+                deliver_event_clip(ctx, store, id, &e)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+async fn handle_event(ctx: &Ctx, store: &Store, e: &Event) -> Result<()> {
+    let id = e.event_id.context("event without id")?;
+    let key = format!("e{id}");
+    let button_data = format!("{ACK_PREFIX}{key}");
+    let quiet = ctx.is_quiet(Utc::now());
+    let Some(mut p) = store.pushed(id)? else {
+        if e.level < 2 {
+            return Ok(()); // level 1: summary only
+        }
+        let phone = needs_phone(e) && ctx.alarm.is_some();
+        let silent = e.kind == "recovery" || (e.level == 2 && quiet);
+        let caption = format::caption(e, false);
+        let photo = snapshot(ctx, e).await;
+        let button = phone.then_some(("✅ 已看到", button_data.as_str()));
+        let mut sent = Vec::new();
+        for chat in &ctx.chats {
+            let opts = SendOpts {
+                silent,
+                parent: None,
+                button,
+            };
+            let r = match &photo {
+                Some(jpeg) => {
+                    ctx.bot
+                        .send_photo(chat, jpeg.clone(), &caption, &opts)
+                        .await
+                }
+                None => ctx.bot.send_text(chat, &caption, &opts).await,
+            };
+            match r {
+                Ok(message_id) => {
+                    let s = Sent {
+                        chat: chat.clone(),
+                        message_id,
+                        is_photo: photo.is_some(),
+                        caption: caption.clone(),
+                    };
+                    store.save_message(id, &s)?;
+                    sent.push(s);
+                }
+                Err(err) => tracing::warn!(event = id, "CCTV push not delivered: {err:#}"),
+            }
+        }
+        store.set_pushed(
+            id,
+            Pushed {
+                level: e.level,
+                has_description: e.description.is_some(),
+                ..Pushed::default()
+            },
+        )?;
+        if phone {
+            if let Some(line) = &ctx.alarm {
+                alarm::start(line.clone(), key, format::headline(e), sent);
+            }
+        }
+        return Ok(());
+    };
+
+    let messages = store.messages(id)?;
+    if e.level > p.level && e.level >= 2 {
+        // Danger rose: push again, as a reply to the first push.
+        let phone = needs_phone(e) && ctx.alarm.is_some();
+        let text = format!("⬆️ 升级：{}", format::caption(e, false));
+        let button = phone.then_some(("✅ 已看到", button_data.as_str()));
+        let mut sent = Vec::new();
+        for chat in &ctx.chats {
+            let parent = messages
+                .iter()
+                .find(|m| &m.chat == chat)
+                .map(|m| m.message_id);
+            let opts = SendOpts {
+                silent: e.level == 2 && quiet,
+                parent,
+                button,
+            };
+            match ctx.bot.send_text(chat, &text, &opts).await {
+                Ok(message_id) => sent.push(Sent {
+                    chat: chat.clone(),
+                    message_id,
+                    is_photo: false,
+                    caption: text.clone(),
+                }),
+                Err(err) => tracing::warn!(event = id, "CCTV upgrade not delivered: {err:#}"),
+            }
+        }
+        p.level = e.level;
+        if phone && !alarm::is_pending(&key) {
+            if let Some(line) = &ctx.alarm {
+                alarm::start(line.clone(), key.clone(), format::headline(e), sent);
+            }
+        }
+    } else if e.level <= 1 && p.level >= 2 && !p.marked_false {
+        p.marked_false = true;
+        edit_all(ctx, &messages, e, true, &key).await;
+    }
+    if e.description.is_some() && !p.has_description {
+        p.has_description = true;
+        edit_all(ctx, &messages, e, p.marked_false, &key).await;
+    }
+    store.set_pushed(id, p)?;
+    Ok(())
+}
+
+async fn edit_all(ctx: &Ctx, messages: &[Sent], e: &Event, false_alarm: bool, key: &str) {
+    let caption = format::caption(e, false_alarm);
+    let data = format!("{ACK_PREFIX}{key}");
+    let button = alarm::is_pending(key).then_some(("✅ 已看到", data.as_str()));
+    for m in messages {
+        if let Err(err) = ctx
+            .bot
+            .edit(&m.chat, m.message_id, &caption, m.is_photo, button)
+            .await
+        {
+            tracing::warn!("CCTV caption not updated: {err:#}");
+        }
+    }
+}
+
+/// The event's snapshot; for an alarm without one (some cameras fail to
+/// produce it), a live frame from the same camera instead.
+async fn snapshot(ctx: &Ctx, e: &Event) -> Option<Vec<u8>> {
+    if let Some(url) = e.snapshot_url.as_deref() {
+        match ctx.api.bytes(url, Duration::from_secs(15)).await {
+            Ok(Some(b)) => return Some(b),
+            Ok(None) => {}
+            Err(err) => tracing::warn!("CCTV snapshot unavailable: {err:#}"),
+        }
+    }
+    if e.kind == "alarm" {
+        if let Some(m) = e.monitor_id {
+            return ctx.api.live_snapshot(m).await.ok();
+        }
+    }
+    None
+}
+
+fn deliver_event_clip(ctx: &Ctx, store: &Store, id: i64, e: &Event) -> Result<()> {
+    let Some(mut p) = store.pushed(id)? else {
+        return Ok(()); // never pushed (level 1, disarmed): no clip either
+    };
+    if p.clip_done {
+        return Ok(());
+    }
+    p.clip_done = true;
+    store.set_pushed(id, p)?;
+    let messages = store.messages(id)?;
+    let clip = e.clip.clone().unwrap_or_default();
+    let (api, bot) = (ctx.api.clone(), ctx.bot.clone());
+    tokio::spawn(async move {
+        if clip.status != "ready" {
+            let reason = clip.reason.unwrap_or_else(|| "原因不明".into());
+            for m in &messages {
+                let opts = SendOpts {
+                    silent: true,
+                    parent: Some(m.message_id),
+                    button: None,
+                };
+                let _ = bot
+                    .send_text(&m.chat, &format!("这次没有录像：{reason}"), &opts)
+                    .await;
+            }
+            return;
+        }
+        let Some(url) = clip.url.as_deref() else {
+            return;
+        };
+        let Some(mp4) = fetch_clip(&api, url).await else {
+            for m in &messages {
+                let opts = SendOpts {
+                    silent: true,
+                    parent: Some(m.message_id),
+                    button: None,
+                };
+                let _ = bot
+                    .send_text(&m.chat, "录像取不下来，可以点上面的链接在网页上看", &opts)
+                    .await;
+            }
+            return;
+        };
+        let caption = format::clip_caption(clip.duration, None);
+        for m in &messages {
+            let opts = SendOpts {
+                silent: true,
+                parent: Some(m.message_id),
+                button: None,
+            };
+            if let Err(err) = bot.send_video(&m.chat, mp4.clone(), &caption, &opts).await {
+                tracing::warn!(event = id, "CCTV clip not delivered: {err:#}");
+            }
+        }
+    });
+    Ok(())
+}
+
+/// A clip someone asked for in Telegram goes back to that chat.
+fn deliver_job_clip(ctx: &Ctx, store: &Store, job: &str, e: &Event) {
+    let chat = match store.take_job(job) {
+        Ok(Some(c)) => c,
+        _ => return,
+    };
+    let clip = e.clip.clone().unwrap_or_default();
+    let requested = requested_secs(e.from.as_deref(), e.to.as_deref());
+    let label = format!(
+        "{} {}–{}",
+        e.monitor_name.as_deref().unwrap_or("监控"),
+        e.from.as_deref().map(format::clock).unwrap_or_default(),
+        e.to.as_deref().map(format::clock).unwrap_or_default()
+    );
+    let (api, bot) = (ctx.api.clone(), ctx.bot.clone());
+    tokio::spawn(async move {
+        let opts = SendOpts {
+            silent: false,
+            parent: None,
+            button: None,
+        };
+        if clip.status != "ready" {
+            let reason = clip.reason.unwrap_or_else(|| "原因不明".into());
+            let _ = bot
+                .send_text(&chat, &format!("{label} 的录像没有生成：{reason}"), &opts)
+                .await;
+            return;
+        }
+        let Some(mp4) = (match clip.url.as_deref() {
+            Some(url) => fetch_clip(&api, url).await,
+            None => None,
+        }) else {
+            let _ = bot
+                .send_text(&chat, &format!("{label} 的录像取不下来"), &opts)
+                .await;
+            return;
+        };
+        let caption = format!(
+            "{label}\n{}",
+            format::clip_caption(clip.duration, requested)
+        );
+        if let Err(err) = bot.send_video(&chat, mp4, &caption, &opts).await {
+            tracing::warn!("requested clip not delivered: {err:#}");
+            let _ = bot
+                .send_text(&chat, &format!("{label} 的录像发送失败：{err}"), &opts)
+                .await;
+        }
+    });
+}
+
+fn requested_secs(from: Option<&str>, to: Option<&str>) -> Option<f64> {
+    let parse = |s: &str| DateTime::parse_from_rfc3339(s).ok();
+    let (a, b) = (parse(from?)?, parse(to?)?);
+    #[allow(clippy::cast_precision_loss)]
+    Some((b - a).num_seconds() as f64)
+}
+
+async fn fetch_clip(api: &CctvApi, url: &str) -> Option<Vec<u8>> {
+    for _ in 0..12 {
+        match api.bytes(url, Duration::from_secs(120)).await {
+            Ok(Some(b)) => return Some(b),
+            Ok(None) => tokio::time::sleep(Duration::from_secs(5)).await,
+            Err(e) => {
+                tracing::warn!("CCTV clip download failed: {e:#}");
+                return None;
+            }
+        }
+    }
+    None
+}
+
+/// Once a day at `summary_at`: what happened since the last summary.
+async fn morning_summary(ctx: &Ctx, store: &Store) -> Result<()> {
+    let now = Utc::now();
+    let local = now.with_timezone(&ctx.tz);
+    let today = local.date_naive().to_string();
+    if ctx.now_minutes(now) < ctx.summary_at
+        || store.get("summary_day")?.as_deref() == Some(today.as_str())
+    {
+        return Ok(());
+    }
+    store.set("summary_day", &today)?;
+    let from = (local - ChronoDuration::hours(24))
+        .format("%Y-%m-%dT%H:%M:%S%:z")
+        .to_string();
+    let to = local.format("%Y-%m-%dT%H:%M:%S%:z").to_string();
+    let enc = |s: &str| s.replace('+', "%2B");
+    let mut before: Option<i64> = None;
+    let mut by_monitor: std::collections::BTreeMap<String, u32> =
+        std::collections::BTreeMap::default();
+    let (mut level1, mut pushed, mut highest) = (0u32, 0u32, 0u32);
+    for _ in 0..SUMMARY_PAGES {
+        let mut q = format!("from={}&to={}&limit=200", enc(&from), enc(&to));
+        if let Some(b) = before {
+            let _ = write!(q, "&before={b}");
+        }
+        let page = ctx.api.events(&q).await?;
+        for e in &page.events {
+            if e.kind != "alarm" {
+                continue;
+            }
+            if e.level >= 2 {
+                pushed += 1;
+                if e.level >= 3 {
+                    highest += 1;
+                }
+            } else {
+                level1 += 1;
+                *by_monitor
+                    .entry(e.monitor_name.clone().unwrap_or_default())
+                    .or_default() += 1;
+            }
+        }
+        match page.next_before {
+            Some(b) if !page.events.is_empty() => before = Some(b),
+            _ => break,
+        }
+    }
+    let mut text = format!("📋 监控汇总（过去 24 小时）\n• 推送过的报警：{pushed} 条（其中最高级 {highest} 条）\n• 只记录、没推送的移动侦测：{level1} 条");
+    if !by_monitor.is_empty() {
+        let mut parts: Vec<(String, u32)> = by_monitor.into_iter().collect();
+        parts.sort_by(|a, b| b.1.cmp(&a.1));
+        let list: Vec<String> = parts.iter().map(|(m, n)| format!("{m} {n}")).collect();
+        let _ = write!(text, "\n  {}", list.join("、"));
+    }
+    broadcast(ctx, &text, true).await;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ctx(quiet: (u32, u32)) -> Ctx {
+        Ctx {
+            api: CctvApi::for_tests(),
+            bot: Bot::new("t"),
+            chats: vec![],
+            tz: chrono_tz::Australia::Sydney,
+            quiet,
+            summary_at: 7 * 60,
+            alarm: None,
+        }
+    }
+
+    #[test]
+    fn quiet_hours_wrap_midnight() {
+        let c = ctx((23 * 60, 6 * 60 + 30));
+        let at = |s: &str| DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc);
+        assert!(c.is_quiet(at("2026-10-14T23:30:00+11:00")));
+        assert!(c.is_quiet(at("2026-10-15T03:00:00+11:00")));
+        assert!(!c.is_quiet(at("2026-10-15T06:30:00+11:00")));
+        assert!(!c.is_quiet(at("2026-10-14T14:00:00+11:00")));
+    }
+
+    #[test]
+    fn only_confirmed_intrusions_and_multi_camera_outages_ring_the_phone() {
+        let alarm = Event {
+            kind: "alarm".into(),
+            level: 3,
+            intrusion_confirmed: true,
+            ..Event::default()
+        };
+        assert!(needs_phone(&alarm));
+        assert!(!needs_phone(&Event {
+            intrusion_confirmed: false,
+            ..alarm.clone()
+        }));
+        let off = Event {
+            kind: "system".into(),
+            level: 3,
+            cause: Some("Device offline".into()),
+            offline_cameras: Some(2),
+            ..Event::default()
+        };
+        assert!(needs_phone(&off));
+        assert!(!needs_phone(&Event {
+            offline_cameras: Some(1),
+            ..off.clone()
+        }));
+        assert!(!needs_phone(&Event {
+            cause: Some("Disk error".into()),
+            ..off
+        }));
+        assert_eq!(
+            requested_secs(
+                Some("2026-10-14T14:00:00+11:00"),
+                Some("2026-10-14T14:02:00+11:00")
+            ),
+            Some(120.0)
+        );
+    }
+}

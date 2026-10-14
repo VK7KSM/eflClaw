@@ -151,6 +151,7 @@ mod tests {
         let caller = CallerInfo {
             channel: "discord".to_string(),
             sender: "alice".to_string(),
+            reply_target: String::new(),
         };
         let result = CALLER_INFO
             .scope(caller, async { tool.execute(json!({})).await.unwrap() })
@@ -169,6 +170,7 @@ mod tests {
         let caller = CallerInfo {
             channel: "telegram".to_string(),
             sender: "mallory".to_string(),
+            reply_target: String::new(),
         };
         let result = CALLER_INFO
             .scope(caller, async { tool.execute(json!({})).await.unwrap() })
@@ -193,6 +195,7 @@ mod tests {
         let caller = CallerInfo {
             channel: "telegram".to_string(),
             sender: "alice".to_string(),
+            reply_target: String::new(),
         };
         let result = CALLER_INFO
             .scope(caller, async { tool.execute(json!({})).await.unwrap() })

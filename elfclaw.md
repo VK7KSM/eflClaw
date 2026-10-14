@@ -620,6 +620,23 @@ Gemini 的地址是 `https://generativelanguage.googleapis.com/v1beta/models/{�
 - **注意**：网关同时只能打一路，家人用 300 打电话时会回 486（线路占用），这算"没打出去"，不算对方拒接。
 - 号码等个人信息不进代码和 git；日志里号码只留后三位。
 
+## 21. 家庭监控对接（2026-10-14）
+
+`src/cctv/` + `tools/cctv.rs`。分工：cctv-server（cctv 会话负责）识别、判断并定级别；elfClaw 只负责送达，以及 Telegram 里的查询和控制。
+只有 elfClaw 去连 cctv（长轮询），接口约定在 `C:\Dev\CCTV\docs\elfclaw-api.md`。
+
+- **推送**：
+  - level 3 任何时候都响铃；level 2 在 23:00–06:30 静音；level 1 只进每天 07:00 的汇总；
+  - 先发快照，视频生成好后作为回复补发；
+  - 推给 `[cctv].send_to` 里的两个账号。
+- **电话报警**：只在"确认有人闯入"和"2 台以上摄像头连不上"（含监控服务整个连不上）时触发。
+  - 短信、电话、Telegram"已看到"按钮同时进行；电话里说"知道了"、挂断、回短信、点按钮，任意一种都算确认；
+  - 2 分钟内没有确认就再补发一次，只补一次。
+- **Telegram 查询和控制**：
+  - `cctv` 工具：看实时画面、查记录、要实时或历史录像、转云台；
+  - `cctv_arm` 工具：布防和撤防，要放进 `autonomy.always_ask`，执行前先让用户确认。
+- 令牌放在 K5 用户环境变量 `CCTV_ELFCLAW_TOKEN`，已加进 `start_bot.vbs` 的现读列表。
+
 ## 13. 代码语言约束
 
 **全部用 Rust 实现，不引入 Python 等其他语言的运行时依赖。** 之前分析阶段用 Python 脚本做过一次性的数据分析（读 K6 拷回来的 SQLite/日志、测 Gemini key），那些是本地一次性工具，不进入 elfClaw 代码库；正式功能代码一律 Rust。

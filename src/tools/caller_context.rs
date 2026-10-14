@@ -17,6 +17,9 @@ pub struct CallerInfo {
     pub channel: String,
     /// Sender identifier within that channel (e.g. Telegram user ID).
     pub sender: String,
+    /// elfClaw 2026-10-14: where replies go (e.g. the Telegram chat id), so a
+    /// tool can deliver a photo or video straight into the conversation.
+    pub reply_target: String,
 }
 
 /// Read the current caller info from the task-local, if set.

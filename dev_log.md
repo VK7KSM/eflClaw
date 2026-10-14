@@ -7278,3 +7278,53 @@ GitHub 上现成的 Rust SIP 库都不合适：rsipstack 只有信令、不管�
 - 提示录音放在 `workspace\sip\`（sip_alarm_prompt.wav、sip_confirm.wav）。
 - `start_bot.vbs` 的现读环境变量列表加上 `CCTV_ELFCLAW_TOKEN`，给接下来的监控对接用。
 - 启动后 5 秒内 SIP 组件为 ok：108 已常驻注册。
+
+## 2026-10-14 — 家庭监控对接：报警推送、电话报警、Telegram 查询与控制
+
+接口约定：`C:\Dev\CCTV\docs\elfclaw-api.md` v1.3（以 cctv-server 为准）。用户定的规则见长期记忆 cctv_integration。
+
+### 新模块 `src/cctv/`
+
+- `api.rs`：cctv-server `/cctv/v1/` 客户端（Bearer 令牌取环境变量 `CCTV_ELFCLAW_TOKEN`）。
+  - 覆盖长轮询事件流、健康检查、摄像头列表、历史查询（分页）、快照和录像下载（202 表示还在生成）、
+    实时录像和历史录像任务、云台、布防撤防；
+  - 认不出的字段一律忽略（实际返回里有接口约定没写的 ai、notes、rule_level）。
+- `tg.rs`：推送专用的 Telegram Bot API 调用，能拿回消息编号（用来回复和改说明文字），支持静音送达和"已看到"按钮。
+  编辑消息时把按钮带上，否则 Telegram 会把它去掉。
+- `store.rs`：`state/cctv.db`，记录游标、每个事件推到了哪一级、各聊天里的消息编号、谁要了哪段录像。
+  连接放在 Mutex 里，这样能在跨线程的异步任务里用。
+- `format.rs`：推送文字。图标按级别和种类区分；
+  内容依次是 AI 描述（没有时写"画面里有人/有车"）、离线台数、误报标注、时间、网页链接。
+- `worker.rs`：长轮询主循环。
+  - level 3 任何时候都响铃推送；level 2 在 23:00–06:30 静音推送；level 1 不推，只进早上的汇总；恢复类事件静音推送。
+  - 先发快照加文字。事件没带快照时（5 号摄像头偶尔取不到），用同一台摄像头的实时画面补一张。
+    视频生成好后作为回复补发；视频失败时回复"这次没有录像：原因"。
+  - 级别升高时重新推一条（作为回复）；AI 描述后到时改原消息的说明文字；AI 降到 level 1 时在原消息上注明"可能是误报"。
+  - 用户主动要的录像（job）发回给要的那个聊天；实际时长比要求的短时，注明"录像不完整"。
+  - 监控服务连不上超过 3 分钟：按最高级报警处理（推送并打电话）；恢复后静音通知一声。
+  - 事件流 gap：提示"中间部分事件没有推送"。每天 07:00 推送过去 24 小时的汇总（静音）。
+- `alarm.rs`：最高级报警的电话流程，只在两种情况触发：
+  `intrusion_confirmed`，或 `system` Device offline 且 `offline_cameras >= 2`（监控服务整个连不上也算）。
+  - 依次发短信、打电话（复用 `src/sip/`），同时等待以下任一确认：
+    电话里说"知道了"、挂断电话、回短信（号码 +61 和 0 两种写法都认）、在 Telegram 点"已看到"。
+  - 2 分钟内没有确认 → 再推一次 Telegram、发一次短信、打一次电话，只补发一次；
+    每次电话的结果都会以静音回复的方式写到报警消息下面。
+  - 同一时间只跑一组电话流程，后来的报警只推 Telegram。
+- `mod.rs`：daemon 组件 "cctv"。读取 `[cctv]` 配置、`workspace/sip/` 里的提示录音，用 `[sip].stt_url` 做本地语音识别，
+  并注册"已看到"按钮的回调。
+
+### 其他改动
+
+- `channels/telegram.rs`：新增 `register_callback_handler(prefix, handler)`，其他模块可以接管自己按钮的点击
+  （只认白名单用户，回调后自动去掉按钮），不再需要 Telegram 模块了解监控的细节。
+- `tools/caller_context.rs`：CallerInfo 增加 `reply_target`（当前聊天编号），工具可以直接把图片和视频发进当前对话。
+- `tools/cctv.rs`：
+  - `cctv` 工具：摄像头列表、实时画面、历史查询、实时录像、历史录像、云台（预置位、转动、变焦、停止，转完自动补发一张新画面）；
+  - `cctv_arm` 工具：布防和撤防。单独拆成一个工具，是为了能放进执行前必须确认的名单（autonomy.always_ask）。
+  - 摄像头可以按编号、全名或名字里的词来匹配；时间可以写 HH:MM（今天，如果还没到就算昨天）或 YYYY-MM-DD HH:MM。
+- 配置：新增 `[cctv]` 段（enabled、base_url、send_to、owner_mobile、quiet_start、quiet_end、summary_time、timezone）。
+
+### 验证
+
+- 单测：`cctv` 相关 11 个；`cargo test --lib` 4238 通过，10 失败 = 已知基线；集成测试只有已知 3 个。
+- 改动行上没有 clippy 告警。`reply_target_field_regression` 测试禁止出现 `reply_to:` 这种写法，所以发送选项的字段改名为 `parent`。

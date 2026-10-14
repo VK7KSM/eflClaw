@@ -386,6 +386,10 @@ pub struct Config {
     #[serde(default)]
     pub sip: SipConfig,
 
+    /// elfClaw 2026-10-14: home CCTV link (`[cctv]`).
+    #[serde(default)]
+    pub cctv: CctvConfig,
+
     /// Chat log persistence and summarization (`[chat_log]`).
     #[serde(default)]
     pub chat_log: ChatLogConfig,
@@ -702,6 +706,65 @@ impl Default for TranscriptionConfig {
             model: default_transcription_model(),
             language: None,
             max_duration_secs: default_transcription_max_duration_secs(),
+        }
+    }
+}
+
+// ── CCTV ─────────────────────────────────────────────────────────
+
+/// elfClaw 2026-10-14: cctv-server alarms to Telegram (and the phone line for
+/// the highest ones). Off unless `enabled`. The API token comes from the
+/// `CCTV_ELFCLAW_TOKEN` environment variable.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct CctvConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// e.g. `http://192.168.2.21:8095/cctv/v1`.
+    #[serde(default)]
+    pub base_url: String,
+    /// Telegram chat ids that get the pushes.
+    #[serde(default)]
+    pub send_to: Vec<String>,
+    /// Mobile called and texted for a confirmed intrusion or ≥ 2 cameras down
+    /// (needs `[sip]`). Empty: Telegram only.
+    #[serde(default)]
+    pub owner_mobile: String,
+    /// Level-2 pushes are silent between these times (`HH:MM`).
+    #[serde(default = "default_cctv_quiet_start")]
+    pub quiet_start: String,
+    #[serde(default = "default_cctv_quiet_end")]
+    pub quiet_end: String,
+    /// Daily summary of the unpushed (level 1) events.
+    #[serde(default = "default_cctv_summary_time")]
+    pub summary_time: String,
+    #[serde(default = "default_cctv_timezone")]
+    pub timezone: String,
+}
+
+fn default_cctv_quiet_start() -> String {
+    "23:00".into()
+}
+fn default_cctv_quiet_end() -> String {
+    "06:30".into()
+}
+fn default_cctv_summary_time() -> String {
+    "07:00".into()
+}
+fn default_cctv_timezone() -> String {
+    "Australia/Sydney".into()
+}
+
+impl Default for CctvConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            base_url: String::new(),
+            send_to: Vec::new(),
+            owner_mobile: String::new(),
+            quiet_start: default_cctv_quiet_start(),
+            quiet_end: default_cctv_quiet_end(),
+            summary_time: default_cctv_summary_time(),
+            timezone: default_cctv_timezone(),
         }
     }
 }
@@ -6539,6 +6602,7 @@ impl Default for Config {
             transcription: TranscriptionConfig::default(),
             tts: TtsConfig::default(),
             sip: SipConfig::default(),
+            cctv: CctvConfig::default(),
             chat_log: ChatLogConfig::default(),
             mcp: McpConfig::default(),
             model_support_vision: None,
@@ -9955,6 +10019,7 @@ ws_url = "ws://127.0.0.1:3002"
             transcription: TranscriptionConfig::default(),
             tts: TtsConfig::default(),
             sip: SipConfig::default(),
+            cctv: CctvConfig::default(),
             chat_log: ChatLogConfig::default(),
             mcp: McpConfig::default(),
             model_support_vision: None,
@@ -10324,6 +10389,7 @@ tool_dispatcher = "xml"
             transcription: TranscriptionConfig::default(),
             tts: TtsConfig::default(),
             sip: SipConfig::default(),
+            cctv: CctvConfig::default(),
             chat_log: ChatLogConfig::default(),
             mcp: McpConfig::default(),
             model_support_vision: None,

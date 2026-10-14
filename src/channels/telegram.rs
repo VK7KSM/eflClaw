@@ -138,6 +138,21 @@ fn build_telegram_ack_reaction_request(
     })
 }
 
+/// elfClaw 2026-10-14: handler for inline-button presses with a given data
+/// prefix — `(data, username) -> toast`. Lets a module (e.g. the CCTV "已看到"
+/// button) own its buttons without the channel knowing about it.
+pub type CallbackHandler = std::sync::Arc<dyn Fn(&str, &str) -> Option<String> + Send + Sync>;
+
+static CALLBACK_HANDLERS: parking_lot::RwLock<Vec<(&'static str, CallbackHandler)>> =
+    parking_lot::RwLock::new(Vec::new());
+
+/// Route button presses whose callback data starts with `prefix` to `handler`.
+pub fn register_callback_handler(prefix: &'static str, handler: CallbackHandler) {
+    let mut handlers = CALLBACK_HANDLERS.write();
+    handlers.retain(|(p, _)| *p != prefix);
+    handlers.push((prefix, handler));
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TelegramAttachmentKind {
     Image,
@@ -784,6 +799,60 @@ impl TelegramChannel {
             }
             let _ = client.post(&url).json(&body).send().await;
         });
+    }
+
+    /// elfClaw 2026-10-14: a button press whose data starts with a prefix
+    /// another module registered (see `register_callback_handler`). Handled
+    /// here — answered with the handler's toast and the button removed — and
+    /// never passed on as a chat message. Only allowed users count.
+    fn try_handle_registered_callback(&self, update: &serde_json::Value) -> bool {
+        let Some(callback) = update.get("callback_query") else {
+            return false;
+        };
+        let Some(data) = callback.get("data").and_then(serde_json::Value::as_str) else {
+            return false;
+        };
+        let handler = CALLBACK_HANDLERS
+            .read()
+            .iter()
+            .find(|(prefix, _)| data.starts_with(prefix))
+            .map(|(_, h)| h.clone());
+        let Some(handler) = handler else {
+            return false;
+        };
+        let callback_id = callback
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let (username, sender_id, _) = Self::extract_sender_info(callback);
+        let mut identities = vec![username.as_str()];
+        if let Some(id) = sender_id.as_deref() {
+            identities.push(id);
+        }
+        if !self.is_any_user_allowed(identities.iter().copied()) {
+            self.answer_callback_query_nonblocking(callback_id, "无权限");
+            return true;
+        }
+        let toast = handler(data, &username).unwrap_or_else(|| "已收到".to_string());
+        self.answer_callback_query_nonblocking(callback_id, &toast);
+        if let Some(message) = callback.get("message") {
+            let chat_id = message
+                .get("chat")
+                .and_then(|chat| chat.get("id"))
+                .and_then(serde_json::Value::as_i64);
+            let message_id = message
+                .get("message_id")
+                .and_then(serde_json::Value::as_i64);
+            if let (Some(chat_id), Some(message_id)) = (chat_id, message_id) {
+                self.clear_callback_inline_keyboard_nonblocking(
+                    chat_id.to_string(),
+                    message_id,
+                    None,
+                );
+            }
+        }
+        true
     }
 
     fn try_parse_approval_callback_query(
@@ -3795,6 +3864,9 @@ Ensure only one `zeroclaw` process is using this bot token."
 
                 // Standalone updates: existing parse chain (behavior unchanged).
                 for update in standalone {
+                    if self.try_handle_registered_callback(update) {
+                        continue;
+                    }
                     let msg = if let Some(m) = self.parse_update_message(update) {
                         m
                     } else if let Some(m) = self.try_parse_approval_callback_query(update) {

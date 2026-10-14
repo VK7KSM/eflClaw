@@ -22,6 +22,7 @@ pub mod bg_run;
 pub mod browser;
 pub mod browser_open;
 pub mod caller_context;
+pub mod cctv; // elfClaw: home CCTV look/control
 pub mod cf_crawler;
 pub mod cli_discovery;
 pub mod composio;
@@ -643,6 +644,23 @@ pub fn all_tools_with_runtime(
             security.clone(),
             email_cfg.clone(),
         )));
+    }
+
+    // elfClaw 2026-10-14: home CCTV tools when [cctv] is on (needs Telegram).
+    if root_config.cctv.enabled {
+        if let Some(ref tg_cfg) = root_config.channels_config.telegram {
+            match cctv::CctvLink::new(root_config, &tg_cfg.bot_token) {
+                Ok(link) => {
+                    let link = Arc::new(link);
+                    tool_arcs.push(Arc::new(cctv::CctvTool::new(
+                        link.clone(),
+                        security.clone(),
+                    )));
+                    tool_arcs.push(Arc::new(cctv::CctvArmTool::new(link, security.clone())));
+                }
+                Err(e) => tracing::warn!("CCTV tools not registered: {e:#}"),
+            }
+        }
     }
 
     // elfClaw: send_telegram + send_voice tools when telegram is configured

@@ -240,6 +240,20 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
         }
     }
 
+    // elfClaw 2026-10-14: home CCTV alarms (long poll to cctv-server).
+    if config.cctv.enabled {
+        let cctv_cfg = config.clone();
+        handles.push(spawn_component_supervisor(
+            "cctv",
+            initial_backoff,
+            max_backoff,
+            move || {
+                let cfg = cctv_cfg.clone();
+                async move { Box::pin(crate::cctv::run(cfg)).await }
+            },
+        ));
+    }
+
     if config.heartbeat.enabled {
         let heartbeat_cfg = config.clone();
         handles.push(spawn_component_supervisor(

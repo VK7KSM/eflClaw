@@ -3269,6 +3269,7 @@ async fn run_message_dispatch_loop(
             let caller = crate::tools::caller_context::CallerInfo {
                 channel: msg.channel.clone(),
                 sender: msg.sender.clone(),
+                reply_target: msg.reply_target.clone(),
             };
             crate::tools::caller_context::CALLER_INFO
                 .scope(caller, async {

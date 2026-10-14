@@ -248,6 +248,7 @@ mod tests {
         let caller = CallerInfo {
             channel: "telegram".into(),
             sender: "zeroclaw_chat_b".into(),
+            reply_target: String::new(),
         };
         let result = CALLER_INFO
             .scope(

@@ -60,6 +60,7 @@ fn parse_temperature(s: &str) -> std::result::Result<f64, String> {
 mod agent;
 mod approval;
 mod auth;
+mod cctv; // elfClaw: home CCTV alarms
 mod channels;
 mod config;
 mod coordination;

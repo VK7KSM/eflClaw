@@ -42,6 +42,7 @@ use serde::{Deserialize, Serialize};
 pub mod agent;
 pub(crate) mod approval;
 pub(crate) mod auth;
+pub(crate) mod cctv; // elfClaw: home CCTV alarms
 pub mod channels;
 pub mod config;
 pub mod coordination;
