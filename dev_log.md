@@ -7270,3 +7270,11 @@ GitHub 上现成的 Rust SIP 库都不合适：rsipstack 只有信令、不管�
 
 - 报警逻辑本身（监控事件 → Telegram + 电话 + 短信、2 分钟补发一次）在下一步的监控对接里做。
 - K5 上还没开启 `[sip]`（部署时再开），提示录音放在 `资料/sip/`，部署时拷到 workspace。
+
+### 部署 K5（10-14 14:55）
+
+- 新 exe 上线；`config.toml`（改前备份为 `config.toml.before-sip`）新增 `[sip]` 段：enabled、server、port 5061、
+  credentials_file = `C:\K5-DEV\elfClaw\SIP.txt`、stt_url = `http://127.0.0.1:8766/stt`。
+- 提示录音放在 `workspace\sip\`（sip_alarm_prompt.wav、sip_confirm.wav）。
+- `start_bot.vbs` 的现读环境变量列表加上 `CCTV_ELFCLAW_TOKEN`，给接下来的监控对接用。
+- 启动后 5 秒内 SIP 组件为 ok：108 已常驻注册。
