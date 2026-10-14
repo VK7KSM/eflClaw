@@ -146,6 +146,38 @@ pub type CallbackHandler = std::sync::Arc<dyn Fn(&str, &str) -> Option<String> +
 static CALLBACK_HANDLERS: parking_lot::RwLock<Vec<(&'static str, CallbackHandler)>> =
     parking_lot::RwLock::new(Vec::new());
 
+/// elfClaw 2026-10-14: a bot-menu command another module owns —
+/// `(chat_id, sender) -> reply`. Answered by the program, never sent to the
+/// model (e.g. the CCTV mute switch).
+pub type CommandHandler = std::sync::Arc<dyn Fn(&str, &str) -> String + Send + Sync>;
+
+static MENU_COMMANDS: parking_lot::RwLock<Vec<(&'static str, &'static str, CommandHandler)>> =
+    parking_lot::RwLock::new(Vec::new());
+
+/// Add `/command` to the bot menu and answer it with `handler`. Register
+/// before the channel starts: the menu is sent to Telegram at start-up.
+pub fn register_menu_command(
+    command: &'static str,
+    description: &'static str,
+    handler: CommandHandler,
+) {
+    let mut commands = MENU_COMMANDS.write();
+    commands.retain(|(c, _, _)| *c != command);
+    commands.push((command, description, handler));
+}
+
+/// The reply to a registered menu command (`/cmd` or `/cmd@bot`), if `text` is one.
+fn menu_command_reply(text: &str, chat: &str, sender: &str) -> Option<String> {
+    let word = text.trim().strip_prefix('/')?.split_whitespace().next()?;
+    let name = word.split('@').next()?;
+    let handler = MENU_COMMANDS
+        .read()
+        .iter()
+        .find(|(c, _, _)| c.eq_ignore_ascii_case(name))
+        .map(|(_, _, h)| h.clone())?;
+    Some(handler(chat, sender))
+}
+
 /// Route button presses whose callback data starts with `prefix` to `handler`.
 pub fn register_callback_handler(prefix: &'static str, handler: CallbackHandler) {
     let mut handlers = CALLBACK_HANDLERS.write();
@@ -1144,14 +1176,16 @@ impl TelegramChannel {
     /// appear in the command menu for users. Called once on startup.
     async fn register_commands(&self) -> anyhow::Result<()> {
         let url = self.api_url("setMyCommands");
-        let body = serde_json::json!({
-            "commands": [
-                { "command": "new", "description": "Start a new conversation" },
-                { "command": "model", "description": "Show or switch the current model" },
-                { "command": "models", "description": "Show or switch the current provider" },
-                { "command": "pause", "description": "Pause current task (⏸ 暂停当前任务)" },
-            ]
-        });
+        let mut commands = vec![
+            serde_json::json!({ "command": "new", "description": "Start a new conversation" }),
+            serde_json::json!({ "command": "model", "description": "Show or switch the current model" }),
+            serde_json::json!({ "command": "models", "description": "Show or switch the current provider" }),
+            serde_json::json!({ "command": "pause", "description": "Pause current task (⏸ 暂停当前任务)" }),
+        ];
+        for (command, description, _) in MENU_COMMANDS.read().iter() {
+            commands.push(serde_json::json!({ "command": command, "description": description }));
+        }
+        let body = serde_json::json!({ "commands": commands });
 
         let resp = self.http_client().post(&url).json(&body).send().await?;
 
@@ -2176,7 +2210,12 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 "[Voice message]".to_string()
             }
         } else if reply.get("photo").is_some() {
-            "[Photo]".to_string()
+            // elfClaw: keep the caption — for a CCTV push it names the camera
+            // and the event, so the agent can look the picture up.
+            match reply.get("caption").and_then(serde_json::Value::as_str) {
+                Some(c) if !c.trim().is_empty() => format!("[Photo] {c}"),
+                _ => "[Photo]".to_string(),
+            }
         } else if reply.get("document").is_some() {
             "[Document]".to_string()
         } else if reply.get("video").is_some() {
@@ -3897,6 +3936,18 @@ Ensure only one `zeroclaw` process is using this bot token."
                         }
                     };
 
+                    // elfClaw: menu commands other modules registered are
+                    // answered here, without the model.
+                    let chat = msg.reply_target.split(':').next().unwrap_or_default();
+                    if let Some(reply) = menu_command_reply(&msg.content, chat, &msg.sender) {
+                        let notice = SendMessage::new(reply, &msg.reply_target)
+                            .in_thread(msg.thread_ts.clone());
+                        if let Err(e) = self.send(&notice).await {
+                            tracing::warn!("Failed to answer menu command: {e}");
+                        }
+                        continue;
+                    }
+
                     if let Some((reaction_chat_id, reaction_message_id, chat_type, sender_id)) =
                         Self::extract_update_message_ack_target(update)
                     {
@@ -4548,6 +4599,34 @@ mod tests {
             infer_attachment_kind_from_target("https://example.com/files/specs.pdf?download=1"),
             Some(TelegramAttachmentKind::Document)
         );
+    }
+
+    #[test]
+    fn registered_menu_commands_are_answered_without_the_model() {
+        register_menu_command(
+            "zz_test_cmd",
+            "test",
+            std::sync::Arc::new(|chat, sender| format!("ok {chat} {sender}")),
+        );
+        assert_eq!(
+            menu_command_reply("/zz_test_cmd", "100", "zeroclaw_user").as_deref(),
+            Some("ok 100 zeroclaw_user")
+        );
+        assert_eq!(
+            menu_command_reply("/zz_test_cmd@elfclaw_bot extra", "100", "u").as_deref(),
+            Some("ok 100 u")
+        );
+        assert!(
+            menu_command_reply("zz_test_cmd", "100", "u").is_none(),
+            "needs the slash"
+        );
+        assert!(
+            menu_command_reply("/new", "100", "u").is_none(),
+            "built-ins stay with the agent"
+        );
+        MENU_COMMANDS
+            .write()
+            .retain(|(c, _, _)| *c != "zz_test_cmd");
     }
 
     #[test]
@@ -5878,6 +5957,27 @@ mod tests {
         });
         let ctx = ch.extract_reply_context(&msg).unwrap();
         assert_eq!(ctx, "> @bob:\n> [Voice message]");
+    }
+
+    #[test]
+    fn extract_reply_context_photo_keeps_caption() {
+        let ch = TelegramChannel::new("t".into(), vec!["*".into()], false, true);
+        let msg = serde_json::json!({
+            "reply_to_message": {
+                "from": { "username": "zeroclaw_bot" },
+                "photo": [{ "file_id": "p" }],
+                "caption": "Front yard\nhttps://example.com/#/events/7"
+            }
+        });
+        let ctx = ch.extract_reply_context(&msg).unwrap();
+        assert_eq!(
+            ctx,
+            "> @zeroclaw_bot:\n> [Photo] Front yard\n> https://example.com/#/events/7"
+        );
+        let bare = serde_json::json!({
+            "reply_to_message": { "from": { "username": "u" }, "photo": [{ "file_id": "p" }] }
+        });
+        assert_eq!(ch.extract_reply_context(&bare).unwrap(), "> @u:\n> [Photo]");
     }
 
     #[test]

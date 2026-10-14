@@ -204,6 +204,8 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
 
     // elfClaw 2026-10-14: SIP phone line (alarm calls, SMS), always registered.
     crate::sip::start_from_config(&config);
+    // elfClaw: CCTV menu switches must exist before Telegram sends its menu.
+    crate::cctv::register_menu(&config);
 
     let mut handles: Vec<JoinHandle<()>> = vec![spawn_state_writer(config.clone())];
 

@@ -6,9 +6,11 @@
 use super::traits::{Tool, ToolResult};
 use crate::cctv::api::{CctvApi, Monitor};
 use crate::cctv::tg::{Bot, SendOpts};
+use crate::providers::{self, ChatMessage, ChatRequest, Provider, ProviderRuntimeOptions};
 use crate::security::SecurityPolicy;
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
+use base64::Engine as _;
 use chrono::{DateTime, FixedOffset, NaiveDateTime, NaiveTime, TimeZone, Utc};
 use chrono_tz::Tz;
 use serde_json::{json, Value};
@@ -17,12 +19,54 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Instructions for looking at a camera picture.
+const LOOK_PROMPT: &str =
+    "你在看用户自己家里监控摄像头的画面。用中文简洁地说清楚画面里看得到的东西：\
+有没有人（几个、在哪、在做什么、穿着）、车辆（停着还是在动）、动物、门和大门的状态、\
+任何异常。只说看得到的，看不清就说看不清，不要编。用户有具体问题时先回答问题。";
+
+/// The model that looks at pictures (the chat model; Gemini sees images).
+struct Vision {
+    provider: Box<dyn Provider>,
+    model: String,
+}
+
 /// Shared by both tools.
 pub struct CctvLink {
     api: CctvApi,
     bot: Bot,
     tz: Tz,
     workspace: PathBuf,
+    send_to: Vec<String>,
+    vision: Option<Vision>,
+}
+
+fn vision_from(config: &crate::config::Config) -> Option<Vision> {
+    let options = ProviderRuntimeOptions {
+        zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
+        secrets_encrypt: config.secrets.encrypt,
+        reasoning_level: Some(1),
+        ..ProviderRuntimeOptions::default()
+    };
+    match providers::create_resilient_provider_with_options(
+        config.default_provider.as_deref().unwrap_or("gemini"),
+        config.api_key.as_deref(),
+        config.api_url.as_deref(),
+        &config.reliability,
+        &options,
+    ) {
+        Ok(provider) => Some(Vision {
+            provider,
+            model: config
+                .default_model
+                .clone()
+                .unwrap_or_else(|| "gemini-3.5-flash".into()),
+        }),
+        Err(e) => {
+            tracing::warn!("CCTV pictures will not be described: {e:#}");
+            None
+        }
+    }
 }
 
 impl CctvLink {
@@ -36,7 +80,45 @@ impl CctvLink {
                 .parse()
                 .unwrap_or(chrono_tz::Australia::Sydney),
             workspace: config.workspace_dir.clone(),
+            send_to: config.cctv.send_to.clone(),
+            vision: vision_from(config),
         })
+    }
+
+    /// What the model sees in `jpeg` (`what` says which camera and when).
+    /// Never fails: a failure becomes the text the agent gets.
+    async fn look(&self, jpeg: &[u8], what: &str, question: Option<&str>) -> String {
+        let Some(v) = &self.vision else {
+            return "（没有能看图的模型，无法分析画面）".into();
+        };
+        let mut user = format!("这是{what}。");
+        if let Some(q) = question.map(str::trim).filter(|q| !q.is_empty()) {
+            let _ = write!(user, "\n用户的问题：{q}");
+        }
+        let _ = write!(
+            user,
+            "\n[IMAGE:data:image/jpeg;base64,{}]",
+            base64::engine::general_purpose::STANDARD.encode(jpeg)
+        );
+        let messages = [ChatMessage::system(LOOK_PROMPT), ChatMessage::user(user)];
+        let request = ChatRequest {
+            messages: &messages,
+            tools: None,
+        };
+        match tokio::time::timeout(
+            Duration::from_secs(90),
+            v.provider.chat(request, &v.model, 0.2),
+        )
+        .await
+        {
+            Ok(Ok(r)) => r
+                .text
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+                .unwrap_or_else(|| "（模型没有给出描述）".into()),
+            Ok(Err(e)) => format!("（看图失败：{e:#}）"),
+            Err(_) => "（看图超时）".into(),
+        }
     }
 
     async fn camera(&self, wanted: Option<&str>, need_ptz: bool) -> Result<Monitor> {
@@ -191,7 +273,77 @@ impl CctvTool {
         let n = |k: &str| args.get(k).and_then(Value::as_u64);
         let action = s("action").unwrap_or_default();
         let camera = s("camera");
+        let question = s("question");
         match action.as_str() {
+            "alerts_off" | "alerts_on" => {
+                let chat = caller_chat().context("只能在 Telegram 对话里开关监控推送")?;
+                Ok(crate::cctv::set_alerts(
+                    &link.workspace,
+                    &link.send_to,
+                    &chat,
+                    action == "alerts_on",
+                )?
+                .to_string())
+            }
+            "event_snapshot" => {
+                let wanted = n("event_id").or_else(|| {
+                    s("event_id").and_then(|v| v.trim().trim_start_matches('#').parse().ok())
+                });
+                let e = match wanted {
+                    Some(id) => link.api.event(i64::try_from(id)?).await?,
+                    None => {
+                        let mut q = vec![
+                            "limit=1".to_string(),
+                            format!("min_level={}", n("min_level").unwrap_or(2)),
+                        ];
+                        if let Some(c) = camera.as_deref() {
+                            q.push(format!("monitor={}", link.camera(Some(c), false).await?.id));
+                        }
+                        link.api
+                            .events(&q.join("&"))
+                            .await?
+                            .events
+                            .into_iter()
+                            .next()
+                            .context("没有找到符合条件的报警")?
+                    }
+                };
+                let url = e.snapshot_url.as_deref().context("这个事件没有快照")?;
+                let jpeg = link
+                    .api
+                    .bytes(url, Duration::from_secs(20))
+                    .await?
+                    .context("快照还没准备好")?;
+                let at = e
+                    .start
+                    .as_deref()
+                    .map(crate::cctv::format::clock)
+                    .unwrap_or_default();
+                let label = format!(
+                    "{} {at} 的报警快照（事件 {}，{}）",
+                    e.monitor_name.as_deref().unwrap_or("监控"),
+                    e.event_id.unwrap_or_default(),
+                    e.cause_zh
+                        .as_deref()
+                        .or(e.cause.as_deref())
+                        .unwrap_or("报警")
+                );
+                let mut out = label.clone();
+                if args.get("send").and_then(Value::as_bool) == Some(true) {
+                    if let Some(chat) = caller_chat() {
+                        link.send_photo(&chat, jpeg.clone(), &label).await?;
+                        out.push_str("，已发到对话里");
+                    }
+                }
+                if let Some(d) = e.description.as_deref().filter(|d| !d.trim().is_empty()) {
+                    let _ = write!(out, "\ncctv 当时的 AI 判断：{d}");
+                }
+                let seen = link
+                    .look(&jpeg, &format!("家里监控 {label}"), question.as_deref())
+                    .await;
+                let _ = write!(out, "\n画面内容：{seen}");
+                Ok(out)
+            }
             "cameras" => {
                 let list = link.api.monitors().await?;
                 Ok(list
@@ -233,9 +385,17 @@ impl CctvTool {
                 let m = link.camera(camera.as_deref(), false).await?;
                 let jpeg = link.api.live_snapshot(m.id).await?;
                 let at = crate::cctv::format::clock(&link.now_iso());
-                link.send_photo(&chat, jpeg, &format!("{} 现在的画面 {at}", m.name))
-                    .await?;
-                Ok(format!("{} 的实时画面已经发到对话里。", m.name))
+                let what = format!("摄像头 {} 在 {at} 的实时画面", m.name);
+                let caption = format!("{} 现在的画面 {at}", m.name);
+                let (sent, seen) = tokio::join!(
+                    link.send_photo(&chat, jpeg.clone(), &caption),
+                    link.look(&jpeg, &what, question.as_deref())
+                );
+                sent?;
+                Ok(format!(
+                    "{} 的实时画面（{at}）已发到对话里，用户能看到。\n画面内容：{seen}",
+                    m.name
+                ))
             }
             "events" => {
                 let now = Utc::now();
@@ -276,7 +436,8 @@ impl CctvTool {
                             })
                             .unwrap_or_default();
                         format!(
-                            "{} {} {} {} 级别{}",
+                            "#{} {} {} {} {} 级别{}",
+                            e.event_id.unwrap_or_default(),
                             e.start
                                 .as_deref()
                                 .map(crate::cctv::format::clock)
@@ -382,10 +543,16 @@ impl CctvTool {
                 if let Some(chat) = chat {
                     tokio::time::sleep(Duration::from_millis(wait_ms)).await;
                     if let Ok(jpeg) = link.api.live_snapshot(m.id).await {
-                        let _ = link
-                            .send_photo(&chat, jpeg, &format!("{}：{done}后的画面", m.name))
-                            .await;
-                        return Ok(format!("{} 已{done}，新画面已发到对话里。", m.name));
+                        let what = format!("云台摄像头 {} {done}后的画面", m.name);
+                        let caption = format!("{}：{done}后的画面", m.name);
+                        let (_, seen) = tokio::join!(
+                            link.send_photo(&chat, jpeg.clone(), &caption),
+                            link.look(&jpeg, &what, question.as_deref())
+                        );
+                        return Ok(format!(
+                            "{} 已{done}，新画面已发到对话里。\n画面内容：{seen}",
+                            m.name
+                        ));
                     }
                 }
                 Ok(format!("{} 已{done}。", m.name))
@@ -403,21 +570,31 @@ impl Tool for CctvTool {
 
     fn description(&self) -> &str {
         "Home CCTV (the user's own cameras). Actions: cameras (list cameras, PTZ presets, arm state); \
-         snapshot (send a live picture of one camera into this chat); events (what happened: \
+         snapshot (send a live picture of one camera into this chat AND get a description of what is \
+         in it); event_snapshot (look at the snapshot of a past alarm: event_id, or the latest alarm \
+         of a camera; a pushed alarm's link ends in /events/<event_id>; send=true also posts the \
+         picture, only needed when the user has not seen it); alerts_off / alerts_on (stop or \
+         resume alarm pushes to this chat; the cameras stay armed; same as the /cctv_off and \
+         /cctv_on menu commands); events (what happened: \
          optional camera, from/to as HH:MM or YYYY-MM-DD HH:MM, min_level 1-3); clip_live (record \
          5-20 s of live video now and send it); clip_history (recorded video from the NVR, from/to, \
          at most 5 minutes, ending at least 2 minutes ago); ptz (move the PTZ camera: ptz_action \
          preset with preset number or name, move/zoom with direction and duration_ms, or stop). \
          Camera names are English (e.g. 'Front yard', 'Garage front'); map the user's words to \
-         them, call cameras first if unsure. Pictures and videos are delivered by the tool itself; \
-         just tell the user they were sent."
+         them, call cameras first if unsure. Pictures and videos are delivered by the tool itself. \
+         snapshot, event_snapshot and ptz return what the picture shows (pass the user's question \
+         as 'question'): answer from that description and never say you cannot see the picture. \
+         Event lines start with #event_id."
     }
 
     fn parameters_schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "action": {"type": "string", "enum": ["cameras", "snapshot", "events", "clip_live", "clip_history", "ptz"]},
+                "action": {"type": "string", "enum": ["cameras", "snapshot", "event_snapshot", "events", "clip_live", "clip_history", "ptz", "alerts_off", "alerts_on"]},
+                "question": {"type": "string", "description": "What the user wants to know about the picture"},
+                "event_id": {"type": "integer", "description": "Alarm event id (event_snapshot)"},
+                "send": {"type": "boolean", "description": "event_snapshot: also post the picture"},
                 "camera": {"type": "string", "description": "Camera name (or number). For ptz it defaults to the PTZ camera."},
                 "from": {"type": "string", "description": "Start time: HH:MM (today) or YYYY-MM-DD HH:MM"},
                 "to": {"type": "string", "description": "End time, same format"},
@@ -464,8 +641,10 @@ impl Tool for CctvArmTool {
     }
 
     fn description(&self) -> &str {
-        "Arm or disarm home CCTV alarm pushes for one camera or all ('all'). Disarmed cameras still \
-         record but their alarms are not pushed. Optional 'until' (HH:MM or YYYY-MM-DD HH:MM) re-arms \
+        "Arm or disarm home CCTV alarm detection for one camera or all ('all'). Disarmed cameras \
+         still record but raise no alarms anywhere: no Telegram, no ntfy, no phone call even for a \
+         real intrusion. If the user only does not want Telegram alarm messages, do NOT disarm: use \
+         the cctv tool's alerts_off (or the /cctv_off menu). Optional 'until' (HH:MM or YYYY-MM-DD HH:MM) re-arms \
          automatically. Use state 'status' to just read the current state."
     }
 

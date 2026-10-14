@@ -16,6 +16,7 @@ pub mod worker;
 
 use crate::config::Config;
 use anyhow::{Context, Result};
+use std::path::Path;
 use std::sync::Arc;
 
 /// Prompt recordings for alarm calls, in `workspace/sip/` (8 kHz WAV).
@@ -56,6 +57,52 @@ fn alarm_line(config: &Config, bot: &tg::Bot, chats: &[String]) -> Option<Arc<al
         confirm: read_prompt(config, CONFIRM_WAV).ok().map(Arc::new),
         speech: crate::sip::stt::confirmation_check(config.sip.stt_url.clone()),
     }))
+}
+
+pub const MUTE_REPLY: &str =
+    "🔕 已停止向这个对话推送监控报警（摄像头照常布防、录像，cctv 自己的 ntfy 推送不受影响）。
+确认有人闯入、多台摄像头掉线这类会打电话的最高级报警仍然会推送。
+恢复：/cctv_on";
+pub const UNMUTE_REPLY: &str = "🔔 已恢复向这个对话推送监控报警。";
+
+/// Switch alarm pushes to `chat` off or on. Only chats in `[cctv] send_to`
+/// receive pushes at all.
+pub fn set_alerts(
+    workspace: &Path,
+    send_to: &[String],
+    chat: &str,
+    on: bool,
+) -> Result<&'static str> {
+    if !send_to.iter().any(|c| c.trim() == chat) {
+        return Ok("这个对话本来就不接收监控推送。");
+    }
+    store::Store::open(workspace)?.set_muted(chat, !on)?;
+    Ok(if on { UNMUTE_REPLY } else { MUTE_REPLY })
+}
+
+/// Bot-menu switches `/cctv_off` and `/cctv_on`, answered without the model.
+/// Call before the Telegram channel starts (it sends the menu at start-up).
+pub fn register_menu(config: &Config) {
+    if !config.cctv.enabled {
+        return;
+    }
+    for (command, description, on) in [
+        ("cctv_off", "停止接收监控报警推送", false),
+        ("cctv_on", "恢复接收监控报警推送", true),
+    ] {
+        let workspace = config.workspace_dir.clone();
+        let send_to = config.cctv.send_to.clone();
+        crate::channels::telegram::register_menu_command(
+            command,
+            description,
+            Arc::new(
+                move |chat, _sender| match set_alerts(&workspace, &send_to, chat, on) {
+                    Ok(reply) => reply.to_string(),
+                    Err(e) => format!("设置失败：{e:#}"),
+                },
+            ),
+        );
+    }
 }
 
 /// Daemon component: build everything from config and run the worker.

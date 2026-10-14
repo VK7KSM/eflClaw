@@ -6,7 +6,9 @@
 //! - first the text + snapshot at once, the clip as a reply once it is ready;
 //! - a later rise in level is pushed again; a description arriving later
 //!   edits the caption; an AI downgrade to level 1 is noted on the caption;
-//! - cctv-server unreachable for 3 minutes is itself a highest alarm.
+//! - cctv-server unreachable for 3 minutes is itself a highest alarm;
+//! - a chat that sent `/cctv_off` gets none of this until `/cctv_on`, except
+//!   the alarms that also ring the phone (confirmed intrusion, cameras down).
 
 use super::alarm::{self, AlarmLine, ACK_PREFIX};
 use super::api::{CctvApi, Event};
@@ -96,6 +98,7 @@ pub async fn run(ctx: Arc<Ctx>, store: Store) -> Result<()> {
                 if page.gap {
                     broadcast(
                         &ctx,
+                        &audience(&ctx, &store),
                         "⚠️ 监控事件有中断（elfClaw 离线太久），中间部分事件没有推送。",
                         true,
                     )
@@ -123,9 +126,28 @@ pub async fn run(ctx: Arc<Ctx>, store: Store) -> Result<()> {
     }
 }
 
-async fn broadcast(ctx: &Ctx, text: &str, silent: bool) -> Vec<Sent> {
+/// The chats that have not switched pushes off.
+fn audience(ctx: &Ctx, store: &Store) -> Vec<String> {
+    ctx.chats
+        .iter()
+        .filter(|c| !store.is_muted(c))
+        .cloned()
+        .collect()
+}
+
+/// Who gets an event: everyone for an alarm that rings the phone (muting
+/// must not hide a confirmed intrusion), otherwise the unmuted chats.
+fn recipients(ctx: &Ctx, store: &Store, e: &Event) -> Vec<String> {
+    if needs_phone(e) {
+        ctx.chats.clone()
+    } else {
+        audience(ctx, store)
+    }
+}
+
+async fn broadcast(ctx: &Ctx, chats: &[String], text: &str, silent: bool) -> Vec<Sent> {
     let mut sent = Vec::new();
-    for chat in &ctx.chats {
+    for chat in chats {
         let opts = SendOpts {
             silent,
             parent: None,
@@ -208,7 +230,7 @@ async fn handle_event(ctx: &Ctx, store: &Store, e: &Event) -> Result<()> {
         let photo = snapshot(ctx, e).await;
         let button = phone.then_some(("✅ 已看到", button_data.as_str()));
         let mut sent = Vec::new();
-        for chat in &ctx.chats {
+        for chat in &recipients(ctx, store, e) {
             let opts = SendOpts {
                 silent,
                 parent: None,
@@ -259,7 +281,7 @@ async fn handle_event(ctx: &Ctx, store: &Store, e: &Event) -> Result<()> {
         let text = format!("⬆️ 升级：{}", format::caption(e, false));
         let button = phone.then_some(("✅ 已看到", button_data.as_str()));
         let mut sent = Vec::new();
-        for chat in &ctx.chats {
+        for chat in &recipients(ctx, store, e) {
             let parent = messages
                 .iter()
                 .find(|m| &m.chat == chat)
@@ -339,7 +361,11 @@ fn deliver_event_clip(ctx: &Ctx, store: &Store, id: i64, e: &Event) -> Result<()
     }
     p.clip_done = true;
     store.set_pushed(id, p)?;
-    let messages = store.messages(id)?;
+    let messages: Vec<Sent> = store
+        .messages(id)?
+        .into_iter()
+        .filter(|m| !store.is_muted(&m.chat))
+        .collect();
     let clip = e.clip.clone().unwrap_or_default();
     let (api, bot) = (ctx.api.clone(), ctx.bot.clone());
     tokio::spawn(async move {
@@ -513,7 +539,7 @@ async fn morning_summary(ctx: &Ctx, store: &Store) -> Result<()> {
         let list: Vec<String> = parts.iter().map(|(m, n)| format!("{m} {n}")).collect();
         let _ = write!(text, "\n  {}", list.join("、"));
     }
-    broadcast(ctx, &text, true).await;
+    broadcast(ctx, &audience(ctx, store), &text, true).await;
     Ok(())
 }
 

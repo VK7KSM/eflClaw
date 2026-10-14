@@ -4,6 +4,7 @@
 //! the two harmless.
 
 use anyhow::Result;
+use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 
@@ -78,6 +79,22 @@ impl Store {
             "INSERT OR REPLACE INTO kv (key, value) VALUES (?1, ?2)",
             params![key, value],
         )?;
+        Ok(())
+    }
+
+    /// Has `chat` switched alarm pushes off (`/cctv_off`)?
+    pub fn is_muted(&self, chat: &str) -> bool {
+        matches!(self.get(&format!("mute:{chat}")), Ok(Some(_)))
+    }
+
+    pub fn set_muted(&self, chat: &str, muted: bool) -> Result<()> {
+        let key = format!("mute:{chat}");
+        if muted {
+            return self.set(&key, &Utc::now().to_rfc3339());
+        }
+        self.conn
+            .lock()
+            .execute("DELETE FROM kv WHERE key = ?1", [key])?;
         Ok(())
     }
 
@@ -217,6 +234,13 @@ mod tests {
         };
         s.save_message(7, &m).unwrap();
         assert_eq!(s.messages(7).unwrap(), vec![m]);
+
+        assert!(!s.is_muted("100"));
+        s.set_muted("100", true).unwrap();
+        assert!(s.is_muted("100"));
+        assert!(!s.is_muted("200"), "per chat");
+        s.set_muted("100", false).unwrap();
+        assert!(!s.is_muted("100"));
 
         s.save_job("c_1", "100").unwrap();
         assert_eq!(s.take_job("c_1").unwrap().as_deref(), Some("100"));

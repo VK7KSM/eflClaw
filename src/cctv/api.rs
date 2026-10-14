@@ -246,6 +246,12 @@ impl CctvApi {
             .await
     }
 
+    /// One event, in its latest state.
+    pub async fn event(&self, id: i64) -> Result<Event> {
+        self.get_json(&format!("events/{id}"), Duration::from_secs(15))
+            .await
+    }
+
     /// Bytes of a snapshot or clip URL handed out by the API. `Ok(None)`
     /// while a clip is still being made (202).
     pub async fn bytes(&self, path: &str, timeout: Duration) -> Result<Option<Vec<u8>>> {
