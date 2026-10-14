@@ -10,6 +10,7 @@
 pub mod alarm;
 pub mod api;
 pub mod format;
+pub mod label;
 pub mod store;
 pub mod tg;
 pub mod worker;
@@ -140,6 +141,8 @@ pub async fn run(config: Config) -> Result<()> {
         alarm::ACK_PREFIX,
         Arc::new(alarm::telegram_callback),
     );
+    let _ = alarm::BOT.set(bot.clone());
+    label::register(ctx.api.clone(), bot.clone());
     tracing::info!(
         chats = ctx.chats.len(),
         phone = ctx.alarm.is_some(),

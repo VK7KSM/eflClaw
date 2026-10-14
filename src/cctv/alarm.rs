@@ -7,8 +7,10 @@
 //! never went out (line busy) do not count. Without an acknowledgement, the
 //! push, SMS and call are repeated once, two minutes after the first.
 
+use super::label::TAG_PREFIX;
 use super::store::Sent;
-use super::tg::{Bot, SendOpts};
+use super::tg::{row, Bot, SendOpts};
+use crate::channels::telegram::{CallbackAnswer, CallbackPress};
 use crate::sip::client::{CallOptions, CallOutcome, Response};
 use crate::sip::media::SpeechCheck;
 use crate::sip::SipClient;
@@ -58,12 +60,47 @@ pub fn is_pending(key: &str) -> bool {
         .is_some_and(|tx| tx.borrow().is_none())
 }
 
-/// Handler for the Telegram channel's button registry.
-pub fn telegram_callback(data: &str, user: &str) -> Option<String> {
+/// The "已看到" press itself — `None` when the data is not ours.
+pub fn ack_press(data: &str, user: &str) -> Option<String> {
     let key = data.strip_prefix(ACK_PREFIX)?;
     acknowledge(key, &format!("{user} 在 Telegram 点了已看到"))
         .or(Some("这次报警已经处理过了".to_string()))
 }
+
+/// Handler for the Telegram channel's button registry. The pressed push
+/// keeps its "标注" button: only "已看到" goes.
+pub fn telegram_callback(p: &CallbackPress<'_>) -> Option<CallbackAnswer> {
+    let toast = ack_press(p.data, p.user)?;
+    let event = p
+        .data
+        .strip_prefix(ACK_PREFIX)
+        .and_then(|k| k.strip_prefix('e'))
+        .and_then(|id| id.parse::<i64>().ok())
+        .filter(|id| *id > 0);
+    let (Some(bot), Some(event), Some(chat), Some(message)) =
+        (BOT.get(), event, p.chat_id, p.message_id)
+    else {
+        return Some(CallbackAnswer {
+            toast,
+            clear_buttons: true,
+        });
+    };
+    let tag = format!("{TAG_PREFIX}{event}");
+    let buttons = row(&[("🏷 标注", tag.as_str())]);
+    let bot = bot.clone();
+    tokio::spawn(async move {
+        if let Err(e) = bot.set_buttons(&chat.to_string(), message, &buttons).await {
+            tracing::warn!("acknowledged push buttons not updated: {e:#}");
+        }
+    });
+    Some(CallbackAnswer {
+        toast,
+        clear_buttons: false,
+    })
+}
+
+/// The bot that updates a push's buttons after "已看到" (set at start-up).
+pub static BOT: std::sync::OnceLock<Bot> = std::sync::OnceLock::new();
 
 /// Digits only, +61 → 0, so "+61444…" and "0444…" compare equal.
 pub fn same_number(a: &str, b: &str) -> bool {
@@ -118,7 +155,7 @@ async fn reply_all(line: &AlarmLine, origin: &[Sent], text: &str, silent: bool) 
         let opts = SendOpts {
             silent,
             parent: Some(s.message_id),
-            button: None,
+            buttons: Vec::new(),
         };
         if let Err(e) = line.bot.send_text(&s.chat, text, &opts).await {
             tracing::warn!("alarm notice not delivered: {e:#}");
@@ -142,7 +179,7 @@ async fn run(
                 let opts = SendOpts {
                     silent: false,
                     parent: None,
-                    button: Some(("✅ 已看到", &button_data)),
+                    buttons: row(&[("✅ 已看到", &button_data)]),
                 };
                 let text = format!("🚨 再次提醒（还没有人确认）：{headline}");
                 if let Err(e) = line.bot.send_text(chat, &text, &opts).await {
@@ -239,7 +276,7 @@ mod tests {
             .get_or_insert_with(HashMap::new)
             .insert("t1".into(), tx);
         assert!(is_pending("t1"));
-        assert!(telegram_callback("cctv_ack:t1", "zeroclaw_user").is_some());
+        assert!(ack_press("cctv_ack:t1", "zeroclaw_user").is_some());
         assert_eq!(
             rx.borrow().as_deref(),
             Some("zeroclaw_user 在 Telegram 点了已看到")
@@ -252,10 +289,10 @@ mod tests {
         );
         assert!(!is_pending("t1"));
         assert_eq!(
-            telegram_callback("cctv_ack:gone", "u").as_deref(),
+            ack_press("cctv_ack:gone", "u").as_deref(),
             Some("这次报警已经处理过了")
         );
-        assert_eq!(telegram_callback("other", "u"), None);
+        assert_eq!(ack_press("other", "u"), None);
         PENDING.lock().as_mut().unwrap().remove("t1");
     }
 }

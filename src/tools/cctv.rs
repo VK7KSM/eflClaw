@@ -285,6 +285,72 @@ impl CctvTool {
                 )?
                 .to_string())
             }
+            "objects" | "label" | "unlabel" => {
+                let id = n("event_id")
+                    .or_else(|| {
+                        s("event_id").and_then(|v| v.trim().trim_start_matches('#').parse().ok())
+                    })
+                    .context("要给报警的事件编号 event_id")?;
+                let id = i64::try_from(id)?;
+                let object = args.get("object").cloned().unwrap_or(Value::Null);
+                match action.as_str() {
+                    "objects" => {
+                        let objects = link.api.objects(id).await?;
+                        if objects.is_empty() {
+                            return Ok(
+                                "这条报警没有保存人和车（AI 改版前的报警，或者已超过 7 天）。"
+                                    .into(),
+                            );
+                        }
+                        let lines: Vec<String> = objects
+                            .iter()
+                            .map(|o| {
+                                let mut l = crate::cctv::label::describe(o);
+                                if !crate::cctv::label::labelable(o) {
+                                    l.push_str("（没看清脸，不能标注）");
+                                }
+                                l
+                            })
+                            .collect();
+                        Ok(format!("事件 {id} 的目标：\n{}", lines.join("\n")))
+                    }
+                    "label" => {
+                        let name = s("name")
+                            .map(|v| v.trim().to_string())
+                            .filter(|v| !v.is_empty())
+                            .context("要给名字 name")?;
+                        let object = match object {
+                            Value::Null => bail!("要给目标序号 object（或 \"all\"）"),
+                            Value::String(v) if v != "all" => {
+                                json!(v.trim().parse::<u32>().context("object 是序号或 \"all\"")?)
+                            }
+                            other => other,
+                        };
+                        Ok(match link.api.label(id, &object, &name).await? {
+                            crate::cctv::api::LabelOutcome::Done { note, level } => {
+                                let mut out =
+                                    format!("标注完成。cctv 的说明（请原样转告用户）：{note}");
+                                if let Some((old, new)) = level.filter(|(o, n)| o != n) {
+                                    let _ =
+                                        write!(out, "\n这条报警从 level {old} 改为 level {new}。");
+                                }
+                                out
+                            }
+                            crate::cctv::api::LabelOutcome::Unlearnable(why) => {
+                                format!("学不了，cctv 的原因（请原样转告用户）：{why}")
+                            }
+                        })
+                    }
+                    _ => {
+                        let idx = object
+                            .as_u64()
+                            .or_else(|| object.as_str().and_then(|v| v.trim().parse().ok()))
+                            .context("要给目标序号 object")?;
+                        link.api.unlabel(id, u32::try_from(idx)?).await?;
+                        Ok(format!("已撤销事件 {id} 目标 {idx} 的标注。"))
+                    }
+                }
+            }
             "greet" => {
                 let m = link
                     .camera(Some(camera.as_deref().context("要给摄像头 camera")?), false)
@@ -595,7 +661,12 @@ impl Tool for CctvTool {
          picture, only needed when the user has not seen it); alerts_off / alerts_on (stop or \
          resume alarm pushes to this chat; the cameras stay armed; same as the /cctv_off and \
          /cctv_on menu commands); greet (say hello at a camera: mode hello = chime + spoken \
-         English greeting on its speaker, flash = blink HI with its light; camera required); events (what happened: \
+         English greeting on its speaker, flash = blink HI with its light; camera required); \
+         objects / label / unlabel (people and vehicles of an alarm, and teaching cctv's AI who \
+         they are: event_id + object index or 'all' + name, e.g. a person's name or '我的车'; a \
+         target picture's caption reads '事件 <event_id> · 目标 <object>', so when the user replies \
+         to one with a name, call label with those numbers; relay cctv's note or reason verbatim; \
+         only people with a clear face can be labelled); events (what happened: \
          optional camera, from/to as HH:MM or YYYY-MM-DD HH:MM, min_level 1-3); clip_live (record \
          5-20 s of live video now and send it); clip_history (recorded video from the NVR, from/to, \
          at most 5 minutes, ending at least 2 minutes ago); ptz (move the PTZ camera: ptz_action \
@@ -611,10 +682,12 @@ impl Tool for CctvTool {
         json!({
             "type": "object",
             "properties": {
-                "action": {"type": "string", "enum": ["cameras", "snapshot", "event_snapshot", "events", "clip_live", "clip_history", "ptz", "greet", "alerts_off", "alerts_on"]},
+                "action": {"type": "string", "enum": ["cameras", "snapshot", "event_snapshot", "events", "clip_live", "clip_history", "ptz", "greet", "objects", "label", "unlabel", "alerts_off", "alerts_on"]},
+                "object": {"description": "label/unlabel: target index (or \"all\" for label)"},
+                "name": {"type": "string", "description": "label: person or vehicle name"},
                 "mode": {"type": "string", "enum": ["hello", "flash"], "description": "greet: speaker or light"},
                 "question": {"type": "string", "description": "What the user wants to know about the picture"},
-                "event_id": {"type": "integer", "description": "Alarm event id (event_snapshot)"},
+                "event_id": {"type": "integer", "description": "Alarm event id (event_snapshot, objects, label, unlabel)"},
                 "send": {"type": "boolean", "description": "event_snapshot: also post the picture"},
                 "camera": {"type": "string", "description": "Camera name (or number). For ptz it defaults to the PTZ camera."},
                 "from": {"type": "string", "description": "Start time: HH:MM (today) or YYYY-MM-DD HH:MM"},

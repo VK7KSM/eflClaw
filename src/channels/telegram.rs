@@ -138,10 +138,27 @@ fn build_telegram_ack_reaction_request(
     })
 }
 
-/// elfClaw 2026-10-14: handler for inline-button presses with a given data
-/// prefix — `(data, username) -> toast`. Lets a module (e.g. the CCTV "已看到"
-/// button) own its buttons without the channel knowing about it.
-pub type CallbackHandler = std::sync::Arc<dyn Fn(&str, &str) -> Option<String> + Send + Sync>;
+/// elfClaw 2026-10-14: a press of an inline button another module owns.
+pub struct CallbackPress<'a> {
+    pub data: &'a str,
+    pub user: &'a str,
+    /// Where the pressed message is.
+    pub chat_id: Option<i64>,
+    pub message_id: Option<i64>,
+}
+
+/// The answer to a press: the toast, and whether to remove the pressed
+/// message's buttons (a handler that edits the message itself keeps them).
+pub struct CallbackAnswer {
+    pub toast: String,
+    pub clear_buttons: bool,
+}
+
+/// Handler for inline-button presses with a given data prefix. Lets a module
+/// (e.g. the CCTV "已看到" and "标注" buttons) own its buttons without the
+/// channel knowing about them. `None`: toast "已收到", buttons removed.
+pub type CallbackHandler =
+    std::sync::Arc<dyn Fn(&CallbackPress<'_>) -> Option<CallbackAnswer> + Send + Sync>;
 
 static CALLBACK_HANDLERS: parking_lot::RwLock<Vec<(&'static str, CallbackHandler)>> =
     parking_lot::RwLock::new(Vec::new());
@@ -866,16 +883,26 @@ impl TelegramChannel {
             self.answer_callback_query_nonblocking(callback_id, "无权限");
             return true;
         }
-        let toast = handler(data, &username).unwrap_or_else(|| "已收到".to_string());
-        self.answer_callback_query_nonblocking(callback_id, &toast);
-        if let Some(message) = callback.get("message") {
-            let chat_id = message
-                .get("chat")
-                .and_then(|chat| chat.get("id"))
-                .and_then(serde_json::Value::as_i64);
-            let message_id = message
-                .get("message_id")
-                .and_then(serde_json::Value::as_i64);
+        let message = callback.get("message");
+        let chat_id = message
+            .and_then(|m| m.get("chat"))
+            .and_then(|chat| chat.get("id"))
+            .and_then(serde_json::Value::as_i64);
+        let message_id = message
+            .and_then(|m| m.get("message_id"))
+            .and_then(serde_json::Value::as_i64);
+        let answer = handler(&CallbackPress {
+            data,
+            user: &username,
+            chat_id,
+            message_id,
+        })
+        .unwrap_or_else(|| CallbackAnswer {
+            toast: "已收到".to_string(),
+            clear_buttons: true,
+        });
+        self.answer_callback_query_nonblocking(callback_id, &answer.toast);
+        if answer.clear_buttons {
             if let (Some(chat_id), Some(message_id)) = (chat_id, message_id) {
                 self.clear_callback_inline_keyboard_nonblocking(
                     chat_id.to_string(),

@@ -1,7 +1,8 @@
 //! The few Telegram Bot API calls monitoring pushes need, with what the chat
 //! channel's own senders do not give back: the message id (to reply the video
 //! under its alarm and to edit a caption later), silent delivery, and an
-//! inline "已看到" button. Plain text only — no parse mode to escape for.
+//! inline buttons ("已看到", "标注", names). Plain text only — no parse mode
+//! to escape for.
 
 use anyhow::{bail, Context, Result};
 use reqwest::multipart::{Form, Part};
@@ -13,14 +14,27 @@ pub struct Bot {
     http: reqwest::Client,
 }
 
+/// Inline buttons, row by row: (label, callback data).
+pub type Buttons = Vec<Vec<(String, String)>>;
+
+/// A single row of buttons.
+pub fn row(buttons: &[(&str, &str)]) -> Buttons {
+    if buttons.is_empty() {
+        return Vec::new();
+    }
+    vec![buttons
+        .iter()
+        .map(|(l, d)| ((*l).to_string(), (*d).to_string()))
+        .collect()]
+}
+
 /// Options shared by every send.
 #[derive(Debug, Clone, Default)]
-pub struct SendOpts<'a> {
+pub struct SendOpts {
     pub silent: bool,
     /// The message this one replies to.
     pub parent: Option<i64>,
-    /// One inline button: (label, callback data).
-    pub button: Option<(&'a str, &'a str)>,
+    pub buttons: Buttons,
 }
 
 impl Bot {
@@ -38,11 +52,20 @@ impl Bot {
         format!("https://api.telegram.org/bot{}/{method}", self.token)
     }
 
-    fn markup(button: Option<(&str, &str)>) -> Option<String> {
-        button.map(|(label, data)| {
-            serde_json::json!({"inline_keyboard": [[{"text": label, "callback_data": data}]]})
-                .to_string()
-        })
+    fn keyboard(buttons: &Buttons) -> serde_json::Value {
+        let rows: Vec<Vec<serde_json::Value>> = buttons
+            .iter()
+            .map(|r| {
+                r.iter()
+                    .map(|(label, data)| serde_json::json!({"text": label, "callback_data": data}))
+                    .collect()
+            })
+            .collect();
+        serde_json::json!({ "inline_keyboard": rows })
+    }
+
+    fn markup(buttons: &Buttons) -> Option<String> {
+        (!buttons.is_empty()).then(|| Self::keyboard(buttons).to_string())
     }
 
     async fn finish(resp: reqwest::Response, what: &str) -> Result<i64> {
@@ -64,7 +87,7 @@ impl Bot {
             .with_context(|| format!("Telegram {what}: no message id"))
     }
 
-    fn form(chat: &str, opts: &SendOpts<'_>) -> Form {
+    fn form(chat: &str, opts: &SendOpts) -> Form {
         let mut form = Form::new()
             .text("chat_id", chat.to_string())
             .text("disable_notification", opts.silent.to_string());
@@ -73,13 +96,13 @@ impl Bot {
                 .text("reply_to_message_id", id.to_string())
                 .text("allow_sending_without_reply", "true");
         }
-        if let Some(m) = Self::markup(opts.button) {
+        if let Some(m) = Self::markup(&opts.buttons) {
             form = form.text("reply_markup", m);
         }
         form
     }
 
-    pub async fn send_text(&self, chat: &str, text: &str, opts: &SendOpts<'_>) -> Result<i64> {
+    pub async fn send_text(&self, chat: &str, text: &str, opts: &SendOpts) -> Result<i64> {
         let mut body = serde_json::json!({
             "chat_id": chat,
             "text": text,
@@ -90,8 +113,8 @@ impl Bot {
             body["reply_to_message_id"] = id.into();
             body["allow_sending_without_reply"] = true.into();
         }
-        if let Some(m) = Self::markup(opts.button) {
-            body["reply_markup"] = serde_json::from_str(&m)?;
+        if !opts.buttons.is_empty() {
+            body["reply_markup"] = Self::keyboard(&opts.buttons);
         }
         let resp = self
             .http
@@ -107,7 +130,7 @@ impl Bot {
         chat: &str,
         jpeg: Vec<u8>,
         caption: &str,
-        opts: &SendOpts<'_>,
+        opts: &SendOpts,
     ) -> Result<i64> {
         let form = Self::form(chat, opts)
             .text("caption", caption.to_string())
@@ -131,7 +154,7 @@ impl Bot {
         chat: &str,
         mp4: Vec<u8>,
         caption: &str,
-        opts: &SendOpts<'_>,
+        opts: &SendOpts,
     ) -> Result<i64> {
         let form = Self::form(chat, opts)
             .text("caption", caption.to_string())
@@ -153,14 +176,14 @@ impl Bot {
 
     /// Replace the caption of a photo (or the text of a text message).
     /// Telegram drops an inline keyboard the edit does not repeat, so a
-    /// message that still needs its button passes it again.
+    /// message that still needs its buttons passes them again.
     pub async fn edit(
         &self,
         chat: &str,
         message_id: i64,
         text: &str,
         is_photo: bool,
-        button: Option<(&str, &str)>,
+        buttons: &Buttons,
     ) -> Result<()> {
         let (method, field) = if is_photo {
             ("editMessageCaption", "caption")
@@ -168,10 +191,24 @@ impl Bot {
             ("editMessageText", "text")
         };
         let mut body = serde_json::json!({"chat_id": chat, "message_id": message_id, field: text});
-        if let Some(m) = Self::markup(button) {
-            body["reply_markup"] = serde_json::from_str(&m)?;
+        if !buttons.is_empty() {
+            body["reply_markup"] = Self::keyboard(buttons);
         }
-        let resp = self.http.post(self.url(method)).json(&body).send().await?;
+        self.post_edit(method, &body).await
+    }
+
+    /// Replace only the buttons of a message (empty: remove them).
+    pub async fn set_buttons(&self, chat: &str, message_id: i64, buttons: &Buttons) -> Result<()> {
+        let body = serde_json::json!({
+            "chat_id": chat,
+            "message_id": message_id,
+            "reply_markup": Self::keyboard(buttons),
+        });
+        self.post_edit("editMessageReplyMarkup", &body).await
+    }
+
+    async fn post_edit(&self, method: &str, body: &serde_json::Value) -> Result<()> {
+        let resp = self.http.post(self.url(method)).json(body).send().await?;
         let v: serde_json::Value = resp.json().await.unwrap_or_default();
         // "message is not modified" is not an error worth reporting.
         if v["ok"].as_bool() != Some(true)

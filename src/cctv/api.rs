@@ -103,6 +103,59 @@ pub struct Event {
     pub test: bool,
 }
 
+/// A person or vehicle the AI tracked in an alarm (v1.5, kept 7 days).
+#[derive(Debug, Clone, Deserialize, PartialEq, Default)]
+pub struct Object {
+    pub idx: u32,
+    /// `person` / `vehicle`.
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub has_face: bool,
+    #[serde(default)]
+    pub face_px: f64,
+    #[serde(default, rename = "match")]
+    pub matched: Option<String>,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub crop_url: String,
+}
+
+/// What `POST /events/{id}/label` did.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LabelOutcome {
+    /// cctv's note (to be shown verbatim) and the event's (old, new) level.
+    Done {
+        note: String,
+        level: Option<(u8, u8)>,
+    },
+    /// 422 unlearnable: why (to be shown verbatim).
+    Unlearnable(String),
+}
+
+/// A label reply, parsed.
+fn label_outcome(status: u16, body: &serde_json::Value) -> Option<LabelOutcome> {
+    if status == 422 {
+        let e = &body["error"];
+        let message = e["message"]
+            .as_str()
+            .or_else(|| body["message"].as_str())
+            .unwrap_or("这个目标学不了");
+        return Some(LabelOutcome::Unlearnable(message.to_string()));
+    }
+    if !(200..300).contains(&status) {
+        return None;
+    }
+    let level = |k: &str| body["event"][k].as_u64().and_then(|v| u8::try_from(v).ok());
+    Some(LabelOutcome::Done {
+        note: body["note"].as_str().unwrap_or("已标注").to_string(),
+        level: level("old_level").zip(level("level")),
+    })
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct StreamPage {
     pub cursor: i64,
@@ -323,6 +376,81 @@ impl CctvApi {
         self.post_json("arm", body).await
     }
 
+    /// The people and vehicles the AI tracked in an alarm (empty for alarms
+    /// before the AI rework or older than 7 days).
+    pub async fn objects(&self, event_id: i64) -> Result<Vec<Object>> {
+        #[derive(Deserialize)]
+        struct O {
+            #[serde(default)]
+            objects: Vec<Object>,
+        }
+        Ok(self
+            .get_json::<O>(
+                &format!("events/{event_id}/objects"),
+                Duration::from_secs(15),
+            )
+            .await?
+            .objects)
+    }
+
+    async fn names(&self, path: &str, field: &str) -> Result<Vec<String>> {
+        let v: serde_json::Value = self.get_json(path, Duration::from_secs(10)).await?;
+        Ok(v[field]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|p| p["name"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    /// Registered people's names.
+    pub async fn people(&self) -> Result<Vec<String>> {
+        self.names("people", "people").await
+    }
+
+    /// Registered vehicles' names.
+    pub async fn vehicles(&self) -> Result<Vec<String>> {
+        self.names("vehicles", "vehicles").await
+    }
+
+    /// Label target `object` (an index, or `"all"`) of an alarm as `name`.
+    pub async fn label(
+        &self,
+        event_id: i64,
+        object: &serde_json::Value,
+        name: &str,
+    ) -> Result<LabelOutcome> {
+        let resp = self
+            .http
+            .post(self.url(&format!("events/{event_id}/label")))
+            .bearer_auth(&self.token)
+            .timeout(Duration::from_secs(30))
+            .json(&serde_json::json!({"object": object, "name": name}))
+            .send()
+            .await
+            .context("cctv-server unreachable")?;
+        let status = resp.status().as_u16();
+        if status != 422 && !resp.status().is_success() {
+            Self::check(resp).await?;
+            bail!("cctv-server {status}");
+        }
+        let body: serde_json::Value = resp.json().await.unwrap_or_default();
+        label_outcome(status, &body).context("bad cctv-server reply")
+    }
+
+    /// Undo the label of one target.
+    pub async fn unlabel(&self, event_id: i64, object: u32) -> Result<()> {
+        let _: serde_json::Value = self
+            .post_json(
+                &format!("events/{event_id}/unlabel"),
+                &serde_json::json!({"object": object}),
+            )
+            .await?;
+        Ok(())
+    }
+
     /// Greet at a camera (v1.4): `hello` plays a chime and a spoken English
     /// greeting on its speaker, `flash` blinks HI in Morse on its light.
     pub async fn greet(&self, monitor: u32, mode: &str) -> Result<()> {
@@ -354,6 +482,39 @@ impl CctvApi {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn objects_and_label_replies_parse() {
+        let json = r#"{"crop_url":"/cctv/v1/events/36628/objects/0.jpg","face_px":0.0,"faces":0,
+            "has_face":false,"idx":0,"kind":"vehicle","label":null,"match":null,"score":null,"status":"parked"}"#;
+        let o: Object = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            (o.idx, o.kind.as_str(), o.status.as_str()),
+            (0, "vehicle", "parked")
+        );
+        assert_eq!(o.matched, None);
+
+        let ok = serde_json::json!({"ok": true, "added": 8, "name": "kasim", "note": "已把1个目标标成「kasim」",
+            "event": {"level": 1, "old_level": 3, "description": "认出：kasim"}});
+        assert_eq!(
+            label_outcome(200, &ok),
+            Some(LabelOutcome::Done {
+                note: "已把1个目标标成「kasim」".into(),
+                level: Some((3, 1))
+            })
+        );
+        let no =
+            serde_json::json!({"error": {"code": "unlearnable", "message": "脸太小（20 像素）"}});
+        assert_eq!(
+            label_outcome(422, &no),
+            Some(LabelOutcome::Unlearnable("脸太小（20 像素）".into()))
+        );
+        let flat = serde_json::json!({"error": "unlearnable", "message": "一直没看清脸"});
+        assert_eq!(
+            label_outcome(422, &flat),
+            Some(LabelOutcome::Unlearnable("一直没看清脸".into()))
+        );
+    }
 
     #[test]
     fn parses_real_events_and_ignores_unknown_fields() {

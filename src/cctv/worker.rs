@@ -13,8 +13,9 @@
 use super::alarm::{self, AlarmLine, ACK_PREFIX};
 use super::api::{CctvApi, Event};
 use super::format;
+use super::label::TAG_PREFIX;
 use super::store::{Pushed, Sent, Store};
-use super::tg::{Bot, SendOpts};
+use super::tg::{row, Bot, Buttons, SendOpts};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration as ChronoDuration, Timelike, Utc};
 use chrono_tz::Tz;
@@ -85,7 +86,7 @@ pub async fn run(ctx: Arc<Ctx>, store: Store) -> Result<()> {
                         let opts = SendOpts {
                             silent: true,
                             parent: Some(s.message_id),
-                            button: None,
+                            buttons: Vec::new(),
                         };
                         let _ = ctx.bot.send_text(&s.chat, text, &opts).await;
                     }
@@ -151,7 +152,7 @@ async fn broadcast(ctx: &Ctx, chats: &[String], text: &str, silent: bool) -> Vec
         let opts = SendOpts {
             silent,
             parent: None,
-            button: None,
+            buttons: Vec::new(),
         };
         match ctx.bot.send_text(chat, text, &opts).await {
             Ok(id) => sent.push(Sent {
@@ -171,13 +172,17 @@ async fn monitoring_down(ctx: &Ctx) -> Vec<Sent> {
     let key = format!("down{}", Utc::now().timestamp());
     let data = format!("{ACK_PREFIX}{key}");
     let text = "🚨 监控服务连不上已超过 3 分钟（所有摄像头都看不到了）";
-    let button = ctx.alarm.as_ref().map(|_| ("✅ 已看到", data.as_str()));
+    let buttons = if ctx.alarm.is_some() {
+        row(&[("✅ 已看到", data.as_str())])
+    } else {
+        Vec::new()
+    };
     let mut sent = Vec::new();
     for chat in &ctx.chats {
         let opts = SendOpts {
             silent: false,
             parent: None,
-            button,
+            buttons: buttons.clone(),
         };
         match ctx.bot.send_text(chat, text, &opts).await {
             Ok(id) => sent.push(Sent {
@@ -218,7 +223,6 @@ async fn handle(ctx: &Ctx, store: &Store, e: Event) -> Result<()> {
 async fn handle_event(ctx: &Ctx, store: &Store, e: &Event) -> Result<()> {
     let id = e.event_id.context("event without id")?;
     let key = format!("e{id}");
-    let button_data = format!("{ACK_PREFIX}{key}");
     let quiet = ctx.is_quiet(Utc::now());
     let Some(mut p) = store.pushed(id)? else {
         if e.level < 2 {
@@ -228,13 +232,13 @@ async fn handle_event(ctx: &Ctx, store: &Store, e: &Event) -> Result<()> {
         let silent = e.kind == "recovery" || (e.level == 2 && quiet);
         let caption = format::caption(e, false);
         let photo = snapshot(ctx, e).await;
-        let button = phone.then_some(("✅ 已看到", button_data.as_str()));
+        let buttons = push_buttons(e, phone, &key);
         let mut sent = Vec::new();
         for chat in &recipients(ctx, store, e) {
             let opts = SendOpts {
                 silent,
                 parent: None,
-                button,
+                buttons: buttons.clone(),
             };
             let r = match &photo {
                 Some(jpeg) => {
@@ -285,7 +289,7 @@ async fn handle_event(ctx: &Ctx, store: &Store, e: &Event) -> Result<()> {
         // Danger rose: push again, as a reply to the first push.
         let phone = needs_phone(e) && ctx.alarm.is_some();
         let text = format!("⬆️ 升级：{}", format::caption(e, false));
-        let button = phone.then_some(("✅ 已看到", button_data.as_str()));
+        let buttons = push_buttons(e, phone, &key);
         let mut sent = Vec::new();
         for chat in &recipients(ctx, store, e) {
             let parent = messages
@@ -295,7 +299,7 @@ async fn handle_event(ctx: &Ctx, store: &Store, e: &Event) -> Result<()> {
             let opts = SendOpts {
                 silent: e.level == 2 && quiet,
                 parent,
-                button,
+                buttons: buttons.clone(),
             };
             match ctx.bot.send_text(chat, &text, &opts).await {
                 Ok(message_id) => sent.push(Sent {
@@ -325,14 +329,31 @@ async fn handle_event(ctx: &Ctx, store: &Store, e: &Event) -> Result<()> {
     Ok(())
 }
 
+/// The buttons under an event push: "已看到" while a phone alarm waits for
+/// an acknowledgement, "标注" on camera alarms (people and vehicles).
+fn push_buttons(e: &Event, ack: bool, key: &str) -> Buttons {
+    let ack_data = format!("{ACK_PREFIX}{key}");
+    let tag_data = e
+        .event_id
+        .filter(|id| *id > 0 && e.kind == "alarm")
+        .map(|id| format!("{TAG_PREFIX}{id}"));
+    let mut buttons = Vec::new();
+    if ack {
+        buttons.push(("✅ 已看到", ack_data.as_str()));
+    }
+    if let Some(d) = &tag_data {
+        buttons.push(("🏷 标注", d.as_str()));
+    }
+    row(&buttons)
+}
+
 async fn edit_all(ctx: &Ctx, messages: &[Sent], e: &Event, false_alarm: bool, key: &str) {
     let caption = format::caption(e, false_alarm);
-    let data = format!("{ACK_PREFIX}{key}");
-    let button = alarm::is_pending(key).then_some(("✅ 已看到", data.as_str()));
+    let buttons = push_buttons(e, alarm::is_pending(key), key);
     for m in messages {
         if let Err(err) = ctx
             .bot
-            .edit(&m.chat, m.message_id, &caption, m.is_photo, button)
+            .edit(&m.chat, m.message_id, &caption, m.is_photo, &buttons)
             .await
         {
             tracing::warn!("CCTV caption not updated: {err:#}");
@@ -381,7 +402,7 @@ fn deliver_event_clip(ctx: &Ctx, store: &Store, id: i64, e: &Event) -> Result<()
                 let opts = SendOpts {
                     silent: true,
                     parent: Some(m.message_id),
-                    button: None,
+                    buttons: Vec::new(),
                 };
                 let _ = bot
                     .send_text(&m.chat, &format!("这次没有录像：{reason}"), &opts)
@@ -397,7 +418,7 @@ fn deliver_event_clip(ctx: &Ctx, store: &Store, id: i64, e: &Event) -> Result<()
                 let opts = SendOpts {
                     silent: true,
                     parent: Some(m.message_id),
-                    button: None,
+                    buttons: Vec::new(),
                 };
                 let _ = bot
                     .send_text(&m.chat, "录像取不下来，可以点上面的链接在网页上看", &opts)
@@ -410,7 +431,7 @@ fn deliver_event_clip(ctx: &Ctx, store: &Store, id: i64, e: &Event) -> Result<()
             let opts = SendOpts {
                 silent: true,
                 parent: Some(m.message_id),
-                button: None,
+                buttons: Vec::new(),
             };
             if let Err(err) = bot.send_video(&m.chat, mp4.clone(), &caption, &opts).await {
                 tracing::warn!(event = id, "CCTV clip not delivered: {err:#}");
@@ -439,7 +460,7 @@ fn deliver_job_clip(ctx: &Ctx, store: &Store, job: &str, e: &Event) {
         let opts = SendOpts {
             silent: false,
             parent: None,
-            button: None,
+            buttons: Vec::new(),
         };
         if clip.status != "ready" {
             let reason = clip.reason.unwrap_or_else(|| "原因不明".into());
