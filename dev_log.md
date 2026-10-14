@@ -7439,3 +7439,20 @@ cctv 把 `C:\Dev\CCTV\docs\elfclaw-api.md` 升级到 v1.4：
   标注结果的文字和撤销按钮。cctv 单测 15 个全部通过；`reply_target_field_regression` 通过。
 - Telegram 渠道测试 173 通过、2 失败，失败的是 Windows 下软链接权限的已知基线问题，与本次改动无关。
 - 改动行上没有 clippy 告警。
+
+## 2026-10-14 监控：推送说明文字有变化就更新（配合 cctv 的 Sonnet 复核）
+
+cctv 从 20:06 起，每条报警的目标都会交给 Sonnet 复核：
+- 复核结果追加到 description 后面，事件流会再发一条同 event_id、level 不变的事件；
+- 把握很大地判为误检时，level 会降下来。
+
+原来只在 description 第一次出现时修改推送，追加的复核结果显示不出来。
+
+- `cctv/worker.rs`：
+  - 改成：每次收到同一事件的更新，都按最新内容重新生成说明文字，和每条推送当前显示的文字比较，不同才编辑；
+    编辑成功后把新文字存回 `messages` 表，下一次只改有变化的。
+  - 降到 level 1 时照旧标"可能是误报"；level 又升上去时去掉这个标记。
+  - 一共只有这一条更新路径，原来"第一次有描述""标记误报"两段编辑合并了。
+- `cctv/format.rs`：Telegram 图片说明最多 1024 个字符，description 超过 800 字时截断并加"…"，避免编辑失败。
+
+验证：cctv 单测 15 个通过（新增超长描述截断的断言）；改动行上没有 clippy 告警。

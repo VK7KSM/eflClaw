@@ -29,6 +29,8 @@ fn target_zh(target: Option<&str>) -> Option<&'static str> {
     }
 }
 
+const MAX_DESCRIPTION: usize = 800;
+
 /// The caption of an event push. `false_alarm` adds the AI's verdict.
 pub fn caption(e: &Event, false_alarm: bool) -> String {
     let what = e
@@ -51,7 +53,15 @@ pub fn caption(e: &Event, false_alarm: bool) -> String {
         None => format!("{} {what}", icon(e)),
     }];
     if let Some(d) = e.description.as_deref().filter(|d| !d.trim().is_empty()) {
-        lines.push(d.trim().to_string());
+        // A photo caption holds at most 1024 characters; the description
+        // grows when cctv appends its second-opinion review.
+        let d = d.trim();
+        if d.chars().count() > MAX_DESCRIPTION {
+            let cut: String = d.chars().take(MAX_DESCRIPTION).collect();
+            lines.push(format!("{cut}…"));
+        } else {
+            lines.push(d.to_string());
+        }
     } else if let Some(t) = target_zh(e.target.as_deref()) {
         lines.push(t.to_string());
     }
@@ -135,6 +145,14 @@ mod tests {
             ..alarm()
         };
         assert!(caption(&test, false).starts_with("🚨 【测试】区域入侵 · Garage Back"));
+        let long = Event {
+            description: Some("字".repeat(2000)),
+            ..alarm()
+        };
+        assert!(
+            caption(&long, false).chars().count() < 1024,
+            "fits a photo caption"
+        );
 
         let off = Event {
             kind: "system".into(),

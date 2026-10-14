@@ -4,8 +4,10 @@
 //! - level 3: always, with sound; level 2: always, silent 23:00–06:30;
 //!   level 1: not pushed, counted in the morning summary; recoveries silent;
 //! - first the text + snapshot at once, the clip as a reply once it is ready;
-//! - a later rise in level is pushed again; a description arriving later
-//!   edits the caption; an AI downgrade to level 1 is noted on the caption;
+//! - a later rise in level is pushed again; any later change of the text
+//!   (the description arriving or growing, e.g. cctv's second-opinion review
+//!   appended to it) edits the caption; an AI downgrade to level 1 is noted
+//!   on the caption;
 //! - cctv-server unreachable for 3 minutes is itself a highest alarm;
 //! - a chat that sent `/cctv_off` gets none of this until `/cctv_on`, except
 //!   the alarms that also ring the phone (confirmed intrusion, cameras down).
@@ -312,18 +314,23 @@ async fn handle_event(ctx: &Ctx, store: &Store, e: &Event) -> Result<()> {
             }
         }
         p.level = e.level;
+        p.marked_false = false;
         if phone && !alarm::is_pending(&key) {
             if let Some(line) = &ctx.alarm {
                 alarm::start(line.clone(), key.clone(), format::headline(e), sent);
             }
         }
-    } else if e.level <= 1 && p.level >= 2 && !p.marked_false {
+    } else if e.level <= 1 && p.level >= 2 {
         p.marked_false = true;
-        edit_all(ctx, &messages, e, true, &key).await;
     }
-    if e.description.is_some() && !p.has_description {
-        p.has_description = true;
-        edit_all(ctx, &messages, e, p.marked_false, &key).await;
+    p.has_description |= e.description.is_some();
+    let caption = format::caption(e, p.marked_false);
+    let stale: Vec<Sent> = messages
+        .into_iter()
+        .filter(|m| m.caption != caption)
+        .collect();
+    if !stale.is_empty() {
+        edit_all(ctx, store, id, &stale, e, &caption, &key).await;
     }
     store.set_pushed(id, p)?;
     Ok(())
@@ -347,16 +354,34 @@ fn push_buttons(e: &Event, ack: bool, key: &str) -> Buttons {
     row(&buttons)
 }
 
-async fn edit_all(ctx: &Ctx, messages: &[Sent], e: &Event, false_alarm: bool, key: &str) {
-    let caption = format::caption(e, false_alarm);
+/// Bring the pushes of event `id` up to `caption`, remembering what each
+/// now shows so the next update edits only what changed.
+async fn edit_all(
+    ctx: &Ctx,
+    store: &Store,
+    id: i64,
+    messages: &[Sent],
+    e: &Event,
+    caption: &str,
+    key: &str,
+) {
     let buttons = push_buttons(e, alarm::is_pending(key), key);
     for m in messages {
-        if let Err(err) = ctx
+        match ctx
             .bot
-            .edit(&m.chat, m.message_id, &caption, m.is_photo, &buttons)
+            .edit(&m.chat, m.message_id, caption, m.is_photo, &buttons)
             .await
         {
-            tracing::warn!("CCTV caption not updated: {err:#}");
+            Ok(()) => {
+                let updated = Sent {
+                    caption: caption.to_string(),
+                    ..m.clone()
+                };
+                if let Err(err) = store.save_message(id, &updated) {
+                    tracing::warn!("CCTV caption not recorded: {err:#}");
+                }
+            }
+            Err(err) => tracing::warn!("CCTV caption not updated: {err:#}"),
         }
     }
 }
