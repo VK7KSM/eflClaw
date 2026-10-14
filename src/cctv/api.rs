@@ -97,6 +97,10 @@ pub struct Event {
     pub intrusion_confirmed: bool,
     #[serde(default)]
     pub offline_cameras: Option<u32>,
+    /// A test alarm (`POST /test/alarm`, v1.4): negative id, not in the
+    /// event database, never reported as delivered.
+    #[serde(default)]
+    pub test: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -317,6 +321,21 @@ impl CctvApi {
 
     pub async fn set_arm(&self, body: &serde_json::Value) -> Result<serde_json::Value> {
         self.post_json("arm", body).await
+    }
+
+    /// Tell cctv-server when the Telegram push went out (v1.4, for its
+    /// end-to-end latency statistics).
+    pub async fn delivered(&self, event_id: i64, at: &str) -> Result<()> {
+        let resp = self
+            .http
+            .post(self.url(&format!("events/{event_id}/delivered")))
+            .bearer_auth(&self.token)
+            .timeout(Duration::from_secs(10))
+            .json(&serde_json::json!({"channel": "telegram", "at": at}))
+            .send()
+            .await
+            .context("cctv-server unreachable")?;
+        Self::check(resp).await.map(|_| ())
     }
 }
 

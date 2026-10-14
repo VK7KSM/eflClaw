@@ -266,6 +266,12 @@ async fn handle_event(ctx: &Ctx, store: &Store, e: &Event) -> Result<()> {
                 ..Pushed::default()
             },
         )?;
+        if !sent.is_empty() && !e.test && id > 0 {
+            let at = Utc::now().to_rfc3339();
+            if let Err(err) = ctx.api.delivered(id, &at).await {
+                tracing::debug!(event = id, "delivery time not reported: {err:#}");
+            }
+        }
         if phone {
             if let Some(line) = &ctx.alarm {
                 alarm::start(line.clone(), key, format::headline(e), sent);

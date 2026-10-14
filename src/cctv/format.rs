@@ -41,6 +41,11 @@ pub fn caption(e: &Event, false_alarm: bool) -> String {
     } else {
         what
     };
+    let what = if e.test {
+        format!("【测试】{what}")
+    } else {
+        what
+    };
     let mut lines = vec![match e.monitor_name.as_deref() {
         Some(m) => format!("{} {what} · {m}", icon(e)),
         None => format!("{} {what}", icon(e)),
@@ -125,6 +130,11 @@ mod tests {
             c.starts_with("⚠️ 区域入侵 · Garage Back\n1 个陌生人在门口\n（AI 判断可能是误报）"),
             "{c}"
         );
+        let test = Event {
+            test: true,
+            ..alarm()
+        };
+        assert!(caption(&test, false).starts_with("🚨 【测试】区域入侵 · Garage Back"));
 
         let off = Event {
             kind: "system".into(),

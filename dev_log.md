@@ -7365,3 +7365,22 @@ GitHub 上现成的 Rust SIP 库都不合适：rsipstack 只有信令、不管�
 
 - 新增单测：静音开关（按对话区分）、照片回复保留说明文字；监控和菜单相关的 18 个单测全部通过。
 - 改动行上没有 clippy 告警。`cargo fmt` 顺带改动的无关文件已还原。
+
+## 2026-10-14 监控：对接接口约定 v1.4
+
+cctv 把 `C:\Dev\CCTV\docs\elfclaw-api.md` 升级到 v1.4：
+- AI 连续看画面后才把事件放进事件流，level 和 description 一出来就是最终结果；
+- 新增 `ai`、`rule_level`、`test` 字段；
+- 新增 `/delivered`、`/stats`、`/greet`、`/test/alarm` 四个接口；
+- 报警视频改为报警一出就开始录，录 20 秒。
+
+核对结果：原有解析会忽略新字段，推送规则不需要改。补了两处：
+- `cctv/api.rs`：
+  - Event 增加 `test`；
+  - 新增 `delivered(event_id, at)`，对应 `POST /events/{id}/delivered`。
+- `cctv/worker.rs`：一条报警首次推送成功（至少送达一个对话）后，回报发出时间，供 cctv 统计端到端延时。
+  测试报警（`test=true`，事件编号是负数）不回报；回报失败只记 debug 日志，不影响推送。
+- `cctv/format.rs`：测试报警的标题加"【测试】"，避免和真报警混淆。
+- 没有接 `/greet`（手动打招呼）和 `/stats`：用户没有提出需要。
+
+验证：cctv 单测 11 个全部通过（新增测试报警标题的断言）；改动行上没有 clippy 告警，rustfmt 检查通过。
