@@ -7384,3 +7384,17 @@ cctv 把 `C:\Dev\CCTV\docs\elfclaw-api.md` 升级到 v1.4：
 - 没有接 `/greet`（手动打招呼）和 `/stats`：用户没有提出需要。
 
 验证：cctv 单测 11 个全部通过（新增测试报警标题的断言）；改动行上没有 clippy 告警，rustfmt 检查通过。
+
+## 2026-10-14 监控：对话里手动打招呼
+
+- `cctv/api.rs`：新增 `greet(monitor, mode)`，对应 v1.4 的 `POST /cctv/v1/greet`。
+- `tools/cctv.rs`：`cctv` 工具新增 `greet` 动作，参数为摄像头和 `mode`：
+  - `hello`：喇叭先"叮咚"，再说一句英文问候；
+  - `flash`：补光灯用摩尔斯码闪 HI。
+  必须指定摄像头；mode 不填默认 hello。
+- 人和车的 Telegram 标注（车牌识别）已向 cctv 提需求，cctv 同意方向，接口写进 v1.5 定稿后再做。
+  - 人、车统一成"目标"：`/events/{id}/objects` 列出，`POST /events/{id}/label` 标注，另有 `/people`、`/vehicles`。
+  - 脸太小（约 32 像素以下）时标注会被拒绝；看不清脸的人无法学身份。
+  - 车牌要先找能认澳洲车牌的模型。
+
+验证：cctv 单测 11 个通过；改动行上没有 clippy 告警；rustfmt 检查通过。

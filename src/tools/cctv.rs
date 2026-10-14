@@ -285,6 +285,25 @@ impl CctvTool {
                 )?
                 .to_string())
             }
+            "greet" => {
+                let m = link
+                    .camera(Some(camera.as_deref().context("要给摄像头 camera")?), false)
+                    .await?;
+                let mode = s("mode").unwrap_or_else(|| "hello".into());
+                if mode != "hello" && mode != "flash" {
+                    bail!("打招呼方式只有 hello（喇叭说话）和 flash（补光灯闪）");
+                }
+                link.api.greet(m.id, &mode).await?;
+                Ok(format!(
+                    "{} 已{}。",
+                    m.name,
+                    if mode == "hello" {
+                        "用喇叭打了招呼（叮咚加一句英文问候）"
+                    } else {
+                        "用补光灯闪了 HI"
+                    }
+                ))
+            }
             "event_snapshot" => {
                 let wanted = n("event_id").or_else(|| {
                     s("event_id").and_then(|v| v.trim().trim_start_matches('#').parse().ok())
@@ -575,7 +594,8 @@ impl Tool for CctvTool {
          of a camera; a pushed alarm's link ends in /events/<event_id>; send=true also posts the \
          picture, only needed when the user has not seen it); alerts_off / alerts_on (stop or \
          resume alarm pushes to this chat; the cameras stay armed; same as the /cctv_off and \
-         /cctv_on menu commands); events (what happened: \
+         /cctv_on menu commands); greet (say hello at a camera: mode hello = chime + spoken \
+         English greeting on its speaker, flash = blink HI with its light; camera required); events (what happened: \
          optional camera, from/to as HH:MM or YYYY-MM-DD HH:MM, min_level 1-3); clip_live (record \
          5-20 s of live video now and send it); clip_history (recorded video from the NVR, from/to, \
          at most 5 minutes, ending at least 2 minutes ago); ptz (move the PTZ camera: ptz_action \
@@ -591,7 +611,8 @@ impl Tool for CctvTool {
         json!({
             "type": "object",
             "properties": {
-                "action": {"type": "string", "enum": ["cameras", "snapshot", "event_snapshot", "events", "clip_live", "clip_history", "ptz", "alerts_off", "alerts_on"]},
+                "action": {"type": "string", "enum": ["cameras", "snapshot", "event_snapshot", "events", "clip_live", "clip_history", "ptz", "greet", "alerts_off", "alerts_on"]},
+                "mode": {"type": "string", "enum": ["hello", "flash"], "description": "greet: speaker or light"},
                 "question": {"type": "string", "description": "What the user wants to know about the picture"},
                 "event_id": {"type": "integer", "description": "Alarm event id (event_snapshot)"},
                 "send": {"type": "boolean", "description": "event_snapshot: also post the picture"},

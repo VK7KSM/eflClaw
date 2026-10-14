@@ -323,6 +323,18 @@ impl CctvApi {
         self.post_json("arm", body).await
     }
 
+    /// Greet at a camera (v1.4): `hello` plays a chime and a spoken English
+    /// greeting on its speaker, `flash` blinks HI in Morse on its light.
+    pub async fn greet(&self, monitor: u32, mode: &str) -> Result<()> {
+        let _: serde_json::Value = self
+            .post_json(
+                "greet",
+                &serde_json::json!({"monitor_id": monitor, "mode": mode}),
+            )
+            .await?;
+        Ok(())
+    }
+
     /// Tell cctv-server when the Telegram push went out (v1.4, for its
     /// end-to-end latency statistics).
     pub async fn delivered(&self, event_id: i64, at: &str) -> Result<()> {
