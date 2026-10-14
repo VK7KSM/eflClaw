@@ -1,17 +1,17 @@
 //! Telling cctv's AI who someone is (or whose car), from Telegram (contract
 //! v1.5, section 10.5). Under each camera alarm push sits a "🏷 标注" button:
 //!
-//! 1. pressed → every person with a usable face and every vehicle of that
-//!    alarm comes back as its own picture, replying to the push, with the
-//!    registered names as buttons (people for a person, vehicles for a car);
+//! 1. pressed → every person and vehicle of that alarm comes back as its own
+//!    picture, replying to the push, with the registered names as buttons
+//!    (people for a person, vehicles for a car);
 //! 2. a name pressed → `POST /events/{id}/label`; the picture's caption
 //!    becomes cctv's note (verbatim, as agreed) with a "撤销" button, or its
 //!    reason when the target cannot be learnt;
 //! 3. a new name: the owner replies to the picture ("这是小明"); its caption
 //!    names the event and target, and the agent calls the `cctv` tool.
 //!
-//! People without a usable face cannot be labelled (cctv recognises faces
-//! only); they are listed in one line instead of offered.
+//! Since v1.6 a person without a clear face can be labelled too: cctv then
+//! remembers only that day's build and clothes (its note says so).
 
 use super::api::{CctvApi, LabelOutcome, Object};
 use super::tg::{Bot, Buttons, SendOpts};
@@ -152,11 +152,6 @@ fn labelled(id: i64, idx: u32, outcome: &LabelOutcome) -> (String, Option<Button
     }
 }
 
-/// Can this target be labelled? (cctv learns people from faces only.)
-pub fn labelable(o: &Object) -> bool {
-    o.kind == "vehicle" || o.has_face
-}
-
 /// One line about a target, also used by the agent's tool.
 pub fn describe(o: &Object) -> String {
     let what = if o.kind == "vehicle" { "车" } else { "人" };
@@ -175,6 +170,9 @@ pub fn describe(o: &Object) -> String {
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let px = o.face_px.max(0.0).round() as u32;
         let _ = write!(line, "，脸 {px} 像素");
+    }
+    if let Some(p) = o.plate.as_deref().filter(|p| !p.is_empty()) {
+        let _ = write!(line, "，车牌 {p}");
     }
     if let Some(l) = &o.label {
         let _ = write!(line, "，已标为「{l}」");
@@ -217,8 +215,7 @@ async fn offer(l: &Labeler, id: i64, chat: &str, push: i64) -> Result<()> {
     }
     let people = l.api.people().await.unwrap_or_default();
     let vehicles = l.api.vehicles().await.unwrap_or_default();
-    let (offered, rest): (Vec<&Object>, Vec<&Object>) = objects.iter().partition(|o| labelable(o));
-    for o in offered.iter().take(MAX_OFFERED) {
+    for o in objects.iter().take(MAX_OFFERED) {
         let jpeg = l
             .api
             .bytes(&o.crop_url, Duration::from_secs(20))
@@ -229,15 +226,14 @@ async fn offer(l: &Labeler, id: i64, chat: &str, push: i64) -> Result<()> {
         } else {
             &people
         };
-        let caption = format!(
-            "事件 {id} · {}\n点名字标注；新名字请回复这张图，例如「这是小明」{}",
-            describe(o),
-            if o.kind == "vehicle" {
-                "或「这是我的车」"
-            } else {
-                ""
+        let hint = match (o.kind.as_str(), o.has_face) {
+            ("vehicle", _) => "点名字标注；新名字请回复这张图，例如「这是我的车」",
+            (_, true) => "点名字标注；新名字请回复这张图，例如「这是小明」",
+            (_, false) => {
+                "没看清脸：标注后只按身形衣着认，今天之内有效。点名字标注；新名字请回复这张图，例如「这是小明」"
             }
-        );
+        };
+        let caption = format!("事件 {id} · {}\n{hint}", describe(o));
         let opts = SendOpts {
             silent: true,
             parent: Some(push),
@@ -245,25 +241,12 @@ async fn offer(l: &Labeler, id: i64, chat: &str, push: i64) -> Result<()> {
         };
         l.bot.send_photo(chat, jpeg, &caption, &opts).await?;
     }
-    let mut notes = Vec::new();
-    if offered.len() > MAX_OFFERED {
-        notes.push(format!(
+    if objects.len() > MAX_OFFERED {
+        reply(format!(
             "还有 {} 个目标没有列出（只列前 {MAX_OFFERED} 个）。",
-            offered.len() - MAX_OFFERED
-        ));
-    }
-    if !rest.is_empty() {
-        let list: Vec<String> = rest.iter().map(|o| describe(o)).collect();
-        notes.push(format!(
-            "下面这些人一直没看清脸，cctv 只靠正脸认人，学不了：\n{}",
-            list.join("\n")
-        ));
-    }
-    if offered.is_empty() && rest.is_empty() {
-        notes.push("这条报警里没有人或车。".into());
-    }
-    if !notes.is_empty() {
-        reply(notes.join("\n")).await?;
+            objects.len() - MAX_OFFERED
+        ))
+        .await?;
     }
     Ok(())
 }
@@ -281,15 +264,20 @@ mod tests {
             face_px: if has_face { 64.4 } else { 0.0 },
             matched: None,
             label: None,
+            plate: None,
             crop_url: "/cctv/v1/events/1/objects/0.jpg".into(),
         }
     }
 
     #[test]
-    fn only_faces_and_vehicles_can_be_labelled() {
-        assert!(labelable(&object("vehicle", "parked", false)));
-        assert!(labelable(&object("person", "stranger", true)));
-        assert!(!labelable(&object("person", "faceless", false)));
+    fn targets_are_described_plainly() {
+        let mut plate = object("vehicle", "moving", false);
+        plate.plate = Some("ZZZ000".into());
+        assert_eq!(describe(&plate), "目标 0：车，在院子里动，车牌 ZZZ000");
+        assert_eq!(
+            describe(&object("person", "faceless", false)),
+            "目标 0：人，一直没看清脸"
+        );
         assert_eq!(
             describe(&object("person", "stranger", true)),
             "目标 0：人，陌生人（看清了脸），脸 64 像素"

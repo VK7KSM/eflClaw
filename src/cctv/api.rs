@@ -120,6 +120,9 @@ pub struct Object {
     pub matched: Option<String>,
     #[serde(default)]
     pub label: Option<String>,
+    /// A vehicle's plate as read (v1.6; `None` when unreadable).
+    #[serde(default)]
+    pub plate: Option<String>,
     #[serde(default)]
     pub crop_url: String,
 }

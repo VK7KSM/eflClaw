@@ -302,16 +302,8 @@ impl CctvTool {
                                     .into(),
                             );
                         }
-                        let lines: Vec<String> = objects
-                            .iter()
-                            .map(|o| {
-                                let mut l = crate::cctv::label::describe(o);
-                                if !crate::cctv::label::labelable(o) {
-                                    l.push_str("（没看清脸，不能标注）");
-                                }
-                                l
-                            })
-                            .collect();
+                        let lines: Vec<String> =
+                            objects.iter().map(crate::cctv::label::describe).collect();
                         Ok(format!("事件 {id} 的目标：\n{}", lines.join("\n")))
                     }
                     "label" => {
@@ -666,7 +658,8 @@ impl Tool for CctvTool {
          they are: event_id + object index or 'all' + name, e.g. a person's name or '我的车'; a \
          target picture's caption reads '事件 <event_id> · 目标 <object>', so when the user replies \
          to one with a name, call label with those numbers; relay cctv's note or reason verbatim; \
-         only people with a clear face can be labelled); events (what happened: \
+         a person without a clear face is remembered by build and clothes for that day only; \
+         '认出是「X」' is a firm recognition, say 'recognised X', never 'maybe'); events (what happened: \
          optional camera, from/to as HH:MM or YYYY-MM-DD HH:MM, min_level 1-3); clip_live (record \
          5-20 s of live video now and send it); clip_history (recorded video from the NVR, from/to, \
          at most 5 minutes, ending at least 2 minutes ago); ptz (move the PTZ camera: ptz_action \
