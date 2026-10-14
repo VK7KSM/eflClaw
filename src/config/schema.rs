@@ -382,6 +382,10 @@ pub struct Config {
     #[serde(default)]
     pub tts: TtsConfig,
 
+    /// elfClaw 2026-10-14: SIP phone line for alarm calls and SMS (`[sip]`).
+    #[serde(default)]
+    pub sip: SipConfig,
+
     /// Chat log persistence and summarization (`[chat_log]`).
     #[serde(default)]
     pub chat_log: ChatLogConfig,
@@ -700,6 +704,36 @@ impl Default for TranscriptionConfig {
             max_duration_secs: default_transcription_max_duration_secs(),
         }
     }
+}
+
+// ── SIP ──────────────────────────────────────────────────────────
+
+/// elfClaw 2026-10-14: one SIP extension on the owner's server, kept
+/// registered for alarm calls and SMS. Off unless `enabled`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct SipConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Server host name (TLS, certificate checked against it).
+    #[serde(default)]
+    pub server: String,
+    /// TLS port.
+    #[serde(default = "default_sip_port")]
+    pub port: u16,
+    /// File holding `Account <ext>` and `Password <secret>` lines. Kept out of
+    /// config.toml so the secret never sits in a file that gets copied around.
+    #[serde(default)]
+    pub credentials_file: String,
+    /// Local speech recogniser for alarm-call confirmations: an HTTP
+    /// endpoint taking a WAV body and answering `{"text": ...}` (on K5 the
+    /// subtitle node, `http://127.0.0.1:8766/stt`). Empty: spoken
+    /// confirmations are not used.
+    #[serde(default)]
+    pub stt_url: String,
+}
+
+fn default_sip_port() -> u16 {
+    5061
 }
 
 // ── TTS ──────────────────────────────────────────────────────────
@@ -6504,6 +6538,7 @@ impl Default for Config {
             query_classification: QueryClassificationConfig::default(),
             transcription: TranscriptionConfig::default(),
             tts: TtsConfig::default(),
+            sip: SipConfig::default(),
             chat_log: ChatLogConfig::default(),
             mcp: McpConfig::default(),
             model_support_vision: None,
@@ -9919,6 +9954,7 @@ ws_url = "ws://127.0.0.1:3002"
             hardware: HardwareConfig::default(),
             transcription: TranscriptionConfig::default(),
             tts: TtsConfig::default(),
+            sip: SipConfig::default(),
             chat_log: ChatLogConfig::default(),
             mcp: McpConfig::default(),
             model_support_vision: None,
@@ -10287,6 +10323,7 @@ tool_dispatcher = "xml"
             hardware: HardwareConfig::default(),
             transcription: TranscriptionConfig::default(),
             tts: TtsConfig::default(),
+            sip: SipConfig::default(),
             chat_log: ChatLogConfig::default(),
             mcp: McpConfig::default(),
             model_support_vision: None,

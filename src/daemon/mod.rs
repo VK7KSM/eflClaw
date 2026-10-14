@@ -202,6 +202,9 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
         tracing::warn!("skills.db init skipped: {e}");
     }
 
+    // elfClaw 2026-10-14: SIP phone line (alarm calls, SMS), always registered.
+    crate::sip::start_from_config(&config);
+
     let mut handles: Vec<JoinHandle<()>> = vec![spawn_state_writer(config.clone())];
 
     {

@@ -86,6 +86,7 @@ mod rag;
 mod runtime;
 mod security;
 mod service;
+mod sip; // elfClaw: SIP phone line (alarm calls, SMS)
 mod skillforge;
 mod skills;
 mod tools;

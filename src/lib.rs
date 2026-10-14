@@ -69,6 +69,7 @@ pub mod rag;
 pub mod runtime;
 pub(crate) mod security;
 pub(crate) mod service;
+pub(crate) mod sip; // elfClaw: SIP phone line (alarm calls, SMS)
 pub(crate) mod skills;
 pub mod tools;
 pub(crate) mod tunnel;

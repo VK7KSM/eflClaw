@@ -9567,6 +9567,7 @@ dependencies = [
  "libc",
  "mail-parser",
  "matrix-sdk",
+ "md-5",
  "mime_guess",
  "msedge-tts",
  "nanohtml2text",
