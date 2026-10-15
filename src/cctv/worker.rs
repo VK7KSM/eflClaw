@@ -210,6 +210,7 @@ async fn monitoring_down(ctx: &Ctx) -> Vec<Sent> {
 async fn handle(ctx: &Ctx, store: &Store, e: Event) -> Result<()> {
     match e.kind.as_str() {
         "alarm" | "system" | "recovery" => handle_event(ctx, store, &e).await,
+        "report" => handle_report(ctx, store, &e).await,
         "clip_ready" => {
             if let Some(job) = e.job_id.as_deref() {
                 deliver_job_clip(ctx, store, job, &e);
@@ -220,6 +221,19 @@ async fn handle(ctx: &Ctx, store: &Store, e: Event) -> Result<()> {
         }
         _ => Ok(()),
     }
+}
+
+/// cctv's own summaries (v1.8): level 2 (the nightly report, or a periodic
+/// one that names something to watch) is pushed like a level 2 alarm,
+/// level 1 only recorded. Each report once.
+async fn handle_report(ctx: &Ctx, store: &Store, e: &Event) -> Result<()> {
+    let id = e.report_id.context("report without id")?;
+    if e.level < 2 || !store.first_report(id)? {
+        return Ok(());
+    }
+    let silent = ctx.is_quiet(Utc::now());
+    broadcast(ctx, &audience(ctx, store), &format::report(e), silent).await;
+    Ok(())
 }
 
 async fn handle_event(ctx: &Ctx, store: &Store, e: &Event) -> Result<()> {

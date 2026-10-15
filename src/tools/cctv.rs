@@ -343,6 +343,49 @@ impl CctvTool {
                     }
                 }
             }
+            "scene" => {
+                let v = link.api.scene().await?;
+                let lines: Vec<String> = v["monitors"]
+                    .as_array()
+                    .map(|a| a.iter().map(scene_line).collect())
+                    .unwrap_or_default();
+                if lines.is_empty() {
+                    return Ok("现在没有画面数据。".into());
+                }
+                Ok(format!(
+                    "现在各路画面（云台机不在内，停留时间单位是秒）：\n{}",
+                    lines.join("\n")
+                ))
+            }
+            "reports" => {
+                let limit = u32::try_from(n("limit").unwrap_or(10).clamp(1, 20)).unwrap_or(10);
+                let v = link.api.reports(limit).await?;
+                let mut out = String::new();
+                for r in v["reports"].as_array().into_iter().flatten() {
+                    let _ = writeln!(
+                        out,
+                        "[{} {}] {}",
+                        r["time"]
+                            .as_str()
+                            .map(crate::cctv::format::clock)
+                            .unwrap_or_default(),
+                        if r["report_kind"] == "daily" {
+                            "日报"
+                        } else {
+                            "小结"
+                        },
+                        r["text"].as_str().unwrap_or("").trim()
+                    );
+                }
+                if out.is_empty() {
+                    out.push_str("最近没有总结。\n");
+                }
+                let watch = &v["watchlist"];
+                if watch.as_array().is_some_and(|a| !a.is_empty()) {
+                    let _ = write!(out, "关注名单：{watch}");
+                }
+                Ok(out)
+            }
             "greet" => {
                 let m = link
                     .camera(Some(camera.as_deref().context("要给摄像头 camera")?), false)
@@ -652,7 +695,10 @@ impl Tool for CctvTool {
          of a camera; a pushed alarm's link ends in /events/<event_id>; send=true also posts the \
          picture, only needed when the user has not seen it); alerts_off / alerts_on (stop or \
          resume alarm pushes to this chat; the cameras stay armed; same as the /cctv_off and \
-         /cctv_on menu commands); greet (say hello at a camera: mode hello = chime + spoken \
+         /cctv_on menu commands); scene (who and what is at each camera right now: people, \
+         whether in the yard, how long they stayed, parked cars — for 'is anyone in the yard now', \
+         'how long has that car been there'); reports (cctv's recent 15-minute summaries, nightly \
+         report and watch list — for 'what happened today'); greet (say hello at a camera: mode hello = chime + spoken \
          English greeting on its speaker, flash = blink HI with its light; camera required); \
          objects / label / unlabel (people and vehicles of an alarm, and teaching cctv's AI who \
          they are: event_id + object index or 'all' + name, e.g. a person's name or '我的车'; a \
@@ -675,7 +721,7 @@ impl Tool for CctvTool {
         json!({
             "type": "object",
             "properties": {
-                "action": {"type": "string", "enum": ["cameras", "snapshot", "event_snapshot", "events", "clip_live", "clip_history", "ptz", "greet", "objects", "label", "unlabel", "alerts_off", "alerts_on"]},
+                "action": {"type": "string", "enum": ["cameras", "snapshot", "event_snapshot", "events", "clip_live", "clip_history", "ptz", "greet", "scene", "reports", "objects", "label", "unlabel", "alerts_off", "alerts_on"]},
                 "object": {"description": "label/unlabel: target index (or \"all\" for label)"},
                 "name": {"type": "string", "description": "label: person or vehicle name"},
                 "mode": {"type": "string", "enum": ["hello", "flash"], "description": "greet: speaker or light"},
@@ -787,6 +833,48 @@ impl Tool for CctvArmTool {
     }
 }
 
+/// One camera of `/scene`: who and what is there now.
+fn scene_line(m: &Value) -> String {
+    let name = m["name"].as_str().unwrap_or("?");
+    if m["stale"].as_bool() == Some(true) {
+        return format!("{name}：超过 30 秒没有更新，不确定");
+    }
+    let empty = Vec::new();
+    let persons = m["persons"].as_array().unwrap_or(&empty);
+    let vehicles = m["vehicles"].as_array().unwrap_or(&empty);
+    let mut parts = Vec::new();
+    if !persons.is_empty() {
+        let in_yard = persons.iter().filter(|p| p["in_yard"] == true).count();
+        let longest = persons
+            .iter()
+            .filter_map(|p| p["dwell_s"].as_f64())
+            .fold(0.0_f64, f64::max);
+        parts.push(format!(
+            "{} 人（院子里 {in_yard}，停留最长 {longest:.0}）",
+            persons.len()
+        ));
+    }
+    if !vehicles.is_empty() {
+        let parked = vehicles.iter().filter(|v| v["parked"] == true).count();
+        let longest = vehicles
+            .iter()
+            .filter_map(|v| v["dwell_s"].as_f64())
+            .fold(0.0_f64, f64::max);
+        parts.push(format!(
+            "{} 辆车（停着 {parked}，停留最长 {longest:.0}）",
+            vehicles.len()
+        ));
+    }
+    if let Some(a) = m["animals"].as_u64().filter(|a| *a > 0) {
+        parts.push(format!("{a} 只动物"));
+    }
+    if parts.is_empty() {
+        format!("{name}：没有人和车")
+    } else {
+        format!("{name}：{}", parts.join("，"))
+    }
+}
+
 /// Like `parse_time`, but `HH:MM` means the next such time (re-arm moments
 /// are in the future).
 fn parse_time_future(s: &str, tz: Tz, now: DateTime<Utc>) -> Result<DateTime<FixedOffset>> {
@@ -822,6 +910,24 @@ mod tests {
             arm: None,
         })
         .collect()
+    }
+
+    #[test]
+    fn scene_lines_read_naturally() {
+        let m = json!({"id": 2, "name": "Garage Back", "state": "yard",
+            "persons": [{"track": 3, "in_yard": true, "dwell_s": 40, "seen_s": 45}],
+            "vehicles": [{"track": 4, "parked": true, "dwell_s": 600}], "animals": 0, "age_s": 1, "stale": false});
+        assert_eq!(
+            scene_line(&m),
+            "Garage Back：1 人（院子里 1，停留最长 40），1 辆车（停着 1，停留最长 600）"
+        );
+        assert_eq!(
+            scene_line(
+                &json!({"name": "Back yard", "persons": [], "vehicles": [], "stale": false})
+            ),
+            "Back yard：没有人和车"
+        );
+        assert!(scene_line(&json!({"name": "X", "stale": true})).contains("没有更新"));
     }
 
     #[test]

@@ -55,6 +55,10 @@ impl Store {
                  caption TEXT NOT NULL,
                  PRIMARY KEY (event_id, chat)
              );
+             CREATE TABLE IF NOT EXISTS reports (
+                 report_id INTEGER PRIMARY KEY,
+                 at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+             );
              CREATE TABLE IF NOT EXISTS jobs (
                  job_id TEXT PRIMARY KEY,
                  chat TEXT NOT NULL,
@@ -186,12 +190,21 @@ impl Store {
         Ok(chat)
     }
 
+    /// Record report `id`; false when it was already handled.
+    pub fn first_report(&self, id: i64) -> Result<bool> {
+        Ok(self.conn.lock().execute(
+            "INSERT OR IGNORE INTO reports (report_id) VALUES (?1)",
+            [id],
+        )? == 1)
+    }
+
     /// Forget events older than two weeks (their clips are long gone).
     pub fn prune(&self) -> Result<()> {
         self.conn.lock().execute_batch(
             "DELETE FROM messages WHERE event_id IN
                  (SELECT event_id FROM pushed WHERE at < datetime('now', '-14 days'));
              DELETE FROM pushed WHERE at < datetime('now', '-14 days');
+             DELETE FROM reports WHERE at < datetime('now', '-14 days');
              DELETE FROM jobs WHERE at < datetime('now', '-2 days');",
         )?;
         Ok(())
@@ -241,6 +254,9 @@ mod tests {
         assert!(!s.is_muted("200"), "per chat");
         s.set_muted("100", false).unwrap();
         assert!(!s.is_muted("100"));
+
+        assert!(s.first_report(7).unwrap());
+        assert!(!s.first_report(7).unwrap(), "a report is handled once");
 
         s.save_job("c_1", "100").unwrap();
         assert_eq!(s.take_job("c_1").unwrap().as_deref(), Some("100"));

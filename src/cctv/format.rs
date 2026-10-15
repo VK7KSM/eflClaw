@@ -80,6 +80,47 @@ pub fn caption(e: &Event, false_alarm: bool) -> String {
     lines.join("\n")
 }
 
+/// Longest report text pushed (a Telegram message holds 4096 characters).
+const MAX_REPORT: usize = 3500;
+
+/// The push of a cctv summary (`kind = "report"`).
+pub fn report(e: &Event) -> String {
+    let span = match (e.from.as_deref(), e.to.as_deref()) {
+        (Some(f), Some(t)) => format!("（{}–{}）", clock(f), clock(t)),
+        _ => String::new(),
+    };
+    let title = if e.report_kind.as_deref() == Some("daily") {
+        "📋 监控日报".to_string()
+    } else {
+        format!("📝 监控小结{span}")
+    };
+    let mut lines = vec![title];
+    if let Some(t) = e.text.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+        if t.chars().count() > MAX_REPORT {
+            let cut: String = t.chars().take(MAX_REPORT).collect();
+            lines.push(format!("{cut}…"));
+        } else {
+            lines.push(t.to_string());
+        }
+    }
+    if !e.attention.is_empty() {
+        lines.push("需要留意：".to_string());
+        for a in &e.attention {
+            let what = if a.kind == "plate" {
+                format!("车牌 {}", a.value)
+            } else {
+                a.value.clone()
+            };
+            lines.push(if a.reason.trim().is_empty() {
+                format!("• {what}")
+            } else {
+                format!("• {what}：{}", a.reason.trim())
+            });
+        }
+    }
+    lines.join("\n")
+}
+
 /// One line for the phone/SMS: what and where.
 pub fn headline(e: &Event) -> String {
     let what = e
@@ -123,6 +164,42 @@ mod tests {
             web_url: Some("https://cctv.example/#/events/1".into()),
             ..Event::default()
         }
+    }
+
+    #[test]
+    fn reports_read_naturally() {
+        let r = Event {
+            kind: "report".into(),
+            level: 2,
+            report_id: Some(7),
+            report_kind: Some("periodic".into()),
+            from: Some("2026-10-15T14:55:00+11:00".into()),
+            to: Some("2026-10-15T15:10:00+11:00".into()),
+            text: Some("前院有一辆车停了 10 分钟。".into()),
+            attention: vec![
+                super::super::api::Attention {
+                    kind: "plate".into(),
+                    value: "ZZZ000".into(),
+                    reason: "第二次出现".into(),
+                },
+                super::super::api::Attention {
+                    kind: "note".into(),
+                    value: "侧门没关".into(),
+                    reason: String::new(),
+                },
+            ],
+            ..Event::default()
+        };
+        assert_eq!(
+            report(&r),
+            "📝 监控小结（14:55:00–15:10:00）\n前院有一辆车停了 10 分钟。\n需要留意：\n• 车牌 ZZZ000：第二次出现\n• 侧门没关"
+        );
+        let daily = Event {
+            report_kind: Some("daily".into()),
+            attention: vec![],
+            ..r
+        };
+        assert!(report(&daily).starts_with("📋 监控日报\n"));
     }
 
     #[test]

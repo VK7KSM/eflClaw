@@ -101,6 +101,29 @@ pub struct Event {
     /// event database, never reported as delivered.
     #[serde(default)]
     pub test: bool,
+    /// `kind = "report"` (v1.8): cctv's own summary of a period — no
+    /// event id, snapshot or clip; deduplicated by `report_id`.
+    #[serde(default)]
+    pub report_id: Option<i64>,
+    /// `periodic` (every 15 minutes when something happened) or `daily`.
+    #[serde(default)]
+    pub report_kind: Option<String>,
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub attention: Vec<Attention>,
+}
+
+/// Something a report asks the owner to keep an eye on (v1.8).
+#[derive(Debug, Clone, Deserialize, PartialEq, Default)]
+pub struct Attention {
+    /// `plate` or `note`.
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub value: String,
+    #[serde(default)]
+    pub reason: String,
 }
 
 /// A person or vehicle the AI tracked in an alarm (v1.5, kept 7 days).
@@ -452,6 +475,17 @@ impl CctvApi {
             )
             .await?;
         Ok(())
+    }
+
+    /// Who is at each camera right now (v1.7, queries only).
+    pub async fn scene(&self) -> Result<serde_json::Value> {
+        self.get_json("scene", Duration::from_secs(10)).await
+    }
+
+    /// Recent summaries and the watch list (v1.8).
+    pub async fn reports(&self, limit: u32) -> Result<serde_json::Value> {
+        self.get_json(&format!("reports?limit={limit}"), Duration::from_secs(15))
+            .await
     }
 
     /// Greet at a camera (v1.4): `hello` plays a chime and a spoken English
