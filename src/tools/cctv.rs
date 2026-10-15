@@ -369,7 +369,7 @@ impl CctvTool {
                             .as_str()
                             .map(crate::cctv::format::clock)
                             .unwrap_or_default(),
-                        if r["report_kind"] == "daily" {
+                        if r["report_kind"] == "daily" || r["kind"] == "daily" {
                             "日报"
                         } else {
                             "小结"
