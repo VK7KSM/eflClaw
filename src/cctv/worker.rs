@@ -3,7 +3,8 @@
 //!
 //! - level 3: always, with sound; level 2: always, silent 23:00–06:30;
 //!   level 1: not pushed, counted in the morning summary; recoveries silent;
-//! - first the text + snapshot at once, the clip as a reply once it is ready;
+//! - the text alone at once (no snapshot: uploading a picture made alarms
+//!   slow — owner's decision 2026-10-16), the clip as a reply once ready;
 //! - a later rise in level is pushed again; any later change of the text
 //!   (the description arriving or growing, e.g. cctv's second-opinion review
 //!   appended to it) edits the caption; an AI downgrade to level 1 is noted
@@ -26,9 +27,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const WAIT_SECS: u64 = 25;
-/// A photo upload slower than this falls back to the text alone: an alarm
-/// must not wait on a stuck upload (the HTTP client allows 120 s).
-const PHOTO_TIMEOUT: Duration = Duration::from_secs(30);
 const DOWN_AFTER: Duration = Duration::from_secs(180);
 const SUMMARY_PAGES: usize = 30;
 
@@ -263,13 +261,11 @@ async fn handle_event(ctx: &Ctx, store: &Store, e: &Event) -> Result<()> {
         let silent = e.kind == "recovery" || (e.level == 2 && quiet);
         let caption = format::caption(e, false);
         let started = Instant::now();
-        let photo = snapshot(ctx, e).await;
-        let snapshot_ms = started.elapsed().as_millis();
         let buttons = push_buttons(e, phone, &key);
-        // All chats at once: one slow upload must not hold up the others.
+        // All chats at once: one slow send must not hold up the others.
         let mut tasks = tokio::task::JoinSet::new();
         for chat in recipients(ctx, store, e) {
-            let (bot, caption, photo) = (ctx.bot.clone(), caption.clone(), photo.clone());
+            let (bot, caption) = (ctx.bot.clone(), caption.clone());
             let opts = SendOpts {
                 silent,
                 parent: None,
@@ -277,7 +273,7 @@ async fn handle_event(ctx: &Ctx, store: &Store, e: &Event) -> Result<()> {
             };
             tasks.spawn(async move {
                 let t = Instant::now();
-                let r = deliver(&bot, &chat, photo, &caption, &opts).await;
+                let r = bot.send_text(&chat, &caption, &opts).await;
                 (chat, r, t.elapsed().as_millis())
             });
         }
@@ -286,12 +282,12 @@ async fn handle_event(ctx: &Ctx, store: &Store, e: &Event) -> Result<()> {
         while let Some(done) = tasks.join_next().await {
             let Ok((chat, r, ms)) = done else { continue };
             match r {
-                Ok((message_id, is_photo)) => {
-                    timings.push(serde_json::json!({"chat": chat, "ms": ms, "photo": is_photo}));
+                Ok(message_id) => {
+                    timings.push(serde_json::json!({"chat": chat, "ms": ms}));
                     let s = Sent {
                         chat,
                         message_id,
-                        is_photo,
+                        is_photo: false,
                         caption: caption.clone(),
                     };
                     store.save_message(id, &s)?;
@@ -310,8 +306,6 @@ async fn handle_event(ctx: &Ctx, store: &Store, e: &Event) -> Result<()> {
             serde_json::json!({
                 "event_id": id,
                 "level": e.level,
-                "snapshot_ms": snapshot_ms,
-                "has_photo": photo.is_some(),
                 "sends": timings,
                 "total_ms": started.elapsed().as_millis(),
             }),
@@ -438,25 +432,6 @@ async fn edit_all(
     }
 }
 
-/// Send the push to one chat: the photo when there is one, the text alone
-/// when the photo cannot be sent in time. Returns (message id, is photo).
-async fn deliver(
-    bot: &Bot,
-    chat: &str,
-    photo: Option<Vec<u8>>,
-    caption: &str,
-    opts: &SendOpts,
-) -> Result<(i64, bool)> {
-    if let Some(jpeg) = photo {
-        match tokio::time::timeout(PHOTO_TIMEOUT, bot.send_photo(chat, jpeg, caption, opts)).await {
-            Ok(Ok(id)) => return Ok((id, true)),
-            Ok(Err(e)) => tracing::warn!("CCTV photo not sent, sending text: {e:#}"),
-            Err(_) => tracing::warn!("CCTV photo upload too slow, sending text"),
-        }
-    }
-    Ok((bot.send_text(chat, caption, opts).await?, false))
-}
-
 /// A line in the elfClaw run log (`state/elfclaw-logs.jsonl`), so push
 /// delays and lost connections can be traced afterwards.
 fn record(message: &str, details: serde_json::Value) {
@@ -469,24 +444,6 @@ fn record(message: &str, details: serde_json::Value) {
         message: message.into(),
         details,
     });
-}
-
-/// The event's snapshot; for an alarm without one (some cameras fail to
-/// produce it), a live frame from the same camera instead.
-async fn snapshot(ctx: &Ctx, e: &Event) -> Option<Vec<u8>> {
-    if let Some(url) = e.snapshot_url.as_deref() {
-        match ctx.api.bytes(url, Duration::from_secs(15)).await {
-            Ok(Some(b)) => return Some(b),
-            Ok(None) => {}
-            Err(err) => tracing::warn!("CCTV snapshot unavailable: {err:#}"),
-        }
-    }
-    if e.kind == "alarm" {
-        if let Some(m) = e.monitor_id {
-            return ctx.api.live_snapshot(m).await.ok();
-        }
-    }
-    None
 }
 
 fn deliver_event_clip(ctx: &Ctx, store: &Store, id: i64, e: &Event) -> Result<()> {
