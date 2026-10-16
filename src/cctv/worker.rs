@@ -26,6 +26,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const WAIT_SECS: u64 = 25;
+/// A photo upload slower than this falls back to the text alone: an alarm
+/// must not wait on a stuck upload (the HTTP client allows 120 s).
+const PHOTO_TIMEOUT: Duration = Duration::from_secs(30);
 const DOWN_AFTER: Duration = Duration::from_secs(180);
 const SUMMARY_PAGES: usize = 30;
 
@@ -82,6 +85,12 @@ pub async fn run(ctx: Arc<Ctx>, store: Store) -> Result<()> {
         }
         match ctx.api.stream(cursor, WAIT_SECS).await {
             Ok(page) => {
+                if let Some(since) = failing_since {
+                    record(
+                        "CCTV stream back",
+                        serde_json::json!({"down_ms": since.elapsed().as_millis()}),
+                    );
+                }
                 if failing_since.take().is_some() && !down_notice.is_empty() {
                     let text = "✅ 监控服务已恢复连接";
                     for s in down_notice.drain(..) {
@@ -118,6 +127,12 @@ pub async fn run(ctx: Arc<Ctx>, store: Store) -> Result<()> {
                 }
             }
             Err(e) => {
+                if failing_since.is_none() {
+                    record(
+                        "CCTV stream lost",
+                        serde_json::json!({"error": format!("{e:#}")}),
+                    );
+                }
                 let since = *failing_since.get_or_insert_with(Instant::now);
                 tracing::warn!("CCTV stream failed: {e:#}");
                 if since.elapsed() >= DOWN_AFTER && down_notice.is_empty() {
@@ -247,37 +262,60 @@ async fn handle_event(ctx: &Ctx, store: &Store, e: &Event) -> Result<()> {
         let phone = needs_phone(e) && ctx.alarm.is_some();
         let silent = e.kind == "recovery" || (e.level == 2 && quiet);
         let caption = format::caption(e, false);
+        let started = Instant::now();
         let photo = snapshot(ctx, e).await;
+        let snapshot_ms = started.elapsed().as_millis();
         let buttons = push_buttons(e, phone, &key);
-        let mut sent = Vec::new();
-        for chat in &recipients(ctx, store, e) {
+        // All chats at once: one slow upload must not hold up the others.
+        let mut tasks = tokio::task::JoinSet::new();
+        for chat in recipients(ctx, store, e) {
+            let (bot, caption, photo) = (ctx.bot.clone(), caption.clone(), photo.clone());
             let opts = SendOpts {
                 silent,
                 parent: None,
                 buttons: buttons.clone(),
             };
-            let r = match &photo {
-                Some(jpeg) => {
-                    ctx.bot
-                        .send_photo(chat, jpeg.clone(), &caption, &opts)
-                        .await
-                }
-                None => ctx.bot.send_text(chat, &caption, &opts).await,
-            };
+            tasks.spawn(async move {
+                let t = Instant::now();
+                let r = deliver(&bot, &chat, photo, &caption, &opts).await;
+                (chat, r, t.elapsed().as_millis())
+            });
+        }
+        let mut sent = Vec::new();
+        let mut timings = Vec::new();
+        while let Some(done) = tasks.join_next().await {
+            let Ok((chat, r, ms)) = done else { continue };
             match r {
-                Ok(message_id) => {
+                Ok((message_id, is_photo)) => {
+                    timings.push(serde_json::json!({"chat": chat, "ms": ms, "photo": is_photo}));
                     let s = Sent {
-                        chat: chat.clone(),
+                        chat,
                         message_id,
-                        is_photo: photo.is_some(),
+                        is_photo,
                         caption: caption.clone(),
                     };
                     store.save_message(id, &s)?;
                     sent.push(s);
                 }
-                Err(err) => tracing::warn!(event = id, "CCTV push not delivered: {err:#}"),
+                Err(err) => {
+                    timings.push(
+                        serde_json::json!({"chat": chat, "ms": ms, "error": format!("{err:#}")}),
+                    );
+                    tracing::warn!(event = id, "CCTV push not delivered: {err:#}");
+                }
             }
         }
+        record(
+            &format!("CCTV push e{id} (level {})", e.level),
+            serde_json::json!({
+                "event_id": id,
+                "level": e.level,
+                "snapshot_ms": snapshot_ms,
+                "has_photo": photo.is_some(),
+                "sends": timings,
+                "total_ms": started.elapsed().as_millis(),
+            }),
+        );
         store.set_pushed(
             id,
             Pushed {
@@ -398,6 +436,39 @@ async fn edit_all(
             Err(err) => tracing::warn!("CCTV caption not updated: {err:#}"),
         }
     }
+}
+
+/// Send the push to one chat: the photo when there is one, the text alone
+/// when the photo cannot be sent in time. Returns (message id, is photo).
+async fn deliver(
+    bot: &Bot,
+    chat: &str,
+    photo: Option<Vec<u8>>,
+    caption: &str,
+    opts: &SendOpts,
+) -> Result<(i64, bool)> {
+    if let Some(jpeg) = photo {
+        match tokio::time::timeout(PHOTO_TIMEOUT, bot.send_photo(chat, jpeg, caption, opts)).await {
+            Ok(Ok(id)) => return Ok((id, true)),
+            Ok(Err(e)) => tracing::warn!("CCTV photo not sent, sending text: {e:#}"),
+            Err(_) => tracing::warn!("CCTV photo upload too slow, sending text"),
+        }
+    }
+    Ok((bot.send_text(chat, caption, opts).await?, false))
+}
+
+/// A line in the elfClaw run log (`state/elfclaw-logs.jsonl`), so push
+/// delays and lost connections can be traced afterwards.
+fn record(message: &str, details: serde_json::Value) {
+    crate::elfclaw_log::log(crate::elfclaw_log::LogEntry {
+        id: uuid::Uuid::new_v4().to_string(),
+        timestamp: Utc::now().to_rfc3339(),
+        level: crate::elfclaw_log::LogLevel::Info,
+        category: crate::elfclaw_log::LogCategory::ChannelMessage,
+        component: "cctv".into(),
+        message: message.into(),
+        details,
+    });
 }
 
 /// The event's snapshot; for an alarm without one (some cameras fail to
