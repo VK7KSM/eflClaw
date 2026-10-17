@@ -486,7 +486,15 @@ impl CctvTool {
                                 .collect();
                             let _ = write!(line, "，有云台，预置位：{}", presets.join("、"));
                         }
-                        if let Some(a) = &m.arm {
+                        if m.rotator.is_some() {
+                            // On the antenna camera "armed" means AI tracking.
+                            let on = m.arm.as_ref().is_some_and(|a| a.state == "armed");
+                            line.push_str(if on {
+                                "，AI 跟踪开"
+                            } else {
+                                "，AI 跟踪关"
+                            });
+                        } else if let Some(a) = &m.arm {
                             if a.state != "armed" {
                                 let _ = write!(
                                     line,
@@ -833,7 +841,10 @@ impl Tool for CctvArmTool {
          still record but raise no alarms anywhere: no Telegram, no ntfy, no phone call even for a \
          real intrusion. If the user only does not want Telegram alarm messages, do NOT disarm: use \
          the cctv tool's alerts_off (or the /cctv_off menu). Optional 'until' (HH:MM or YYYY-MM-DD HH:MM) re-arms \
-         automatically. Use state 'status' to just read the current state."
+         automatically. Use state 'status' to just read the current state. Exception: on the roof \
+         antenna camera 'Yagi ANT' armed/disarmed switches the rotator's AI tracking on/off (it then \
+         turns by itself to follow people and cars on the street); it is not touched by 'all', must be \
+         named, and must be called 'AI 跟踪' to the user, never '布防'."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -862,10 +873,15 @@ impl Tool for CctvArmTool {
                 return Ok(link.api.arm_status().await?.to_string());
             }
             let camera = args.get("camera").and_then(Value::as_str).unwrap_or("all");
+            let mut antenna = None;
             let monitor: Value = if camera.eq_ignore_ascii_case("all") || camera == "全部" {
                 "all".into()
             } else {
-                link.camera(Some(camera), false).await?.id.into()
+                let m = link.camera(Some(camera), false).await?;
+                if m.rotator.is_some() {
+                    antenna = Some(m.name.clone());
+                }
+                m.id.into()
             };
             let mut body = json!({"monitor_id": monitor, "state": state});
             if let Some(u) = args
@@ -878,6 +894,18 @@ impl Tool for CctvArmTool {
                     .into();
             }
             link.api.set_arm(&body).await?;
+            if let Some(name) = antenna {
+                let on = state == "armed";
+                return Ok(format!(
+                    "已{} {name} 天线云台的 AI 跟踪{}",
+                    if on { "打开" } else { "关闭" },
+                    if on {
+                        "（云台会自己转去跟街上的人和车）"
+                    } else {
+                        ""
+                    }
+                ));
+            }
             Ok(format!("已设置：{camera} → {state}"))
         }
         .await;
@@ -912,6 +940,9 @@ fn rotator_line(v: &Value) -> String {
     }
     if v["at_home"].as_bool() == Some(true) {
         line.push_str("，在守望位");
+    }
+    if v["ai_track"].as_bool() == Some(true) {
+        line.push_str("，AI 跟踪开");
     }
     if let Some(msg) = v["message"].as_str().filter(|m| !m.is_empty()) {
         let _ = write!(line, "（{msg}）");
@@ -1008,9 +1039,11 @@ mod tests {
             rotator_line(&v),
             "方位 182°、俯仰 32°，当前由DTrac 追星控制（正在追星，云台由 DTrac 控制）"
         );
-        let idle =
-            json!({"az": 90, "el": 0, "moving": true, "controller": "idle", "at_home": true});
-        assert_eq!(rotator_line(&idle), "方位 90°、俯仰 0°，正在转动，在守望位");
+        let idle = json!({"az": 90, "el": 0, "moving": true, "controller": "idle", "at_home": true, "ai_track": true});
+        assert_eq!(
+            rotator_line(&idle),
+            "方位 90°、俯仰 0°，正在转动，在守望位，AI 跟踪开"
+        );
     }
 
     #[test]
