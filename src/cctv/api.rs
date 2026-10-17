@@ -33,6 +33,13 @@ pub struct Monitor {
     pub presets: Vec<Preset>,
     #[serde(default)]
     pub arm: Option<Arm>,
+    /// v1.9: cameras that are not always powered (the roof antenna one);
+    /// `Some(false)` means switched off, not a fault.
+    #[serde(default)]
+    pub powered: Option<bool>,
+    /// v1.9: the antenna rotator's state, present on the camera mounted on it.
+    #[serde(default)]
+    pub rotator: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Default)]
@@ -392,6 +399,15 @@ impl CctvApi {
     pub async fn ptz(&self, body: &serde_json::Value) -> Result<()> {
         let _: serde_json::Value = self.post_json("ptz", body).await?;
         Ok(())
+    }
+
+    /// The antenna rotator's state (v1.9): az, el, moving, controller, locked…
+    pub async fn rotator(&self, monitor: u32) -> Result<serde_json::Value> {
+        self.get_json(
+            &format!("ptz?monitor_id={monitor}"),
+            Duration::from_secs(10),
+        )
+        .await
     }
 
     pub async fn arm_status(&self) -> Result<serde_json::Value> {

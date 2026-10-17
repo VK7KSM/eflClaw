@@ -469,12 +469,15 @@ impl CctvTool {
                 Ok(list
                     .iter()
                     .map(|m| {
-                        let mut line = format!(
-                            "{}. {}{}",
-                            m.id,
-                            m.name,
-                            if m.online { "" } else { "（离线）" }
-                        );
+                        let state = match (m.online, m.powered) {
+                            (true, _) => "",
+                            (false, Some(false)) => "（没通电，不是故障）",
+                            (false, _) => "（离线）",
+                        };
+                        let mut line = format!("{}. {}{state}", m.id, m.name);
+                        if m.rotator.is_some() {
+                            line.push_str("，装在屋顶天线云台上");
+                        }
                         if m.ptz {
                             let presets: Vec<String> = m
                                 .presets
@@ -613,6 +616,11 @@ impl CctvTool {
                 let chat = caller_chat();
                 let m = link.camera(camera.as_deref(), true).await?;
                 let ptz_action = s("ptz_action").unwrap_or_else(|| "preset".into());
+                let antenna = m.rotator.is_some();
+                if ptz_action == "status" {
+                    let v = link.api.rotator(m.id).await?;
+                    return Ok(format!("{}：{}", m.name, rotator_line(&v)));
+                }
                 let mut body = json!({"monitor_id": m.id, "action": ptz_action});
                 let mut wait_ms = 1500u64;
                 let done = match ptz_action.as_str() {
@@ -657,9 +665,48 @@ impl CctvTool {
                         )
                     }
                     "stop" => "停止".to_string(),
+                    "goto" if antenna => {
+                        let deg = |k: &str| args.get(k).and_then(Value::as_f64);
+                        let (az, el) = (
+                            deg("az").context("要给方位 az（度，0=正北，顺时针）")?,
+                            deg("el").context("要给俯仰 el（度，0=水平）")?,
+                        );
+                        body["az"] = az.into();
+                        body["el"] = el.into();
+                        format!("转到方位 {az:.0}°、俯仰 {el:.0}°")
+                    }
+                    "home" if antenna => "回到守望位".to_string(),
+                    "look" if antenna => {
+                        let from = link
+                            .camera(
+                                Some(
+                                    s("from_camera")
+                                        .context("要给对准哪一路摄像头 from_camera")?
+                                        .as_str(),
+                                ),
+                                false,
+                            )
+                            .await?;
+                        body["from_monitor"] = from.id.into();
+                        format!("转向 {} 看的方向", from.name)
+                    }
+                    "goto" | "home" | "look" => {
+                        bail!("{} 不是天线云台，只能 preset/move/zoom/stop", m.name)
+                    }
                     other => bail!("不认识的云台动作：{other}"),
                 };
                 link.api.ptz(&body).await?;
+                if antenna {
+                    // The rotator turns slowly (about 7°/s); look once it stops.
+                    wait_ms = 0;
+                    for _ in 0..30 {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        match link.api.rotator(m.id).await {
+                            Ok(v) if v["moving"].as_bool() == Some(true) => {}
+                            _ => break,
+                        }
+                    }
+                }
                 if let Some(chat) = chat {
                     tokio::time::sleep(Duration::from_millis(wait_ms)).await;
                     if let Ok(jpeg) = link.api.live_snapshot(m.id).await {
@@ -709,7 +756,12 @@ impl Tool for CctvTool {
          optional camera, from/to as HH:MM or YYYY-MM-DD HH:MM, min_level 1-3); clip_live (record \
          5-20 s of live video now and send it); clip_history (recorded video from the NVR, from/to, \
          at most 5 minutes, ending at least 2 minutes ago); ptz (move the PTZ camera: ptz_action \
-         preset with preset number or name, move/zoom with direction and duration_ms, or stop). \
+         preset with preset number or name, move/zoom with direction and duration_ms, or stop; \
+         the roof antenna camera 'Yagi ANT' sits on the satellite-antenna rotator and also takes \
+         goto (az = compass bearing 0 north clockwise, el = elevation 0 horizontal), home, look \
+         (from_camera: point where that camera looks) and status; it is not always powered — \
+         'not powered' is normal, not a fault; while the user tracks a satellite with DTrac every \
+         command is refused with '正在追星，云台由 DTrac 控制': tell the user that, it is not an error). \
          Camera names are English (e.g. 'Front yard', 'Garage front'); map the user's words to \
          them, call cameras first if unsure. Pictures and videos are delivered by the tool itself. \
          snapshot, event_snapshot and ptz return what the picture shows (pass the user's question \
@@ -734,7 +786,10 @@ impl Tool for CctvTool {
                 "min_level": {"type": "integer", "minimum": 1, "maximum": 3},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 200},
                 "seconds": {"type": "integer", "minimum": 5, "maximum": 20},
-                "ptz_action": {"type": "string", "enum": ["preset", "move", "zoom", "stop"]},
+                "ptz_action": {"type": "string", "enum": ["preset", "move", "zoom", "stop", "goto", "home", "look", "status"]},
+                "az": {"type": "number", "description": "ptz goto (antenna): bearing in degrees, 0 = north, clockwise"},
+                "el": {"type": "number", "description": "ptz goto (antenna): elevation in degrees, 0 = horizontal"},
+                "from_camera": {"type": "string", "description": "ptz look (antenna): point where this camera looks"},
                 "preset": {"type": "string", "description": "Preset number or name"},
                 "direction": {"type": "string", "enum": ["up", "down", "left", "right", "up_left", "up_right", "down_left", "down_right", "in", "out"]},
                 "duration_ms": {"type": "integer", "minimum": 100, "maximum": 5000},
@@ -833,6 +888,37 @@ impl Tool for CctvArmTool {
     }
 }
 
+/// The antenna rotator's state in one line.
+fn rotator_line(v: &Value) -> String {
+    let mut line = format!(
+        "方位 {:.0}°、俯仰 {:.0}°{}",
+        v["az"].as_f64().unwrap_or_default(),
+        v["el"].as_f64().unwrap_or_default(),
+        if v["moving"].as_bool() == Some(true) {
+            "，正在转动"
+        } else {
+            ""
+        }
+    );
+    let by = match v["controller"].as_str().unwrap_or("") {
+        "dtrac" => "DTrac 追星",
+        "manual" => "手动控制",
+        "ai" => "AI 跟踪",
+        "look" => "对准某一路摄像头",
+        _ => "",
+    };
+    if !by.is_empty() {
+        let _ = write!(line, "，当前由{by}控制");
+    }
+    if v["at_home"].as_bool() == Some(true) {
+        line.push_str("，在守望位");
+    }
+    if let Some(msg) = v["message"].as_str().filter(|m| !m.is_empty()) {
+        let _ = write!(line, "（{msg}）");
+    }
+    line
+}
+
 /// One camera of `/scene`: who and what is there now.
 fn scene_line(m: &Value) -> String {
     let name = m["name"].as_str().unwrap_or("?");
@@ -908,8 +994,23 @@ mod tests {
             ptz: *n == "Front yard PTZ",
             presets: vec![],
             arm: None,
+            powered: None,
+            rotator: None,
         })
         .collect()
+    }
+
+    #[test]
+    fn rotator_state_reads_naturally() {
+        let v = json!({"az": 181.6, "el": 32.2, "moving": false, "controller": "dtrac",
+            "locked": true, "at_home": false, "message": "正在追星，云台由 DTrac 控制"});
+        assert_eq!(
+            rotator_line(&v),
+            "方位 182°、俯仰 32°，当前由DTrac 追星控制（正在追星，云台由 DTrac 控制）"
+        );
+        let idle =
+            json!({"az": 90, "el": 0, "moving": true, "controller": "idle", "at_home": true});
+        assert_eq!(rotator_line(&idle), "方位 90°、俯仰 0°，正在转动，在守望位");
     }
 
     #[test]
