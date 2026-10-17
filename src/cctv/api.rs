@@ -154,11 +154,23 @@ pub struct Object {
     /// 自家车 / 邻居车 / 朋友车 / 陌生车.
     #[serde(default)]
     pub category_zh: Option<String>,
+    /// The automatic group this target was put in (v1.11), if any.
+    #[serde(default)]
+    pub group: Option<Group>,
     /// A vehicle's plate as read (v1.6; `None` when unreadable).
     #[serde(default)]
     pub plate: Option<String>,
     #[serde(default)]
     pub crop_url: String,
+}
+
+/// An automatic group (v1.11): cctv's guess that several pictures show the
+/// same person or vehicle, under a nickname shown as "〔自动〕…". Not a name.
+#[derive(Debug, Clone, Deserialize, PartialEq, Default)]
+pub struct Group {
+    pub id: i64,
+    #[serde(default)]
+    pub display: String,
 }
 
 /// A registered person or vehicle (v1.10: with its category).
@@ -475,6 +487,32 @@ impl CctvApi {
     /// Registered vehicles.
     pub async fn vehicles(&self) -> Result<Vec<Name>> {
         self.names("vehicles", "vehicles").await
+    }
+
+    /// The automatic groups not handled yet (v1.11): `auto_people` and
+    /// `auto_vehicles` of `/people` and `/vehicles`.
+    pub async fn auto_groups(&self) -> Result<(serde_json::Value, serde_json::Value)> {
+        let p: serde_json::Value = self.get_json("people", Duration::from_secs(10)).await?;
+        let v: serde_json::Value = self.get_json("vehicles", Duration::from_secs(10)).await?;
+        Ok((p["auto_people"].clone(), v["auto_vehicles"].clone()))
+    }
+
+    /// Label a whole automatic group as `name` (v1.11); cctv's note.
+    pub async fn group_label(&self, id: i64, name: &str, category: Option<&str>) -> Result<String> {
+        let mut body = serde_json::json!({"name": name});
+        if let Some(c) = category {
+            body["category"] = c.into();
+        }
+        let v: serde_json::Value = self.post_json(&format!("groups/{id}/label"), &body).await?;
+        Ok(v["note"].as_str().unwrap_or("已标注").to_string())
+    }
+
+    /// Ignore a whole automatic group, now and later (v1.11); cctv's note.
+    pub async fn group_ignore(&self, id: i64) -> Result<String> {
+        let v: serde_json::Value = self
+            .post_json(&format!("groups/{id}/ignore"), &serde_json::json!({}))
+            .await?;
+        Ok(v["note"].as_str().unwrap_or("已忽略").to_string())
     }
 
     /// Change a registered name's category (v1.10); cctv's note, to be

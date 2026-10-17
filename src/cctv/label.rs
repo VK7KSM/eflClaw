@@ -174,6 +174,9 @@ pub fn describe(o: &Object) -> String {
     if let Some(p) = o.plate.as_deref().filter(|p| !p.is_empty()) {
         let _ = write!(line, "，车牌 {p}");
     }
+    if let Some(g) = o.group.as_ref().filter(|g| !g.display.is_empty()) {
+        let _ = write!(line, "，像是{}（组 {}）", g.display, g.id);
+    }
     if let Some(l) = &o.label {
         let _ = write!(line, "，已标为「{l}」");
     }
@@ -276,6 +279,7 @@ mod tests {
             matched: None,
             label: None,
             category_zh: None,
+            group: None,
             plate: None,
             crop_url: "/cctv/v1/events/1/objects/0.jpg".into(),
         }
@@ -286,6 +290,14 @@ mod tests {
         let mut plate = object("vehicle", "moving", false);
         plate.plate = Some("ZZZ000".into());
         assert_eq!(describe(&plate), "目标 0：车，在院子里动，车牌 ZZZ000");
+        plate.group = Some(crate::cctv::api::Group {
+            id: 12,
+            display: "〔自动〕银色皮卡".into(),
+        });
+        assert_eq!(
+            describe(&plate),
+            "目标 0：车，在院子里动，车牌 ZZZ000，像是〔自动〕银色皮卡（组 12）"
+        );
         assert_eq!(
             describe(&object("person", "faceless", false)),
             "目标 0：人，一直没看清脸"

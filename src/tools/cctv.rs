@@ -302,6 +302,50 @@ impl CctvTool {
                     list(&vehicles)
                 ))
             }
+            "groups" => {
+                let (people, vehicles) = link.api.auto_groups().await?;
+                let line = |g: &Value| {
+                    let mut l = format!(
+                        "组 {}：{}，{} 张",
+                        g["id"],
+                        g["display"].as_str().unwrap_or(""),
+                        g["size"]
+                    );
+                    if let Some(w) = g["when"].as_str() {
+                        let _ = write!(l, "，多在{w}");
+                    }
+                    if let Some(n) = g["suggest"]["name"].as_str() {
+                        let _ = write!(l, "，可能是 {n}（只是建议）");
+                    }
+                    l
+                };
+                let list = |v: &Value| {
+                    v.as_array()
+                        .map(|a| a.iter().take(20).map(line).collect::<Vec<_>>().join("\n"))
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| "（没有）".into())
+                };
+                Ok(format!(
+                    "还没认领的自动外号（cctv 自动把同一个人或车归成一组，外号不是真名）：\n人：\n{}\n车：\n{}",
+                    list(&people),
+                    list(&vehicles)
+                ))
+            }
+            "group_label" | "group_ignore" => {
+                let id = n("group_id")
+                    .or_else(|| s("group_id").and_then(|v| v.trim().parse().ok()))
+                    .context("要给组号 group_id")?;
+                let id = i64::try_from(id)?;
+                let note = if action == "group_ignore" {
+                    link.api.group_ignore(id).await?
+                } else {
+                    let name = s("name").context("要给名字 name")?;
+                    link.api
+                        .group_label(id, name.trim(), s("category").as_deref())
+                        .await?
+                };
+                Ok(format!("cctv 的说明（请原样转告用户）：{note}"))
+            }
             "set_category" => {
                 let kind = s("kind").unwrap_or_else(|| "person".into());
                 let name = s("name").context("要给名字 name")?;
@@ -815,7 +859,12 @@ impl Tool for CctvTool {
          say, without it cctv treats it as friend); names (registered people and vehicles with \
          their categories); set_category (kind person/vehicle, name, category: change a \
          registered name's category; family or own means that person or car never raises an \
-         alarm again, so make sure the user really asked for it first; relay cctv's note); events (what happened: \
+         alarm again, so make sure the user really asked for it first; relay cctv's note); groups \
+         (cctv's automatic groups: pictures it thinks show the same person or vehicle, under a \
+         nickname shown as '〔自动〕…' — a nickname, never a real name; a target in an alarm may say \
+         '像是〔自动〕X（组 N）'); group_label (group_id + name [+ category for a new name]: the user \
+         says that nickname is really someone — same category rules as label); group_ignore \
+         (group_id: ignore that group from now on); events (what happened: \
          optional camera, from/to as HH:MM or YYYY-MM-DD HH:MM, min_level 1-3); clip_live (record \
          5-20 s of live video now and send it); clip_history (recorded video from the NVR, from/to, \
          at most 5 minutes, ending at least 2 minutes ago); ptz (move the PTZ camera: ptz_action \
@@ -836,9 +885,10 @@ impl Tool for CctvTool {
         json!({
             "type": "object",
             "properties": {
-                "action": {"type": "string", "enum": ["cameras", "snapshot", "event_snapshot", "events", "clip_live", "clip_history", "ptz", "greet", "scene", "reports", "objects", "label", "unlabel", "names", "set_category", "alerts_off", "alerts_on"]},
+                "action": {"type": "string", "enum": ["cameras", "snapshot", "event_snapshot", "events", "clip_live", "clip_history", "ptz", "greet", "scene", "reports", "objects", "label", "unlabel", "names", "set_category", "groups", "group_label", "group_ignore", "alerts_off", "alerts_on"]},
                 "category": {"type": "string", "enum": ["family", "own", "neighbor", "friend", "stranger"], "description": "label (new name) / set_category: person family|neighbor|friend|stranger, vehicle own|neighbor|friend|stranger"},
                 "kind": {"type": "string", "enum": ["person", "vehicle"], "description": "set_category: a person's or a vehicle's name"},
+                "group_id": {"type": "integer", "description": "group_label / group_ignore: the automatic group's number"},
                 "object": {"description": "label/unlabel: target index (or \"all\" for label)"},
                 "name": {"type": "string", "description": "label: person or vehicle name"},
                 "mode": {"type": "string", "enum": ["hello", "flash"], "description": "greet: speaker or light"},
