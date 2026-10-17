@@ -13,7 +13,7 @@
 //! Since v1.6 a person without a clear face can be labelled too: cctv then
 //! remembers only that day's build and clothes (its note says so).
 
-use super::api::{CctvApi, LabelOutcome, Object};
+use super::api::{CctvApi, LabelOutcome, Name, Object};
 use super::tg::{Bot, Buttons, SendOpts};
 use crate::channels::telegram::{CallbackAnswer, CallbackPress};
 use anyhow::{Context, Result};
@@ -30,7 +30,7 @@ const NAME_PREFIX: &str = "cctv_lbl:";
 const UNDO_PREFIX: &str = "cctv_unl:";
 /// Pictures offered per press (a street full of parked cars is not useful).
 const MAX_OFFERED: usize = 8;
-const MAX_NAME_BUTTONS: usize = 8;
+const MAX_NAME_BUTTONS: usize = 12;
 
 struct Labeler {
     api: CctvApi,
@@ -101,7 +101,7 @@ fn on_name(p: &CallbackPress<'_>) -> Option<CallbackAnswer> {
     let l = LABELER.get()?;
     let toast = format!("正在标成「{name}」…");
     tokio::spawn(async move {
-        let (caption, buttons) = match l.api.label(id, &serde_json::json!(idx), &name).await {
+        let (caption, buttons) = match l.api.label(id, &serde_json::json!(idx), &name, None).await {
             Ok(outcome) => labelled(id, idx, &outcome),
             Err(e) => (
                 format!("事件 {id} · 目标 {idx}：标注失败（{e:#}），可以再点一次"),
@@ -177,11 +177,18 @@ pub fn describe(o: &Object) -> String {
     if let Some(l) = &o.label {
         let _ = write!(line, "，已标为「{l}」");
     }
+    if let Some(c) = o
+        .category_zh
+        .as_deref()
+        .filter(|_| o.label.is_some() || o.matched.is_some())
+    {
+        let _ = write!(line, "（{c}）");
+    }
     line
 }
 
-/// Name buttons for one target, two per row.
-fn name_buttons(id: i64, idx: u32, names: &[String]) -> Buttons {
+/// Name buttons for one target, two per row, each showing its category.
+fn name_buttons(id: i64, idx: u32, names: &[Name]) -> Buttons {
     let mut guard = CHOICES.lock();
     let map = guard.get_or_insert_with(HashMap::new);
     if map.len() > 2000 {
@@ -192,8 +199,12 @@ fn name_buttons(id: i64, idx: u32, names: &[String]) -> Buttons {
         .take(MAX_NAME_BUTTONS)
         .map(|n| {
             let token = NEXT_CHOICE.fetch_add(1, Ordering::Relaxed);
-            map.insert(token, (id, idx, n.clone()));
-            (n.clone(), format!("{NAME_PREFIX}{token}"))
+            map.insert(token, (id, idx, n.name.clone()));
+            let label = match &n.category_zh {
+                Some(c) => format!("{}（{c}）", n.name),
+                None => n.name.clone(),
+            };
+            (label, format!("{NAME_PREFIX}{token}"))
         })
         .collect();
     buttons.chunks(2).map(<[_]>::to_vec).collect()
@@ -227,10 +238,10 @@ async fn offer(l: &Labeler, id: i64, chat: &str, push: i64) -> Result<()> {
             &people
         };
         let hint = match (o.kind.as_str(), o.has_face) {
-            ("vehicle", _) => "点名字标注；新名字请回复这张图，例如「这是我的车」",
-            (_, true) => "点名字标注；新名字请回复这张图，例如「这是小明」",
+            ("vehicle", _) => "点名字标注；新的车请回复这张图，写上名字和分类，例如「这是邻居的车」",
+            (_, true) => "点名字标注；新的人请回复这张图，写上名字和分类，例如「这是邻居小明」",
             (_, false) => {
-                "没看清脸：标注后只按身形衣着认，今天之内有效。点名字标注；新名字请回复这张图，例如「这是小明」"
+                "没看清脸：标注后只按身形衣着认，今天之内有效。点名字标注；新的人请回复这张图，写上名字和分类，例如「这是邻居小明」"
             }
         };
         let caption = format!("事件 {id} · {}\n{hint}", describe(o));
@@ -264,6 +275,7 @@ mod tests {
             face_px: if has_face { 64.4 } else { 0.0 },
             matched: None,
             label: None,
+            category_zh: None,
             plate: None,
             crop_url: "/cctv/v1/events/1/objects/0.jpg".into(),
         }
@@ -285,29 +297,38 @@ mod tests {
         let mut car = object("vehicle", "known", false);
         car.matched = Some("我的车".into());
         car.label = Some("我的车".into());
+        car.category_zh = Some("自家车".into());
         assert_eq!(
             describe(&car),
-            "目标 0：车，认出是「我的车」，已标为「我的车」"
+            "目标 0：车，认出是「我的车」，已标为「我的车」（自家车）"
         );
     }
 
     #[test]
     fn name_buttons_fit_telegram_and_map_back() {
-        let names: Vec<String> = [
-            "kasim",
-            "一个很长很长很长很长很长很长很长很长很长的名字",
-            "c",
+        let names: Vec<Name> = [
+            ("kasim", Some("家人")),
+            ("一个很长很长很长很长很长很长很长很长很长的名字", None),
+            ("c", Some("邻居")),
         ]
         .iter()
-        .map(|s| (*s).to_string())
+        .map(|(n, c)| Name {
+            name: (*n).to_string(),
+            category_zh: c.map(str::to_string),
+        })
         .collect();
         let rows = name_buttons(36628, 3, &names);
         assert_eq!(rows.len(), 2, "two per row");
+        assert_eq!(
+            rows[0][0].0, "kasim（家人）",
+            "the category shows on the button"
+        );
         for (label, data) in rows.iter().flatten() {
             assert!(data.len() <= 64, "callback data limit");
             let token: u64 = data.strip_prefix(NAME_PREFIX).unwrap().parse().unwrap();
             let (id, idx, name) = CHOICES.lock().as_ref().unwrap()[&token].clone();
-            assert_eq!((id, idx, name.as_str()), (36628, 3, label.as_str()));
+            assert_eq!((id, idx), (36628, 3));
+            assert!(label.starts_with(&name), "the button sends its own name");
         }
     }
 

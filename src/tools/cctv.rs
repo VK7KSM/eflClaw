@@ -285,6 +285,38 @@ impl CctvTool {
                 )?
                 .to_string())
             }
+            "names" => {
+                let (people, vehicles) = (link.api.people().await?, link.api.vehicles().await?);
+                let list = |v: &[crate::cctv::api::Name]| {
+                    v.iter()
+                        .map(|n| match &n.category_zh {
+                            Some(c) => format!("{}（{c}）", n.name),
+                            None => n.name.clone(),
+                        })
+                        .collect::<Vec<_>>()
+                        .join("、")
+                };
+                Ok(format!(
+                    "已登记的人：{}\n已登记的车：{}",
+                    list(&people),
+                    list(&vehicles)
+                ))
+            }
+            "set_category" => {
+                let kind = s("kind").unwrap_or_else(|| "person".into());
+                let name = s("name").context("要给名字 name")?;
+                let category = s("category").context("要给分类 category")?;
+                let allowed: &[&str] = if kind == "vehicle" {
+                    &crate::cctv::api::VEHICLE_CATEGORIES
+                } else {
+                    &crate::cctv::api::PERSON_CATEGORIES
+                };
+                if !allowed.contains(&category.as_str()) {
+                    bail!("{kind} 的分类只能是：{}", allowed.join("、"));
+                }
+                let note = link.api.set_category(&kind, &name, &category).await?;
+                Ok(format!("cctv 的说明（请原样转告用户）：{note}"))
+            }
             "objects" | "label" | "unlabel" => {
                 let id = n("event_id")
                     .or_else(|| {
@@ -318,20 +350,36 @@ impl CctvTool {
                             }
                             other => other,
                         };
-                        Ok(match link.api.label(id, &object, &name).await? {
-                            crate::cctv::api::LabelOutcome::Done { note, level } => {
-                                let mut out =
-                                    format!("标注完成。cctv 的说明（请原样转告用户）：{note}");
-                                if let Some((old, new)) = level.filter(|(o, n)| o != n) {
-                                    let _ =
-                                        write!(out, "\n这条报警从 level {old} 改为 level {new}。");
+                        let category = s("category");
+                        if let Some(c) = category.as_deref() {
+                            let ok = crate::cctv::api::PERSON_CATEGORIES.contains(&c)
+                                || crate::cctv::api::VEHICLE_CATEGORIES.contains(&c);
+                            if !ok {
+                                bail!("分类只能是 family/neighbor/friend/stranger（人）或 own/neighbor/friend/stranger（车）");
+                            }
+                        }
+                        Ok(
+                            match link
+                                .api
+                                .label(id, &object, &name, category.as_deref())
+                                .await?
+                            {
+                                crate::cctv::api::LabelOutcome::Done { note, level } => {
+                                    let mut out =
+                                        format!("标注完成。cctv 的说明（请原样转告用户）：{note}");
+                                    if let Some((old, new)) = level.filter(|(o, n)| o != n) {
+                                        let _ = write!(
+                                            out,
+                                            "\n这条报警从 level {old} 改为 level {new}。"
+                                        );
+                                    }
+                                    out
                                 }
-                                out
-                            }
-                            crate::cctv::api::LabelOutcome::Unlearnable(why) => {
-                                format!("学不了，cctv 的原因（请原样转告用户）：{why}")
-                            }
-                        })
+                                crate::cctv::api::LabelOutcome::Unlearnable(why) => {
+                                    format!("学不了，cctv 的原因（请原样转告用户）：{why}")
+                                }
+                            },
+                        )
                     }
                     _ => {
                         let idx = object
@@ -760,7 +808,14 @@ impl Tool for CctvTool {
          target picture's caption reads '事件 <event_id> · 目标 <object>', so when the user replies \
          to one with a name, call label with those numbers; relay cctv's note or reason verbatim; \
          a person without a clear face is remembered by build and clothes for that day only; \
-         '认出是「X」' is a firm recognition, say 'recognised X', never 'maybe'); events (what happened: \
+         '认出是「X」' is a firm recognition, say 'recognised X', never 'maybe'; every name has a \
+         category — people 家人 family / 邻居 neighbor / 朋友 friend / 陌生人 stranger, vehicles \
+         自家车 own / 邻居车 neighbor / 朋友车 friend / 陌生车 stranger; only family and own stop \
+         the alarms; a new name in label takes 'category' — ask the user which if they did not \
+         say, without it cctv treats it as friend); names (registered people and vehicles with \
+         their categories); set_category (kind person/vehicle, name, category: change a \
+         registered name's category; family or own means that person or car never raises an \
+         alarm again, so make sure the user really asked for it first; relay cctv's note); events (what happened: \
          optional camera, from/to as HH:MM or YYYY-MM-DD HH:MM, min_level 1-3); clip_live (record \
          5-20 s of live video now and send it); clip_history (recorded video from the NVR, from/to, \
          at most 5 minutes, ending at least 2 minutes ago); ptz (move the PTZ camera: ptz_action \
@@ -781,7 +836,9 @@ impl Tool for CctvTool {
         json!({
             "type": "object",
             "properties": {
-                "action": {"type": "string", "enum": ["cameras", "snapshot", "event_snapshot", "events", "clip_live", "clip_history", "ptz", "greet", "scene", "reports", "objects", "label", "unlabel", "alerts_off", "alerts_on"]},
+                "action": {"type": "string", "enum": ["cameras", "snapshot", "event_snapshot", "events", "clip_live", "clip_history", "ptz", "greet", "scene", "reports", "objects", "label", "unlabel", "names", "set_category", "alerts_off", "alerts_on"]},
+                "category": {"type": "string", "enum": ["family", "own", "neighbor", "friend", "stranger"], "description": "label (new name) / set_category: person family|neighbor|friend|stranger, vehicle own|neighbor|friend|stranger"},
+                "kind": {"type": "string", "enum": ["person", "vehicle"], "description": "set_category: a person's or a vehicle's name"},
                 "object": {"description": "label/unlabel: target index (or \"all\" for label)"},
                 "name": {"type": "string", "description": "label: person or vehicle name"},
                 "mode": {"type": "string", "enum": ["hello", "flash"], "description": "greet: speaker or light"},

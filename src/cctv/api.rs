@@ -150,12 +150,27 @@ pub struct Object {
     pub matched: Option<String>,
     #[serde(default)]
     pub label: Option<String>,
+    /// The name's category in Chinese (v1.10): 家人 / 邻居 / 朋友 / 陌生人,
+    /// 自家车 / 邻居车 / 朋友车 / 陌生车.
+    #[serde(default)]
+    pub category_zh: Option<String>,
     /// A vehicle's plate as read (v1.6; `None` when unreadable).
     #[serde(default)]
     pub plate: Option<String>,
     #[serde(default)]
     pub crop_url: String,
 }
+
+/// A registered person or vehicle (v1.10: with its category).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Name {
+    pub name: String,
+    pub category_zh: Option<String>,
+}
+
+/// Allowed categories (v1.10). Only family / own stop the alarms.
+pub const PERSON_CATEGORIES: [&str; 4] = ["family", "neighbor", "friend", "stranger"];
+pub const VEHICLE_CATEGORIES: [&str; 4] = ["own", "neighbor", "friend", "stranger"];
 
 /// What `POST /events/{id}/label` did.
 #[derive(Debug, Clone, PartialEq)]
@@ -435,26 +450,43 @@ impl CctvApi {
             .objects)
     }
 
-    async fn names(&self, path: &str, field: &str) -> Result<Vec<String>> {
+    async fn names(&self, path: &str, field: &str) -> Result<Vec<Name>> {
         let v: serde_json::Value = self.get_json(path, Duration::from_secs(10)).await?;
         Ok(v[field]
             .as_array()
             .map(|a| {
                 a.iter()
-                    .filter_map(|p| p["name"].as_str().map(str::to_string))
+                    .filter_map(|p| {
+                        Some(Name {
+                            name: p["name"].as_str()?.to_string(),
+                            category_zh: p["category_zh"].as_str().map(str::to_string),
+                        })
+                    })
                     .collect()
             })
             .unwrap_or_default())
     }
 
-    /// Registered people's names.
-    pub async fn people(&self) -> Result<Vec<String>> {
+    /// Registered people.
+    pub async fn people(&self) -> Result<Vec<Name>> {
         self.names("people", "people").await
     }
 
-    /// Registered vehicles' names.
-    pub async fn vehicles(&self) -> Result<Vec<String>> {
+    /// Registered vehicles.
+    pub async fn vehicles(&self) -> Result<Vec<Name>> {
         self.names("vehicles", "vehicles").await
+    }
+
+    /// Change a registered name's category (v1.10); cctv's note, to be
+    /// shown verbatim. `kind` is `person` or `vehicle`.
+    pub async fn set_category(&self, kind: &str, name: &str, category: &str) -> Result<String> {
+        let v: serde_json::Value = self
+            .post_json(
+                "names/category",
+                &serde_json::json!({"kind": kind, "name": name, "category": category}),
+            )
+            .await?;
+        Ok(v["note"].as_str().unwrap_or("已设置").to_string())
     }
 
     /// Label target `object` (an index, or `"all"`) of an alarm as `name`.
@@ -463,13 +495,18 @@ impl CctvApi {
         event_id: i64,
         object: &serde_json::Value,
         name: &str,
+        category: Option<&str>,
     ) -> Result<LabelOutcome> {
+        let mut body = serde_json::json!({"object": object, "name": name});
+        if let Some(c) = category {
+            body["category"] = c.into();
+        }
         let resp = self
             .http
             .post(self.url(&format!("events/{event_id}/label")))
             .bearer_auth(&self.token)
             .timeout(Duration::from_secs(30))
-            .json(&serde_json::json!({"object": object, "name": name}))
+            .json(&body)
             .send()
             .await
             .context("cctv-server unreachable")?;
