@@ -31,7 +31,12 @@ fn read_prompt(config: &Config, name: &str) -> Result<Vec<i16>> {
 }
 
 /// The phone line for the highest alarms, when SIP and an owner number are set.
-fn alarm_line(config: &Config, bot: &tg::Bot, chats: &[String]) -> Option<Arc<alarm::AlarmLine>> {
+fn alarm_line(
+    config: &Config,
+    bot: &tg::Bot,
+    api: &api::CctvApi,
+    chats: &[String],
+) -> Option<Arc<alarm::AlarmLine>> {
     let owner = config.cctv.owner_mobile.trim();
     if owner.is_empty() {
         return None;
@@ -51,6 +56,7 @@ fn alarm_line(config: &Config, bot: &tg::Bot, chats: &[String]) -> Option<Arc<al
     };
     Some(Arc::new(alarm::AlarmLine {
         bot: bot.clone(),
+        api: api.clone(),
         chats: chats.to_vec(),
         owner: owner.to_string(),
         sip,
@@ -125,10 +131,11 @@ pub async fn run(config: Config) -> Result<()> {
         .filter(|s| !s.trim().is_empty())
         .cloned()
         .collect();
+    let cctv_api = api::CctvApi::new(&c.base_url)?;
     let ctx = Arc::new(worker::Ctx {
-        api: api::CctvApi::new(&c.base_url)?,
+        alarm: alarm_line(&config, &bot, &cctv_api, &chats),
+        api: cctv_api,
         bot: bot.clone(),
-        alarm: alarm_line(&config, &bot, &chats),
         chats,
         tz,
         quiet: (

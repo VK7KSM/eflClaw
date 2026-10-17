@@ -173,6 +173,28 @@ pub struct Group {
     pub display: String,
 }
 
+/// A delivery report for `POST /events/{id}/delivered` (v1.13). `note`
+/// (why it failed) is cut to 200 characters as the contract asks.
+pub fn delivery(channel: &str, accounts: Option<usize>, ok: bool, note: &str) -> serde_json::Value {
+    let mut v = serde_json::json!({
+        "channel": channel,
+        "ok": ok,
+        "at": chrono::Utc::now().to_rfc3339(),
+    });
+    match channel {
+        "call" => v["call"] = true.into(),
+        "sms" => v["sms"] = true.into(),
+        _ => {}
+    }
+    if let Some(n) = accounts {
+        v["accounts"] = n.into();
+    }
+    if !note.is_empty() {
+        v["note"] = note.chars().take(200).collect::<String>().into();
+    }
+    v
+}
+
 /// A registered person or vehicle (v1.10: with its category).
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Name {
@@ -593,13 +615,15 @@ impl CctvApi {
 
     /// Tell cctv-server when the Telegram push went out (v1.4, for its
     /// end-to-end latency statistics).
-    pub async fn delivered(&self, event_id: i64, at: &str) -> Result<()> {
+    /// `report` is the v1.13 body: channel (telegram / call / sms),
+    /// accounts, call, sms, ok, note, at — see [`delivery`].
+    pub async fn delivered(&self, event_id: i64, report: &serde_json::Value) -> Result<()> {
         let resp = self
             .http
             .post(self.url(&format!("events/{event_id}/delivered")))
             .bearer_auth(&self.token)
             .timeout(Duration::from_secs(10))
-            .json(&serde_json::json!({"channel": "telegram", "at": at}))
+            .json(report)
             .send()
             .await
             .context("cctv-server unreachable")?;
@@ -610,6 +634,25 @@ impl CctvApi {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delivery_reports_follow_the_contract() {
+        let t = delivery("telegram", Some(2), true, "");
+        assert_eq!(
+            (
+                t["channel"].as_str(),
+                t["accounts"].as_u64(),
+                t["ok"].as_bool()
+            ),
+            (Some("telegram"), Some(2), Some(true))
+        );
+        assert!(t.get("note").is_none() && t.get("call").is_none());
+        let c = delivery("call", None, false, &"x".repeat(300));
+        assert_eq!(c["call"], true);
+        assert_eq!(c["ok"], false);
+        assert_eq!(c["note"].as_str().unwrap().chars().count(), 200);
+        assert_eq!(delivery("sms", None, true, "")["sms"], true);
+    }
 
     #[test]
     fn objects_and_label_replies_parse() {

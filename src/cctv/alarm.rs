@@ -7,6 +7,7 @@
 //! never went out (line busy) do not count. Without an acknowledgement, the
 //! push, SMS and call are repeated once, two minutes after the first.
 
+use super::api::{delivery, CctvApi};
 use super::label::TAG_PREFIX;
 use super::store::Sent;
 use super::tg::{row, Bot, SendOpts};
@@ -28,6 +29,8 @@ const ATTEMPTS: u32 = 2;
 
 pub struct AlarmLine {
     pub bot: Bot,
+    /// For delivery reports of calls and SMS (v1.13).
+    pub api: CctvApi,
     pub chats: Vec<String>,
     pub owner: String,
     pub sip: SipClient,
@@ -150,6 +153,25 @@ pub fn start(line: Arc<AlarmLine>, key: String, headline: String, origin: Vec<Se
     true
 }
 
+/// Tell cctv a call or SMS went out for an event alarm (keys `e<id>`;
+/// the "cctv unreachable" alarm has no event to report on). In the
+/// background: a report must never hold up the alarm.
+fn report(line: &AlarmLine, key: &str, body: serde_json::Value) {
+    let Some(id) = key
+        .strip_prefix('e')
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|id| *id > 0)
+    else {
+        return;
+    };
+    let api = line.api.clone();
+    tokio::spawn(async move {
+        if let Err(e) = api.delivered(id, &body).await {
+            tracing::debug!(event = id, "call/SMS delivery not reported: {e:#}");
+        }
+    });
+}
+
 async fn reply_all(line: &AlarmLine, origin: &[Sent], text: &str, silent: bool) {
     for s in origin {
         let opts = SendOpts {
@@ -189,8 +211,12 @@ async fn run(
         }
         let mut sms = line.sip.subscribe_sms();
         let text = format!("【家庭监控】最高级报警：{headline}。回复任意内容表示知道了。");
-        if let Err(e) = line.sip.send_sms(&line.owner, &text).await {
-            tracing::warn!("alarm SMS not sent: {e:#}");
+        match line.sip.send_sms(&line.owner, &text).await {
+            Ok(()) => report(line, key, delivery("sms", None, true, "")),
+            Err(e) => {
+                tracing::warn!("alarm SMS not sent: {e:#}");
+                report(line, key, delivery("sms", None, false, &format!("{e:#}")));
+            }
         }
         let call = line.sip.call(
             &line.owner,
@@ -213,6 +239,12 @@ async fn run(
             tokio::select! {
                 outcome = &mut call, if !call_done => {
                     call_done = true;
+                    let (ok, note) = match &outcome {
+                        Ok(o @ CallOutcome::NotConnected { .. }) => (false, outcome_zh(o)),
+                        Ok(o) => (true, outcome_zh(o)),
+                        Err(e) => (false, format!("{e:#}")),
+                    };
+                    report(line, key, delivery("call", None, ok, &note));
                     match outcome {
                         Ok(CallOutcome::Responded(r)) => {
                             by = Some(outcome_zh(&CallOutcome::Responded(r)));

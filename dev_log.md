@@ -7670,3 +7670,24 @@ cctv v1.12 的变化：
 - 按外观认车变少不用改代码：描述原样显示。
 
 验证：cctv 单测 18 个通过；改动行上没有 clippy 告警。
+
+## 2026-10-18 监控：对接接口约定 v1.13（送达回报带渠道、账号数、成败）
+
+cctv v1.13 给 `POST /events/{id}/delivered` 增加了这些可选字段：channel（telegram/call/sms）、accounts、call、sms、ok、note。
+cctv 把回报写进事件的 `delivery` 字段，警戒区域页面的运行日志会显示，例如"elfClaw 回报：Telegram ×2 已送达，打了电话"。
+- 没有这个事件时（包括测试报警的负数编号）现在返回 404；字段不合法返回 400。
+
+- `cctv/api.rs`：
+  - `delivered()` 改为接收整份回报；
+  - 新增 `delivery(channel, accounts, ok, note)`：组装回报，note 截到 200 字。
+- `cctv/worker.rs`：每条报警推完 Telegram 都回报一次，带 accounts（实际送达的账号数）。
+  全部失败时 ok=false，失败原因放在 note。原来只在成功时回报。
+- `cctv/alarm.rs`：
+  - `AlarmLine` 增加 `api`；
+  - 每次发短信回报一次（channel=sms）；
+  - 每次电话有结果时回报一次（channel=call）：没打出去或出错时 ok=false，其他情况 ok=true，note 写电话结果（"没人接""转进了语音信箱"等）。
+  - 回报在后台发，不耽误电话流程。
+  - "监控服务连不上"那种报警没有事件编号，不回报。
+- `cctv/mod.rs`：先建好 `CctvApi`，再交给 worker 和电话线路共用。
+
+验证：cctv 单测 19 个通过（新增回报格式测试）；改动行上没有 clippy 告警。

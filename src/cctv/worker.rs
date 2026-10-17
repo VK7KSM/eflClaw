@@ -282,6 +282,7 @@ async fn handle_event(ctx: &Ctx, store: &Store, e: &Event) -> Result<()> {
         }
         let mut sent = Vec::new();
         let mut timings = Vec::new();
+        let mut failures = Vec::new();
         while let Some(done) = tasks.join_next().await {
             let Ok((chat, r, ms)) = done else { continue };
             match r {
@@ -301,6 +302,7 @@ async fn handle_event(ctx: &Ctx, store: &Store, e: &Event) -> Result<()> {
                         serde_json::json!({"chat": chat, "ms": ms, "error": format!("{err:#}")}),
                     );
                     tracing::warn!(event = id, "CCTV push not delivered: {err:#}");
+                    failures.push(format!("{err:#}"));
                 }
             }
         }
@@ -321,10 +323,15 @@ async fn handle_event(ctx: &Ctx, store: &Store, e: &Event) -> Result<()> {
                 ..Pushed::default()
             },
         )?;
-        if !sent.is_empty() && !e.test && id > 0 {
-            let at = Utc::now().to_rfc3339();
-            if let Err(err) = ctx.api.delivered(id, &at).await {
-                tracing::debug!(event = id, "delivery time not reported: {err:#}");
+        if !e.test && id > 0 {
+            let report = super::api::delivery(
+                "telegram",
+                Some(sent.len()),
+                !sent.is_empty(),
+                &failures.join("；"),
+            );
+            if let Err(err) = ctx.api.delivered(id, &report).await {
+                tracing::debug!(event = id, "delivery not reported: {err:#}");
             }
         }
         if phone {
