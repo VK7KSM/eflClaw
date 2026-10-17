@@ -10,6 +10,7 @@
 //!   appended to it) edits the caption; an AI downgrade to level 1 is noted
 //!   on the caption;
 //! - cctv-server unreachable for 3 minutes is itself a highest alarm;
+//! - of cctv's own summaries only the nightly report is pushed;
 //! - a chat that sent `/cctv_off` gets none of this until `/cctv_on`, except
 //!   the alarms that also ring the phone (confirmed intrusion, cameras down).
 
@@ -236,12 +237,14 @@ async fn handle(ctx: &Ctx, store: &Store, e: Event) -> Result<()> {
     }
 }
 
-/// cctv's own summaries (v1.8): level 2 (the nightly report, or a periodic
-/// one that names something to watch) is pushed like a level 2 alarm,
-/// level 1 only recorded. Each report once.
+/// cctv's own summaries (v1.8): only the nightly report is pushed (like a
+/// level 2 alarm). The 15-minute summaries are not — they repeated the same
+/// parked car every quarter hour (owner's decision 2026-10-17); they stay
+/// queryable through the `cctv` tool. Each report once.
 async fn handle_report(ctx: &Ctx, store: &Store, e: &Event) -> Result<()> {
     let id = e.report_id.context("report without id")?;
-    if e.level < 2 || !store.first_report(id)? {
+    let daily = e.report_kind.as_deref() == Some("daily");
+    if !daily || e.level < 2 || !store.first_report(id)? {
         return Ok(());
     }
     let silent = ctx.is_quiet(Utc::now());
