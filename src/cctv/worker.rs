@@ -379,7 +379,7 @@ async fn handle_event(ctx: &Ctx, store: &Store, e: &Event) -> Result<()> {
         .filter(|m| m.caption != caption)
         .collect();
     if !stale.is_empty() {
-        edit_all(ctx, store, id, &stale, e, &caption, &key).await;
+        edit_all(&ctx.bot, store, id, &stale, e, &caption, &key).await;
     }
     store.set_pushed(id, p)?;
     Ok(())
@@ -406,7 +406,7 @@ fn push_buttons(e: &Event, ack: bool, key: &str) -> Buttons {
 /// Bring the pushes of event `id` up to `caption`, remembering what each
 /// now shows so the next update edits only what changed.
 async fn edit_all(
-    ctx: &Ctx,
+    bot: &Bot,
     store: &Store,
     id: i64,
     messages: &[Sent],
@@ -416,8 +416,7 @@ async fn edit_all(
 ) {
     let buttons = push_buttons(e, alarm::is_pending(key), key);
     for m in messages {
-        match ctx
-            .bot
+        match bot
             .edit(&m.chat, m.message_id, caption, m.is_photo, &buttons)
             .await
         {
@@ -433,6 +432,28 @@ async fn edit_all(
             Err(err) => tracing::warn!("CCTV caption not updated: {err:#}"),
         }
     }
+}
+
+/// Bring a pushed event's messages up to its current state, outside the
+/// event stream: since v1.12 a label that does not lower the level changes
+/// the description without a stream update, so the labeller refreshes.
+pub(super) async fn refresh_push(bot: &Bot, store: &Store, e: &Event) -> Result<()> {
+    let Some(id) = e.event_id else {
+        return Ok(());
+    };
+    let Some(p) = store.pushed(id)? else {
+        return Ok(()); // never pushed
+    };
+    let caption = format::caption(e, p.marked_false);
+    let stale: Vec<Sent> = store
+        .messages(id)?
+        .into_iter()
+        .filter(|m| m.caption != caption)
+        .collect();
+    if !stale.is_empty() {
+        edit_all(bot, store, id, &stale, e, &caption, &format!("e{id}")).await;
+    }
+    Ok(())
 }
 
 /// A line in the elfClaw run log (`state/elfclaw-logs.jsonl`), so push

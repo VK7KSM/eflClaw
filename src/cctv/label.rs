@@ -20,6 +20,7 @@ use anyhow::{Context, Result};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -35,6 +36,7 @@ const MAX_NAME_BUTTONS: usize = 12;
 struct Labeler {
     api: CctvApi,
     bot: Bot,
+    workspace: PathBuf,
 }
 
 static LABELER: OnceLock<Labeler> = OnceLock::new();
@@ -49,8 +51,15 @@ static CHOICES: Mutex<Option<HashMap<u64, Choice>>> = Mutex::new(None);
 static NEXT_CHOICE: AtomicU64 = AtomicU64::new(1);
 
 /// Set up the button handlers (cctv link start-up).
-pub fn register(api: CctvApi, bot: Bot) {
-    if LABELER.set(Labeler { api, bot }).is_err() {
+pub fn register(api: CctvApi, bot: Bot, workspace: PathBuf) {
+    if LABELER
+        .set(Labeler {
+            api,
+            bot,
+            workspace,
+        })
+        .is_err()
+    {
         return;
     }
     for (prefix, handler) in [
@@ -112,6 +121,7 @@ fn on_name(p: &CallbackPress<'_>) -> Option<CallbackAnswer> {
         if let Err(e) = l.bot.edit(&chat, message, &caption, true, &buttons).await {
             tracing::warn!("label result not shown: {e:#}");
         }
+        refresh(&l.api, &l.bot, &l.workspace, id).await;
     });
     answer(&toast)
 }
@@ -133,8 +143,26 @@ fn on_undo(p: &CallbackPress<'_>) -> Option<CallbackAnswer> {
         {
             tracing::warn!("undo result not shown: {e:#}");
         }
+        refresh(&l.api, &l.bot, &l.workspace, id).await;
     });
     answer("正在撤销…")
+}
+
+/// After a label or undo, show the alarm's new description on its push
+/// (since v1.12 the event stream carries it only when the level drops).
+pub async fn refresh(api: &CctvApi, bot: &Bot, workspace: &Path, id: i64) {
+    let result: Result<()> = async {
+        let e = api.event(id).await?;
+        let store = super::store::Store::open(workspace)?;
+        super::worker::refresh_push(bot, &store, &e).await
+    }
+    .await;
+    if let Err(e) = result {
+        tracing::warn!(
+            event = id,
+            "alarm push not refreshed after labelling: {e:#}"
+        );
+    }
 }
 
 /// The caption (and undo button) after a label request.

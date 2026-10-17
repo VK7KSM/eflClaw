@@ -402,28 +402,26 @@ impl CctvTool {
                                 bail!("分类只能是 family/neighbor/friend/stranger（人）或 own/neighbor/friend/stranger（车）");
                             }
                         }
-                        Ok(
-                            match link
-                                .api
-                                .label(id, &object, &name, category.as_deref())
-                                .await?
-                            {
-                                crate::cctv::api::LabelOutcome::Done { note, level } => {
-                                    let mut out =
-                                        format!("标注完成。cctv 的说明（请原样转告用户）：{note}");
-                                    if let Some((old, new)) = level.filter(|(o, n)| o != n) {
-                                        let _ = write!(
-                                            out,
-                                            "\n这条报警从 level {old} 改为 level {new}。"
-                                        );
-                                    }
-                                    out
+                        let outcome = link
+                            .api
+                            .label(id, &object, &name, category.as_deref())
+                            .await?;
+                        crate::cctv::label::refresh(&link.api, &link.bot, &link.workspace, id)
+                            .await;
+                        Ok(match outcome {
+                            crate::cctv::api::LabelOutcome::Done { note, level } => {
+                                let mut out =
+                                    format!("标注完成。cctv 的说明（请原样转告用户）：{note}");
+                                if let Some((old, new)) = level.filter(|(o, n)| o != n) {
+                                    let _ =
+                                        write!(out, "\n这条报警从 level {old} 改为 level {new}。");
                                 }
-                                crate::cctv::api::LabelOutcome::Unlearnable(why) => {
-                                    format!("学不了，cctv 的原因（请原样转告用户）：{why}")
-                                }
-                            },
-                        )
+                                out
+                            }
+                            crate::cctv::api::LabelOutcome::Unlearnable(why) => {
+                                format!("学不了，cctv 的原因（请原样转告用户）：{why}")
+                            }
+                        })
                     }
                     _ => {
                         let idx = object
@@ -431,6 +429,8 @@ impl CctvTool {
                             .or_else(|| object.as_str().and_then(|v| v.trim().parse().ok()))
                             .context("要给目标序号 object")?;
                         link.api.unlabel(id, u32::try_from(idx)?).await?;
+                        crate::cctv::label::refresh(&link.api, &link.bot, &link.workspace, id)
+                            .await;
                         Ok(format!("已撤销事件 {id} 目标 {idx} 的标注。"))
                     }
                 }
