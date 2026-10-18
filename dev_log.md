@@ -7767,3 +7767,12 @@ cctv 把回报写进事件的 `delivery` 字段，警戒区域页面的运行日
 
 验证：cctv 单测 23 个通过（新增：在家限时与出门、时长按钮、撤回后重新推送用到的存储函数、打电话的推送不放「我在家」）；
 改动行上没有 clippy 告警。
+
+## 2026-10-18 监控：presence 的 account 字段不会为空
+
+cctv 定死了 `/presence` 的字段：home 必填；minutes 在 home=true 时必填，1–240；by 只能是 telegram 或 web；account 必填，1–64 个字；多出或缺少字段一律返回 400。
+elfClaw 发的格式本来就对，只有 account 可能出问题：用户没设 Telegram 用户名时，拿到的是 "unknown"；出门菜单原来写成"名字（对话编号）"。
+- `cctv/home.rs`：新增 `account()`，用户名为空或 "unknown" 时改用对话编号，最长 64 个字；三处发 presence 的地方都用它。
+- 这次只提交，等接 v1.14 时一起部署（presence 接口现在还没上线）。
+
+验证：home 单测 3 个通过（新增 account 的测试）；改动行上没有 clippy 告警。

@@ -131,6 +131,17 @@ fn clock(h: &Home, t: DateTime<Utc>) -> String {
     t.with_timezone(&h.tz).format("%H:%M").to_string()
 }
 
+/// Who pressed, for `/presence` (`account`: 1–64 characters, required):
+/// the Telegram username, or the chat id when there is none.
+fn account(user: &str, chat: &str) -> String {
+    let who = if user.is_empty() || user == "unknown" {
+        chat
+    } else {
+        user
+    };
+    who.chars().take(64).collect()
+}
+
 async fn tell_cctv(h: &Home, minutes: Option<i64>, by: &str) {
     let r = match minutes {
         Some(m) => h.api.presence(m, by).await,
@@ -146,7 +157,7 @@ fn on_press(p: &CallbackPress<'_>) -> Option<CallbackAnswer> {
     let id: i64 = p.data.strip_prefix(HOME_PREFIX)?.parse().ok()?;
     let h = HOME.get()?;
     let chat = p.chat_id?.to_string();
-    let user = p.user.to_string();
+    let user = account(p.user, &p.chat_id?.to_string());
     let store = Store::open(&h.workspace).ok()?;
     let until = set_home(&store, CHOICES[0], &chat, Utc::now()).ok()?;
     let _ = store.set_flag(id, DISMISSED);
@@ -171,7 +182,7 @@ fn on_choose(p: &CallbackPress<'_>) -> Option<CallbackAnswer> {
     let minutes: i64 = p.data.strip_prefix(HOME_FOR_PREFIX)?.parse().ok()?;
     let h = HOME.get()?;
     let (chat, message) = (p.chat_id?.to_string(), p.message_id?);
-    let user = p.user.to_string();
+    let user = account(p.user, &p.chat_id?.to_string());
     let store = Store::open(&h.workspace).ok()?;
     let until = set_home(&store, minutes, &chat, Utc::now()).ok()?;
     let text = format!(
@@ -226,7 +237,7 @@ pub fn menu_away(chat: &str, sender: &str) -> String {
     if let Err(e) = set_away(&store, Utc::now()) {
         return format!("设置失败：{e:#}");
     }
-    let by = format!("{sender}（{chat}）");
+    let by = account(sender, chat);
     tokio::spawn(async move { tell_cctv(h, None, &by).await });
     "🚪 已记为出门：现在按家里没人处理，cctv 只认人脸或车牌认出的家人。".into()
 }
@@ -277,6 +288,14 @@ mod tests {
         );
         set_away(&s, now).unwrap();
         assert!(!active_at(&s, now + ChronoDuration::seconds(1)));
+    }
+
+    #[test]
+    fn the_account_is_never_empty_or_too_long() {
+        assert_eq!(account("zeroclaw_user", "100"), "zeroclaw_user");
+        assert_eq!(account("unknown", "100"), "100");
+        assert_eq!(account("", "100"), "100");
+        assert_eq!(account(&"x".repeat(80), "100").chars().count(), 64);
     }
 
     #[test]
