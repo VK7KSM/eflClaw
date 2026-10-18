@@ -131,15 +131,8 @@ fn clock(h: &Home, t: DateTime<Utc>) -> String {
     t.with_timezone(&h.tz).format("%H:%M").to_string()
 }
 
-/// Who pressed, for `/presence` (`account`: 1–64 characters, required):
-/// the Telegram username, or the chat id when there is none.
 fn account(user: &str, chat: &str) -> String {
-    let who = if user.is_empty() || user == "unknown" {
-        chat
-    } else {
-        user
-    };
-    who.chars().take(64).collect()
+    super::api::account_of(user, chat)
 }
 
 async fn tell_cctv(h: &Home, minutes: Option<i64>, by: &str) {

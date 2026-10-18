@@ -107,10 +107,15 @@ fn on_name(p: &CallbackPress<'_>) -> Option<CallbackAnswer> {
         return answer("按钮已过期，请在报警下面重新点「标注」");
     };
     let (chat, message) = (p.chat_id?.to_string(), p.message_id?);
+    let account = super::api::account_of(p.user, &chat);
     let l = LABELER.get()?;
     let toast = format!("正在标成「{name}」…");
     tokio::spawn(async move {
-        let (caption, buttons) = match l.api.label(id, &serde_json::json!(idx), &name, None).await {
+        let (caption, buttons) = match l
+            .api
+            .label(id, &serde_json::json!(idx), &name, None, &account)
+            .await
+        {
             Ok(outcome) => labelled(id, idx, &outcome),
             Err(e) => (
                 format!("事件 {id} · 目标 {idx}：标注失败（{e:#}），可以再点一次"),
@@ -130,9 +135,10 @@ fn on_undo(p: &CallbackPress<'_>) -> Option<CallbackAnswer> {
     let (id, idx) = p.data.strip_prefix(UNDO_PREFIX)?.split_once(':')?;
     let (id, idx): (i64, u32) = (id.parse().ok()?, idx.parse().ok()?);
     let (chat, message) = (p.chat_id?.to_string(), p.message_id?);
+    let account = super::api::account_of(p.user, &chat);
     let l = LABELER.get()?;
     tokio::spawn(async move {
-        let caption = match l.api.unlabel(id, idx).await {
+        let caption = match l.api.unlabel(id, idx, &account).await {
             Ok(()) => format!("事件 {id} · 目标 {idx}：已撤销标注"),
             Err(e) => format!("事件 {id} · 目标 {idx}：撤销失败（{e:#}）"),
         };

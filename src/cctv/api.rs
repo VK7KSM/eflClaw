@@ -173,6 +173,30 @@ pub struct Group {
     pub display: String,
 }
 
+/// Who did it, on every request a person triggers (cctv's unified fields):
+/// `by` is always "telegram" here; `account` is the person (1–64 chars).
+fn who(mut body: serde_json::Value, account: &str) -> serde_json::Value {
+    body["by"] = "telegram".into();
+    body["account"] = account.into();
+    body
+}
+
+/// The `account` for a person: their Telegram username, or `fallback` (the
+/// chat id) when they have none; never empty, at most 64 characters.
+pub fn account_of(user: &str, fallback: &str) -> String {
+    let who = if user.trim().is_empty() || user == "unknown" {
+        fallback
+    } else {
+        user
+    };
+    let who = if who.trim().is_empty() {
+        "elfclaw"
+    } else {
+        who
+    };
+    who.chars().take(64).collect()
+}
+
 /// A delivery report for `POST /events/{id}/delivered` (v1.13). `note`
 /// (why it failed) is cut to 200 characters as the contract asks.
 pub fn delivery(channel: &str, accounts: Option<usize>, ok: bool, note: &str) -> serde_json::Value {
@@ -418,11 +442,11 @@ impl CctvApi {
     }
 
     /// Record `seconds` (5–20) of live video; returns the job id.
-    pub async fn clip_live(&self, monitor: u32, seconds: u32) -> Result<String> {
+    pub async fn clip_live(&self, monitor: u32, seconds: u32, account: &str) -> Result<String> {
         let v: serde_json::Value = self
             .post_json(
                 &format!("monitors/{monitor}/clip"),
-                &serde_json::json!({"seconds": seconds}),
+                &who(serde_json::json!({"seconds": seconds}), account),
             )
             .await?;
         v["job_id"]
@@ -432,11 +456,20 @@ impl CctvApi {
     }
 
     /// Recorded video from the NVR (≤ 5 min, ending ≥ 2 min ago); job id.
-    pub async fn clip_history(&self, monitor: u32, from: &str, to: &str) -> Result<String> {
+    pub async fn clip_history(
+        &self,
+        monitor: u32,
+        from: &str,
+        to: &str,
+        account: &str,
+    ) -> Result<String> {
         let v: serde_json::Value = self
             .post_json(
                 "clips",
-                &serde_json::json!({"monitor_id": monitor, "from": from, "to": to}),
+                &who(
+                    serde_json::json!({"monitor_id": monitor, "from": from, "to": to}),
+                    account,
+                ),
             )
             .await?;
         v["job_id"]
@@ -445,8 +478,8 @@ impl CctvApi {
             .context("no job id")
     }
 
-    pub async fn ptz(&self, body: &serde_json::Value) -> Result<()> {
-        let _: serde_json::Value = self.post_json("ptz", body).await?;
+    pub async fn ptz(&self, body: &serde_json::Value, account: &str) -> Result<()> {
+        let _: serde_json::Value = self.post_json("ptz", &who(body.clone(), account)).await?;
         Ok(())
     }
 
@@ -463,8 +496,12 @@ impl CctvApi {
         self.get_json("arm", Duration::from_secs(10)).await
     }
 
-    pub async fn set_arm(&self, body: &serde_json::Value) -> Result<serde_json::Value> {
-        self.post_json("arm", body).await
+    pub async fn set_arm(
+        &self,
+        body: &serde_json::Value,
+        account: &str,
+    ) -> Result<serde_json::Value> {
+        self.post_json("arm", &who(body.clone(), account)).await
     }
 
     /// The people and vehicles the AI tracked in an alarm (empty for alarms
@@ -520,8 +557,14 @@ impl CctvApi {
     }
 
     /// Label a whole automatic group as `name` (v1.11); cctv's note.
-    pub async fn group_label(&self, id: i64, name: &str, category: Option<&str>) -> Result<String> {
-        let mut body = serde_json::json!({"name": name});
+    pub async fn group_label(
+        &self,
+        id: i64,
+        name: &str,
+        category: Option<&str>,
+        account: &str,
+    ) -> Result<String> {
+        let mut body = who(serde_json::json!({"name": name}), account);
         if let Some(c) = category {
             body["category"] = c.into();
         }
@@ -530,20 +573,32 @@ impl CctvApi {
     }
 
     /// Ignore a whole automatic group, now and later (v1.11); cctv's note.
-    pub async fn group_ignore(&self, id: i64) -> Result<String> {
+    pub async fn group_ignore(&self, id: i64, account: &str) -> Result<String> {
         let v: serde_json::Value = self
-            .post_json(&format!("groups/{id}/ignore"), &serde_json::json!({}))
+            .post_json(
+                &format!("groups/{id}/ignore"),
+                &who(serde_json::json!({}), account),
+            )
             .await?;
         Ok(v["note"].as_str().unwrap_or("已忽略").to_string())
     }
 
     /// Change a registered name's category (v1.10); cctv's note, to be
     /// shown verbatim. `kind` is `person` or `vehicle`.
-    pub async fn set_category(&self, kind: &str, name: &str, category: &str) -> Result<String> {
+    pub async fn set_category(
+        &self,
+        kind: &str,
+        name: &str,
+        category: &str,
+        account: &str,
+    ) -> Result<String> {
         let v: serde_json::Value = self
             .post_json(
                 "names/category",
-                &serde_json::json!({"kind": kind, "name": name, "category": category}),
+                &who(
+                    serde_json::json!({"kind": kind, "name": name, "category": category}),
+                    account,
+                ),
             )
             .await?;
         Ok(v["note"].as_str().unwrap_or("已设置").to_string())
@@ -556,8 +611,9 @@ impl CctvApi {
         object: &serde_json::Value,
         name: &str,
         category: Option<&str>,
+        account: &str,
     ) -> Result<LabelOutcome> {
-        let mut body = serde_json::json!({"object": object, "name": name});
+        let mut body = who(serde_json::json!({"object": object, "name": name}), account);
         if let Some(c) = category {
             body["category"] = c.into();
         }
@@ -580,11 +636,11 @@ impl CctvApi {
     }
 
     /// Undo the label of one target.
-    pub async fn unlabel(&self, event_id: i64, object: u32) -> Result<()> {
+    pub async fn unlabel(&self, event_id: i64, object: u32, account: &str) -> Result<()> {
         let _: serde_json::Value = self
             .post_json(
                 &format!("events/{event_id}/unlabel"),
-                &serde_json::json!({"object": object}),
+                &who(serde_json::json!({"object": object}), account),
             )
             .await?;
         Ok(())
@@ -626,11 +682,14 @@ impl CctvApi {
 
     /// Greet at a camera (v1.4): `hello` plays a chime and a spoken English
     /// greeting on its speaker, `flash` blinks HI in Morse on its light.
-    pub async fn greet(&self, monitor: u32, mode: &str) -> Result<()> {
+    pub async fn greet(&self, monitor: u32, mode: &str, account: &str) -> Result<()> {
         let _: serde_json::Value = self
             .post_json(
                 "greet",
-                &serde_json::json!({"monitor_id": monitor, "mode": mode}),
+                &who(
+                    serde_json::json!({"monitor_id": monitor, "mode": mode}),
+                    account,
+                ),
             )
             .await?;
         Ok(())
@@ -657,6 +716,17 @@ impl CctvApi {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn person_triggered_requests_say_who() {
+        let b = who(serde_json::json!({"seconds": 15}), "zeroclaw_user");
+        assert_eq!(b["by"], "telegram");
+        assert_eq!(b["account"], "zeroclaw_user");
+        assert_eq!(b["seconds"], 15);
+        assert_eq!(account_of("unknown", "100"), "100");
+        assert_eq!(account_of("", ""), "elfclaw");
+        assert_eq!(account_of(&"x".repeat(80), "100").chars().count(), 64);
+    }
 
     #[test]
     fn delivery_reports_follow_the_contract() {

@@ -7776,3 +7776,20 @@ elfClaw 发的格式本来就对，只有 account 可能出问题：用户没设
 - 这次只提交，等接 v1.14 时一起部署（presence 接口现在还没上线）。
 
 验证：home 单测 3 个通过（新增 account 的测试）；改动行上没有 clippy 告警。
+
+## 2026-10-18 监控：人触发的请求都带上 by + account（配合 cctv 统一接口写法）
+
+用户拍板"所有接口统一成一套写法"：字段写死，多、少或类型不对都返回 400；人触发的操作一律带 `by`（渠道，telegram 或 web）和 `account`（谁，1–64 字）。
+cctv 会把老接口也收紧（并进 v1.15）。上线顺序：elfClaw 先加字段、先上线（现在的 cctv 会忽略不认识的字段），cctv 再部署严格版。
+
+- `cctv/api.rs`：
+  - 新增 `who()`，给请求体加上 `"by":"telegram"` 和 `"account"`；
+  - 新增 `account_of()`：取 Telegram 用户名，没有就用对话编号，再没有就用 "elfclaw"，最长 64 字；
+  - 这些接口都加了 account 参数：monitors/{id}/clip、clips、ptz、arm、greet、names/category、groups/{id}/label、groups/{id}/ignore（原来是空对象）、events/{id}/label、events/{id}/unlabel；
+  - presence 原来就带。
+- `tools/cctv.rs`：新增 `caller_account()`，模型调用工具时 account 用发这条消息的人，命令行等没有发起人的情况用 "elfclaw"。
+- `cctv/label.rs`：点名字标注、点撤销按钮时，account 用按按钮的人。
+- `cctv/home.rs`：`account()` 改用 `api::account_of`。
+- 不变：delivered 是 elfClaw 自己回报，不是人触发的，不加 by/account（cctv 同意，at 用 UTC 偏移照收）；所有 GET 不变。
+
+验证：cctv 单测 24 个通过（新增 by/account 组装和 account 兜底的测试）；改动行上没有 clippy 告警。

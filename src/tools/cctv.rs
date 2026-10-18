@@ -231,6 +231,15 @@ fn caller_chat() -> Option<String> {
     })
 }
 
+/// The person this tool call is for, as cctv's `account` (the Telegram
+/// sender; "elfclaw" when there is none, e.g. the command line).
+fn caller_account() -> String {
+    crate::tools::caller_context::current_caller().map_or_else(
+        || "elfclaw".to_string(),
+        |c| crate::cctv::api::account_of(&c.sender, &c.reply_target),
+    )
+}
+
 fn ok(output: impl Into<String>) -> ToolResult {
     ToolResult {
         success: true,
@@ -337,11 +346,11 @@ impl CctvTool {
                     .context("要给组号 group_id")?;
                 let id = i64::try_from(id)?;
                 let note = if action == "group_ignore" {
-                    link.api.group_ignore(id).await?
+                    link.api.group_ignore(id, &caller_account()).await?
                 } else {
                     let name = s("name").context("要给名字 name")?;
                     link.api
-                        .group_label(id, name.trim(), s("category").as_deref())
+                        .group_label(id, name.trim(), s("category").as_deref(), &caller_account())
                         .await?
                 };
                 Ok(format!("cctv 的说明（请原样转告用户）：{note}"))
@@ -358,7 +367,10 @@ impl CctvTool {
                 if !allowed.contains(&category.as_str()) {
                     bail!("{kind} 的分类只能是：{}", allowed.join("、"));
                 }
-                let note = link.api.set_category(&kind, &name, &category).await?;
+                let note = link
+                    .api
+                    .set_category(&kind, &name, &category, &caller_account())
+                    .await?;
                 Ok(format!("cctv 的说明（请原样转告用户）：{note}"))
             }
             "objects" | "label" | "unlabel" => {
@@ -404,7 +416,7 @@ impl CctvTool {
                         }
                         let outcome = link
                             .api
-                            .label(id, &object, &name, category.as_deref())
+                            .label(id, &object, &name, category.as_deref(), &caller_account())
                             .await?;
                         crate::cctv::label::refresh(&link.api, &link.bot, &link.workspace, id)
                             .await;
@@ -428,7 +440,9 @@ impl CctvTool {
                             .as_u64()
                             .or_else(|| object.as_str().and_then(|v| v.trim().parse().ok()))
                             .context("要给目标序号 object")?;
-                        link.api.unlabel(id, u32::try_from(idx)?).await?;
+                        link.api
+                            .unlabel(id, u32::try_from(idx)?, &caller_account())
+                            .await?;
                         crate::cctv::label::refresh(&link.api, &link.bot, &link.workspace, id)
                             .await;
                         Ok(format!("已撤销事件 {id} 目标 {idx} 的标注。"))
@@ -486,7 +500,7 @@ impl CctvTool {
                 if mode != "hello" && mode != "flash" {
                     bail!("打招呼方式只有 hello（喇叭说话）和 flash（补光灯闪）");
                 }
-                link.api.greet(m.id, &mode).await?;
+                link.api.greet(m.id, &mode, &caller_account()).await?;
                 Ok(format!(
                     "{} 已{}。",
                     m.name,
@@ -684,7 +698,7 @@ impl CctvTool {
                 let (job, wait) = if action == "clip_live" {
                     let secs = u32::try_from(n("seconds").unwrap_or(15).clamp(5, 20)).unwrap_or(15);
                     (
-                        link.api.clip_live(m.id, secs).await?,
+                        link.api.clip_live(m.id, secs, &caller_account()).await?,
                         format!("约 {} 秒后", secs + 10),
                     )
                 } else {
@@ -705,7 +719,12 @@ impl CctvTool {
                     }
                     let job = link
                         .api
-                        .clip_history(m.id, &from.to_rfc3339(), &to.to_rfc3339())
+                        .clip_history(
+                            m.id,
+                            &from.to_rfc3339(),
+                            &to.to_rfc3339(),
+                            &caller_account(),
+                        )
                         .await?;
                     (job, format!("约 {} 分钟后", secs / 60 + 2))
                 };
@@ -795,7 +814,7 @@ impl CctvTool {
                     }
                     other => bail!("不认识的云台动作：{other}"),
                 };
-                link.api.ptz(&body).await?;
+                link.api.ptz(&body, &caller_account()).await?;
                 if antenna {
                     // The rotator turns slowly (about 7°/s); look once it stops.
                     wait_ms = 0;
@@ -1000,7 +1019,7 @@ impl Tool for CctvArmTool {
                     .to_rfc3339()
                     .into();
             }
-            link.api.set_arm(&body).await?;
+            link.api.set_arm(&body, &caller_account()).await?;
             if let Some(name) = antenna {
                 let on = state == "armed";
                 return Ok(format!(
