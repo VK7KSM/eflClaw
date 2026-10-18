@@ -294,6 +294,105 @@ impl CctvTool {
                 )?
                 .to_string())
             }
+            "runlog" => {
+                let mut q = vec![format!("limit={}", n("limit").unwrap_or(40).clamp(1, 200))];
+                if let Some(id) = n("event_id").or_else(|| {
+                    s("event_id").and_then(|v| v.trim().trim_start_matches('#').parse().ok())
+                }) {
+                    q.push(format!("event_id={id}"));
+                }
+                if let Some(c) = camera.as_deref() {
+                    q.push(format!("monitor={}", link.camera(Some(c), false).await?.id));
+                }
+                let now = Utc::now();
+                for k in ["from", "to"] {
+                    if let Some(t) = s(k) {
+                        let t = parse_time(&t, link.tz, now)?.to_rfc3339();
+                        q.push(format!("{k}={}", urlencoding::encode(&t)));
+                    }
+                }
+                let v = link.api.runlog(&q.join("&")).await?;
+                let lines: Vec<String> = v["rows"]
+                    .as_array()
+                    .map(|rows| rows.iter().map(runlog_line).collect())
+                    .unwrap_or_default();
+                if lines.is_empty() {
+                    return Ok("运行日志里没有找到相关记录。".into());
+                }
+                Ok(format!(
+                    "cctv 运行日志（新的在前；「为什么」在破折号后面）：\n{}",
+                    lines.join("\n")
+                ))
+            }
+            "memory_list" => {
+                let mut q = vec!["limit=100".to_string()];
+                if let Some(text) = s("q").filter(|v| !v.trim().is_empty()) {
+                    q.push(format!("q={}", urlencoding::encode(text.trim())));
+                }
+                if let Some(k) = s("kind") {
+                    q.push(format!("kind={k}"));
+                }
+                if args.get("all").and_then(Value::as_bool) == Some(true) {
+                    q.push("active=all".into());
+                }
+                let v = link.api.memory_list(&q.join("&")).await?;
+                let lines: Vec<String> = v["memories"]
+                    .as_array()
+                    .map(|m| m.iter().map(memory_line).collect())
+                    .unwrap_or_default();
+                if lines.is_empty() {
+                    return Ok("看家记忆里没有符合的条目。".into());
+                }
+                Ok(format!("看家记忆（cctv 保管）：\n{}", lines.join("\n")))
+            }
+            "memory_add" => {
+                let kind = s("kind").context("要给类别 kind")?;
+                let content = s("content").context("要给内容 content")?;
+                let quote = s("quote").context("要给用户的原话 quote")?;
+                let v = link
+                    .api
+                    .memory_add(&kind, &content, &quote, n("days"), &caller_account())
+                    .await?;
+                Ok(format!("已记进看家记忆：{}", memory_line(&v["memory"])))
+            }
+            "memory_update" | "memory_revoke" => {
+                let id = n("memory_id")
+                    .or_else(|| {
+                        s("memory_id").and_then(|v| v.trim().trim_start_matches('#').parse().ok())
+                    })
+                    .context("要给记忆编号 memory_id")?;
+                let id = i64::try_from(id)?;
+                let v = if action == "memory_revoke" {
+                    link.api
+                        .memory_revoke(id, s("reason").as_deref(), &caller_account())
+                        .await?
+                } else {
+                    let mut changes = json!({});
+                    for k in ["kind", "content", "quote"] {
+                        if let Some(val) = s(k) {
+                            changes[k] = val.into();
+                        }
+                    }
+                    if let Some(d) = n("days") {
+                        changes["days"] = d.into();
+                    }
+                    if changes.as_object().is_some_and(serde_json::Map::is_empty) {
+                        bail!("要改什么？给 content、kind、quote 或 days");
+                    }
+                    link.api
+                        .memory_update(id, changes, &caller_account())
+                        .await?
+                };
+                Ok(format!(
+                    "{}：{}",
+                    if action == "memory_revoke" {
+                        "已撤销"
+                    } else {
+                        "已修改"
+                    },
+                    memory_line(&v["memory"])
+                ))
+            }
             "names" => {
                 let (people, vehicles) = (link.api.people().await?, link.api.vehicles().await?);
                 let list = |v: &[crate::cctv::api::Name]| {
@@ -887,7 +986,7 @@ impl Tool for CctvTool {
          nickname shown as '〔自动〕…' — a nickname, never a real name; a target in an alarm may say \
          '像是〔自动〕X（组 N）'); group_label (group_id + name [+ category for a new name]: the user \
          says that nickname is really someone — same category rules as label); group_ignore \
-         (group_id: ignore that group from now on); events (what happened: \
+         (group_id: ignore that group from now on); runlog (cctv's own run log: what it did and WHY \n         - optional event_id, camera, from/to, limit. When the user asks why an alarm was or was not pushed, \n         or why cctv judged something, read the log of that event (a push's link ends in /events/<id>) and \n         answer from cctv's reasons, never guess); memory_list / memory_add / memory_update / \n         memory_revoke (cctv's guarding memory, the single store for facts about the household that matter \n         for guarding: who lives or stays here, visitors, vehicles, routines, house rules, temporary \n         situations such as 'grandma stays this week'. Write ONLY what the user explicitly said, with \n         'quote' = the user's own words verbatim; never write your own guesses; do not put such facts \n         into your own memory_store. kind: person/vehicle/routine/rule/lesson/temp; days for how long. \n         Show, change or revoke entries when the user asks); events (what happened: \
          optional camera, from/to as HH:MM or YYYY-MM-DD HH:MM, min_level 1-3); clip_live (record \
          5-20 s of live video now and send it); clip_history (recorded video from the NVR, from/to, \
          at most 5 minutes, ending at least 2 minutes ago); ptz (move the PTZ camera: ptz_action \
@@ -908,9 +1007,16 @@ impl Tool for CctvTool {
         json!({
             "type": "object",
             "properties": {
-                "action": {"type": "string", "enum": ["cameras", "snapshot", "event_snapshot", "events", "clip_live", "clip_history", "ptz", "greet", "scene", "reports", "objects", "label", "unlabel", "names", "set_category", "groups", "group_label", "group_ignore", "alerts_off", "alerts_on"]},
+                "action": {"type": "string", "enum": ["cameras", "snapshot", "event_snapshot", "events", "clip_live", "clip_history", "ptz", "greet", "scene", "reports", "runlog", "objects", "label", "unlabel", "names", "set_category", "groups", "group_label", "group_ignore", "memory_list", "memory_add", "memory_update", "memory_revoke", "alerts_off", "alerts_on"]},
+                "q": {"type": "string", "description": "memory_list: words to look for"},
+                "memory_id": {"type": "integer", "description": "memory_update / memory_revoke: the memory's number"},
+                "content": {"type": "string", "description": "memory_add / memory_update: the fact, in Chinese"},
+                "quote": {"type": "string", "description": "memory_add / memory_update: the user's own words, verbatim"},
+                "days": {"type": "integer", "minimum": 1, "maximum": 3650, "description": "memory: valid for this many days (temp defaults to 7)"},
+                "reason": {"type": "string", "description": "memory_revoke: why"},
+                "all": {"type": "boolean", "description": "memory_list: include revoked and expired"},
                 "category": {"type": "string", "enum": ["family", "own", "neighbor", "friend", "stranger"], "description": "label (new name) / set_category: person family|neighbor|friend|stranger, vehicle own|neighbor|friend|stranger"},
-                "kind": {"type": "string", "enum": ["person", "vehicle"], "description": "set_category: a person's or a vehicle's name"},
+                "kind": {"type": "string", "enum": ["person", "vehicle", "routine", "rule", "lesson", "temp"], "description": "set_category: person or vehicle; memory: person 人 / vehicle 车 / routine 规律 / rule 规矩 / lesson 教训 / temp 临时情况"},
                 "group_id": {"type": "integer", "description": "group_label / group_ignore: the automatic group's number"},
                 "object": {"description": "label/unlabel: target index (or \"all\" for label)"},
                 "name": {"type": "string", "description": "label: person or vehicle name"},
@@ -1046,6 +1152,74 @@ impl Tool for CctvArmTool {
     }
 }
 
+/// One run-log row: time, camera, what happened — why → result.
+fn runlog_line(r: &Value) -> String {
+    let t = r["t"]
+        .as_str()
+        .map(crate::cctv::format::clock)
+        .unwrap_or_default();
+    let mut line = t;
+    if let Some(m) = r["monitor_name"].as_str() {
+        let _ = write!(line, " {m}");
+    }
+    let _ = write!(line, " {}", r["text"].as_str().unwrap_or(""));
+    if let Some(note) = r["note"].as_str().filter(|v| !v.is_empty()) {
+        let _ = write!(line, " —— {note}");
+    }
+    if let Some(res) = r["result"].as_str().filter(|v| !v.is_empty()) {
+        let _ = write!(line, " → {res}");
+    }
+    if let Some(c) = r["count"].as_u64().filter(|c| *c > 1) {
+        let _ = write!(line, "（×{c}）");
+    }
+    if let Some(id) = r["event_id"].as_i64() {
+        let _ = write!(line, " [事件 {id}]");
+    }
+    line
+}
+
+/// One memory: number, kind, content, who said it, expiry.
+fn memory_line(m: &Value) -> String {
+    let mut line = format!(
+        "#{} [{}] {}",
+        m["id"],
+        m["kind_zh"].as_str().or(m["kind"].as_str()).unwrap_or(""),
+        m["content"].as_str().unwrap_or("")
+    );
+    let source = match m["source"].as_str() {
+        Some("user") => "用户说的",
+        Some("ai") => "值班 AI",
+        Some("system") => "系统",
+        _ => "",
+    };
+    if !source.is_empty() {
+        let _ = write!(line, "（{source}");
+        if let Some(a) = m["account"].as_str() {
+            let _ = write!(line, "，{a}");
+        }
+        line.push('）');
+    }
+    if let Some(e) = m["expires"].as_str() {
+        let _ = write!(
+            line,
+            "，到 {} 过期",
+            e.get(..16).unwrap_or(e).replace('T', " ")
+        );
+    }
+    if let Some(st) = m["status"].as_str().filter(|s| *s != "active") {
+        let _ = write!(
+            line,
+            "，{}",
+            if st == "revoked" {
+                "已撤销"
+            } else {
+                "已过期"
+            }
+        );
+    }
+    line
+}
+
 /// The antenna rotator's state in one line.
 fn rotator_line(v: &Value) -> String {
     let mut line = format!(
@@ -1159,6 +1333,23 @@ mod tests {
             rotator: None,
         })
         .collect()
+    }
+
+    #[test]
+    fn run_log_and_memory_lines_read_naturally() {
+        let row = json!({"count": 46, "event_id": 101_595, "kind": "ai", "monitor_name": "Garage Back",
+            "note": "多半是风吹", "result": "误触发 · 只记录", "t": "2026-10-18T18:10:41+11:00",
+            "text": "移动侦测 → 全天感知没看到人，没细看"});
+        assert_eq!(
+            runlog_line(&row),
+            "18:10:41 Garage Back 移动侦测 → 全天感知没看到人，没细看 —— 多半是风吹 → 误触发 · 只记录（×46） [事件 101595]"
+        );
+        let m = json!({"id": 12, "kind": "temp", "kind_zh": "临时情况", "content": "外婆这周住我家",
+            "source": "user", "account": "kasim", "expires": "2026-10-25T15:20:00+11:00", "status": "active"});
+        assert_eq!(
+            memory_line(&m),
+            "#12 [临时情况] 外婆这周住我家（用户说的，kasim），到 2026-10-25 15:20 过期"
+        );
     }
 
     #[test]

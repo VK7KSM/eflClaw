@@ -7808,3 +7808,40 @@ cctv 17:43 部署了 v1.14（status、runlog、presence）、v1.15（call/call_r
 - 另外告诉 cctv：对不存在的事件调 unlabel 返回 200（removed=0），按约定应该是 404。
 
 验证：cctv 单测 24 个通过；改动行上没有 clippy 告警。
+
+## 2026-10-18 监控：接入 cctv v1.14/v1.15（打电话看 call 字段、电话反馈、运行日志、看家记忆）
+
+cctv 18:0x 部署了 v1.14、v1.15。elfClaw 这边分两步接：
+
+### 1. 打电话改看 `call`，打过电话的推送加"有用 / 没用"（提交 fd0748b64）
+- `cctv/api.rs`：
+  - Event 增加 `call`、`call_rule`；
+  - 新增 `call_feedback()`（返回 cctv 的 `ask_label`）和 `call_feedback_unreachable()`（"cctv 连不上"的电话，没有事件编号）。
+- `cctv/worker.rs`：
+  - `needs_phone()` 先看 `call`；没有这个字段的旧事件照旧按 intrusion_confirmed、offline_cameras 推断；
+  - 更新里 `call` 第一次变成 true（级别没变也算）就当作升级：回复一条"⬆️ 升级"并开始打电话；
+  - 按钮改成 `push_buttons(e, key, taggable, called, answered)`：
+    - 打过电话的推送第一行是「✅ 有用 / ❌ 没用」，替代原来的「已看到」；
+    - 第二行是「🏷 标注」（有人或车时）；没打电话的推送才有「🏠 我在家」；
+  - "监控服务连不上"的推送也放反馈按钮。
+- `cctv/feedback.rs`（新）：
+  - 按「有用」：算已看到（停止补推、补打），回报 cctv；
+  - 按「没用」：先换成五个原因按钮（是家人 / 是邻居朋友 / 是快递工人 / 不是人 / 别的），选了再回报；
+  - 反馈后按钮里不再出现反馈（事件标记 `feedback`）；cctv 返回 `ask_label` 时，接着弹出这条报警的标注（`label::offer_now`）；
+  - 回报失败时在原推送下回复原因，可以再按。
+- `cctv/label.rs`：抽出 `offer_now()`，「标注」按钮和电话反馈共用。
+- `cctv/alarm.rs`：旧推送点「已看到」后的按钮改用 `plain_buttons`。
+
+### 2. 运行日志和看家记忆接进对话工具
+- `cctv/api.rs`：
+  - 新增 `runlog()`、`memory_list()`、`memory_add()`（source=user，必带原话）、`memory_update()`、`memory_revoke()`；
+  - 新增 `patch_json()`，用于 PATCH /memory/{id}。
+- `tools/cctv.rs`：
+  - `runlog`：可按 event_id、摄像头、from/to 查；每行是"时间 摄像头 发生了什么 —— 为什么 → 结果（×次数）[事件 N]"。
+    工具说明要求：用户问"为什么推了 / 为什么没推"时读这条事件的日志，按 cctv 的理由回答，不能猜。
+  - `memory_list`、`memory_add`、`memory_update`、`memory_revoke`：看家记忆。
+    工具说明要求：只记用户明确说的，`quote` 填用户原话，不写自己的猜测；这类事不再写进 elfClaw 自己的 memory_store。
+  - `kind` 参数的取值扩充为 person、vehicle、routine、rule、lesson、temp。
+- 在 K5 上取了真实的 runlog 和 memory 返回，格式和解析一致（记忆目前是空的）。
+
+验证：cctv 单测 27 个通过（新增反馈按钮和原因、按钮长度、运行日志和记忆的显示格式）；改动行上没有 clippy 告警。

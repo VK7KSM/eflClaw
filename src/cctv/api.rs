@@ -371,6 +371,27 @@ impl CctvApi {
             .context("bad cctv-server reply")
     }
 
+    async fn patch_json<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> Result<T> {
+        let resp = self
+            .http
+            .patch(self.url(path))
+            .bearer_auth(&self.token)
+            .timeout(Duration::from_secs(20))
+            .json(body)
+            .send()
+            .await
+            .context("cctv-server unreachable")?;
+        Self::check(resp)
+            .await?
+            .json()
+            .await
+            .context("bad cctv-server reply")
+    }
+
     async fn check(resp: reqwest::Response) -> Result<reqwest::Response> {
         let status = resp.status();
         if status.is_success() {
@@ -711,6 +732,63 @@ impl CctvApi {
         }
         let _: serde_json::Value = self.post_json("call_feedback", &body).await?;
         Ok(())
+    }
+
+    /// cctv's run log (v1.14 §14): what it did and why. `query` is the raw
+    /// query string (event_id, monitor, kind, from, to, since_rev, limit).
+    pub async fn runlog(&self, query: &str) -> Result<serde_json::Value> {
+        self.get_json(&format!("runlog?{query}"), Duration::from_secs(15))
+            .await
+    }
+
+    /// The guarding memory (v1.15 §17): `query` is q, kind, active, limit.
+    pub async fn memory_list(&self, query: &str) -> Result<serde_json::Value> {
+        self.get_json(&format!("memory?{query}"), Duration::from_secs(15))
+            .await
+    }
+
+    /// Something the user said, written as they said it (`source = user`).
+    pub async fn memory_add(
+        &self,
+        kind: &str,
+        content: &str,
+        quote: &str,
+        days: Option<u64>,
+        account: &str,
+    ) -> Result<serde_json::Value> {
+        let mut body = who(
+            serde_json::json!({"kind": kind, "content": content, "source": "user", "quote": quote}),
+            account,
+        );
+        if let Some(d) = days {
+            body["days"] = d.into();
+        }
+        self.post_json("memory", &body).await
+    }
+
+    /// Change a memory as the user (`changes`: kind, content, quote, days).
+    pub async fn memory_update(
+        &self,
+        id: i64,
+        changes: serde_json::Value,
+        account: &str,
+    ) -> Result<serde_json::Value> {
+        let mut body = who(changes, account);
+        body["source"] = "user".into();
+        self.patch_json(&format!("memory/{id}"), &body).await
+    }
+
+    pub async fn memory_revoke(
+        &self,
+        id: i64,
+        reason: Option<&str>,
+        account: &str,
+    ) -> Result<serde_json::Value> {
+        let mut body = who(serde_json::json!({"source": "user"}), account);
+        if let Some(r) = reason {
+            body["reason"] = r.into();
+        }
+        self.post_json(&format!("memory/{id}/revoke"), &body).await
     }
 
     /// "我出门": nobody home from now on (v1.14).
