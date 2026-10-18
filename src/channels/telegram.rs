@@ -3967,10 +3967,14 @@ Ensure only one `zeroclaw` process is using this bot token."
                     // answered here, without the model.
                     let chat = msg.reply_target.split(':').next().unwrap_or_default();
                     if let Some(reply) = menu_command_reply(&msg.content, chat, &msg.sender) {
-                        let notice = SendMessage::new(reply, &msg.reply_target)
-                            .in_thread(msg.thread_ts.clone());
-                        if let Err(e) = self.send(&notice).await {
-                            tracing::warn!("Failed to answer menu command: {e}");
+                        // An empty reply: the handler answers by itself
+                        // (e.g. with buttons).
+                        if !reply.is_empty() {
+                            let notice = SendMessage::new(reply, &msg.reply_target)
+                                .in_thread(msg.thread_ts.clone());
+                            if let Err(e) = self.send(&notice).await {
+                                tracing::warn!("Failed to answer menu command: {e}");
+                            }
                         }
                         continue;
                     }

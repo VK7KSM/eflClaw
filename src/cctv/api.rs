@@ -613,6 +613,17 @@ impl CctvApi {
         Ok(())
     }
 
+    /// "我出门": nobody home from now on (v1.14).
+    pub async fn presence_away(&self, account: &str) -> Result<()> {
+        let _: serde_json::Value = self
+            .post_json(
+                "presence",
+                &serde_json::json!({"home": false, "by": "telegram", "account": account}),
+            )
+            .await?;
+        Ok(())
+    }
+
     /// Greet at a camera (v1.4): `hello` plays a chime and a spoken English
     /// greeting on its speaker, `flash` blinks HI in Morse on its light.
     pub async fn greet(&self, monitor: u32, mode: &str) -> Result<()> {

@@ -111,6 +111,33 @@ pub fn register_menu(config: &Config) {
             ),
         );
     }
+    // "我在家 / 我出门" (owner's rules 2026-10-18): only the accounts that
+    // receive the pushes; any one of them saying "我出门" ends it.
+    let send_to = config.cctv.send_to.clone();
+    let ours = move |chat: &str| send_to.iter().any(|c| c.trim() == chat);
+    let home_ours = ours.clone();
+    crate::channels::telegram::register_menu_command(
+        "cctv_home",
+        "我在家（选时长，最长 4 小时）",
+        Arc::new(move |chat, _sender| {
+            if home_ours(chat) {
+                home::menu_home(chat)
+            } else {
+                "这个对话不接收监控推送。".into()
+            }
+        }),
+    );
+    crate::channels::telegram::register_menu_command(
+        "cctv_away",
+        "我出门",
+        Arc::new(move |chat, sender| {
+            if ours(chat) {
+                home::menu_away(chat, sender)
+            } else {
+                "这个对话不接收监控推送。".into()
+            }
+        }),
+    );
 }
 
 /// Daemon component: build everything from config and run the worker.
@@ -151,7 +178,12 @@ pub async fn run(config: Config) -> Result<()> {
         Arc::new(alarm::telegram_callback),
     );
     let _ = alarm::BOT.set(bot.clone());
-    home::register(ctx.api.clone(), bot.clone(), config.workspace_dir.clone());
+    home::register(
+        ctx.api.clone(),
+        bot.clone(),
+        config.workspace_dir.clone(),
+        ctx.tz,
+    );
     label::register(ctx.api.clone(), bot.clone(), config.workspace_dir.clone());
     tracing::info!(
         chats = ctx.chats.len(),

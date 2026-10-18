@@ -7728,3 +7728,42 @@ cctv 把回报写进事件的 `delivery` 字段，警戒区域页面的运行日
 - 补充：cctv v1.14 新增 `POST /cctv/v1/presence`。按「我在家」时，elfClaw 会通知 cctv：`{"home":true,"minutes":30,"by":"telegram","account":按的人}`。
   据 cctv 转述，用户同意让 cctv 知道，但只记录和显示（警戒区域页顶栏、运行日志），AI 的判断和级别一律不变，用户原话是"看家护院是 cctv 的活"。
   接口上线前会返回 404，elfClaw 只记 debug 日志、忽略。`api.rs` 新增 `presence()`，`home::register` 增加 `api`。
+
+## 2026-10-18 监控：在家改成限时、在家静音推送、降级自动撤回（联动方案 v1.6 里 elfClaw 可以先做的）
+
+据 cctv 转述，用户批准了联动方案（`C:\Dev\CCTV\docs\linkage-plan.md` v1.6），让 elfClaw 在能跟进时动工。先做不依赖 cctv 新接口的三件：
+
+1. **在家时照推但静音**：替换原来"按「我在家」后 30 分钟内不推普通摄像头报警"。
+   - 在家期间 level 2 静音送达，level 3 照常响铃（夜间同样）；不再拦下任何推送，看家是 cctv 的活。
+2. **降到 level 1 自动撤回**：
+   - 推送后报警被降到 level 1（例如后来认出是家人），在所有对话里删掉这条推送和它的回复（视频、升级提醒），还没发的视频不再发；
+   - **打过电话的不撤回**，只更新说明文字，留给以后的"有用/没用"反馈（电话反馈菜单等 cctv 的 v1.15）；
+   - 撤回后如果级别又升回 2 以上，就当作新推送重新推。
+3. **「我在家」一定有时限**（用户 v1.3 的决定：默认家里没人）：
+   - 推送下的「🏠 我在家」：在家 30 分钟，删掉这条推送；
+   - 菜单 `/cctv_home`：选 30 分钟 / 2 小时 / 4 小时，最长 4 小时；到期自动回到"没人在家"，并提醒按的人要不要再按；
+   - 菜单 `/cctv_away`（我出门）：任何一个账号按了就马上结束；
+   - 打过电话的推送下面不放「我在家」，免得一按就删掉；
+   - 按「我在家」以后，之前推送的报警中还没发出的视频不再补发；
+   - 都通知 cctv `/presence`（在家带分钟数，出门带 home=false）。接口还没上线时返回 404，忽略。
+
+改动：
+- `cctv/home.rs` 重写：
+  - 状态存在 kv：`home_until` 在家到什么时候、`home_by` 谁按的、`home_pressed` 最后一次按的时间（和 `pushed.at` 比较，用来停发视频）、`home_reminded` 是否已经提醒过；
+  - `set_home`（限 1–240 分钟）、`set_away`、`pressed_after_push`；
+  - 推送按钮 `on_press`、时长按钮 `on_choose`、菜单 `menu_home` / `menu_away`、到期提醒 `remind_if_expired`。
+- `cctv/worker.rs`：
+  - 去掉 `held()`；`quiet` 改为"夜间或在家"，只影响 level 2；
+  - 新增事件标记 `called`（打过电话）、`withdrawn`（已撤回）；新增 `withdraw_push()` 和 `clip_unwanted()`；
+  - `alarm_buttons`、`push_buttons` 增加"放不放「我在家」"的参数；
+  - 主循环每一轮检查在家是否到期。
+- `cctv/store.rs`：新增 `forget_push()`、`pushed_no_later_than()`。
+- `cctv/api.rs`：新增 `presence_away()`。
+- `cctv/mod.rs`：注册菜单命令 `/cctv_home`、`/cctv_away`（只有 send_to 里的账号能用）；`home::register` 增加时区参数。
+- `cctv/alarm.rs`：点「已看到」后，打电话的推送只留「标注」，不放「我在家」。
+- `channels/telegram.rs`：菜单命令的回复为空时不发消息（处理函数自己带按钮发）。
+
+另：用户定了方案第十四节第 10 条：只有靠人脸或车牌认出家人、因此降级时，才取消补推补打，按更新里的 `call_cancel` 字段办，不能从 `call` 变成 false 去推断。这是第三阶段（v1.16）的字段，到时再做。
+
+验证：cctv 单测 23 个通过（新增：在家限时与出门、时长按钮、撤回后重新推送用到的存储函数、打电话的推送不放「我在家」）；
+改动行上没有 clippy 告警。

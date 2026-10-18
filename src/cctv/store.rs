@@ -220,6 +220,29 @@ impl Store {
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
+    /// Forget that event `event_id` was pushed (it is pushed afresh).
+    pub fn forget_push(&self, event_id: i64) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute("DELETE FROM pushed WHERE event_id = ?1", [event_id])?;
+        conn.execute("DELETE FROM messages WHERE event_id = ?1", [event_id])?;
+        Ok(())
+    }
+
+    /// Was event `event_id` pushed at or before `at` (SQLite UTC time)?
+    pub fn pushed_no_later_than(&self, event_id: i64, at: &str) -> bool {
+        self.conn
+            .lock()
+            .query_row(
+                "SELECT 1 FROM pushed WHERE event_id = ?1 AND at <= ?2",
+                params![event_id, at],
+                |_| Ok(()),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .is_some()
+    }
+
     /// Mark event `event_id` (e.g. "dismissed", "notag").
     pub fn set_flag(&self, event_id: i64, flag: &str) -> Result<()> {
         self.conn.lock().execute(
@@ -326,6 +349,11 @@ mod tests {
         assert!(s.has_flag(7, "dismissed"));
         assert!(!s.has_flag(8, "dismissed"), "per event");
         s.clear_flag(7, "dismissed").unwrap();
+        assert!(s.pushed_no_later_than(7, "2999-01-01 00:00:00"));
+        assert!(!s.pushed_no_later_than(7, "2000-01-01 00:00:00"));
+        s.forget_push(7).unwrap();
+        assert_eq!(s.pushed(7).unwrap(), None);
+        assert!(s.messages(7).unwrap().is_empty());
         assert!(!s.has_flag(7, "dismissed"));
 
         assert!(s.first_report(7).unwrap());
