@@ -9,6 +9,7 @@
 
 pub mod alarm;
 pub mod api;
+pub mod feedback;
 pub mod format;
 pub mod home;
 pub mod label;
@@ -184,6 +185,7 @@ pub async fn run(config: Config) -> Result<()> {
         config.workspace_dir.clone(),
         ctx.tz,
     );
+    feedback::register(ctx.api.clone(), bot.clone(), config.workspace_dir.clone());
     label::register(ctx.api.clone(), bot.clone(), config.workspace_dir.clone());
     tracing::info!(
         chats = ctx.chats.len(),

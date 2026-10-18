@@ -19,8 +19,9 @@
 //! - a chat that sent `/cctv_off` gets none of this until `/cctv_on`, except
 //!   the alarms that also ring the phone (confirmed intrusion, cameras down).
 
-use super::alarm::{self, AlarmLine, ACK_PREFIX};
+use super::alarm::{self, AlarmLine};
 use super::api::{CctvApi, Event};
+use super::feedback::{feedback_row, FEEDBACK_DONE};
 use super::format;
 use super::home::{self, DISMISSED, HOME_PREFIX};
 use super::label::TAG_PREFIX;
@@ -75,8 +76,12 @@ impl Ctx {
     }
 }
 
-/// Does this event call for the phone (user's rule)?
+/// Does this event call for the phone? Since v1.15 cctv says so in
+/// `call`; older events fall back to the user's rule as inferred before.
 pub fn needs_phone(e: &Event) -> bool {
+    if let Some(call) = e.call {
+        return call;
+    }
     (e.kind == "alarm" && e.intrusion_confirmed)
         || (e.kind == "system"
             && e.cause.as_deref() == Some("Device offline")
@@ -202,10 +207,10 @@ async fn broadcast(ctx: &Ctx, chats: &[String], text: &str, silent: bool) -> Vec
 /// cctv-server unreachable: every camera is effectively down — a highest alarm.
 async fn monitoring_down(ctx: &Ctx) -> Vec<Sent> {
     let key = format!("down{}", Utc::now().timestamp());
-    let data = format!("{ACK_PREFIX}{key}");
     let text = "🚨 监控服务连不上已超过 3 分钟（所有摄像头都看不到了）";
+    // The call this rings gets the same feedback as any other call.
     let buttons = if ctx.alarm.is_some() {
-        row(&[("✅ 已看到", data.as_str())])
+        vec![feedback_row(&key)]
     } else {
         Vec::new()
     };
@@ -297,7 +302,7 @@ async fn handle_event(ctx: &Ctx, store: &Store, e: &Event) -> Result<()> {
         if !taggable {
             store.set_flag(id, NOTAG)?;
         }
-        let buttons = push_buttons(e, phone, &key, taggable, !phone);
+        let buttons = push_buttons(e, &key, taggable, phone, false);
         // All chats at once: one slow send must not hold up the others.
         let mut tasks = tokio::task::JoinSet::new();
         for chat in recipients(ctx, store, e) {
@@ -379,7 +384,10 @@ async fn handle_event(ctx: &Ctx, store: &Store, e: &Event) -> Result<()> {
         return Ok(()); // the owner deleted it ("我在家")
     }
     let messages = store.messages(id)?;
-    if e.level > p.level && e.level >= 2 {
+    // `call` turning true is pushed like a rise in level (contract v1.15):
+    // the call starts from that update on.
+    let newly_called = needs_phone(e) && ctx.alarm.is_some() && !store.has_flag(id, CALLED);
+    if (e.level > p.level && e.level >= 2) || newly_called {
         // Danger rose: push again, as a reply to the first push.
         let phone = needs_phone(e) && ctx.alarm.is_some();
         if phone {
@@ -388,10 +396,10 @@ async fn handle_event(ctx: &Ctx, store: &Store, e: &Event) -> Result<()> {
         let text = format!("⬆️ 升级：{}", format::caption(e, false));
         let buttons = push_buttons(
             e,
-            phone,
             &key,
             !store.has_flag(id, NOTAG),
-            !store.has_flag(id, CALLED),
+            store.has_flag(id, CALLED),
+            store.has_flag(id, FEEDBACK_DONE),
         );
         let mut sent = Vec::new();
         for chat in &recipients(ctx, store, e) {
@@ -417,7 +425,7 @@ async fn handle_event(ctx: &Ctx, store: &Store, e: &Event) -> Result<()> {
                 Err(err) => tracing::warn!(event = id, "CCTV upgrade not delivered: {err:#}"),
             }
         }
-        p.level = e.level;
+        p.level = p.level.max(e.level);
         p.marked_false = false;
         if phone && !alarm::is_pending(&key) {
             if let Some(line) = &ctx.alarm {
@@ -457,16 +465,9 @@ async fn handle_event(ctx: &Ctx, store: &Store, e: &Event) -> Result<()> {
     Ok(())
 }
 
-/// The buttons under a push: "已看到" while a phone alarm waits (`ack`:
-/// its key), and on a camera alarm "标注" (when it has people or vehicles)
-/// and "我在家".
-pub(super) fn alarm_buttons(
-    camera_event: Option<i64>,
-    ack: Option<&str>,
-    taggable: bool,
-    home: bool,
-) -> Buttons {
-    let ack_data = ack.map(|k| format!("{ACK_PREFIX}{k}"));
+/// "标注" (when the camera alarm has people or vehicles) and "我在家" (not
+/// under a push that rang the phone: it would delete it).
+pub(super) fn plain_buttons(camera_event: Option<i64>, taggable: bool, home: bool) -> Buttons {
     let tag_data = camera_event
         .filter(|_| taggable)
         .map(|id| format!("{TAG_PREFIX}{id}"));
@@ -474,9 +475,6 @@ pub(super) fn alarm_buttons(
         .filter(|_| home)
         .map(|id| format!("{HOME_PREFIX}{id}"));
     let mut buttons = Vec::new();
-    if let Some(d) = &ack_data {
-        buttons.push(("✅ 已看到", d.as_str()));
-    }
     if let Some(d) = &tag_data {
         buttons.push(("🏷 标注", d.as_str()));
     }
@@ -486,10 +484,16 @@ pub(super) fn alarm_buttons(
     row(&buttons)
 }
 
-/// `home`: offer "我在家" (not under a push that rang the phone).
-fn push_buttons(e: &Event, ack: bool, key: &str, taggable: bool, home: bool) -> Buttons {
+/// The buttons under a push. One that rang the phone (`called`) carries
+/// "有用 / 没用" until answered — pressing either also counts as "seen".
+fn push_buttons(e: &Event, key: &str, taggable: bool, called: bool, answered: bool) -> Buttons {
     let camera = e.event_id.filter(|id| *id > 0 && e.kind == "alarm");
-    alarm_buttons(camera, ack.then_some(key), taggable, home)
+    let mut rows = Vec::new();
+    if called && !answered {
+        rows.push(feedback_row(key));
+    }
+    rows.extend(plain_buttons(camera, taggable, !called));
+    rows
 }
 
 /// Delete an alarm's push and its replies (clip, upgrade) in every chat.
@@ -538,10 +542,10 @@ async fn edit_all(
 ) {
     let buttons = push_buttons(
         e,
-        alarm::is_pending(key),
         key,
         !store.has_flag(id, NOTAG),
-        !store.has_flag(id, CALLED),
+        store.has_flag(id, CALLED),
+        store.has_flag(id, FEEDBACK_DONE),
     );
     for m in messages {
         match bot
@@ -823,20 +827,30 @@ mod tests {
                 .map(|(l, _)| l.clone())
                 .collect::<Vec<_>>()
         };
+        let alarm = Event {
+            event_id: Some(7),
+            kind: "alarm".into(),
+            ..Event::default()
+        };
         assert_eq!(
-            labels(&alarm_buttons(Some(7), Some("e7"), true, false)),
-            ["✅ 已看到", "🏷 标注"],
-            "a push that rang the phone has no 我在家"
+            labels(&push_buttons(&alarm, "e7", true, true, false)),
+            ["✅ 有用", "❌ 没用", "🏷 标注"],
+            "a push that rang the phone: feedback, no 我在家"
         );
         assert_eq!(
-            labels(&alarm_buttons(Some(7), None, false, true)),
+            labels(&push_buttons(&alarm, "e7", true, true, true)),
+            ["🏷 标注"],
+            "feedback given: it does not come back"
+        );
+        assert_eq!(
+            labels(&push_buttons(&alarm, "e7", false, false, false)),
             ["🏠 我在家"]
         );
         assert!(
-            alarm_buttons(None, None, true, true).is_empty(),
+            plain_buttons(None, true, true).is_empty(),
             "system events: none"
         );
-        let b = alarm_buttons(Some(7), None, true, true);
+        let b = plain_buttons(Some(7), true, true);
         assert_eq!(b[0][1].1, "cctv_home:7");
     }
 

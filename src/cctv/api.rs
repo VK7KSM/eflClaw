@@ -108,6 +108,12 @@ pub struct Event {
     /// event database, never reported as delivered.
     #[serde(default)]
     pub test: bool,
+    /// v1.15: whether this event rings the phone, and by which rule. Only
+    /// `call` decides; events without it fall back to the old inference.
+    #[serde(default)]
+    pub call: Option<bool>,
+    #[serde(default)]
+    pub call_rule: Option<String>,
     /// `kind = "report"` (v1.8): cctv's own summary of a period — no
     /// event id, snapshot or clip; deduplicated by `report_id`.
     #[serde(default)]
@@ -666,6 +672,44 @@ impl CctvApi {
                 &serde_json::json!({"home": true, "minutes": minutes, "by": "telegram", "account": account}),
             )
             .await?;
+        Ok(())
+    }
+
+    /// Feedback on a call (v1.15 §16). `reason` only when not useful.
+    /// Returns cctv's `ask_label` (family or friends: label them next).
+    pub async fn call_feedback(
+        &self,
+        event_id: i64,
+        useful: bool,
+        reason: Option<&str>,
+        account: &str,
+    ) -> Result<bool> {
+        let mut body = who(serde_json::json!({"useful": useful}), account);
+        if let Some(r) = reason.filter(|_| !useful) {
+            body["reason"] = r.into();
+        }
+        let v: serde_json::Value = self
+            .post_json(&format!("events/{event_id}/call_feedback"), &body)
+            .await?;
+        Ok(v["ask_label"].as_bool().unwrap_or(false))
+    }
+
+    /// Feedback on a "cctv unreachable" call, which has no event.
+    pub async fn call_feedback_unreachable(
+        &self,
+        at: &str,
+        useful: bool,
+        reason: Option<&str>,
+        account: &str,
+    ) -> Result<()> {
+        let mut body = who(
+            serde_json::json!({"kind": "cctv_unreachable", "at": at, "useful": useful}),
+            account,
+        );
+        if let Some(r) = reason.filter(|_| !useful) {
+            body["reason"] = r.into();
+        }
+        let _: serde_json::Value = self.post_json("call_feedback", &body).await?;
         Ok(())
     }
 

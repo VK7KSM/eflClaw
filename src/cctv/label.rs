@@ -84,7 +84,14 @@ fn answer(toast: &str) -> Option<CallbackAnswer> {
 fn on_tag(p: &CallbackPress<'_>) -> Option<CallbackAnswer> {
     let id: i64 = p.data.strip_prefix(TAG_PREFIX)?.parse().ok()?;
     let (chat, message) = (p.chat_id?.to_string(), p.message_id?);
-    let l = LABELER.get()?;
+    offer_now(id, chat, message);
+    answer("正在取这条报警里的人和车…")
+}
+
+/// Offer the people and vehicles of alarm `id` for labelling, replying to
+/// `message` (the "标注" button, or after "没用：是家人" feedback).
+pub fn offer_now(id: i64, chat: String, message: i64) {
+    let Some(l) = LABELER.get() else { return };
     tokio::spawn(async move {
         if let Err(e) = offer(l, id, &chat, message).await {
             let opts = SendOpts {
@@ -98,7 +105,6 @@ fn on_tag(p: &CallbackPress<'_>) -> Option<CallbackAnswer> {
                 .await;
         }
     });
-    answer("正在取这条报警里的人和车…")
 }
 
 fn on_name(p: &CallbackPress<'_>) -> Option<CallbackAnswer> {

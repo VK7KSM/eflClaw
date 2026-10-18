@@ -90,7 +90,7 @@ pub fn telegram_callback(p: &CallbackPress<'_>) -> Option<CallbackAnswer> {
     let taggable =
         super::home::open_store().is_none_or(|s| !s.has_flag(event, super::worker::NOTAG));
     // A push that rang the phone never offers "我在家" (it would delete it).
-    let buttons = super::worker::alarm_buttons(Some(event), None, taggable, false);
+    let buttons = super::worker::plain_buttons(Some(event), taggable, false);
     let bot = bot.clone();
     tokio::spawn(async move {
         if let Err(e) = bot.set_buttons(&chat.to_string(), message, &buttons).await {
