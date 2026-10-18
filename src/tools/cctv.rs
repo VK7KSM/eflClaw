@@ -790,9 +790,13 @@ impl CctvTool {
                             deg("az").context("要给方位 az（度，0=正北，顺时针）")?,
                             deg("el").context("要给俯仰 el（度，0=水平）")?,
                         );
+                        // cctv takes whole degrees (the rotator turns by
+                        // whole degrees anyway); a fraction is rejected.
+                        #[allow(clippy::cast_possible_truncation)]
+                        let (az, el) = (az.round() as i64, el.round() as i64);
                         body["az"] = az.into();
                         body["el"] = el.into();
-                        format!("转到方位 {az:.0}°、俯仰 {el:.0}°")
+                        format!("转到方位 {az}°、俯仰 {el}°")
                     }
                     "home" if antenna => "回到守望位".to_string(),
                     "look" if antenna => {

@@ -7793,3 +7793,18 @@ cctv 会把老接口也收紧（并进 v1.15）。上线顺序：elfClaw 先加�
 - 不变：delivered 是 elfClaw 自己回报，不是人触发的，不加 by/account（cctv 同意，at 用 UTC 偏移照收）；所有 GET 不变。
 
 验证：cctv 单测 24 个通过（新增 by/account 组装和 account 兜底的测试）；改动行上没有 clippy 告警。
+
+## 2026-10-18 监控：cctv 严格版上线后的实测，天线 goto 改发整数度
+
+cctv 17:43 部署了 v1.14（status、runlog、presence）、v1.15（call/call_rule、电话反馈、看家记忆、标误检、在线 AI 用量）和老接口严格版。
+在 K5 上按 elfClaw 实际用的参数逐个调了一遍：
+- 有副作用的接口用不存在的编号调，只验证字段，不真动设备；
+- 所有 GET（包括新的 status、runlog、presence）都返回 200；
+- POST 都返回 404（字段通过、编号不存在），只有天线 `ptz goto` 返回 400：
+  "invalid type: floating point `180.5`, expected i32"。cctv 只收整数度，elfClaw 原来发的是小数。
+- 故意加一个不认识的字段返回 400，说明严格检查已经生效。
+
+- `tools/cctv.rs`：天线 goto 的 az、el 四舍五入成整数度再发（云台本来就是按整度转的），回复文字也显示整数。
+- 另外告诉 cctv：对不存在的事件调 unlabel 返回 200（removed=0），按约定应该是 404。
+
+验证：cctv 单测 24 个通过；改动行上没有 clippy 告警。
