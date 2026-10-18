@@ -11,12 +11,16 @@
 //!   on the caption;
 //! - cctv-server unreachable for 3 minutes is itself a highest alarm;
 //! - of cctv's own summaries only the nightly report is pushed;
+//! - "🏠 我在家" on a camera alarm deletes it everywhere and holds camera
+//!   alarms back for 30 minutes (`home`), except those that ring the phone;
+//!   "🏷 标注" appears only when the alarm has people or vehicles to label;
 //! - a chat that sent `/cctv_off` gets none of this until `/cctv_on`, except
 //!   the alarms that also ring the phone (confirmed intrusion, cameras down).
 
 use super::alarm::{self, AlarmLine, ACK_PREFIX};
 use super::api::{CctvApi, Event};
 use super::format;
+use super::home::{self, DISMISSED, HOME_PREFIX};
 use super::label::TAG_PREFIX;
 use super::store::{Pushed, Sent, Store};
 use super::tg::{row, Bot, Buttons, SendOpts};
@@ -41,7 +45,12 @@ pub struct Ctx {
     pub summary_at: u32,
     /// The phone line for the highest alarms (`None`: Telegram only).
     pub alarm: Option<Arc<AlarmLine>>,
+    /// Where `state/cctv.db` lives (clip deliveries record their replies).
+    pub workspace: std::path::PathBuf,
 }
+
+/// Event flag: the alarm had no people or vehicles, so no "标注" button.
+pub(super) const NOTAG: &str = "notag";
 
 impl Ctx {
     fn now_minutes(&self, now: DateTime<Utc>) -> u32 {
@@ -261,10 +270,29 @@ async fn handle_event(ctx: &Ctx, store: &Store, e: &Event) -> Result<()> {
             return Ok(()); // level 1: summary only
         }
         let phone = needs_phone(e) && ctx.alarm.is_some();
+        if held(store, e) {
+            store.set_pushed(
+                id,
+                Pushed {
+                    level: e.level,
+                    has_description: e.description.is_some(),
+                    ..Pushed::default()
+                },
+            )?;
+            record(
+                &format!("CCTV push e{id} held (owner is home)"),
+                serde_json::json!({"event_id": id, "level": e.level}),
+            );
+            return Ok(());
+        }
         let silent = e.kind == "recovery" || (e.level == 2 && quiet);
         let caption = format::caption(e, false);
         let started = Instant::now();
-        let buttons = push_buttons(e, phone, &key);
+        let taggable = e.kind == "alarm" && has_targets(ctx, id).await;
+        if !taggable {
+            store.set_flag(id, NOTAG)?;
+        }
+        let buttons = push_buttons(e, phone, &key, taggable);
         // All chats at once: one slow send must not hold up the others.
         let mut tasks = tokio::task::JoinSet::new();
         for chat in recipients(ctx, store, e) {
@@ -342,14 +370,22 @@ async fn handle_event(ctx: &Ctx, store: &Store, e: &Event) -> Result<()> {
         return Ok(());
     };
 
+    if store.has_flag(id, DISMISSED) && !needs_phone(e) {
+        return Ok(()); // the owner deleted it ("我在家")
+    }
     let messages = store.messages(id)?;
     if e.level > p.level && e.level >= 2 {
         // Danger rose: push again, as a reply to the first push.
         let phone = needs_phone(e) && ctx.alarm.is_some();
         let text = format!("⬆️ 升级：{}", format::caption(e, false));
-        let buttons = push_buttons(e, phone, &key);
+        let buttons = push_buttons(e, phone, &key, !store.has_flag(id, NOTAG));
         let mut sent = Vec::new();
-        for chat in &recipients(ctx, store, e) {
+        let audience = if held(store, e) {
+            Vec::new()
+        } else {
+            recipients(ctx, store, e)
+        };
+        for chat in &audience {
             let parent = messages
                 .iter()
                 .find(|m| &m.chat == chat)
@@ -360,12 +396,15 @@ async fn handle_event(ctx: &Ctx, store: &Store, e: &Event) -> Result<()> {
                 buttons: buttons.clone(),
             };
             match ctx.bot.send_text(chat, &text, &opts).await {
-                Ok(message_id) => sent.push(Sent {
-                    chat: chat.clone(),
-                    message_id,
-                    is_photo: false,
-                    caption: text.clone(),
-                }),
+                Ok(message_id) => {
+                    store.save_reply(id, chat, message_id)?;
+                    sent.push(Sent {
+                        chat: chat.clone(),
+                        message_id,
+                        is_photo: false,
+                        caption: text.clone(),
+                    });
+                }
                 Err(err) => tracing::warn!(event = id, "CCTV upgrade not delivered: {err:#}"),
             }
         }
@@ -392,22 +431,49 @@ async fn handle_event(ctx: &Ctx, store: &Store, e: &Event) -> Result<()> {
     Ok(())
 }
 
-/// The buttons under an event push: "已看到" while a phone alarm waits for
-/// an acknowledgement, "标注" on camera alarms (people and vehicles).
-fn push_buttons(e: &Event, ack: bool, key: &str) -> Buttons {
-    let ack_data = format!("{ACK_PREFIX}{key}");
-    let tag_data = e
-        .event_id
-        .filter(|id| *id > 0 && e.kind == "alarm")
+/// The buttons under a push: "已看到" while a phone alarm waits (`ack`:
+/// its key), and on a camera alarm "标注" (when it has people or vehicles)
+/// and "我在家".
+pub(super) fn alarm_buttons(
+    camera_event: Option<i64>,
+    ack: Option<&str>,
+    taggable: bool,
+) -> Buttons {
+    let ack_data = ack.map(|k| format!("{ACK_PREFIX}{k}"));
+    let tag_data = camera_event
+        .filter(|_| taggable)
         .map(|id| format!("{TAG_PREFIX}{id}"));
+    let home_data = camera_event.map(|id| format!("{HOME_PREFIX}{id}"));
     let mut buttons = Vec::new();
-    if ack {
-        buttons.push(("✅ 已看到", ack_data.as_str()));
+    if let Some(d) = &ack_data {
+        buttons.push(("✅ 已看到", d.as_str()));
     }
     if let Some(d) = &tag_data {
         buttons.push(("🏷 标注", d.as_str()));
     }
+    if let Some(d) = &home_data {
+        buttons.push(("🏠 我在家", d.as_str()));
+    }
     row(&buttons)
+}
+
+fn push_buttons(e: &Event, ack: bool, key: &str, taggable: bool) -> Buttons {
+    let camera = e.event_id.filter(|id| *id > 0 && e.kind == "alarm");
+    alarm_buttons(camera, ack.then_some(key), taggable)
+}
+
+/// Camera alarms wait while the owner said "我在家" — unless they ring the phone.
+fn held(store: &Store, e: &Event) -> bool {
+    e.kind == "alarm" && !needs_phone(e) && home::active(store)
+}
+
+/// Does the alarm have people or vehicles to label? cctv answering slowly
+/// or not at all counts as yes: a useless button beats a missing one.
+async fn has_targets(ctx: &Ctx, id: i64) -> bool {
+    match tokio::time::timeout(Duration::from_millis(1500), ctx.api.objects(id)).await {
+        Ok(Ok(objects)) => !objects.is_empty(),
+        _ => true,
+    }
 }
 
 /// Bring the pushes of event `id` up to `caption`, remembering what each
@@ -421,7 +487,7 @@ async fn edit_all(
     caption: &str,
     key: &str,
 ) {
-    let buttons = push_buttons(e, alarm::is_pending(key), key);
+    let buttons = push_buttons(e, alarm::is_pending(key), key, !store.has_flag(id, NOTAG));
     for m in messages {
         match bot
             .edit(&m.chat, m.message_id, caption, m.is_photo, &buttons)
@@ -481,7 +547,7 @@ fn deliver_event_clip(ctx: &Ctx, store: &Store, id: i64, e: &Event) -> Result<()
     let Some(mut p) = store.pushed(id)? else {
         return Ok(()); // never pushed (level 1, disarmed): no clip either
     };
-    if p.clip_done {
+    if p.clip_done || store.has_flag(id, DISMISSED) {
         return Ok(());
     }
     p.clip_done = true;
@@ -492,19 +558,32 @@ fn deliver_event_clip(ctx: &Ctx, store: &Store, id: i64, e: &Event) -> Result<()
         .filter(|m| !store.is_muted(&m.chat))
         .collect();
     let clip = e.clip.clone().unwrap_or_default();
-    let (api, bot) = (ctx.api.clone(), ctx.bot.clone());
+    let (api, bot, workspace) = (ctx.api.clone(), ctx.bot.clone(), ctx.workspace.clone());
     tokio::spawn(async move {
+        // Replies are recorded so "我在家" can delete them with the push;
+        // a push dismissed while the clip downloaded gets none.
+        let store = Store::open(&workspace).ok();
+        let dismissed = || store.as_ref().is_some_and(|s| s.has_flag(id, DISMISSED));
+        let remember = |chat: &str, sent: Result<i64>| match sent {
+            Ok(message_id) => {
+                if let Some(s) = &store {
+                    let _ = s.save_reply(id, chat, message_id);
+                }
+            }
+            Err(err) => tracing::warn!(event = id, "CCTV clip reply not delivered: {err:#}"),
+        };
+        let reply_opts = |m: &Sent| SendOpts {
+            silent: true,
+            parent: Some(m.message_id),
+            buttons: Vec::new(),
+        };
         if clip.status != "ready" {
             let reason = clip.reason.unwrap_or_else(|| "原因不明".into());
-            for m in &messages {
-                let opts = SendOpts {
-                    silent: true,
-                    parent: Some(m.message_id),
-                    buttons: Vec::new(),
-                };
-                let _ = bot
-                    .send_text(&m.chat, &format!("这次没有录像：{reason}"), &opts)
+            for m in messages.iter().filter(|_| !dismissed()) {
+                let r = bot
+                    .send_text(&m.chat, &format!("这次没有录像：{reason}"), &reply_opts(m))
                     .await;
+                remember(&m.chat, r);
             }
             return;
         }
@@ -512,28 +591,24 @@ fn deliver_event_clip(ctx: &Ctx, store: &Store, id: i64, e: &Event) -> Result<()
             return;
         };
         let Some(mp4) = fetch_clip(&api, url).await else {
-            for m in &messages {
-                let opts = SendOpts {
-                    silent: true,
-                    parent: Some(m.message_id),
-                    buttons: Vec::new(),
-                };
-                let _ = bot
-                    .send_text(&m.chat, "录像取不下来，可以点上面的链接在网页上看", &opts)
+            for m in messages.iter().filter(|_| !dismissed()) {
+                let r = bot
+                    .send_text(
+                        &m.chat,
+                        "录像取不下来，可以点上面的链接在网页上看",
+                        &reply_opts(m),
+                    )
                     .await;
+                remember(&m.chat, r);
             }
             return;
         };
         let caption = format::clip_caption(clip.duration, None);
-        for m in &messages {
-            let opts = SendOpts {
-                silent: true,
-                parent: Some(m.message_id),
-                buttons: Vec::new(),
-            };
-            if let Err(err) = bot.send_video(&m.chat, mp4.clone(), &caption, &opts).await {
-                tracing::warn!(event = id, "CCTV clip not delivered: {err:#}");
-            }
+        for m in messages.iter().filter(|_| !dismissed()) {
+            let r = bot
+                .send_video(&m.chat, mp4.clone(), &caption, &reply_opts(m))
+                .await;
+            remember(&m.chat, r);
         }
     });
     Ok(())
@@ -681,7 +756,29 @@ mod tests {
             quiet,
             summary_at: 7 * 60,
             alarm: None,
+            workspace: std::path::PathBuf::new(),
         }
+    }
+
+    #[test]
+    fn camera_alarms_get_tag_only_with_targets_and_always_home() {
+        let labels = |b: &Buttons| {
+            b.iter()
+                .flatten()
+                .map(|(l, _)| l.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            labels(&alarm_buttons(Some(7), Some("e7"), true)),
+            ["✅ 已看到", "🏷 标注", "🏠 我在家"]
+        );
+        assert_eq!(labels(&alarm_buttons(Some(7), None, false)), ["🏠 我在家"]);
+        assert!(
+            alarm_buttons(None, None, true).is_empty(),
+            "system events: none"
+        );
+        let b = alarm_buttons(Some(7), None, true);
+        assert_eq!(b[0][1].1, "cctv_home:7");
     }
 
     #[test]

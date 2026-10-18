@@ -10,6 +10,7 @@
 pub mod alarm;
 pub mod api;
 pub mod format;
+pub mod home;
 pub mod label;
 pub mod store;
 pub mod tg;
@@ -136,6 +137,7 @@ pub async fn run(config: Config) -> Result<()> {
         alarm: alarm_line(&config, &bot, &cctv_api, &chats),
         api: cctv_api,
         bot: bot.clone(),
+        workspace: config.workspace_dir.clone(),
         chats,
         tz,
         quiet: (
@@ -149,6 +151,7 @@ pub async fn run(config: Config) -> Result<()> {
         Arc::new(alarm::telegram_callback),
     );
     let _ = alarm::BOT.set(bot.clone());
+    home::register(bot.clone(), config.workspace_dir.clone());
     label::register(ctx.api.clone(), bot.clone(), config.workspace_dir.clone());
     tracing::info!(
         chats = ctx.chats.len(),

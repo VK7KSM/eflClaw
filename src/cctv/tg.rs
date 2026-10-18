@@ -197,6 +197,12 @@ impl Bot {
         self.post_edit(method, &body).await
     }
 
+    /// Delete a message the bot sent (Telegram allows it within 48 hours).
+    pub async fn delete(&self, chat: &str, message_id: i64) -> Result<()> {
+        let body = serde_json::json!({"chat_id": chat, "message_id": message_id});
+        self.post_edit("deleteMessage", &body).await
+    }
+
     /// Replace only the buttons of a message (empty: remove them).
     pub async fn set_buttons(&self, chat: &str, message_id: i64, buttons: &Buttons) -> Result<()> {
         let body = serde_json::json!({

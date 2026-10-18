@@ -55,6 +55,19 @@ impl Store {
                  caption TEXT NOT NULL,
                  PRIMARY KEY (event_id, chat)
              );
+             CREATE TABLE IF NOT EXISTS replies (
+                 event_id INTEGER NOT NULL,
+                 chat TEXT NOT NULL,
+                 message_id INTEGER NOT NULL,
+                 at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                 PRIMARY KEY (event_id, chat, message_id)
+             );
+             CREATE TABLE IF NOT EXISTS flags (
+                 event_id INTEGER NOT NULL,
+                 flag TEXT NOT NULL,
+                 at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                 PRIMARY KEY (event_id, flag)
+             );
              CREATE TABLE IF NOT EXISTS reports (
                  report_id INTEGER PRIMARY KEY,
                  at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -190,6 +203,46 @@ impl Store {
         Ok(chat)
     }
 
+    /// A message sent in reply to an event's push (clip, upgrade), so it can
+    /// be deleted with the push.
+    pub fn save_reply(&self, event_id: i64, chat: &str, message_id: i64) -> Result<()> {
+        self.conn.lock().execute(
+            "INSERT OR IGNORE INTO replies (event_id, chat, message_id) VALUES (?1, ?2, ?3)",
+            params![event_id, chat, message_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn replies(&self, event_id: i64) -> Result<Vec<(String, i64)>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare("SELECT chat, message_id FROM replies WHERE event_id = ?1")?;
+        let rows = stmt.query_map([event_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// Mark event `event_id` (e.g. "dismissed", "notag").
+    pub fn set_flag(&self, event_id: i64, flag: &str) -> Result<()> {
+        self.conn.lock().execute(
+            "INSERT OR IGNORE INTO flags (event_id, flag) VALUES (?1, ?2)",
+            params![event_id, flag],
+        )?;
+        Ok(())
+    }
+
+    pub fn has_flag(&self, event_id: i64, flag: &str) -> bool {
+        self.conn
+            .lock()
+            .query_row(
+                "SELECT 1 FROM flags WHERE event_id = ?1 AND flag = ?2",
+                params![event_id, flag],
+                |_| Ok(()),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .is_some()
+    }
+
     /// Record report `id`; false when it was already handled.
     pub fn first_report(&self, id: i64) -> Result<bool> {
         Ok(self.conn.lock().execute(
@@ -205,6 +258,8 @@ impl Store {
                  (SELECT event_id FROM pushed WHERE at < datetime('now', '-14 days'));
              DELETE FROM pushed WHERE at < datetime('now', '-14 days');
              DELETE FROM reports WHERE at < datetime('now', '-14 days');
+             DELETE FROM replies WHERE at < datetime('now', '-14 days');
+             DELETE FROM flags WHERE at < datetime('now', '-14 days');
              DELETE FROM jobs WHERE at < datetime('now', '-2 days');",
         )?;
         Ok(())
@@ -254,6 +309,14 @@ mod tests {
         assert!(!s.is_muted("200"), "per chat");
         s.set_muted("100", false).unwrap();
         assert!(!s.is_muted("100"));
+
+        s.save_reply(7, "100", 9).unwrap();
+        s.save_reply(7, "100", 9).unwrap();
+        assert_eq!(s.replies(7).unwrap(), vec![("100".to_string(), 9)]);
+        assert!(!s.has_flag(7, "dismissed"));
+        s.set_flag(7, "dismissed").unwrap();
+        assert!(s.has_flag(7, "dismissed"));
+        assert!(!s.has_flag(8, "dismissed"), "per event");
 
         assert!(s.first_report(7).unwrap());
         assert!(!s.first_report(7).unwrap(), "a report is handled once");

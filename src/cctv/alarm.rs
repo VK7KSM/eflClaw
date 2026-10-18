@@ -8,7 +8,6 @@
 //! push, SMS and call are repeated once, two minutes after the first.
 
 use super::api::{delivery, CctvApi};
-use super::label::TAG_PREFIX;
 use super::store::Sent;
 use super::tg::{row, Bot, SendOpts};
 use crate::channels::telegram::{CallbackAnswer, CallbackPress};
@@ -71,7 +70,7 @@ pub fn ack_press(data: &str, user: &str) -> Option<String> {
 }
 
 /// Handler for the Telegram channel's button registry. The pressed push
-/// keeps its "标注" button: only "已看到" goes.
+/// keeps its other buttons ("标注", "我在家"): only "已看到" goes.
 pub fn telegram_callback(p: &CallbackPress<'_>) -> Option<CallbackAnswer> {
     let toast = ack_press(p.data, p.user)?;
     let event = p
@@ -88,8 +87,9 @@ pub fn telegram_callback(p: &CallbackPress<'_>) -> Option<CallbackAnswer> {
             clear_buttons: true,
         });
     };
-    let tag = format!("{TAG_PREFIX}{event}");
-    let buttons = row(&[("🏷 标注", tag.as_str())]);
+    let taggable =
+        super::home::open_store().is_none_or(|s| !s.has_flag(event, super::worker::NOTAG));
+    let buttons = super::worker::alarm_buttons(Some(event), None, taggable);
     let bot = bot.clone();
     tokio::spawn(async move {
         if let Err(e) = bot.set_buttons(&chat.to_string(), message, &buttons).await {
