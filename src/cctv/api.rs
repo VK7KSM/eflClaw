@@ -601,6 +601,18 @@ impl CctvApi {
             .await
     }
 
+    /// Tell cctv the owner said "我在家" (v1.14): recorded and shown there
+    /// only — cctv's judgement and levels do not change.
+    pub async fn presence(&self, minutes: i64, account: &str) -> Result<()> {
+        let _: serde_json::Value = self
+            .post_json(
+                "presence",
+                &serde_json::json!({"home": true, "minutes": minutes, "by": "telegram", "account": account}),
+            )
+            .await?;
+        Ok(())
+    }
+
     /// Greet at a camera (v1.4): `hello` plays a chime and a spoken English
     /// greeting on its speaker, `flash` blinks HI in Morse on its light.
     pub async fn greet(&self, monitor: u32, mode: &str) -> Result<()> {

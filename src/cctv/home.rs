@@ -6,8 +6,11 @@
 //!   the bot's history does not fill up with useless alarms;
 //! - holds back camera alarms for 30 minutes — except those that ring the
 //!   phone (confirmed intrusion), which never wait;
-//! - counts as "seen" for a phone alarm waiting on that push.
+//! - counts as "seen" for a phone alarm waiting on that push;
+//! - is told to cctv (v1.14 `/presence`), which only records and shows it:
+//!   the owner's rule is that cctv keeps judging exactly as before.
 
+use super::api::CctvApi;
 use super::store::Store;
 use super::tg::Bot;
 use crate::channels::telegram::{CallbackAnswer, CallbackPress};
@@ -26,6 +29,7 @@ const HOME_UNTIL: &str = "home_until";
 pub const DISMISSED: &str = "dismissed";
 
 struct Home {
+    api: CctvApi,
     bot: Bot,
     workspace: PathBuf,
 }
@@ -33,8 +37,15 @@ struct Home {
 static HOME: OnceLock<Home> = OnceLock::new();
 
 /// Set up the button (cctv link start-up).
-pub fn register(bot: Bot, workspace: PathBuf) {
-    if HOME.set(Home { bot, workspace }).is_ok() {
+pub fn register(api: CctvApi, bot: Bot, workspace: PathBuf) {
+    if HOME
+        .set(Home {
+            api,
+            bot,
+            workspace,
+        })
+        .is_ok()
+    {
         crate::channels::telegram::register_callback_handler(HOME_PREFIX, Arc::new(on_press));
     }
 }
@@ -84,6 +95,9 @@ fn on_press(p: &CallbackPress<'_>) -> Option<CallbackAnswer> {
 async fn dismiss(h: &Home, id: i64, user: &str) -> Result<()> {
     let store = Store::open(&h.workspace)?;
     hold(&store, Utc::now())?;
+    if let Err(e) = h.api.presence(HOLD_MINUTES, user).await {
+        tracing::debug!("presence not told to cctv: {e:#}");
+    }
     store.set_flag(id, DISMISSED)?;
     let _ = super::alarm::acknowledge(&format!("e{id}"), &format!("{user} 点了我在家"));
     let mut targets: Vec<(String, i64)> = store

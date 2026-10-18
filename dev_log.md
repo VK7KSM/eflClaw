@@ -7725,3 +7725,6 @@ cctv 把回报写进事件的 `delivery` 字段，警戒区域页面的运行日
 - 补充：cctv 确认，正常情况下事件进事件流时，目标已经存好。例外是 AI 超时：报警先推送，目标跟着后来的更新才到。
   所以更新时，如果这条报警记着 `notag`，就再查一次 `/objects`；有目标就去掉 `notag`，并在原推送上补上「标注」按钮
   （说明文字没变也会改按钮）。`store.rs` 新增 `clear_flag()`。
+- 补充：cctv v1.14 新增 `POST /cctv/v1/presence`。按「我在家」时，elfClaw 会通知 cctv：`{"home":true,"minutes":30,"by":"telegram","account":按的人}`。
+  据 cctv 转述，用户同意让 cctv 知道，但只记录和显示（警戒区域页顶栏、运行日志），AI 的判断和级别一律不变，用户原话是"看家护院是 cctv 的活"。
+  接口上线前会返回 404，elfClaw 只记 debug 日志、忽略。`api.rs` 新增 `presence()`，`home::register` 增加 `api`。

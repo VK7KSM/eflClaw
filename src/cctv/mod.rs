@@ -151,7 +151,7 @@ pub async fn run(config: Config) -> Result<()> {
         Arc::new(alarm::telegram_callback),
     );
     let _ = alarm::BOT.set(bot.clone());
-    home::register(bot.clone(), config.workspace_dir.clone());
+    home::register(ctx.api.clone(), bot.clone(), config.workspace_dir.clone());
     label::register(ctx.api.clone(), bot.clone(), config.workspace_dir.clone());
     tracing::info!(
         chats = ctx.chats.len(),
