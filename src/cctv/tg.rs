@@ -197,6 +197,27 @@ impl Bot {
         self.post_edit(method, &body).await
     }
 
+    /// Show a persistent reply keyboard (the panel) with a short message.
+    pub async fn send_keyboard(&self, chat: &str, text: &str, rows: &[Vec<String>]) -> Result<i64> {
+        let keyboard: Vec<Vec<serde_json::Value>> = rows
+            .iter()
+            .map(|r| r.iter().map(|t| serde_json::json!({"text": t})).collect())
+            .collect();
+        let body = serde_json::json!({
+            "chat_id": chat,
+            "text": text,
+            "disable_notification": true,
+            "reply_markup": {"keyboard": keyboard, "resize_keyboard": true, "is_persistent": true},
+        });
+        let resp = self
+            .http
+            .post(self.url("sendMessage"))
+            .json(&body)
+            .send()
+            .await?;
+        Self::finish(resp, "sendMessage").await
+    }
+
     /// Delete a message the bot sent (Telegram allows it within 48 hours).
     pub async fn delete(&self, chat: &str, message_id: i64) -> Result<()> {
         let body = serde_json::json!({"chat_id": chat, "message_id": message_id});

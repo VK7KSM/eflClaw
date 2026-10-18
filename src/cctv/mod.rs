@@ -13,6 +13,8 @@ pub mod feedback;
 pub mod format;
 pub mod home;
 pub mod label;
+pub mod look;
+pub mod panel;
 pub mod store;
 pub mod tg;
 pub mod worker;
@@ -112,6 +114,7 @@ pub fn register_menu(config: &Config) {
             ),
         );
     }
+    panel::register_buttons(config);
     // "我在家 / 我出门" (owner's rules 2026-10-18): only the accounts that
     // receive the pushes; any one of them saying "我出门" ends it.
     let send_to = config.cctv.send_to.clone();
@@ -186,6 +189,14 @@ pub async fn run(config: Config) -> Result<()> {
         ctx.tz,
     );
     feedback::register(ctx.api.clone(), bot.clone(), config.workspace_dir.clone());
+    panel::init(
+        ctx.api.clone(),
+        bot.clone(),
+        config.workspace_dir.clone(),
+        ctx.tz,
+        ctx.chats.clone(),
+        look::Looker::from_config(&config),
+    );
     label::register(ctx.api.clone(), bot.clone(), config.workspace_dir.clone());
     tracing::info!(
         chats = ctx.chats.len(),

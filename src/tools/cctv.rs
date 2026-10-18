@@ -6,11 +6,9 @@
 use super::traits::{Tool, ToolResult};
 use crate::cctv::api::{CctvApi, Monitor};
 use crate::cctv::tg::{Bot, SendOpts};
-use crate::providers::{self, ChatMessage, ChatRequest, Provider, ProviderRuntimeOptions};
 use crate::security::SecurityPolicy;
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
-use base64::Engine as _;
 use chrono::{DateTime, FixedOffset, NaiveDateTime, NaiveTime, TimeZone, Utc};
 use chrono_tz::Tz;
 use serde_json::{json, Value};
@@ -19,18 +17,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Instructions for looking at a camera picture.
-const LOOK_PROMPT: &str =
-    "你在看用户自己家里监控摄像头的画面。用中文简洁地说清楚画面里看得到的东西：\
-有没有人（几个、在哪、在做什么、穿着）、车辆（停着还是在动）、动物、门和大门的状态、\
-任何异常。只说看得到的，看不清就说看不清，不要编。用户有具体问题时先回答问题。";
-
-/// The model that looks at pictures (the chat model; Gemini sees images).
-struct Vision {
-    provider: Box<dyn Provider>,
-    model: String,
-}
-
 /// Shared by both tools.
 pub struct CctvLink {
     api: CctvApi,
@@ -38,35 +24,7 @@ pub struct CctvLink {
     tz: Tz,
     workspace: PathBuf,
     send_to: Vec<String>,
-    vision: Option<Vision>,
-}
-
-fn vision_from(config: &crate::config::Config) -> Option<Vision> {
-    let options = ProviderRuntimeOptions {
-        zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
-        secrets_encrypt: config.secrets.encrypt,
-        reasoning_level: Some(1),
-        ..ProviderRuntimeOptions::default()
-    };
-    match providers::create_resilient_provider_with_options(
-        config.default_provider.as_deref().unwrap_or("gemini"),
-        config.api_key.as_deref(),
-        config.api_url.as_deref(),
-        &config.reliability,
-        &options,
-    ) {
-        Ok(provider) => Some(Vision {
-            provider,
-            model: config
-                .default_model
-                .clone()
-                .unwrap_or_else(|| "gemini-3.5-flash".into()),
-        }),
-        Err(e) => {
-            tracing::warn!("CCTV pictures will not be described: {e:#}");
-            None
-        }
-    }
+    vision: Option<crate::cctv::look::Looker>,
 }
 
 impl CctvLink {
@@ -81,44 +39,13 @@ impl CctvLink {
                 .unwrap_or(chrono_tz::Australia::Sydney),
             workspace: config.workspace_dir.clone(),
             send_to: config.cctv.send_to.clone(),
-            vision: vision_from(config),
+            vision: crate::cctv::look::Looker::from_config(config),
         })
     }
 
     /// What the model sees in `jpeg` (`what` says which camera and when).
-    /// Never fails: a failure becomes the text the agent gets.
     async fn look(&self, jpeg: &[u8], what: &str, question: Option<&str>) -> String {
-        let Some(v) = &self.vision else {
-            return "（没有能看图的模型，无法分析画面）".into();
-        };
-        let mut user = format!("这是{what}。");
-        if let Some(q) = question.map(str::trim).filter(|q| !q.is_empty()) {
-            let _ = write!(user, "\n用户的问题：{q}");
-        }
-        let _ = write!(
-            user,
-            "\n[IMAGE:data:image/jpeg;base64,{}]",
-            base64::engine::general_purpose::STANDARD.encode(jpeg)
-        );
-        let messages = [ChatMessage::system(LOOK_PROMPT), ChatMessage::user(user)];
-        let request = ChatRequest {
-            messages: &messages,
-            tools: None,
-        };
-        match tokio::time::timeout(
-            Duration::from_secs(90),
-            v.provider.chat(request, &v.model, 0.2),
-        )
-        .await
-        {
-            Ok(Ok(r)) => r
-                .text
-                .map(|t| t.trim().to_string())
-                .filter(|t| !t.is_empty())
-                .unwrap_or_else(|| "（模型没有给出描述）".into()),
-            Ok(Err(e)) => format!("（看图失败：{e:#}）"),
-            Err(_) => "（看图超时）".into(),
-        }
+        crate::cctv::look::describe(self.vision.as_ref(), jpeg, what, question).await
     }
 
     async fn camera(&self, wanted: Option<&str>, need_ptz: bool) -> Result<Monitor> {
@@ -837,7 +764,11 @@ impl CctvTool {
                 let antenna = m.rotator.is_some();
                 if ptz_action == "status" {
                     let v = link.api.rotator(m.id).await?;
-                    return Ok(format!("{}：{}", m.name, rotator_line(&v)));
+                    return Ok(format!(
+                        "{}：{}",
+                        m.name,
+                        crate::cctv::format::rotator_line(&v)
+                    ));
                 }
                 let mut body = json!({"monitor_id": m.id, "action": ptz_action});
                 let mut wait_ms = 1500u64;
@@ -1220,40 +1151,6 @@ fn memory_line(m: &Value) -> String {
     line
 }
 
-/// The antenna rotator's state in one line.
-fn rotator_line(v: &Value) -> String {
-    let mut line = format!(
-        "方位 {:.0}°、俯仰 {:.0}°{}",
-        v["az"].as_f64().unwrap_or_default(),
-        v["el"].as_f64().unwrap_or_default(),
-        if v["moving"].as_bool() == Some(true) {
-            "，正在转动"
-        } else {
-            ""
-        }
-    );
-    let by = match v["controller"].as_str().unwrap_or("") {
-        "dtrac" => "DTrac 追星",
-        "manual" => "手动控制",
-        "ai" => "AI 跟踪",
-        "look" => "对准某一路摄像头",
-        _ => "",
-    };
-    if !by.is_empty() {
-        let _ = write!(line, "，当前由{by}控制");
-    }
-    if v["at_home"].as_bool() == Some(true) {
-        line.push_str("，在守望位");
-    }
-    if v["ai_track"].as_bool() == Some(true) {
-        line.push_str("，AI 跟踪开");
-    }
-    if let Some(msg) = v["message"].as_str().filter(|m| !m.is_empty()) {
-        let _ = write!(line, "（{msg}）");
-    }
-    line
-}
-
 /// One camera of `/scene`: who and what is there now.
 fn scene_line(m: &Value) -> String {
     let name = m["name"].as_str().unwrap_or("?");
@@ -1357,12 +1254,12 @@ mod tests {
         let v = json!({"az": 181.6, "el": 32.2, "moving": false, "controller": "dtrac",
             "locked": true, "at_home": false, "message": "正在追星，云台由 DTrac 控制"});
         assert_eq!(
-            rotator_line(&v),
+            crate::cctv::format::rotator_line(&v),
             "方位 182°、俯仰 32°，当前由DTrac 追星控制（正在追星，云台由 DTrac 控制）"
         );
         let idle = json!({"az": 90, "el": 0, "moving": true, "controller": "idle", "at_home": true, "ai_track": true});
         assert_eq!(
-            rotator_line(&idle),
+            crate::cctv::format::rotator_line(&idle),
             "方位 90°、俯仰 0°，正在转动，在守望位，AI 跟踪开"
         );
     }

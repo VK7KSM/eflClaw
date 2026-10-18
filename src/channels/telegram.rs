@@ -183,8 +183,30 @@ pub fn register_menu_command(
     commands.push((command, description, handler));
 }
 
-/// The reply to a registered menu command (`/cmd` or `/cmd@bot`), if `text` is one.
+/// elfClaw 2026-10-18: buttons of a reply keyboard another module shows
+/// (the CCTV panel). A press sends the button's text as a message; an exact
+/// match is answered by its handler, never by the model.
+static TEXT_COMMANDS: parking_lot::RwLock<Vec<(String, CommandHandler)>> =
+    parking_lot::RwLock::new(Vec::new());
+
+/// Answer messages that are exactly `text` with `handler`.
+pub fn register_text_command(text: &str, handler: CommandHandler) {
+    let mut commands = TEXT_COMMANDS.write();
+    commands.retain(|(t, _)| t != text);
+    commands.push((text.to_string(), handler));
+}
+
+/// The reply to a registered menu command (`/cmd` or `/cmd@bot`) or panel
+/// button text, if `text` is one.
 fn menu_command_reply(text: &str, chat: &str, sender: &str) -> Option<String> {
+    let exact = TEXT_COMMANDS
+        .read()
+        .iter()
+        .find(|(t, _)| t == text.trim())
+        .map(|(_, h)| h.clone());
+    if let Some(handler) = exact {
+        return Some(handler(chat, sender));
+    }
     let word = text.trim().strip_prefix('/')?.split_whitespace().next()?;
     let name = word.split('@').next()?;
     let handler = MENU_COMMANDS
@@ -4655,6 +4677,17 @@ mod tests {
             menu_command_reply("/new", "100", "u").is_none(),
             "built-ins stay with the agent"
         );
+        register_text_command(
+            "📊 zz状态",
+            std::sync::Arc::new(|chat, _| format!("status {chat}")),
+        );
+        assert_eq!(
+            menu_command_reply(" 📊 zz状态 ", "100", "u").as_deref(),
+            Some("status 100"),
+            "a panel button's exact text"
+        );
+        assert!(menu_command_reply("📊 zz状态 好吗", "100", "u").is_none());
+        TEXT_COMMANDS.write().retain(|(t, _)| t != "📊 zz状态");
         MENU_COMMANDS
             .write()
             .retain(|(c, _, _)| *c != "zz_test_cmd");

@@ -1,6 +1,7 @@
 //! Push texts. Plain text (no Telegram parse mode), Chinese, short.
 
 use super::api::Event;
+use std::fmt::Write as _;
 
 /// `14:47:06` from `2026-10-14T14:47:06+11:00` (cctv sends local times).
 pub fn clock(iso: &str) -> String {
@@ -119,6 +120,40 @@ pub fn report(e: &Event) -> String {
         }
     }
     lines.join("\n")
+}
+
+/// The antenna rotator's state in one line.
+pub fn rotator_line(v: &serde_json::Value) -> String {
+    let mut line = format!(
+        "方位 {:.0}°、俯仰 {:.0}°{}",
+        v["az"].as_f64().unwrap_or_default(),
+        v["el"].as_f64().unwrap_or_default(),
+        if v["moving"].as_bool() == Some(true) {
+            "，正在转动"
+        } else {
+            ""
+        }
+    );
+    let by = match v["controller"].as_str().unwrap_or("") {
+        "dtrac" => "DTrac 追星",
+        "manual" => "手动控制",
+        "ai" => "AI 跟踪",
+        "look" => "对准某一路摄像头",
+        _ => "",
+    };
+    if !by.is_empty() {
+        let _ = write!(line, "，当前由{by}控制");
+    }
+    if v["at_home"].as_bool() == Some(true) {
+        line.push_str("，在守望位");
+    }
+    if v["ai_track"].as_bool() == Some(true) {
+        line.push_str("，AI 跟踪开");
+    }
+    if let Some(msg) = v["message"].as_str().filter(|m| !m.is_empty()) {
+        let _ = write!(line, "（{msg}）");
+    }
+    line
 }
 
 /// One line for the phone/SMS: what and where.

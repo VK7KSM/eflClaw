@@ -734,6 +734,11 @@ impl CctvApi {
         Ok(())
     }
 
+    /// Everything the panel's "📊 状态" shows (v1.14 §13).
+    pub async fn status(&self) -> Result<serde_json::Value> {
+        self.get_json("status", Duration::from_secs(15)).await
+    }
+
     /// cctv's run log (v1.14 §14): what it did and why. `query` is the raw
     /// query string (event_id, monitor, kind, from, to, since_rev, limit).
     pub async fn runlog(&self, query: &str) -> Result<serde_json::Value> {
