@@ -419,10 +419,16 @@ async fn handle_event(ctx: &Ctx, store: &Store, e: &Event) -> Result<()> {
         p.marked_false = true;
     }
     p.has_description |= e.description.is_some();
+    // An alarm the AI timed out on is pushed before its people and vehicles
+    // are saved; they come with a later update — then "标注" is added.
+    let tag_added = e.kind == "alarm"
+        && store.has_flag(id, NOTAG)
+        && has_targets(ctx, id).await
+        && store.clear_flag(id, NOTAG).is_ok();
     let caption = format::caption(e, p.marked_false);
     let stale: Vec<Sent> = messages
         .into_iter()
-        .filter(|m| m.caption != caption)
+        .filter(|m| tag_added || m.caption != caption)
         .collect();
     if !stale.is_empty() {
         edit_all(&ctx.bot, store, id, &stale, e, &caption, &key).await;

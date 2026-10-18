@@ -229,6 +229,14 @@ impl Store {
         Ok(())
     }
 
+    pub fn clear_flag(&self, event_id: i64, flag: &str) -> Result<()> {
+        self.conn.lock().execute(
+            "DELETE FROM flags WHERE event_id = ?1 AND flag = ?2",
+            params![event_id, flag],
+        )?;
+        Ok(())
+    }
+
     pub fn has_flag(&self, event_id: i64, flag: &str) -> bool {
         self.conn
             .lock()
@@ -317,6 +325,8 @@ mod tests {
         s.set_flag(7, "dismissed").unwrap();
         assert!(s.has_flag(7, "dismissed"));
         assert!(!s.has_flag(8, "dismissed"), "per event");
+        s.clear_flag(7, "dismissed").unwrap();
+        assert!(!s.has_flag(7, "dismissed"));
 
         assert!(s.first_report(7).unwrap());
         assert!(!s.first_report(7).unwrap(), "a report is handled once");
