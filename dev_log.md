@@ -7889,3 +7889,10 @@ cctv 18:0x 部署了 v1.14、v1.15。elfClaw 这边分两步接：
 - 关掉后没有草稿气泡：工具进度（⏳/✅）和最终回答的分段显示都没了，要等整轮结束才一次发出。
 - 处理：K5 `config.toml` 改为 `stream_mode = "native"`、`draft_update_interval_ms = 200`（和 K3 一样），备份为 `config.toml.before-stream`，21:09 重启生效。代码没改。
 - 说明：Gemini 是整段生成后才返回的，"流式"其实是拿到回答后再分段打进草稿，总耗时不变，但等待时能看到工具进度。
+
+## 2026-10-18 K5：监控工具 cctv 不再每次要授权（只改配置）
+
+用户反馈：每次让 elfClaw 调用 cctv 都会弹授权消息。
+- 原因：K5 的 `[autonomy]` 是 `level = "supervised"`，不在 `auto_approve` 里的工具每次都要用户确认，`cctv` 不在名单里。
+- 处理：K5 `config.toml` 的 `auto_approve` 加上 `"cctv"`，备份为 `config.toml.before-cctv-approve`，21:33 重启生效。
+- 不变：`cctv_arm`（布防/撤防）仍在 `always_ask`，照旧先确认（用户 10-14 定的"撤防前先确认"）。面板上的布防按钮本身就是用户亲手按的，"全部撤防"会再确认一次。
