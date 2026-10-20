@@ -7952,3 +7952,26 @@ cctv 定了明细接口：`GET /cctv/v1/ai/usage?after_id=N&limit=M`，按 id �
 - 结果：每天的额度统计和推送末尾的"今日用量"都包含 cctv 的调用，观测到的单 key 上限也更准。
 - 验证：cctv 单测 33 个通过（新增 3 个）；quota 单测 27 个通过；clippy 没有新告警。
 - 部署：等 cctv 部署新接口时一起上 K5。
+
+## 2026-10-20 回退链加入反代的 Claude Sonnet 4.6 和 GPT-OSS
+
+K5 上的 Antigravity Tools 反代又能用了（13:13 重新启动）。它的 Gemini 额度已用光，但 Claude / GPT 额度还在。用户要求的回退顺序：
+
+gemini-3.8-flash → gemini-3.6-flash → claude-sonnet-4-6（反代）→ gemini-3.5-flash-lite → gpt-oss-120b-medium（反代）
+
+- 先在 K5 上用 elfClaw 调反代的方式（Gemini 原生 `generateContent`）实测：
+  - `claude-sonnet-4-6` 和 `gpt-oss-120b-medium` 普通问答都返回 200，约 3.5 秒；
+  - 两个模型都能正确发出 function call。
+  - 反代的 `/v1/models` 里还有 claude-opus-4-6-thinking、claude-sonnet-5-5、gemini-4-argon 等。
+- `providers/reliable.rs`：
+  - 新增 `proxy_only_model()`：`claude-` / `gpt-` 开头的模型只有反代提供。
+  - 回退链里遇到这类模型，不管排第几，都只发给反代，官方 key 不会被问到；Gemini 模型照旧，反代只用于请求的那个模型。
+  - 只在有反代条目时生效；不是 Gemini 的配置（没有反代）行为不变。
+  - 反代失败的日志从 "using the official API" 改为 "moving on down the chain"。
+- 新增单测：
+  - `proxy_only_models_go_to_the_proxy_alone_in_chain_order`：整条链按用户的顺序走，反代只被问 3.8 / sonnet / gpt-oss，官方 key 只被问 3 个 Gemini 模型；
+  - `without_a_proxy_claude_names_are_left_to_the_chain`。
+- Gemini 不会给非 gemini 模型加 thinkingConfig（`build_thinking_config` 返回 None）；每天的"模型已下线"检查只看 gemini 开头的名字，不会误报。
+- 用量：反代的调用在推送末尾单独列为"反代 … 已用 N 次"（已有逻辑）。
+- K5 配置 `[reliability.model_fallbacks]` 的 `"gemini-3.8-flash"` 改为上面的顺序，原文件备份为 `config.toml.bak-20261020-chain`。
+- 已告诉 cctv：它只用 gemini-3.8-flash，不往下退（用户说 cctv 已有 Sonnet 5.5）。

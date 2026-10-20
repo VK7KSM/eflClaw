@@ -408,6 +408,14 @@ fn until_next_pacific_midnight(now: chrono::DateTime<chrono::Utc>) -> Duration {
 /// label, see `quota`).
 pub const GEMINI_PROXY_PROVIDER: &str = "gemini-proxy";
 
+/// elfClaw 2026-10-20: models only the proxy serves — Antigravity Tools also
+/// offers Claude and GPT-OSS, which Google's API has never heard of. In the
+/// fallback chain such a model goes to the proxy alone (whatever its place),
+/// and the official keys are not asked for it.
+fn proxy_only_model(model: &str) -> bool {
+    model.starts_with("claude-") || model.starts_with("gpt-")
+}
+
 /// How long the proxy is left alone after a failure. Antigravity Tools
 /// reports how long its accounts are limited ("... Wait 62033s"); otherwise
 /// ten minutes. Capped at six hours.
@@ -537,9 +545,18 @@ impl ReliableProvider {
         T: Send,
     {
         let mut entries: Vec<(&'a str, &'a dyn Provider, &'a str)> = Vec::new();
+        let has_proxy = self
+            .providers
+            .iter()
+            .any(|(name, _)| name == GEMINI_PROXY_PROVIDER);
         for current_model in self.model_chain(model) {
+            let proxy_only = has_proxy && proxy_only_model(current_model);
             for (provider_index, (provider_name, provider)) in self.providers.iter().enumerate() {
-                if provider_name == GEMINI_PROXY_PROVIDER && current_model != model {
+                let is_proxy = provider_name == GEMINI_PROXY_PROVIDER;
+                if is_proxy && current_model != model && !proxy_only {
+                    continue;
+                }
+                if !is_proxy && proxy_only {
                     continue;
                 }
                 for sent_model in
@@ -608,7 +625,7 @@ impl ReliableProvider {
                             model = sent_model,
                             rest_secs = rest.as_secs(),
                             error = %error_detail,
-                            "Gemini proxy failed; using the official API"
+                            "Gemini proxy failed; moving on down the chain"
                         );
                         self.cooldowns.lock().insert(
                             (provider_name.to_string(), sent_model.to_string()),
@@ -2493,6 +2510,111 @@ mod tests {
         assert_eq!(result, "m-b via key a");
         assert_eq!(*proxy_dead.seen.lock(), vec!["m-a"], "never asked for m-b");
         assert!(proxy.seen.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn proxy_only_models_go_to_the_proxy_alone_in_chain_order() {
+        // 3.8 → 3.6 → sonnet (proxy) → lite → gpt-oss (proxy), the owner's
+        // order of 2026-10-20, with every Gemini model spent on the keys.
+        let spent = "Gemini API error (429 Too Many Requests): limit: 20, quota exceeded per day";
+        let proxy = Arc::new(ScriptedModelMock {
+            script: [
+                (
+                    "gemini-3.8-flash",
+                    vec![Err("503: All accounts limited. Wait 600s")],
+                ),
+                (
+                    "claude-sonnet-4-6",
+                    vec![Err("503: All accounts limited. Wait 600s")],
+                ),
+                ("gpt-oss-120b-medium", vec![Ok("from gpt-oss")]),
+            ]
+            .into_iter()
+            .collect(),
+            seen: parking_lot::Mutex::new(Vec::new()),
+        });
+        let key_a = Arc::new(ScriptedModelMock {
+            script: [
+                ("gemini-3.8-flash", vec![Err(spent)]),
+                ("gemini-3.6-flash", vec![Err(spent)]),
+                ("gemini-3.5-flash-lite", vec![Err(spent)]),
+            ]
+            .into_iter()
+            .collect(),
+            seen: parking_lot::Mutex::new(Vec::new()),
+        });
+        let mut fallbacks = HashMap::new();
+        fallbacks.insert(
+            "gemini-3.8-flash".to_string(),
+            vec![
+                "gemini-3.6-flash".to_string(),
+                "claude-sonnet-4-6".to_string(),
+                "gemini-3.5-flash-lite".to_string(),
+                "gpt-oss-120b-medium".to_string(),
+            ],
+        );
+        let provider = ReliableProvider::new(
+            vec![
+                (
+                    GEMINI_PROXY_PROVIDER.into(),
+                    Box::new(proxy.clone()) as Box<dyn Provider>,
+                ),
+                (
+                    "gemini".into(),
+                    Box::new(key_a.clone()) as Box<dyn Provider>,
+                ),
+            ],
+            0,
+            1,
+        )
+        .with_model_fallbacks(fallbacks);
+        let result = provider
+            .simple_chat("hi", "gemini-3.8-flash", 0.0)
+            .await
+            .unwrap();
+        assert_eq!(result, "from gpt-oss");
+        assert_eq!(
+            *proxy.seen.lock(),
+            vec![
+                "gemini-3.8-flash",
+                "claude-sonnet-4-6",
+                "gpt-oss-120b-medium"
+            ],
+            "the proxy is not asked for 3.6 or lite"
+        );
+        assert_eq!(
+            *key_a.seen.lock(),
+            vec![
+                "gemini-3.8-flash",
+                "gemini-3.6-flash",
+                "gemini-3.5-flash-lite"
+            ],
+            "the official key is never asked for Claude or GPT-OSS"
+        );
+    }
+
+    #[tokio::test]
+    async fn without_a_proxy_claude_names_are_left_to_the_chain() {
+        // Not a Gemini setup: nothing is filtered out.
+        let key_a = Arc::new(ScriptedModelMock {
+            script: [("claude-sonnet-4-6", vec![Ok("direct")])]
+                .into_iter()
+                .collect(),
+            seen: parking_lot::Mutex::new(Vec::new()),
+        });
+        let provider = ReliableProvider::new(
+            vec![(
+                "anthropic".into(),
+                Box::new(key_a.clone()) as Box<dyn Provider>,
+            )],
+            0,
+            1,
+        );
+        let result = provider
+            .simple_chat("hi", "claude-sonnet-4-6", 0.0)
+            .await
+            .unwrap();
+        assert_eq!(result, "direct");
     }
 
     #[test]
