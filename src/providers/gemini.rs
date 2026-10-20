@@ -128,12 +128,20 @@ struct FunctionCallingConfig {
 
 #[derive(Debug, Serialize, Clone)]
 struct RequestFunctionCall {
+    /// Only sent for models the Gemini proxy serves from elsewhere (see
+    /// `reliable::proxy_only_model`): it turns calls into OpenAI-style
+    /// `tool_calls`, which GPT-OSS rejects without an id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<String>,
     name: String,
     args: serde_json::Value,
 }
 
 #[derive(Debug, Serialize, Clone)]
 struct FunctionResponse {
+    /// Matches `RequestFunctionCall::id`; same condition.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<String>,
     name: String,
     response: serde_json::Value,
 }
@@ -357,8 +365,13 @@ impl CandidateContent {
             }
         }
 
+        // elfClaw 2026-10-20: with tool calls and no answer, there is no text —
+        // reasoning is not a reply. Claude through the proxy streams its
+        // thinking in fragments; the first one ("Let") was kept as the turn's
+        // text, and on the next turn the proxy pinned its thinking signature
+        // to it and Claude rejected the request ("Invalid `signature`").
         let final_text = if answer_parts.is_empty() {
-            first_thinking
+            first_thinking.filter(|_| tool_calls.is_empty())
         } else {
             Some(answer_parts.join(""))
         };
@@ -1562,6 +1575,12 @@ impl Provider for GeminiProvider {
         // Maps tool_call_id → tool_name for building functionResponse parts.
         let mut tool_id_to_name: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
+        // elfClaw 2026-10-20: Claude / GPT-OSS through the proxy. Tested on
+        // K5: GPT-OSS needs ids on calls and results; Claude rejected the
+        // empty thought Part elfClaw replays for Gemini ("Invalid
+        // `signature` in `thinking` block"). Ids without signatures works
+        // for both. Gemini models keep the replay exactly as before.
+        let foreign = crate::providers::reliable::proxy_only_model(model);
 
         for msg in request.messages {
             match msg.role.as_str() {
@@ -1636,7 +1655,10 @@ impl Provider for GeminiProvider {
                                 // insert a thought Part before the functionCall Part (Gemini 2.5).
                                 // elfClaw: also set thought_signature on the functionCall Part itself
                                 // (Gemini 3 requires it there to avoid 400 "missing thought_signature").
-                                let sig_opt = tc.get("thought_signature").and_then(|v| v.as_str());
+                                let sig_opt = tc
+                                    .get("thought_signature")
+                                    .and_then(|v| v.as_str())
+                                    .filter(|_| !foreign);
                                 if let Some(sig) = sig_opt {
                                     parts.push(Part {
                                         text: Some(String::new()),
@@ -1650,7 +1672,11 @@ impl Provider for GeminiProvider {
                                 parts.push(Part {
                                     text: None,
                                     inline_data: None,
-                                    function_call: Some(RequestFunctionCall { name, args }),
+                                    function_call: Some(RequestFunctionCall {
+                                        id: foreign.then(|| id.clone()),
+                                        name,
+                                        args,
+                                    }),
                                     function_response: None,
                                     thought: None,
                                     // elfClaw: include sig on functionCall Part — Gemini 3 requires this
@@ -1696,6 +1722,7 @@ impl Provider for GeminiProvider {
                                 inline_data: None,
                                 function_call: None,
                                 function_response: Some(FunctionResponse {
+                                    id: foreign.then(|| tool_call_id.clone()),
                                     name: tool_name,
                                     response: serde_json::json!({ "output": content }),
                                 }),
@@ -1807,6 +1834,49 @@ impl Provider for GeminiProvider {
 mod tests {
     use super::*;
     use reqwest::{header::AUTHORIZATION, StatusCode};
+
+    #[test]
+    fn thinking_is_not_kept_as_text_beside_tool_calls() {
+        let parts: CandidateContent = serde_json::from_value(serde_json::json!({
+            "parts": [
+                {"thought": true, "text": "Let"},
+                {"thought": true, "text": " me check."},
+                {"functionCall": {"name": "cctv", "args": {"action": "cameras"}}}
+            ]
+        }))
+        .unwrap();
+        let (text, calls) = parts.extract_tool_calls();
+        assert_eq!(text, None);
+        assert_eq!(calls.len(), 1);
+        // Without a tool call, thinking is still the fallback answer.
+        let only_thought: CandidateContent = serde_json::from_value(serde_json::json!({
+            "parts": [{"thought": true, "text": "answer in thought"}]
+        }))
+        .unwrap();
+        assert_eq!(
+            only_thought.extract_tool_calls().0.as_deref(),
+            Some("answer in thought")
+        );
+    }
+
+    #[test]
+    fn function_call_ids_are_sent_only_when_set() {
+        // Gemini models: no `id`, as before. Proxy-only models: `id` on both.
+        let gemini = serde_json::to_value(RequestFunctionCall {
+            id: None,
+            name: "cctv".into(),
+            args: serde_json::json!({}),
+        })
+        .unwrap();
+        assert!(gemini.get("id").is_none());
+        let foreign = serde_json::to_value(FunctionResponse {
+            id: Some("call_1".into()),
+            name: "cctv".into(),
+            response: serde_json::json!({"output": "ok"}),
+        })
+        .unwrap();
+        assert_eq!(foreign["id"], "call_1");
+    }
 
     /// Helper to create a test OAuth auth variant.
     fn test_oauth_auth(token: &str) -> GeminiAuth {

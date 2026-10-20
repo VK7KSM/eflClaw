@@ -7975,3 +7975,40 @@ gemini-3.8-flash → gemini-3.6-flash → claude-sonnet-4-6（反代）→ gemin
 - 用量：反代的调用在推送末尾单独列为"反代 … 已用 N 次"（已有逻辑）。
 - K5 配置 `[reliability.model_fallbacks]` 的 `"gemini-3.8-flash"` 改为上面的顺序，原文件备份为 `config.toml.bak-20261020-chain`。
 - 已告诉 cctv：它只用 gemini-3.8-flash，不往下退（用户说 cctv 已有 Sonnet 5.5）。
+
+### 补充：回传工具调用的格式（实测后修正）
+
+第一次部署后，在 K5 用 `zeroclaw agent --model …` 跑真实对话（让模型调用 cctv 工具）。两个模型第一轮都正常发出了工具调用，第二轮把工具结果送回去时都被反代拒绝：
+- Claude：`Invalid signature in thinking block`；
+- GPT-OSS：`Expected the 'id' of a(n) 'assistant' 'tool_calls' array element to be populated`。
+
+直接对反代试了 4 种回传写法：Claude 4 种都接受；GPT-OSS 只接受"调用和结果都带 `id`、不带思考签名"。这种写法两个模型都能用。
+
+- `providers/gemini.rs`：
+  - `RequestFunctionCall`、`FunctionResponse` 加可选的 `id`，没有时不发送；
+  - 模型是 `proxy_only_model`（claude- / gpt-）时：调用和结果带上同一个工具调用 id，不再回放空的思考片段和 `thoughtSignature`；
+  - Gemini 模型的请求和之前完全一样。
+- `providers/reliable.rs`：`proxy_only_model` 改为 `pub(crate)`，两处共用同一个判断。
+- 新增单测 `function_call_ids_are_sent_only_when_set`；providers 单测 662 个通过。
+
+### 补充 2：Claude 第二轮仍报签名错误的真正原因
+
+查反代的请求日志（`proxy_logs.db`）发现两件事：
+- 反代会自动给 `claude-sonnet-4-6` 打开思考（thinkingBudget 1024），并把思考内容拆成很多小片段返回。
+- 模型那一轮只发了工具调用、没有正文时，`CandidateContent::extract_tool_calls` 会把第一个思考片段当成正文。这里就是 "Let"，它被存进历史。下一轮反代把缓存的思考签名挂到这段 "Let" 上，Claude 校验失败。
+
+- `providers/gemini.rs`：有工具调用、没有正文时，正文为空，思考内容不再当正文；没有工具调用时，仍按原样退回思考内容。
+- 新增单测 `thinking_is_not_kept_as_text_beside_tool_calls`；providers 单测 663 个通过。
+
+### 补充 3：实测结果和部署脚本加固
+
+- K5 实测（`zeroclaw agent --model …`，让模型调用 cctv 工具列出摄像头，再用一句话回答）：
+  - `claude-sonnet-4-6`：答"一共 9 路摄像头，Back yard 是第 6 号"，8.2 秒；
+  - `gpt-oss-120b-medium`：同样答对，6.6 秒；
+  - `gemini-3.8-flash`（默认链）：也答对。当时官方 3.8 的 key 大多已用完（429）；其中 `gemini#5` 的 3.8 请求挂了 120 秒才超时，然后退到 3.6 成功，总共 137 秒。这个 120 秒超时是官方接口那边的老问题，和这次改动无关。
+- 部署时出了一次事故：旧进程刚被结束时 exe 仍被占用，`deploy_exe.ps1` 复制失败后直接退出，没有重新拉起 elfClaw；看门狗看到 stage 目录也不拉。约 1 分钟后发现，手动重跑部署脚本恢复（14:21:35）。
+- K5 `C:\K5-DEV\elfClaw\deploy_exe.ps1` 加固（原文件备份为 `.bak-20261020`）：
+  - 先 `Wait-Process` 等旧进程完全退出；
+  - 复制最多重试 10 次；
+  - 用 `finally` 保证无论复制成败都启动 `elfClaw_Workspace`；
+  - 复制失败时保留旧 exe，并输出 `COPY FAILED`。

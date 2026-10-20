@@ -412,7 +412,7 @@ pub const GEMINI_PROXY_PROVIDER: &str = "gemini-proxy";
 /// offers Claude and GPT-OSS, which Google's API has never heard of. In the
 /// fallback chain such a model goes to the proxy alone (whatever its place),
 /// and the official keys are not asked for it.
-fn proxy_only_model(model: &str) -> bool {
+pub(crate) fn proxy_only_model(model: &str) -> bool {
     model.starts_with("claude-") || model.starts_with("gpt-")
 }
 
