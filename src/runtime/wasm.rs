@@ -109,7 +109,9 @@ impl WasmRuntime {
         }
         if self.config.security.require_workspace_relative_tools_dir {
             let tools_dir_path = Path::new(&self.config.tools_dir);
-            if tools_dir_path.is_absolute() {
+            // elfClaw 2026-10-20: `/x` and `C:x` are not `is_absolute()` on
+            // Windows but still leave the workspace.
+            if crate::security::policy::is_rooted(tools_dir_path) {
                 bail!("runtime.wasm.tools_dir must be a workspace-relative path");
             }
             if tools_dir_path

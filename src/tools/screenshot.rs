@@ -352,14 +352,26 @@ mod tests {
     use crate::security::{AutonomyLevel, SecurityPolicy};
     use std::path::Path;
 
+    /// Creates the link; `false` when this machine may not (see the
+    /// Windows version), and the caller skips the test.
     #[cfg(unix)]
-    fn symlink_file(src: &Path, dst: &Path) {
+    fn symlink_file(src: &Path, dst: &Path) -> bool {
         std::os::unix::fs::symlink(src, dst).expect("symlink should be created");
+        true
     }
 
+    /// Windows needs the symlink privilege (or Developer Mode) to create
+    /// links; without it (error 1314) the test cannot set up its case.
     #[cfg(windows)]
-    fn symlink_file(src: &Path, dst: &Path) {
-        std::os::windows::fs::symlink_file(src, dst).expect("symlink should be created");
+    fn symlink_file(src: &Path, dst: &Path) -> bool {
+        match std::os::windows::fs::symlink_file(src, dst) {
+            Ok(()) => true,
+            Err(e) if e.raw_os_error() == Some(1314) => {
+                eprintln!("skipped: no privilege to create symlinks here");
+                false
+            }
+            Err(e) => panic!("symlink should be created: {e}"),
+        }
     }
 
     fn test_security() -> Arc<SecurityPolicy> {
@@ -448,6 +460,11 @@ mod tests {
     #[test]
     fn screenshot_command_contains_output_path() {
         let commands = ScreenshotTool::screenshot_commands("/tmp/my_screenshot.png");
+        if !cfg!(any(target_os = "macos", target_os = "linux")) {
+            // No capture command here: the tool reports "not supported".
+            assert!(commands.is_empty());
+            return;
+        }
         assert!(!commands.is_empty());
         let joined = commands[0].join(" ");
         assert!(
@@ -468,7 +485,9 @@ mod tests {
         tokio::fs::write(&outside, b"secret")
             .await
             .expect("outside fixture should be written");
-        symlink_file(&outside, &workspace.join("screen.png"));
+        if !symlink_file(&outside, &workspace.join("screen.png")) {
+            return;
+        }
 
         let tool = ScreenshotTool::new(Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Full,

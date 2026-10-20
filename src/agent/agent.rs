@@ -1,6 +1,7 @@
 use crate::agent::dispatcher::{
     NativeToolDispatcher, ParsedToolCall, ToolDispatcher, ToolExecutionResult, XmlToolDispatcher,
 };
+use crate::agent::loop_::detection::{DetectionVerdict, LoopDetectionConfig, LoopDetector};
 use crate::agent::memory_loader::{DefaultMemoryLoader, MemoryLoader};
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
 use crate::config::Config;
@@ -409,7 +410,11 @@ impl Agent {
                         duration: start.elapsed(),
                         success: r.success,
                         args: None,
-                        error: if r.success { None } else { r.error.clone().or_else(|| Some(r.output.clone())) },
+                        error: if r.success {
+                            None
+                        } else {
+                            r.error.clone().or_else(|| Some(r.output.clone()))
+                        },
                     });
                     if r.success {
                         r.output
@@ -554,8 +559,18 @@ impl Agent {
             .push(ConversationMessage::Chat(ChatMessage::user(enriched)));
 
         let effective_model = self.classify_model(user_message);
+        // elfClaw 2026-10-20: the loop detector the channel path uses, as
+        // upstream has it here too; without it a repeating model ran all
+        // `max_tool_iterations` (tests/agent_loop_robustness.rs).
+        let mut loop_detector = LoopDetector::new(LoopDetectionConfig {
+            no_progress_threshold: self.config.loop_detection_no_progress_threshold,
+            ping_pong_cycles: self.config.loop_detection_ping_pong_cycles,
+            failure_streak_threshold: self.config.loop_detection_failure_streak,
+            total_failure_budget: self.config.loop_detection_total_failure_budget,
+            ..Default::default()
+        });
 
-        for _ in 0..self.config.max_tool_iterations {
+        for iteration in 0..self.config.max_tool_iterations {
             let messages = self.tool_dispatcher.to_provider_messages(&self.history);
             let response = match self
                 .provider
@@ -621,9 +636,30 @@ impl Agent {
             });
 
             let results = self.execute_tools(&calls).await;
+            for (call, result) in calls.iter().zip(results.iter()) {
+                let args_sig =
+                    serde_json::to_string(&call.arguments).unwrap_or_else(|_| "{}".into());
+                loop_detector.record_call(&call.name, &args_sig, &result.output, result.success);
+            }
             let formatted = self.tool_dispatcher.format_results(&results);
             self.history.push(formatted);
             self.trim_history();
+
+            match loop_detector.check() {
+                DetectionVerdict::Continue => {}
+                DetectionVerdict::InjectWarning(warning) => {
+                    self.history
+                        .push(ConversationMessage::Chat(ChatMessage::user(warning)));
+                }
+                DetectionVerdict::HardStop(reason) => {
+                    anyhow::bail!(
+                        "Agent stopped early due to detected loop pattern (iteration {}/{}): {}",
+                        iteration + 1,
+                        self.config.max_tool_iterations,
+                        reason
+                    );
+                }
+            }
         }
 
         anyhow::bail!(

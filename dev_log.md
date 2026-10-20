@@ -8062,3 +8062,33 @@ cctv 14:40 部署了 v1.15.2（`GET /cctv/v1/ai/usage`），cctv-ai 已开启 Ge
 - 验证：
   - 新增单测 7 个：纠正措辞识别、提议解析与过滤、对话摘录（含工具、去掉记忆块）、卡片文字和按钮、只有确认的经验进提示词、状态只能前进、按来源判断当天是否已提议。
   - `cargo test --lib` 只失败已知的 10 个老问题；clippy 在改动行上没有新告警。
+
+## 2026-10-20 修掉半年来的 13 个老测试失败（其中 3 处是 Windows 上的真问题）
+
+用户要求："失败的这已知的 10 个老问题你也想办法解决掉"。修完以后：
+- `cargo test --lib`：4285 个通过，0 失败（之前固定失败 10 个）；
+- `cargo test --test '*'`：全部通过（之前 `agent_loop_robustness` 固定失败 3 个）。
+
+真问题（elfClaw 跑在 Windows 上，这些检查在生产环境里失效或出错）：
+1. **路径策略**（`security/policy.rs`）：Windows 上 `Path::is_absolute()` 对 `/etc`、`\x`、`C:x` 都返回 false，`workspace_only` 的第一道检查会放行它们。
+   - 好在第二道检查（拼完整路径后看是否在工作区内）兜住了，目前没有实际越权。
+   - 修复：新增 `is_rooted()`，有根或带盘符前缀的路径一律当绝对路径。`runtime/wasm.rs` 的 `tools_dir` 校验也改用它。
+2. **防硬链接**（`security/file_link_guard.rs`）：Windows 版 `link_count` 一直写死返回 1，相当于不检查；而 NTFS 建硬链接不需要任何权限。
+   - 修复：用 `GetFileInformationByHandle` 读真实链接数。打不开的文件按 1 处理，反正调用方自己读写也会失败。
+   - `has_multiple_hard_links` 多一个 path 参数，`file_read` / `file_edit` / `file_write` 三处调用都已更新。
+3. **图片失败回滚**（`channels/mod.rs`）：模型不支持看图时，本该把那条带图片的用户消息从历史里撤掉。
+   - 但历史里存的是带时间戳前缀的版本，回滚却拿原文比对，永远对不上。结果图片标记一直留在历史里，这个人之后的每条消息都报"不支持看图"，直到历史过期。
+   - 现在回退链最后是不能看图的 GPT-OSS，这个问题会真的发生。修复：回滚时用存进去的原样内容比对。
+
+测试本身的问题：
+4. 4 个符号链接测试（telegram ×2、image_info、screenshot）：这台 Windows 没有建符号链接的权限（错误 1314），改为没权限就跳过，有权限的机器上照常检查。
+5. `screenshot_command_contains_output_path`：Windows 上本来就没有截图命令（工具会明确报"不支持"），测试改为按平台断言。
+6. `e2e_failed_vision_turn…`：除了上面第 3 条的真修复，历史内容的断言改为认可 elfClaw 的时间戳前缀。
+7. `agent_loop_robustness` 的 3 个循环检测测试：
+   - `Agent::turn` 原来没接循环检测器（Telegram 和命令行走的另一条路径一直有），模型一直重复调用时会跑满所有轮次。
+   - 照上游把 `LoopDetector` 接进来，配置和其他路径一样。
+   - `Agent::turn` 目前只有 `run_single` / `run_interactive` 在用，生产影响很小。
+
+验证：
+- `cargo test --lib` 和 `cargo test --no-fail-fast --test '*'` 全部通过；
+- clippy 在改动行上没有新告警（全库原有 101 处）。

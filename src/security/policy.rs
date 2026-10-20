@@ -142,6 +142,18 @@ fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
 
+/// Absolute, rooted (`/x`, `\x`) or drive-relative (`C:x`): anything that
+/// does not resolve under the directory it is joined to. Same as
+/// `is_absolute()` on Unix.
+pub(crate) fn is_rooted(path: &Path) -> bool {
+    path.is_absolute()
+        || path.has_root()
+        || matches!(
+            path.components().next(),
+            Some(std::path::Component::Prefix(_))
+        )
+}
+
 fn expand_user_path(path: &str) -> PathBuf {
     if path == "~" {
         if let Some(home) = home_dir() {
@@ -195,8 +207,11 @@ impl SecurityPolicy {
         // Expand "~" for consistent matching with forbidden paths and allowlists.
         let expanded_path = expand_user_path(path);
 
-        // Block absolute paths when workspace_only is set
-        if self.workspace_only && expanded_path.is_absolute() {
+        // Block absolute paths when workspace_only is set. elfClaw
+        // 2026-10-20: on Windows `is_absolute()` is false for `/etc`, `\x`
+        // and `C:x` — rooted or drive-relative paths that leave the
+        // workspace all the same — so those count as absolute too.
+        if self.workspace_only && is_rooted(&expanded_path) {
             return false;
         }
 

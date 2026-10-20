@@ -3086,8 +3086,11 @@ async fn process_channel_message(
                 let should_rollback_user_turn = e
                     .downcast_ref::<providers::ProviderCapabilityError>()
                     .is_some_and(|capability| capability.capability.eq_ignore_ascii_case("vision"));
+                // elfClaw 2026-10-20: the stored turn carries the timestamp
+                // prefix; matching the bare text never rolled anything back,
+                // so a failed image turn kept failing every later message.
                 let rolled_back = should_rollback_user_turn
-                    && rollback_orphan_user_turn(ctx.as_ref(), &history_key, &msg.content);
+                    && rollback_orphan_user_turn(ctx.as_ref(), &history_key, &timestamped_content);
 
                 if !rolled_back {
                     // Close the orphan user turn so subsequent messages don't
@@ -8507,9 +8510,10 @@ This is an example JSON object for profile settings."#;
             .expect("history should exist for sender");
         assert_eq!(turns.len(), 2);
         assert_eq!(turns[0].role, "user");
-        assert_eq!(turns[0].content, "What is WAL?");
+        // elfClaw prefixes stored turns with "[MM-DD HH:MM] ".
+        assert!(turns[0].content.ends_with("] What is WAL?"), "{}", turns[0].content);
         assert_eq!(turns[1].role, "assistant");
-        assert_eq!(turns[1].content, "ok");
+        assert!(turns[1].content.ends_with("] ok"), "{}", turns[1].content);
         assert!(
             turns.iter().all(|turn| !turn.content.contains("[IMAGE:")),
             "failed vision turn must not persist image marker content"
