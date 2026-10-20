@@ -288,6 +288,21 @@ pub struct UsagePage {
     pub next_after_id: i64,
 }
 
+/// What a disarm with a PIN came to (v1.15.4 §9.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Disarm {
+    Done,
+    /// The owner has not set a disarm PIN yet.
+    PinNotSet,
+    PinWrong {
+        remaining: Option<i64>,
+    },
+    /// Five wrong PINs: locked for a while.
+    Locked {
+        retry_after_s: Option<i64>,
+    },
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct StreamPage {
     pub cursor: i64,
@@ -549,6 +564,47 @@ impl CctvApi {
         account: &str,
     ) -> Result<serde_json::Value> {
         self.post_json("arm", &who(body.clone(), account)).await
+    }
+
+    /// Disarm with the PIN the user typed (v1.15.4 §9.1). The PIN goes into
+    /// the request only; nothing here logs the body.
+    pub async fn disarm(
+        &self,
+        body: &serde_json::Value,
+        pin: &str,
+        account: &str,
+    ) -> Result<Disarm> {
+        let mut body = who(body.clone(), account);
+        body["pin"] = pin.into();
+        let resp = self
+            .http
+            .post(self.url("arm"))
+            .bearer_auth(&self.token)
+            .timeout(Duration::from_secs(20))
+            .json(&body)
+            .send()
+            .await
+            .context("cctv-server unreachable")?;
+        let status = resp.status().as_u16();
+        if resp.status().is_success() {
+            return Ok(Disarm::Done);
+        }
+        let v: serde_json::Value =
+            serde_json::from_str(&resp.text().await.unwrap_or_default()).unwrap_or_default();
+        let e = &v["error"];
+        Ok(match (status, e["code"].as_str()) {
+            (403, Some("pin_not_set")) => Disarm::PinNotSet,
+            (403, Some("pin_wrong")) => Disarm::PinWrong {
+                remaining: e["remaining"].as_i64(),
+            },
+            (429, Some("pin_locked")) => Disarm::Locked {
+                retry_after_s: e["retry_after_s"].as_i64(),
+            },
+            _ => bail!(
+                "cctv-server {status}: {}",
+                e["message"].as_str().unwrap_or("撤防失败")
+            ),
+        })
     }
 
     /// The people and vehicles the AI tracked in an alarm (empty for alarms

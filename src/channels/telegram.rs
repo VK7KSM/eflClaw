@@ -217,6 +217,28 @@ fn menu_command_reply(text: &str, chat: &str, sender: &str) -> Option<String> {
     Some(handler(chat, sender))
 }
 
+/// elfClaw 2026-10-20: a module that wants a chat's text message before
+/// anything else sees it — the CCTV disarm PIN. `(chat, sender, message_id,
+/// text) -> consumed`. A consumed message is not answered, logged, stored or
+/// given to the model.
+pub type MessageInterceptor = std::sync::Arc<dyn Fn(&str, &str, i64, &str) -> bool + Send + Sync>;
+
+static INTERCEPTORS: parking_lot::RwLock<Vec<(&'static str, MessageInterceptor)>> =
+    parking_lot::RwLock::new(Vec::new());
+
+/// Offer every incoming text message to `handler` first.
+pub fn register_message_interceptor(name: &'static str, handler: MessageInterceptor) {
+    let mut all = INTERCEPTORS.write();
+    all.retain(|(n, _)| *n != name);
+    all.push((name, handler));
+}
+
+fn intercepted(chat: &str, sender: &str, message_id: i64, text: &str) -> bool {
+    let handlers: Vec<MessageInterceptor> =
+        INTERCEPTORS.read().iter().map(|(_, h)| h.clone()).collect();
+    handlers.iter().any(|h| h(chat, sender, message_id, text))
+}
+
 /// Route button presses whose callback data starts with `prefix` to `handler`.
 pub fn register_callback_handler(prefix: &'static str, handler: CallbackHandler) {
     let mut handlers = CALLBACK_HANDLERS.write();
@@ -3988,6 +4010,16 @@ Ensure only one `zeroclaw` process is using this bot token."
                     // elfClaw: menu commands other modules registered are
                     // answered here, without the model.
                     let chat = msg.reply_target.split(':').next().unwrap_or_default();
+                    // elfClaw 2026-10-20: a message a module is waiting for
+                    // (the disarm PIN) stops here, before any log or store.
+                    let message_id = update
+                        .get("message")
+                        .and_then(|m| m.get("message_id"))
+                        .and_then(serde_json::Value::as_i64)
+                        .unwrap_or(0);
+                    if message_id != 0 && intercepted(chat, &msg.sender, message_id, &msg.content) {
+                        continue;
+                    }
                     if let Some(reply) = menu_command_reply(&msg.content, chat, &msg.sender) {
                         // An empty reply: the handler answers by itself
                         // (e.g. with buttons).

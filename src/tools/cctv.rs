@@ -1029,7 +1029,7 @@ impl Tool for CctvArmTool {
          automatically. Use state 'status' to just read the current state. Exception: on the roof \
          antenna camera 'Yagi ANT' armed/disarmed switches the rotator's AI tracking on/off (it then \
          turns by itself to follow people and cars on the street); it is not touched by 'all', must be \
-         named, and must be called 'AI 跟踪' to the user, never '布防'."
+         named, and must be called 'AI 跟踪' to the user, never '布防'. Disarming (including AI          tracking off) needs the owner's disarm PIN: the program asks the user for it in the chat and          disarms by itself. Never ask for, repeat or handle a PIN yourself."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -1077,6 +1077,26 @@ impl Tool for CctvArmTool {
                 body["until"] = parse_time_future(u, link.tz, Utc::now())?
                     .to_rfc3339()
                     .into();
+            }
+            if state == "disarmed" {
+                // elfClaw 2026-10-20: disarming needs the owner's PIN
+                // (cctv v1.15.4). The program asks the chat for it and does
+                // the disarm itself; the PIN never passes through the model.
+                let chat = caller_chat().context(
+                    "撤防要在 Telegram 里输入 PIN，这里没法撤防；请用户在 Telegram 里操作",
+                )?;
+                let what = match &antenna {
+                    Some(name) => format!(" {name} 天线云台的 AI 跟踪"),
+                    None if camera.eq_ignore_ascii_case("all") || camera == "全部" => {
+                        "全部摄像头".to_string()
+                    }
+                    None => format!(" {camera}"),
+                };
+                crate::cctv::pin::ask(&chat, body, &caller_account(), &what, None).await?;
+                return Ok(format!(
+                    "还没撤防：撤防{what}需要 PIN，程序已在对话里请用户直接发送 PIN，收到后由程序撤防，结果会直接显示给用户。\
+                     不要向用户索要、复述或确认 PIN，也不要说已经撤防。"
+                ));
             }
             link.api.set_arm(&body, &caller_account()).await?;
             if let Some(name) = antenna {

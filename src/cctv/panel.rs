@@ -633,41 +633,42 @@ async fn handle(p: &Panel, rest: &str, chat: &str, message: i64, account: &str) 
             .context("按钮数据不对")
     };
     match rest {
-        "arm:off" => {
-            let confirm = vec![vec![
-                ("⏸ 确定撤防".into(), data("arm:offok")),
-                ("取消".into(), data("arm:cancel")),
-            ]];
-            p.bot
-                .edit(
-                    chat,
-                    message,
-                    "确定把摄像头全部撤防吗？撤防后它们不报警、不打电话，ntfy 也不推。",
-                    false,
-                    &confirm,
-                )
-                .await
+        // elfClaw 2026-10-20: disarming asks for the PIN (cctv v1.15.4),
+        // which also stands in for the old "确定撤防" step; "arm:offok" stays
+        // for confirm buttons still in the chat.
+        "arm:off" | "arm:offok" => {
+            let (chat_owned, api) = (chat.to_string(), p.api.clone());
+            let after: super::pin::AfterDisarm = Box::new(move || {
+                Box::pin(async move {
+                    let Some(p) = PANEL.get() else { return };
+                    if let Ok(v) = api.status().await {
+                        let text = format!("⏸ 已全部撤防\n{}", arm_text(&v));
+                        let _ = p
+                            .bot
+                            .edit(&chat_owned, message, &text, false, &arm_buttons())
+                            .await;
+                    }
+                })
+            });
+            super::pin::ask(
+                chat,
+                json!({"monitor_id": "all", "state": "disarmed"}),
+                account,
+                "全部摄像头",
+                Some(after),
+            )
+            .await
         }
-        "arm:on" | "arm:offok" => {
-            let state = if rest == "arm:on" {
-                "armed"
-            } else {
-                "disarmed"
-            };
+        "arm:on" => {
             p.api
-                .set_arm(&json!({"monitor_id": "all", "state": state}), account)
+                .set_arm(&json!({"monitor_id": "all", "state": "armed"}), account)
                 .await?;
             let v = p.api.status().await?;
-            let head = if state == "armed" {
-                "✅ 已全部布防"
-            } else {
-                "⏸ 已全部撤防"
-            };
             p.bot
                 .edit(
                     chat,
                     message,
-                    &format!("{head}\n{}", arm_text(&v)),
+                    &format!("✅ 已全部布防\n{}", arm_text(&v)),
                     false,
                     &arm_buttons(),
                 )
@@ -718,16 +719,34 @@ async fn handle(p: &Panel, rest: &str, chat: &str, message: i64, account: &str) 
         }
         r if r.starts_with("track:") => {
             let id = id_of(r)?;
-            let state = if r.starts_with("track:on") {
-                "armed"
-            } else {
-                "disarmed"
-            };
-            p.api
-                .set_arm(&json!({"monitor_id": id, "state": state}), account)
-                .await?;
-            let (text, buttons) = antenna_view(p).await?;
-            p.bot.edit(chat, message, &text, false, &buttons).await
+            if r.starts_with("track:on") {
+                p.api
+                    .set_arm(&json!({"monitor_id": id, "state": "armed"}), account)
+                    .await?;
+                let (text, buttons) = antenna_view(p).await?;
+                return p.bot.edit(chat, message, &text, false, &buttons).await;
+            }
+            // Switching the antenna's AI tracking off is a disarm: PIN.
+            let chat_owned = chat.to_string();
+            let after: super::pin::AfterDisarm = Box::new(move || {
+                Box::pin(async move {
+                    let Some(p) = PANEL.get() else { return };
+                    if let Ok((text, buttons)) = antenna_view(p).await {
+                        let _ = p
+                            .bot
+                            .edit(&chat_owned, message, &text, false, &buttons)
+                            .await;
+                    }
+                })
+            });
+            super::pin::ask(
+                chat,
+                json!({"monitor_id": id, "state": "disarmed"}),
+                account,
+                "天线云台的 AI 跟踪",
+                Some(after),
+            )
+            .await
         }
         r if r.starts_with("homepos:") => {
             let id = id_of(r)?;

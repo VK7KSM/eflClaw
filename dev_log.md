@@ -8092,3 +8092,32 @@ cctv 14:40 部署了 v1.15.2（`GET /cctv/v1/ai/usage`），cctv-ai 已开启 Ge
 验证：
 - `cargo test --lib` 和 `cargo test --no-fail-fast --test '*'` 全部通过；
 - clippy 在改动行上没有新告警（全库原有 101 处）。
+
+## 2026-10-20 撤防要 PIN（cctv 接口约定 v1.15.4 §9.1）
+
+cctv 改了接口：`POST /cctv/v1/arm` 撤防时必须带 `pin`（4–8 位数字的字符串）；布防时不能带。PIN 错了返回 403 `pin_wrong`（带剩余次数），连错 5 次锁 15 分钟（429 `pin_locked`），没设 PIN 返回 403 `pin_not_set`。关掉屋顶天线的 AI 跟踪也算撤防。
+
+做法：PIN 只由程序经手，模型看不到。
+- `channels/telegram.rs`：新增 `register_message_interceptor`。消息解析出来后、菜单命令之前，先交给登记的拦截器；被拿走的消息不回复、不写日志、不进聊天记录和历史、也不交给模型。
+- `cctv/pin.rs`（新）：
+  - `ask()`：向这个对话发"🔐 撤防…需要 PIN，请在 2 分钟内直接发送"，带"取消"按钮，记下待撤防的请求。
+  - 拦截器：
+    - 等 PIN 期间，这个对话的下一条消息如果是 4–8 位数字（空格忽略），先立刻删掉那条消息，再带 PIN 调 `disarm`；
+    - 位数不对：删掉并请对方重发；
+    - 不是数字：取消撤防，消息照常交给模型。
+  - 结果改写在提示消息上：
+    - 成功："⏸ 已撤防…"，并刷新面板；
+    - PIN 错："还能再试 N 次"，继续等；
+    - 锁定："约 N 分钟后再试"；
+    - 没设 PIN：提示到警戒区域页「布置 → 撤防 PIN」设置。
+- `cctv/api.rs`：新增 `disarm(body, pin, account) -> Disarm`，按状态码和 `error.code` 分辨四种结果。请求体不写日志。
+- `cctv/panel.rs`：
+  - "⏸ 全部撤防"直接走 PIN，PIN 取代了原来的"确定撤防"那一步；旧的 `arm:offok` 按钮也走 PIN。
+  - 天线面板的"AI 跟踪关"也走 PIN。
+  - 布防不变。
+- `tools/cctv.rs` 的 `cctv_arm`：
+  - `disarmed` 不再直接调接口，改为 `pin::ask`，并告诉模型"还没撤防、程序已请用户发 PIN、不要索要或复述 PIN、不要说已撤防"。
+  - 不在 Telegram 对话里调用时（没有对话可问）直接报错。
+  - 工具说明加了 PIN 规则。
+- 新增单测 `only_four_to_eight_digits_are_a_pin`。
+- 部署：cctv v1.15.4 和 elfClaw 必须一起上。旧 cctv 不认识 `pin` 字段会返回 400；新 cctv 收到不带 PIN 的撤防也会返回 400。

@@ -15,6 +15,7 @@ pub mod home;
 pub mod label;
 pub mod look;
 pub mod panel;
+pub mod pin;
 pub mod store;
 pub mod tg;
 pub mod usage;
@@ -198,6 +199,7 @@ pub async fn run(config: Config) -> Result<()> {
         ctx.chats.clone(),
     );
     label::register(ctx.api.clone(), bot.clone(), config.workspace_dir.clone());
+    pin::init(ctx.api.clone(), bot.clone());
     tokio::spawn(usage::run(ctx.api.clone(), config.workspace_dir.clone()));
     tracing::info!(
         chats = ctx.chats.len(),
