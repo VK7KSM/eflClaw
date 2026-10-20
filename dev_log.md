@@ -8012,3 +8012,10 @@ gemini-3.8-flash → gemini-3.6-flash → claude-sonnet-4-6（反代）→ gemin
   - 复制最多重试 10 次；
   - 用 `finally` 保证无论复制成败都启动 `elfClaw_Workspace`；
   - 复制失败时保留旧 exe，并输出 `COPY FAILED`。
+
+## 2026-10-20 14:47 核对：elfClaw 已开始读取 cctv 的用量记录
+
+cctv 14:40 部署了 v1.15.2（`GET /cctv/v1/ai/usage`），cctv-ai 已开启 Gemini：6 个 key，只用 gemini-3.8-flash，每天上限 40 次。
+- 14:47 查 K5：`cctv.db` 的游标 `ai_usage_after` 已推进到 1466，说明 elfClaw 读通了接口。
+- 目前的记录都是 anthropic（Sonnet），所以 `quota.db` 里还没有 cctv 的 Gemini 调用。等 cctv 真的去问 Gemini 时才会出现。
+- 顺带看到今天（太平洋时间 10-19 额度日）每个 key 的 3.8 大约用到 22–28 次就用完；反代的 claude-sonnet-4-6 已用 6 次、gpt-oss 9 次（含我实测的几次）。
