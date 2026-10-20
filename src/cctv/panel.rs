@@ -3,8 +3,11 @@
 //! the program, never by the model:
 //!
 //! | 📊 状态 | 🛡 布防 | 🔔 推送 |
-//! | 📷 Garage front | 📷 Front yard fix | 📷 Front yard |
-//! | 📷 Garage Back | 📷 Back yard | 📷 其它摄像头 |
+//! | Garage front | Front yard fix | Front yard |
+//! | Garage Back | Back yard | 其它摄像头 |
+//!
+//! Camera buttons carry no icon: on an iPhone the names then fit on one
+//! line (owner's request 2026-10-20).
 //! | 🏠 我在家 | 🚪 我出门 | 📡 天线 |
 //!
 //! - a camera button sends its live picture, then what is in it, with
@@ -31,7 +34,7 @@ use std::time::Duration;
 const STATUS: &str = "📊 状态";
 const ARM: &str = "🛡 布防";
 const PUSH: &str = "🔔 推送";
-const OTHER: &str = "📷 其它摄像头";
+const OTHER: &str = "其它摄像头";
 const HOME: &str = "🏠 我在家";
 const AWAY: &str = "🚪 我出门";
 const ANTENNA: &str = "📡 天线";
@@ -46,7 +49,7 @@ const KEY_CAMERAS: [&str; 5] = [
 /// Callback data prefix of the panel's inline buttons.
 const P: &str = "cctv_p:";
 /// Shown once to each account whenever this changes.
-const PANEL_VERSION: &str = "2026-10-18";
+const PANEL_VERSION: &str = "2026-10-20";
 
 struct Panel {
     api: CctvApi,
@@ -65,7 +68,7 @@ fn cam_button(name: &str) -> String {
 
 /// The keyboard, row by row.
 pub fn keyboard() -> Vec<Vec<String>> {
-    let cams: Vec<String> = KEY_CAMERAS.iter().map(|c| cam_button(c)).collect();
+    let cams: Vec<String> = KEY_CAMERAS.iter().map(|c| (*c).to_string()).collect();
     vec![
         vec![STATUS.into(), ARM.into(), PUSH.into()],
         cams[..3].to_vec(),
@@ -176,10 +179,8 @@ fn press(label: &str, chat: &str, sender: &str, send_to: &[String]) -> String {
             PUSH => show_push(p, &chat).await,
             OTHER => show_other(p, &chat).await,
             ANTENNA => show_antenna(p, &chat).await,
-            cam => match cam.strip_prefix("📷 ") {
-                Some(name) => snap_by_name(p, &chat, name).await,
-                None => Ok(()),
-            },
+            cam if KEY_CAMERAS.contains(&cam) => snap_by_name(p, &chat, cam).await,
+            _ => Ok(()),
         };
         if let Err(e) = result {
             let _ = p
@@ -760,11 +761,8 @@ mod tests {
         let k = keyboard();
         assert_eq!(k.len(), 4);
         assert_eq!(k[0], ["📊 状态", "🛡 布防", "🔔 推送"]);
-        assert_eq!(
-            k[1],
-            ["📷 Garage front", "📷 Front yard fix", "📷 Front yard"]
-        );
-        assert_eq!(k[2], ["📷 Garage Back", "📷 Back yard", "📷 其它摄像头"]);
+        assert_eq!(k[1], ["Garage front", "Front yard fix", "Front yard"]);
+        assert_eq!(k[2], ["Garage Back", "Back yard", "其它摄像头"]);
         assert_eq!(k[3], ["🏠 我在家", "🚪 我出门", "📡 天线"]);
         for (_, d) in arm_buttons()
             .iter()

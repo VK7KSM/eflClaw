@@ -7896,3 +7896,12 @@ cctv 18:0x 部署了 v1.14、v1.15。elfClaw 这边分两步接：
 - 原因：K5 的 `[autonomy]` 是 `level = "supervised"`，不在 `auto_approve` 里的工具每次都要用户确认，`cctv` 不在名单里。
 - 处理：K5 `config.toml` 的 `auto_approve` 加上 `"cctv"`，备份为 `config.toml.before-cctv-approve`，21:33 重启生效。
 - 不变：`cctv_arm`（布防/撤防）仍在 `always_ask`，照旧先确认（用户 10-14 定的"撤防前先确认"）。面板上的布防按钮本身就是用户亲手按的，"全部撤防"会再确认一次。
+
+## 2026-10-20 监控面板：摄像头按钮去掉 📷 图标
+
+用户反馈：iPhone 上底部面板的摄像头按钮（例如"📷 Front yard fix"）文字折成两行。
+- `cctv/panel.rs`：
+  - 键盘上的 5 个摄像头按钮和"其它摄像头"去掉 📷，只留名字；按名字匹配，在 `KEY_CAMERAS` 里就发这一路的画面；
+  - `PANEL_VERSION` 改为 2026-10-20，重启后自动给两个账号各重发一次新键盘，替换旧的；
+  - "其它摄像头"弹出的内联按钮不在底部键盘里，保留 📷。
+- 验证：panel 单测 3 个通过（键盘布局断言已更新）；改动行上没有 clippy 告警。
