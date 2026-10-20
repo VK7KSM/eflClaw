@@ -734,6 +734,24 @@ impl CctvApi {
         Ok(())
     }
 
+    /// Who and what one camera sees now (v1.15.1 §20): the people and cars
+    /// of cctv's live scene for that camera, with a one-line `summary`.
+    pub async fn now(&self, monitor: u32) -> Result<serde_json::Value> {
+        self.get_json(&format!("monitors/{monitor}/now"), Duration::from_secs(10))
+            .await
+    }
+
+    /// cctv's one-line answer to "what is at this camera now", or why not.
+    pub async fn now_summary(&self, monitor: u32) -> String {
+        match self.now(monitor).await {
+            Ok(v) => v["summary"]
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| "（cctv 没有给出现场情况）".into()),
+            Err(e) => format!("（取不到现场情况：{e:#}）"),
+        }
+    }
+
     /// Everything the panel's "📊 状态" shows (v1.14 §13).
     pub async fn status(&self) -> Result<serde_json::Value> {
         self.get_json("status", Duration::from_secs(15)).await

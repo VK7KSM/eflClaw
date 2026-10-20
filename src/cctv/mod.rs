@@ -195,7 +195,6 @@ pub async fn run(config: Config) -> Result<()> {
         config.workspace_dir.clone(),
         ctx.tz,
         ctx.chats.clone(),
-        look::Looker::from_config(&config),
     );
     label::register(ctx.api.clone(), bot.clone(), config.workspace_dir.clone());
     tracing::info!(

@@ -646,19 +646,31 @@ impl CctvTool {
             "snapshot" => {
                 let chat = caller_chat().context("实时画面只能发到 Telegram 对话里")?;
                 let m = link.camera(camera.as_deref(), false).await?;
-                let jpeg = link.api.live_snapshot(m.id).await?;
+                // cctv says who and whose car is there (owner 2026-10-20:
+                // plain facts, not a model describing pixels); the picture
+                // goes to the model only for a specific question.
+                let (jpeg, summary) =
+                    tokio::join!(link.api.live_snapshot(m.id), link.api.now_summary(m.id));
+                let jpeg = jpeg?;
                 let at = crate::cctv::format::clock(&link.now_iso());
-                let what = format!("摄像头 {} 在 {at} 的实时画面", m.name);
-                let caption = format!("{} 现在的画面 {at}", m.name);
-                let (sent, seen) = tokio::join!(
-                    link.send_photo(&chat, jpeg.clone(), &caption),
-                    link.look(&jpeg, &what, question.as_deref())
-                );
-                sent?;
-                Ok(format!(
-                    "{} 的实时画面（{at}）已发到对话里，用户能看到。\n画面内容：{seen}",
+                let caption = format!("{summary}\n📷 {} {at}", m.name);
+                let mut out = format!(
+                    "{} 的实时画面（{at}）已发到对话里，说明第一句就是下面 cctv 的现场情况。\ncctv 现场情况：{summary}",
                     m.name
-                ))
+                );
+                match question.as_deref().filter(|q| !q.trim().is_empty()) {
+                    Some(q) => {
+                        let what = format!("摄像头 {} 在 {at} 的实时画面", m.name);
+                        let (sent, seen) = tokio::join!(
+                            link.send_photo(&chat, jpeg.clone(), &caption),
+                            link.look(&jpeg, &what, Some(q))
+                        );
+                        sent?;
+                        let _ = write!(out, "\n针对用户问题看图：{seen}");
+                    }
+                    None => link.send_photo(&chat, jpeg, &caption).await?,
+                }
+                Ok(out)
             }
             "events" => {
                 let now = Utc::now();
@@ -890,8 +902,9 @@ impl Tool for CctvTool {
 
     fn description(&self) -> &str {
         "Home CCTV (the user's own cameras). Actions: cameras (list cameras, PTZ presets, arm state); \
-         snapshot (send a live picture of one camera into this chat AND get a description of what is \
-         in it); event_snapshot (look at the snapshot of a past alarm: event_id, or the latest alarm \
+         snapshot (send a live picture of one camera into this chat; returns cctv's own account of who \
+         and whose car is there — answer from it in one or two plain sentences (who, whose car), do not \
+         describe the picture; pass 'question' only for something the account cannot answer); event_snapshot (look at the snapshot of a past alarm: event_id, or the latest alarm \
          of a camera; a pushed alarm's link ends in /events/<event_id>; send=true also posts the \
          picture, only needed when the user has not seen it); alerts_off / alerts_on (stop or \
          resume alarm pushes to this chat; the cameras stay armed; same as the /cctv_off and \

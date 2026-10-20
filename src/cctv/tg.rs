@@ -207,7 +207,7 @@ impl Bot {
             "chat_id": chat,
             "text": text,
             "disable_notification": true,
-            "reply_markup": {"keyboard": keyboard, "resize_keyboard": true, "is_persistent": true},
+            "reply_markup": {"keyboard": keyboard, "resize_keyboard": true, "is_persistent": false},
         });
         let resp = self
             .http

@@ -10,7 +10,9 @@
 //! line (owner's request 2026-10-20).
 //! | 🏠 我在家 | 🚪 我出门 | 📡 天线 |
 //!
-//! - a camera button sends its live picture, then what is in it, with
+//! - a camera button sends its live picture captioned first with cctv's own
+//!   one-line account of who and whose car is there (`/monitors/{id}/now`;
+//!   owner 2026-10-20: "简单明了…谁的车", no model describing pixels), with
 //!   "录 15 秒" and "再看一次" under it; "其它摄像头" lists the rest;
 //! - 布防 / 推送 / 天线 show the state with buttons to change it; stopping
 //!   the arming asks once more (owner's rule); 推送 switches only the
@@ -18,7 +20,6 @@
 
 use super::api::{account_of, CctvApi, Monitor};
 use super::format::{clock, rotator_line};
-use super::look::{describe, Looker};
 use super::store::Store;
 use super::tg::{Bot, Buttons, SendOpts};
 use crate::channels::telegram::{CallbackAnswer, CallbackPress};
@@ -49,7 +50,7 @@ const KEY_CAMERAS: [&str; 5] = [
 /// Callback data prefix of the panel's inline buttons.
 const P: &str = "cctv_p:";
 /// Shown once to each account whenever this changes.
-const PANEL_VERSION: &str = "2026-10-20";
+const PANEL_VERSION: &str = "2026-10-20b";
 
 struct Panel {
     api: CctvApi,
@@ -57,7 +58,6 @@ struct Panel {
     workspace: PathBuf,
     tz: Tz,
     send_to: Vec<String>,
-    looker: Option<Looker>,
 }
 
 static PANEL: OnceLock<Panel> = OnceLock::new();
@@ -116,21 +116,13 @@ pub fn register_buttons(config: &crate::config::Config) {
 
 /// Set up the inline buttons; show the panel once to each account when it
 /// changed (cctv link start-up).
-pub fn init(
-    api: CctvApi,
-    bot: Bot,
-    workspace: PathBuf,
-    tz: Tz,
-    send_to: Vec<String>,
-    looker: Option<Looker>,
-) {
+pub fn init(api: CctvApi, bot: Bot, workspace: PathBuf, tz: Tz, send_to: Vec<String>) {
     let panel = Panel {
         api,
         bot,
         workspace,
         tz,
         send_to,
-        looker,
     };
     if PANEL.set(panel).is_err() {
         return;
@@ -146,7 +138,7 @@ pub fn init(
             if store.get(&key).ok().flatten().as_deref() == Some(PANEL_VERSION) {
                 continue;
             }
-            let text = "📺 监控面板已更新：下面的按钮由程序直接处理。收起后点输入框旁的键盘图标就能再打开，菜单里 /cctv_panel 也可以。";
+            let text = "📺 监控面板已更新：下面的按钮由程序直接处理。点输入框旁的键盘图标可以收起或打开面板，菜单里 /cctv_panel 也可以。";
             match p.bot.send_keyboard(chat, text, &keyboard()).await {
                 Ok(_) => {
                     let _ = store.set(&key, PANEL_VERSION);
@@ -503,33 +495,31 @@ async fn snap(p: &Panel, chat: &str, m: &Monitor) -> Result<()> {
             .await?;
         return Ok(());
     }
-    let jpeg = p.api.live_snapshot(m.id).await?;
+    let (jpeg, summary) = tokio::join!(p.api.live_snapshot(m.id), p.api.now_summary(m.id));
     let at = Utc::now()
         .with_timezone(&p.tz)
         .format("%H:%M:%S")
         .to_string();
-    let head = format!("📷 {} {at}", m.name);
-    let message = p
-        .bot
-        .send_photo(
-            chat,
-            jpeg.clone(),
-            &format!("{head}\n正在看画面…"),
-            &quiet(cam_buttons(m.id)),
-        )
-        .await?;
-    let what = format!("摄像头 {} 在 {at} 的实时画面", m.name);
-    let seen = describe(p.looker.as_ref(), &jpeg, &what, None).await;
-    let seen: String = seen.chars().take(900).collect();
-    p.bot
-        .edit(
-            chat,
-            message,
-            &format!("{head}\n{seen}"),
-            true,
-            &cam_buttons(m.id),
-        )
-        .await
+    let summary: String = summary.chars().take(900).collect();
+    let caption = format!("{summary}\n📷 {} {at}", m.name);
+    match jpeg {
+        Ok(jpeg) => {
+            p.bot
+                .send_photo(chat, jpeg, &caption, &quiet(cam_buttons(m.id)))
+                .await?;
+        }
+        // No picture: the account of who is there still helps.
+        Err(e) => {
+            p.bot
+                .send_text(
+                    chat,
+                    &format!("{caption}\n（截图取不到：{e:#}）"),
+                    &quiet(cam_buttons(m.id)),
+                )
+                .await?;
+        }
+    }
+    Ok(())
 }
 
 async fn show_other(p: &Panel, chat: &str) -> Result<()> {
