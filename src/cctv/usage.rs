@@ -6,7 +6,7 @@
 //! count against elfClaw's usage. cctv-ai logs every online-AI call with the
 //! key's label in `provider`; this task reads them back from
 //! `GET /cctv/v1/ai/usage` (v1.15.2) every few minutes and adds the Gemini
-//! ones to `state/quota.db`, so the daily figures and the note under every
+//! ones (and its Antigravity proxy calls) to `state/quota.db`, so the daily figures and the note under every
 //! push include cctv. A `quota_day:` error also marks that key spent for the
 //! day, which makes the observed per-key limit truer, not lower.
 
@@ -33,12 +33,24 @@ enum Counted<'a> {
 }
 
 fn counted(r: &UsageRecord, now: DateTime<Utc>) -> Option<Counted<'_>> {
-    let label = r.provider.as_str();
-    if label != "gemini" && !label.starts_with("gemini#") {
-        return None;
-    }
     let at = Utc.timestamp_millis_opt(r.t_ms).single()?;
     if now - at > MAX_AGE {
+        return None;
+    }
+    // 2026-10-20: cctv-ai also calls the Antigravity proxy (`antigravity`);
+    // its calls join elfClaw's own proxy count. The proxy has no Google
+    // daily quota of ours, so only successes count there.
+    if r.provider == "antigravity" {
+        return r.ok.then(|| {
+            Counted::Call(
+                crate::providers::reliable::GEMINI_PROXY_PROVIDER,
+                &r.model,
+                at,
+            )
+        });
+    }
+    let label = r.provider.as_str();
+    if label != "gemini" && !label.starts_with("gemini#") {
         return None;
     }
     if r.ok {
@@ -124,6 +136,15 @@ mod tests {
         );
         assert_eq!(counted(&rec("anthropic", true, None, t), now), None);
         assert_eq!(counted(&rec("gemini_proxy", true, None, t), now), None);
+        // The proxy: successes only, under elfClaw's proxy label.
+        assert_eq!(
+            counted(&rec("antigravity", true, None, t), now),
+            Some(Counted::Call("gemini-proxy", "gemini-3.8-flash", at))
+        );
+        assert_eq!(
+            counted(&rec("antigravity", false, Some("quota_day: x"), t), now),
+            None
+        );
     }
 
     #[test]

@@ -8121,3 +8121,17 @@ cctv 改了接口：`POST /cctv/v1/arm` 撤防时必须带 `pin`（4–8 位数�
   - 工具说明加了 PIN 规则。
 - 新增单测 `only_four_to_eight_digits_are_a_pin`。
 - 部署：cctv v1.15.4 和 elfClaw 必须一起上。旧 cctv 不认识 `pin` 字段会返回 400；新 cctv 收到不带 PIN 的撤防也会返回 400。
+
+## 2026-10-20 cctv 走中转的调用也算进 elfClaw 的反代用量
+
+cctv 说用户定了它的分析专家顺序：
+1. 中转 gemini-4-argon；
+2. Sonnet；
+3. gemini-3.8-flash（先走中转，中转不行再走 6 个官方 key）。
+
+cctv 走中转的调用记为 `provider = antigravity`。
+
+- `cctv/usage.rs`：provider 是 `antigravity` 的成功调用，按实际模型记到 elfClaw 的反代标签（`gemini-proxy`）下，推送末尾的"反代 … 已用 N 次"会包含它们；出错的不计，因为中转没有我们的 Google 每日额度可算。
+- 新增断言：成功的 antigravity 调用记到反代名下，失败的不计。
+- 已把中转的规矩告诉 cctv：账号池三家共用；按 "Wait Ns" 退避，最短 60 秒、最长 6 小时，没有就退 10 分钟；按模型分别退避；调用间隔至少 1 秒；中转的 Gemini 周额度目前为 0。
+- 和撤防 PIN 那版一起部署。
