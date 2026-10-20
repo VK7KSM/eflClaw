@@ -7923,3 +7923,16 @@ cctv 18:0x 部署了 v1.14、v1.15。elfClaw 这边分两步接：
    - `PANEL_VERSION` 改为 2026-10-20b，重启后给两个账号重发一次。
 
 验证：cctv 单测 30 个通过；改动行上没有 clippy 告警。
+
+## 2026-10-20 cctv 与 elfClaw 共用 Gemini 官方 key（K5 运维，未改代码）
+
+用户决定：cctv 不单独配 key，与 elfClaw 共用 6 个官方 key（6 个独立 Google 账户）；cctv 的调用量要算进 elfClaw 的用量；cctv 的用量由用户自己限制。Antigravity 中转（127.0.0.1:8045）已被封，只剩官方 API。
+
+- K5 新增用户环境变量 `GEMINI_API_KEYS`：从 `config.toml` 的 `api_key` + `[reliability].api_keys` 取出，逗号分隔，顺序对应 elfClaw 的 key 标签 `gemini`、`gemini#2`…`gemini#6`。写入时不显示 key 内容。
+  - 注意：以后在 config 里换 key，要同步更新这个环境变量。
+- 6 个 key 逐个调 ListModels（不耗额度），全部 HTTP 200；都能看到 gemini-3.8-flash / 3.6-flash / 3.5-flash-lite / gemini-4-argon。gemini-4-argon 免费档 limit: 0，调不了。
+- 已告诉 cctv：
+  - 地址、格式、模型顺序和 key 轮换规则；
+  - 请它在 ai_usage 的 `provider` 里写 key 标签（不写 key 本身）；
+  - 请它加一个只读接口给 elfClaw 拉用量明细。
+- 待做（等 cctv 接口定好）：elfClaw 定时拉 cctv 的 Gemini 调用，记进 `state/quota.db`（`providers/quota.rs` 的 `record_call` / `record_exhausted`），与自己的用量合并统计。
