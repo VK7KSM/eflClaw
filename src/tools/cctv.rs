@@ -221,6 +221,10 @@ impl CctvTool {
                 )?
                 .to_string())
             }
+            "sysload" => {
+                let hours = u32::try_from(n("hours").unwrap_or(3).clamp(1, 720)).unwrap_or(3);
+                Ok(sysload_text(&link.api.sysload(hours).await?))
+            }
             "runlog" => {
                 let mut q = vec![format!("limit={}", n("limit").unwrap_or(40).clamp(1, 200))];
                 if let Some(id) = n("event_id").or_else(|| {
@@ -930,7 +934,7 @@ impl Tool for CctvTool {
          nickname shown as '〔自动〕…' — a nickname, never a real name; a target in an alarm may say \
          '像是〔自动〕X（组 N）'); group_label (group_id + name [+ category for a new name]: the user \
          says that nickname is really someone — same category rules as label); group_ignore \
-         (group_id: ignore that group from now on); runlog (cctv's own run log: what it did and WHY \n         - optional event_id, camera, from/to, limit. When the user asks why an alarm was or was not pushed, \n         or why cctv judged something, read the log of that event (a push's link ends in /events/<id>) and \n         answer from cctv's reasons, never guess); memory_list / memory_add / memory_update / \n         memory_revoke (cctv's guarding memory, the single store for facts about the household that matter \n         for guarding: who lives or stays here, visitors, vehicles, routines, house rules, temporary \n         situations such as 'grandma stays this week'. Write ONLY what the user explicitly said, with \n         'quote' = the user's own words verbatim; never write your own guesses; do not put such facts \n         into your own memory_store. kind: person/vehicle/routine/rule/lesson/temp; days for how long. \n         Show, change or revoke entries when the user asks); events (what happened: \
+         (group_id: ignore that group from now on); runlog (cctv's own run log: what it did and WHY \n         - optional event_id, camera, from/to, limit. When the user asks why an alarm was or was not pushed, \n         or why cctv judged something, read the log of that event (a push's link ends in /events/<id>) and \n         answer from cctv's reasons, never guess); sysload (K5's whole-machine load: CPU, integrated GPU, memory, disks and the OBS stream, now and per hour; optional hours 1-720, default 3; relay the figures as given, do not invent causes); memory_list / memory_add / memory_update / \n         memory_revoke (cctv's guarding memory, the single store for facts about the household that matter \n         for guarding: who lives or stays here, visitors, vehicles, routines, house rules, temporary \n         situations such as 'grandma stays this week'. Write ONLY what the user explicitly said, with \n         'quote' = the user's own words verbatim; never write your own guesses; do not put such facts \n         into your own memory_store. kind: person/vehicle/routine/rule/lesson/temp; days for how long. \n         Show, change or revoke entries when the user asks); events (what happened: \
          optional camera, from/to as HH:MM or YYYY-MM-DD HH:MM, min_level 1-3); clip_live (record \
          5-20 s of live video now and send it); clip_history (recorded video from the NVR, from/to, \
          at most 5 minutes, ending at least 2 minutes ago); ptz (move the PTZ camera: ptz_action \
@@ -951,7 +955,7 @@ impl Tool for CctvTool {
         json!({
             "type": "object",
             "properties": {
-                "action": {"type": "string", "enum": ["cameras", "snapshot", "event_snapshot", "events", "clip_live", "clip_history", "ptz", "greet", "scene", "reports", "runlog", "objects", "label", "unlabel", "names", "set_category", "groups", "group_label", "group_ignore", "memory_list", "memory_add", "memory_update", "memory_revoke", "alerts_off", "alerts_on"]},
+                "action": {"type": "string", "enum": ["cameras", "snapshot", "event_snapshot", "events", "clip_live", "clip_history", "ptz", "greet", "scene", "reports", "runlog", "sysload", "objects", "label", "unlabel", "names", "set_category", "groups", "group_label", "group_ignore", "memory_list", "memory_add", "memory_update", "memory_revoke", "alerts_off", "alerts_on"]},
                 "q": {"type": "string", "description": "memory_list: words to look for"},
                 "memory_id": {"type": "integer", "description": "memory_update / memory_revoke: the memory's number"},
                 "content": {"type": "string", "description": "memory_add / memory_update: the fact, in Chinese"},
@@ -973,6 +977,7 @@ impl Tool for CctvTool {
                 "to": {"type": "string", "description": "End time, same format"},
                 "min_level": {"type": "integer", "minimum": 1, "maximum": 3},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 200},
+                "hours": {"type": "integer", "minimum": 1, "maximum": 720, "description": "sysload: how many past hours to summarise (default 3)"},
                 "seconds": {"type": "integer", "minimum": 5, "maximum": 20},
                 "ptz_action": {"type": "string", "enum": ["preset", "move", "zoom", "stop", "goto", "home", "look", "status"]},
                 "az": {"type": "number", "description": "ptz goto (antenna): bearing in degrees, 0 = north, clockwise"},
@@ -1094,6 +1099,156 @@ impl Tool for CctvArmTool {
             Err(e) => fail(format!("{e:#}")),
         })
     }
+}
+
+/// A percentage as cctv gives it (0–100, one decimal), shown without a
+/// trailing ".0".
+fn pct(v: &Value) -> String {
+    match v.as_f64() {
+        Some(f) if (f - f.round()).abs() < 0.05 => format!("{f:.0}%"),
+        Some(f) => format!("{f:.1}%"),
+        None => "?".into(),
+    }
+}
+
+fn mb(v: &Value) -> String {
+    v.as_f64()
+        .map_or_else(|| "?".into(), |f| format!("{f:.0} MB"))
+}
+
+fn fps(v: &Value) -> String {
+    v.as_f64().map_or_else(|| "?".into(), |f| format!("{f:.0}"))
+}
+
+/// cctv / flight / other shares of one figure, e.g. `cctv 24% · flight 35%`.
+fn shares(v: &Value) -> String {
+    ["cctv", "flight", "other"]
+        .iter()
+        .filter(|k| v[**k]["avg"].is_number())
+        .map(|k| {
+            let name = if *k == "other" { "其他" } else { k };
+            format!("{name} {}", pct(&v[*k]["avg"]))
+        })
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+/// K5's load (v1.15.3 §22) as plain lines: the latest minute, then one line
+/// per hour. Written by code so the model only relays it.
+fn sysload_text(v: &Value) -> String {
+    let mut out = String::new();
+    let l = &v["latest"];
+    if l.is_object() {
+        let stale = if l["stale"].as_bool() == Some(true) {
+            "，读数已过时"
+        } else {
+            ""
+        };
+        let _ = writeln!(
+            out,
+            "K5 整机负载（{} 秒前的一分钟读数{stale}）：",
+            l["age_s"].as_i64().unwrap_or(0)
+        );
+        let cpu = &l["cpu"];
+        let _ = writeln!(
+            out,
+            "• CPU 整机 {}（最高 {}）；按进程：{}",
+            pct(&cpu["total"]["avg"]),
+            pct(&cpu["total"]["max"]),
+            shares(cpu)
+        );
+        let gpu = &l["gpu"];
+        let _ = writeln!(
+            out,
+            "• 核显 3D {}（{}）；视频编解码 {}（{}）；显存 {}",
+            pct(&gpu["3d"]["total"]["avg"]),
+            shares(&gpu["3d"]),
+            pct(&gpu["video"]["total"]["avg"]),
+            shares(&gpu["video"]),
+            mb(&gpu["dedicated_mb"]["total"]["avg"])
+        );
+        let _ = writeln!(
+            out,
+            "• 内存可用 {}（最少 {}），cctv 占 {}",
+            mb(&l["mem"]["avail_mb"]["avg"]),
+            mb(&l["mem"]["avail_mb"]["min"]),
+            mb(&l["mem"]["cctv_mb"]["avg"])
+        );
+        let disks: Vec<String> = l["disks"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|d| {
+                let name = d["name"].as_str().unwrap_or("?");
+                let name = name.rsplit(' ').next().unwrap_or(name);
+                format!(
+                    "{name} {}（最高 {}）",
+                    pct(&d["busy"]["avg"]),
+                    pct(&d["busy"]["max"])
+                )
+            })
+            .collect();
+        if !disks.is_empty() {
+            let _ = writeln!(out, "• 硬盘忙：{}", disks.join("、"));
+        }
+        let obs = &l["obs"];
+        if obs.is_object() {
+            let _ = writeln!(
+                out,
+                "• 推流：{}，最低 {} fps，编码跳帧 {}、渲染跳帧 {}",
+                if obs["streaming"].as_bool() == Some(true) {
+                    "在推"
+                } else {
+                    "没在推"
+                },
+                fps(&obs["fps_min"]),
+                obs["encode_skipped"].as_i64().unwrap_or(0),
+                obs["render_skipped"].as_i64().unwrap_or(0)
+            );
+        }
+    } else {
+        out.push_str(
+            "cctv 现在没有 K5 负载读数。
+",
+        );
+    }
+    let hourly: Vec<&Value> = v["hourly"].as_array().into_iter().flatten().collect();
+    if !hourly.is_empty() {
+        out.push_str(
+            "每小时（CPU 平均 / 最高，按进程平均；核显 3D、视频；内存可用最少；推流）：
+",
+        );
+        let skip = hourly.len().saturating_sub(48);
+        for h in hourly.iter().skip(skip) {
+            let at = h["hour"]
+                .as_str()
+                .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+                .map(|t| t.format("%m-%d %H:00").to_string())
+                .unwrap_or_default();
+            let _ = writeln!(
+                out,
+                "{at} CPU {} / {}（cctv {} · flight {} · 其他 {}）；核显 3D {}、视频 {}；内存可用最少 {}；推流最低 {} fps、跳帧 {}（{} 分钟）",
+                pct(&h["cpu_total_avg"]),
+                pct(&h["cpu_total_max"]),
+                pct(&h["cpu_cctv_avg"]),
+                pct(&h["cpu_flight_avg"]),
+                pct(&h["cpu_other_avg"]),
+                pct(&h["gpu_3d_avg"]),
+                pct(&h["gpu_video_avg"]),
+                mb(&h["mem_avail_min_mb"]),
+                fps(&h["obs_fps_min"]),
+                h["obs_skipped"].as_i64().unwrap_or(0),
+                h["minutes"].as_i64().unwrap_or(0)
+            );
+        }
+        if skip > 0 {
+            let _ = writeln!(out, "（只列最近 48 小时，共 {} 小时）", hourly.len());
+        }
+    }
+    out.push_str(
+        "注：按进程的 CPU 是各进程自己的 CPU 时间，三组加起来和整机对不上；摄像头硬解和 OBS 编码都算在视频里。",
+    );
+    out
 }
 
 /// One run-log row: time, camera, what happened — why → result.
@@ -1259,6 +1414,45 @@ mod tests {
         assert_eq!(
             memory_line(&m),
             "#12 [临时情况] 外婆这周住我家（用户说的，kasim），到 2026-10-25 15:20 过期"
+        );
+    }
+
+    #[test]
+    fn sysload_reads_naturally() {
+        let v = json!({
+            "hourly": [{"hour": "2026-10-20T15:00:00+11:00", "cpu_total_avg": 95.2, "cpu_total_max": 100.0,
+                "cpu_cctv_avg": 15.1, "cpu_flight_avg": 31.2, "cpu_other_avg": 9.6, "gpu_3d_avg": 55.2,
+                "gpu_video_avg": 57.4, "mem_avail_min_mb": 11587.0, "obs_fps_min": 25.0, "obs_skipped": 0,
+                "minutes": 41}],
+            "latest": {"age_s": 7, "stale": false,
+                "cpu": {"cctv": {"avg": 24.2, "max": 28.9}, "flight": {"avg": 35.0, "max": 50.3},
+                    "other": {"avg": 15.1, "max": 20.8}, "total": {"avg": 99.6, "max": 100.0}},
+                "disks": [{"busy": {"avg": 8.5, "max": 28.2}, "name": "1 C:"}],
+                "gpu": {"3d": {"cctv": {"avg": 56.6}, "flight": {"avg": 13.2}, "other": {"avg": 1.2}, "total": {"avg": 70.9}},
+                    "video": {"cctv": {"avg": 38.9}, "flight": {"avg": 19.0}, "other": {"avg": 0.0}, "total": {"avg": 57.9}},
+                    "dedicated_mb": {"total": {"avg": 1551.0}}},
+                "mem": {"avail_mb": {"avg": 12083.0, "min": 11972.0}, "cctv_mb": {"avg": 1542.0}},
+                "obs": {"streaming": true, "fps_min": 25.0, "encode_skipped": 0, "render_skipped": 0}}
+        });
+        let text = sysload_text(&v);
+        assert!(
+            text.starts_with("K5 整机负载（7 秒前的一分钟读数）：\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "• CPU 整机 99.6%（最高 100%）；按进程：cctv 24.2% · flight 35% · 其他 15.1%"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("• 硬盘忙：C: 8.5%（最高 28.2%）"), "{text}");
+        assert!(
+            text.contains("• 推流：在推，最低 25 fps，编码跳帧 0、渲染跳帧 0"),
+            "{text}"
+        );
+        assert!(
+            text.contains("10-20 15:00 CPU 95.2% / 100%（cctv 15.1% · flight 31.2% · 其他 9.6%）"),
+            "{text}"
         );
     }
 

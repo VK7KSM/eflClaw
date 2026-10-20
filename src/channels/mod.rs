@@ -30,6 +30,7 @@ pub mod imessage;
 pub mod irc;
 #[cfg(feature = "channel-lark")]
 pub mod lark;
+pub mod lessons;
 pub mod linq;
 #[cfg(feature = "channel-matrix")]
 pub mod matrix;
@@ -2122,32 +2123,39 @@ async fn process_channel_message(
     } else {
         msg
     };
-    // elfClaw: mutable for /reflect command rewrite
-    let mut msg = msg;
 
     // ── elfClaw: /reflect command — deep self-reflection using main model ──
     let is_reflect_command = msg.content.starts_with("/reflect");
     if is_reflect_command {
         let reflect_focus = msg.content.strip_prefix("/reflect").unwrap_or("").trim();
-        let focus_hint = if reflect_focus.is_empty() {
-            String::new()
-        } else {
-            format!("\n\n重点关注：{reflect_focus}")
-        };
-        msg.content = format!(
-            "请回顾我们最近的对话历史，分析你的表现：\n\
-             1. 我有没有纠正过你的错误？如果有，总结每个纠正\n\
-             2. 有没有反复出现的问题模式？\n\
-             3. 有什么可以改进的地方？\n\n\
-             对于每个发现的教训，用 memory_store 记录：\n\
-             - key: \"correction_<简短英文描述>\"\n\
-             - content: \"错误：<做错了什么>。正确：<应该怎么做>\"\n\
-             - category: \"core\"\n\
-             - 每次纠正最多调用 1 次 memory_store\n\
-             {focus_hint}\n\
-             完成后简短报告你记录了什么。"
+        // elfClaw 2026-10-20: /reflect asks for the same review a correction
+        // gets (channels::lessons): the recent conversation, tool calls
+        // included, becomes at most one proposed lesson for the owner.
+        let history = ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&conversation_history_key(&msg))
+            .cloned()
+            .unwrap_or_default();
+        lessons::spawn_review_of_history(
+            &msg.sender,
+            &history,
+            Some(reflect_focus.to_string()).filter(|f| !f.is_empty()),
         );
+        if let Some(channel) = ctx.channels_by_name.get(&msg.channel) {
+            let _ = channel
+                .send(&SendMessage::new(
+                    "好，我回顾一下最近的对话。有值得记住的经验，会发卡片给主人确认。",
+                    &msg.reply_target,
+                ))
+                .await;
+        }
+        return;
     }
+    // elfClaw 2026-10-20: a message that reads like a correction gets its
+    // turn reviewed for a lesson once it is answered.
+    let correction = msg.channel == "telegram" && lessons::looks_like_correction(&msg.content);
 
     let target_channel = ctx.channels_by_name.get(&msg.channel).cloned();
     if let Err(err) = maybe_apply_runtime_config_update(ctx.as_ref()).await {
@@ -2306,34 +2314,17 @@ async fn process_channel_message(
     turn_context.push_str("\n\n");
     turn_context.push_str(&build_cron_jobs_section(&ctx.config));
 
-    // elfClaw: inject learned correction rules into system prompt (self-improving)
+    // elfClaw 2026-10-20: lessons the owner approved (memory::lessons). The
+    // old unreviewed `correction_*` memories become proposals once.
+    match crate::memory::lessons::LessonStore::open(&ctx.workspace_dir) {
+        Ok(store) => turn_context.push_str(&crate::memory::lessons::lessons_for_prompt(&store)),
+        Err(e) => tracing::warn!("Lessons unavailable for this turn: {e}"),
+    }
     {
-        let corrections = ctx
-            .memory
-            .list(Some(&crate::memory::MemoryCategory::Core), None)
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|e| e.key.starts_with("correction_"))
-            .collect::<Vec<_>>();
-
-        if !corrections.is_empty() {
-            use std::collections::HashSet;
-            let mut seen = HashSet::new();
-            turn_context.push_str("\n\n## 已学习的纠错规则\n\n");
-            turn_context.push_str("以下是从过往对话中学到的纠错。遇到相关场景时必须遵守：\n\n");
-            let mut count = 0;
-            for entry in &corrections {
-                let normalized = entry.content.trim().to_lowercase();
-                if seen.insert(normalized) {
-                    let _ = writeln!(turn_context, "- {}", entry.content.trim());
-                    count += 1;
-                    if count >= 20 {
-                        break;
-                    }
-                }
-            }
-        }
+        static LEGACY: std::sync::Once = std::sync::Once::new();
+        LEGACY.call_once(|| {
+            tokio::spawn(lessons::migrate_legacy_once(ctx.memory.clone()));
+        });
     }
 
     // Inject cross-user chat summaries for the owner only
@@ -2808,6 +2799,13 @@ async fn process_channel_message(
                 &history_key,
                 ChatMessage::assistant(&timestamped_response),
             );
+            if correction {
+                // This turn's history still has its tool calls and results;
+                // the stored one keeps only the final answers.
+                let mut reviewed = history.clone();
+                reviewed.push(ChatMessage::assistant(&delivered_response));
+                lessons::spawn_review_of_history(&msg.sender, &reviewed, None);
+            }
 
             // Persist assistant turn to local chat log
             if ctx.chat_log_config.enabled && msg.channel == "telegram" {

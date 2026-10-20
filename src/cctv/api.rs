@@ -786,6 +786,16 @@ impl CctvApi {
         .await
     }
 
+    /// K5's whole-machine load (v1.15.3 §22): the latest reading plus one
+    /// summary per hour over the last `hours` (1–720), no per-minute rows.
+    pub async fn sysload(&self, hours: u32) -> Result<serde_json::Value> {
+        self.get_json(
+            &format!("sysload?hours={}&minutes=0", hours.clamp(1, 720)),
+            Duration::from_secs(15),
+        )
+        .await
+    }
+
     /// cctv's run log (v1.14 §14): what it did and why. `query` is the raw
     /// query string (event_id, monitor, kind, from, to, since_rev, limit).
     pub async fn runlog(&self, query: &str) -> Result<serde_json::Value> {

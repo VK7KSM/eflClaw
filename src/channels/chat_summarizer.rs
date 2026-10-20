@@ -141,24 +141,23 @@ async fn process_single_file(
     // Parse the response
     let (summary, topics, corrections) = parse_summary_response(&response);
 
-    // Write corrections to memory if present
-    if let (Some(ref correction), Some(mem)) = (&corrections, memory) {
-        let key = format!("correction_{}_{}", entry.date, log.chat_id);
-        if let Err(e) = mem
-            .store(
-                &key,
-                correction,
-                crate::memory::MemoryCategory::Core,
-                None,
-            )
-            .await
-        {
-            tracing::warn!("Failed to store correction in memory: {e}");
-        } else {
-            tracing::info!(
-                "Self-improving: stored correction from {}/{}",
-                entry.username,
-                entry.date
+    // elfClaw 2026-10-20: a correction found here no longer becomes a
+    // `correction_*` memory (a description, unreviewed). It is the fallback
+    // for corrections the wording check missed: unless a lesson was already
+    // proposed for this user that day, the day's conversation is reviewed
+    // and any lesson goes to the owner (channels::lessons).
+    let _ = memory;
+    if let Some(ref correction) = corrections {
+        let day_start = chrono::NaiveDate::parse_from_str(&entry.date, "%Y-%m-%d")
+            .ok()
+            .and_then(|d| d.and_hms_opt(0, 0, 0))
+            .map(|t| t.and_utc() - chrono::Duration::hours(14));
+        if let Some(since) = day_start {
+            crate::channels::lessons::spawn_review_unless_proposed(
+                entry.username.clone(),
+                since,
+                messages_text.clone(),
+                format!("夜间整理时发现的纠正：{correction}"),
             );
         }
     }
@@ -262,7 +261,8 @@ mod tests {
 
     #[test]
     fn parse_summary_with_corrections() {
-        let response = "摘要：讨论了时区设置\n话题：时区,配置\n纠错：用户纠正了时区应该用AEST而不是UTC";
+        let response =
+            "摘要：讨论了时区设置\n话题：时区,配置\n纠错：用户纠正了时区应该用AEST而不是UTC";
         let (summary, topics, corrections) = parse_summary_response(response);
         assert_eq!(summary, "讨论了时区设置");
         assert_eq!(topics.as_deref(), Some("时区,配置"));

@@ -206,6 +206,8 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
     crate::sip::start_from_config(&config);
     // elfClaw: CCTV menu switches must exist before Telegram sends its menu.
     crate::cctv::register_menu(&config);
+    // elfClaw 2026-10-20: lessons from corrections (cards, /lessons).
+    crate::channels::lessons::register(&config);
 
     let mut handles: Vec<JoinHandle<()>> = vec![spawn_state_writer(config.clone())];
 
