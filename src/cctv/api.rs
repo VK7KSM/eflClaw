@@ -268,6 +268,26 @@ fn label_outcome(status: u16, body: &serde_json::Value) -> Option<LabelOutcome> 
     })
 }
 
+/// One online-AI call cctv-ai made (v1.15.2 `GET /ai/usage`). Gemini calls
+/// run on elfClaw's keys and name the key by elfClaw's label in `provider`
+/// (`gemini`, `gemini#2` … `gemini#6`), never the key itself.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct UsageRecord {
+    pub id: i64,
+    pub t_ms: i64,
+    pub provider: String,
+    pub model: String,
+    pub ok: bool,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UsagePage {
+    pub records: Vec<UsageRecord>,
+    pub next_after_id: i64,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct StreamPage {
     pub cursor: i64,
@@ -755,6 +775,15 @@ impl CctvApi {
     /// Everything the panel's "📊 状态" shows (v1.14 §13).
     pub async fn status(&self) -> Result<serde_json::Value> {
         self.get_json("status", Duration::from_secs(15)).await
+    }
+
+    /// cctv-ai's online-AI calls after `after_id`, oldest first (v1.15.2).
+    pub async fn ai_usage(&self, after_id: i64, limit: usize) -> Result<UsagePage> {
+        self.get_json(
+            &format!("ai/usage?after_id={after_id}&limit={limit}"),
+            Duration::from_secs(15),
+        )
+        .await
     }
 
     /// cctv's run log (v1.14 §14): what it did and why. `query` is the raw

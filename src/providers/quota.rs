@@ -222,8 +222,14 @@ pub fn init(workspace_dir: &Path) {
 /// Count one successful call against `label` (the per-key provider name, e.g.
 /// `gemini#2`). Best-effort: never fails a request.
 pub fn record_call(label: &str, model: &str) {
+    record_call_at(label, model, Utc::now());
+}
+
+/// `record_call` for a call made at `at` — e.g. one cctv-ai made on the same
+/// keys, read back later, so it lands on the quota day it was made on.
+pub fn record_call_at(label: &str, model: &str, at: DateTime<Utc>) {
     if let Some(store) = store() {
-        store.record_call(label, model, Utc::now());
+        store.record_call(label, model, at);
     }
 }
 
@@ -231,8 +237,13 @@ pub fn record_call(label: &str, model: &str) {
 /// beforehand become the observed limit, keeping the largest seen so far —
 /// a key that was already partly used on an earlier day would understate it.
 pub fn record_exhausted(label: &str, model: &str) {
+    record_exhausted_at(label, model, Utc::now());
+}
+
+/// `record_exhausted` for a daily-quota 429 seen at `at`.
+pub fn record_exhausted_at(label: &str, model: &str, at: DateTime<Utc>) {
     if let Some(store) = store() {
-        store.record_exhausted(label, model, Utc::now());
+        store.record_exhausted(label, model, at);
     }
 }
 

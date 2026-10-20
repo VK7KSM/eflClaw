@@ -17,6 +17,7 @@ pub mod look;
 pub mod panel;
 pub mod store;
 pub mod tg;
+pub mod usage;
 pub mod worker;
 
 use crate::config::Config;
@@ -197,6 +198,7 @@ pub async fn run(config: Config) -> Result<()> {
         ctx.chats.clone(),
     );
     label::register(ctx.api.clone(), bot.clone(), config.workspace_dir.clone());
+    tokio::spawn(usage::run(ctx.api.clone(), config.workspace_dir.clone()));
     tracing::info!(
         chats = ctx.chats.len(),
         phone = ctx.alarm.is_some(),

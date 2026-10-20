@@ -7936,3 +7936,19 @@ cctv 18:0x 部署了 v1.14、v1.15。elfClaw 这边分两步接：
   - 请它在 ai_usage 的 `provider` 里写 key 标签（不写 key 本身）；
   - 请它加一个只读接口给 elfClaw 拉用量明细。
 - 待做（等 cctv 接口定好）：elfClaw 定时拉 cctv 的 Gemini 调用，记进 `state/quota.db`（`providers/quota.rs` 的 `record_call` / `record_exhausted`），与自己的用量合并统计。
+
+## 2026-10-20 cctv 用掉的 Gemini 次数并进 elfClaw 用量（接口约定 v1.15.2 `GET /ai/usage`）
+
+cctv 定了明细接口：`GET /cctv/v1/ai/usage?after_id=N&limit=M`，按 id 升序返回 `records` 和 `next_after_id`。Gemini 调用的 `provider` 写 elfClaw 的 key 标签（`gemini`、`gemini#2`…`gemini#6`）；`error` 用固定前缀开头（`quota_day:` / `quota_minute:` / `http_NNN:` / `net:` / `parse:`）。
+
+- `providers/quota.rs`：新增 `record_call_at` / `record_exhausted_at`，按调用发生的时间记到对应的额度日；原来的 `record_call` / `record_exhausted` 改为调用它们，传当前时间。
+- `cctv/api.rs`：新增 `UsageRecord`、`UsagePage`、`ai_usage(after_id, limit)`。
+- `cctv/usage.rs`（新）：每 5 分钟拉一次，游标存在 `cctv.db` 的 kv 表（`ai_usage_after`）。
+  - 只取 provider 是 `gemini` 或 `gemini#N` 的记录，Sonnet（anthropic）不算。
+  - 成功的记一次调用；`quota_day:` 错误标记这个 key 当天用完；其他错误不计。
+  - 超过 2 天的旧记录跳过。
+  - cctv 没部署新接口前会返回 404，只记 debug 日志，5 分钟后重试。
+- `cctv/mod.rs`：启动时开这个后台任务。
+- 结果：每天的额度统计和推送末尾的"今日用量"都包含 cctv 的调用，观测到的单 key 上限也更准。
+- 验证：cctv 单测 33 个通过（新增 3 个）；quota 单测 27 个通过；clippy 没有新告警。
+- 部署：等 cctv 部署新接口时一起上 K5。
