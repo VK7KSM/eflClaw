@@ -8135,3 +8135,12 @@ cctv 走中转的调用记为 `provider = antigravity`。
 - 新增断言：成功的 antigravity 调用记到反代名下，失败的不计。
 - 已把中转的规矩告诉 cctv：账号池三家共用；按 "Wait Ns" 退避，最短 60 秒、最长 6 小时，没有就退 10 分钟；按模型分别退避；调用间隔至少 1 秒；中转的 Gemini 周额度目前为 0。
 - 和撤防 PIN 那版一起部署。
+
+## 2026-10-23 K5：elfClaw_Watchdog 计划任务改为完全无窗口（运维，未改代码）
+
+用户反馈（经 cctv 转达）：这个任务每 5 分钟跑一次，`powershell -WindowStyle Hidden` 在 Windows 11 上仍会先闪一下终端窗口，打字或操作时经常被打断。
+- 先导出任务 XML 备份到 `C:\K5-DEV\elfClaw\elfClaw_Watchdog.task.bak-20261023.xml`。
+- Exec 从 `powershell …` 改为 `conhost.exe --headless powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File C:\K5-DEV\elfClaw\watchdog.ps1`，用 `schtasks /create /xml … /f` 重新注册。触发时间、身份（InteractiveToken）、脚本本身都没变。
+- watchdog.ps1 通过 `schtasks /run elfClaw_Workspace` 拉起 elfClaw，不直接启动 exe，所以 elfClaw 不会继承这个无窗口控制台，有界面的浏览器不受影响。
+- 验证：手动运行一次，LastTaskResult = 0，下次按时运行；zeroclaw 一直在运行。
+- 回滚：`schtasks /create /tn elfClaw_Watchdog /xml <备份文件> /f`。
