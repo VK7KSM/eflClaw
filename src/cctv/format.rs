@@ -18,6 +18,9 @@ fn icon(e: &Event) -> &'static str {
         ("system", Some("Disk error")) => "💽",
         ("system", _) => "⚙️",
         _ if e.level >= 3 => "🚨",
+        // Only a push corrected after the fact is shown at level 1
+        // (worker: "corrected in place"): cctv found it harmless.
+        ("alarm", _) if e.level <= 1 => "✅",
         _ => "⚠️",
     }
 }
@@ -251,6 +254,18 @@ mod tests {
         assert!(
             c.starts_with("⚠️ 区域入侵 · Garage Back\n1 个陌生人在门口\n（AI 判断可能是误报）"),
             "{c}"
+        );
+        let mut harmless = alarm();
+        harmless.level = 1;
+        harmless.description = Some("认出 kasim，按家人处理".into());
+        assert!(
+            caption(&harmless, false).starts_with(
+                "✅ 区域入侵 · Garage Back
+认出 kasim，按家人处理
+"
+            ),
+            "{}",
+            caption(&harmless, false)
         );
         let test = Event {
             test: true,

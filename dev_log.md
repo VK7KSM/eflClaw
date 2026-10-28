@@ -8144,3 +8144,23 @@ cctv 走中转的调用记为 `provider = antigravity`。
 - watchdog.ps1 通过 `schtasks /run elfClaw_Workspace` 拉起 elfClaw，不直接启动 exe，所以 elfClaw 不会继承这个无窗口控制台，有界面的浏览器不受影响。
 - 验证：手动运行一次，LastTaskResult = 0，下次按时运行；zeroclaw 一直在运行。
 - 回滚：`schtasks /create /tn elfClaw_Watchdog /xml <备份文件> /f`。
+
+## 2026-10-28 报警降级不再删除，改为修改原消息
+
+用户的决定（经 cctv 转达）："院里的警戒区域进了人，就先推送报警消息，认错不怕，随后识别出来后再改就好，Telegram 消息是可以二次修改的。"
+起因：大风天，晾衣架上的衣服被当成看不到脸的陌生人推送，随后被判误检降级，用户看到的是"推了又被删掉"。
+
+- `cctv/worker.rs`：
+  - 推送过的报警降到 level ≤ 1、而且没打过电话时，不再 `withdraw_push` 删除，而是打上新标志 `downgraded`，在原消息上改成 cctv 的结论，不响铃（编辑本来就不提醒）。
+  - 这时 `p.level` 降为当前值，之后如果再升到 2，会重新以"⬆️ 升级"回复并按规则响铃 / 打电话；升级时清掉 `downgraded`。
+  - 降级后的消息按钮：去掉"🏠 我在家"（新增 `without_home`），保留"🏷 标注"和电话反馈按钮。
+  - `clip_unwanted` 加上 `downgraded`：降级后不再补发视频。
+  - 打过电话的降级沿用原规则：保留消息，标注"（AI 判断可能是误报）"。
+  - 旧的 `withdrawn` 标志只为兼容旧事件保留。
+- `cctv/format.rs`：level ≤ 1 的报警图标用 ✅（只有被改正的推送会以 level 1 显示），不再显示 ⚠️。
+- 新增断言：改正后的按钮只剩"标注"；level 1 报警的说明以 ✅ 开头。
+- cctv 那边接下来做"先推后改"（`provisional` 和 `rev` 字段），等它写进接口文档后再改；level 不变、只有描述变化的更新，现有代码已经会静默修改原消息。
+- 验证：
+  - cctv 单测 35 个通过；
+  - `cargo test --lib` 只有偶发失败的 `message_dispatch_processes_messages_in_parallel` 失败一次，单独重跑通过；
+  - clippy 在改动行上没有新告警。

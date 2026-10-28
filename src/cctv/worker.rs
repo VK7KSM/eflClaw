@@ -14,8 +14,12 @@
 //! - while someone is home (`home`, always time-limited) level 2 arrives
 //!   silently, level 3 still rings; "🏠 我在家" under a camera alarm deletes
 //!   that push everywhere; "🏷 标注" appears only with people or vehicles;
-//! - an alarm that drops to level 1 is withdrawn (push and clip) — unless it
-//!   rang the phone: that push stays, its text updated, for the feedback;
+//! - an alarm that drops to level 1 is corrected in place: the push's text
+//!   becomes cctv's conclusion, "🏠 我在家" goes, no clip follows, nothing
+//!   rings (owner 2026-10-28: "认错不怕…Telegram 消息是可以二次修改的" — it
+//!   used to be deleted, which read as "pushed, then vanished"); one that
+//!   rang the phone keeps its feedback buttons and is marked as a likely
+//!   false alarm;
 //! - a chat that sent `/cctv_off` gets none of this until `/cctv_on`, except
 //!   the alarms that also ring the phone (confirmed intrusion, cameras down).
 
@@ -56,8 +60,12 @@ pub struct Ctx {
 pub(super) const NOTAG: &str = "notag";
 /// Event flag: this alarm rang the phone — never withdrawn, no "我在家".
 const CALLED: &str = "called";
-/// Event flag: withdrawn after dropping to level 1.
+/// Event flag: withdrawn after dropping to level 1 (until 2026-10-28; old
+/// events may still carry it).
 const WITHDRAWN: &str = "withdrawn";
+/// Event flag: dropped to level 1 after it was pushed; the push was
+/// corrected in place.
+const DOWNGRADED: &str = "downgraded";
 
 impl Ctx {
     fn now_minutes(&self, now: DateTime<Utc>) -> u32 {
@@ -427,24 +435,25 @@ async fn handle_event(ctx: &Ctx, store: &Store, e: &Event) -> Result<()> {
         }
         p.level = p.level.max(e.level);
         p.marked_false = false;
+        store.clear_flag(id, DOWNGRADED)?;
         if phone && !alarm::is_pending(&key) {
             if let Some(line) = &ctx.alarm {
                 alarm::start(line.clone(), key.clone(), format::headline(e), sent);
             }
         }
     } else if e.level <= 1 && p.level >= 2 {
-        if !store.has_flag(id, CALLED) {
-            // Owner's rule: an alarm found harmless after it was pushed is
-            // taken back, push and clip.
-            withdraw_push(&ctx.bot, store, id).await;
-            store.set_flag(id, WITHDRAWN)?;
+        if store.has_flag(id, CALLED) {
+            p.marked_false = true;
+        } else {
+            // Corrected in place below (the caption follows the event). The
+            // level is lowered so a later rise is pushed — and rings — again.
+            store.set_flag(id, DOWNGRADED)?;
+            p.level = e.level;
             record(
-                &format!("CCTV push e{id} withdrawn (level {})", e.level),
+                &format!("CCTV push e{id} corrected in place (level {})", e.level),
                 serde_json::json!({"event_id": id, "level": e.level}),
             );
-            return Ok(());
         }
-        p.marked_false = true;
     }
     p.has_description |= e.description.is_some();
     // An alarm the AI timed out on is pushed before its people and vehicles
@@ -496,6 +505,20 @@ fn push_buttons(e: &Event, key: &str, taggable: bool, called: bool, answered: bo
     rows
 }
 
+/// A corrected (harmless) push keeps "标注" and the call feedback, not
+/// "我在家": there is nothing left to stand down.
+fn without_home(buttons: Buttons) -> Buttons {
+    buttons
+        .into_iter()
+        .map(|r| {
+            r.into_iter()
+                .filter(|(_, data)| !data.starts_with(HOME_PREFIX))
+                .collect::<Vec<_>>()
+        })
+        .filter(|r| !r.is_empty())
+        .collect()
+}
+
 /// Delete an alarm's push and its replies (clip, upgrade) in every chat.
 pub(super) async fn withdraw_push(bot: &Bot, store: &Store, id: i64) {
     let mut targets: Vec<(String, i64)> = store
@@ -517,6 +540,7 @@ pub(super) async fn withdraw_push(bot: &Bot, store: &Store, id: i64) {
 fn clip_unwanted(store: &Store, id: i64) -> bool {
     store.has_flag(id, DISMISSED)
         || store.has_flag(id, WITHDRAWN)
+        || store.has_flag(id, DOWNGRADED)
         || home::pressed_after_push(store, id)
 }
 
@@ -540,13 +564,16 @@ async fn edit_all(
     caption: &str,
     key: &str,
 ) {
-    let buttons = push_buttons(
+    let mut buttons = push_buttons(
         e,
         key,
         !store.has_flag(id, NOTAG),
         store.has_flag(id, CALLED),
         store.has_flag(id, FEEDBACK_DONE),
     );
+    if store.has_flag(id, DOWNGRADED) {
+        buttons = without_home(buttons);
+    }
     for m in messages {
         match bot
             .edit(&m.chat, m.message_id, caption, m.is_photo, &buttons)
@@ -852,6 +879,14 @@ mod tests {
         );
         let b = plain_buttons(Some(7), true, true);
         assert_eq!(b[0][1].1, "cctv_home:7");
+        // Corrected to harmless: 标注 stays, 我在家 goes.
+        assert_eq!(
+            labels(&without_home(push_buttons(
+                &alarm, "e7", true, false, false
+            ))),
+            ["🏷 标注"]
+        );
+        assert!(without_home(push_buttons(&alarm, "e7", false, false, false)).is_empty());
     }
 
     #[test]
