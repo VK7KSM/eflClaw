@@ -129,6 +129,16 @@ impl QuotaStore {
         let _ = conn.execute("DELETE FROM usage WHERE day < ?1", [cutoff.to_string()]);
     }
 
+    /// The daily limit Google states in a 429 (`quotaValue`) replaces the
+    /// one guessed from call counts.
+    fn record_stated_limit(&self, model: &str, limit: i64, now: DateTime<Utc>) {
+        let _ = self.conn.lock().execute(
+            "INSERT INTO observed_limit (model, calls, seen_on) VALUES (?1, ?2, ?3)
+             ON CONFLICT(model) DO UPDATE SET calls = ?2, seen_on = ?3",
+            rusqlite::params![model, limit, quota_day(now)],
+        );
+    }
+
     /// The result of today's availability check, if it already ran.
     fn model_check(&self, day: &str) -> Option<String> {
         self.conn
@@ -244,6 +254,30 @@ pub fn record_exhausted(label: &str, model: &str) {
 pub fn record_exhausted_at(label: &str, model: &str, at: DateTime<Utc>) {
     if let Some(store) = store() {
         store.record_exhausted(label, model, at);
+    }
+}
+
+/// elfClaw 2026-10-28: Google's daily-quota 429 names the limit, e.g.
+/// `"quotaId": "GenerateRequestsPerDayPerProjectPerModel-FreeTier",
+/// "quotaValue": "20"`. The count of calls before running out is a poor
+/// stand-in (requests that timed out count for Google, not for us: the
+/// note said "单 key 约 38" when the limit was 20).
+pub fn stated_daily_limit(error: &str) -> Option<i64> {
+    let i = error.find("PerDay")?;
+    let rest = &error[i..];
+    let v = rest.find("quotaValue")?;
+    let digits: String = rest[v + "quotaValue".len()..]
+        .chars()
+        .skip_while(|c| !c.is_ascii_digit())
+        .take_while(char::is_ascii_digit)
+        .collect();
+    digits.parse().ok().filter(|n| *n > 0)
+}
+
+/// Record Google's stated daily limit for `model`.
+pub fn record_stated_limit(model: &str, limit: i64) {
+    if let Some(store) = store() {
+        store.record_stated_limit(model, limit, Utc::now());
     }
 }
 
@@ -478,6 +512,16 @@ mod tests {
     /// these stay independent under the parallel test runner.
     fn store_in(dir: &tempfile::TempDir) -> QuotaStore {
         QuotaStore::init(dir.path()).unwrap()
+    }
+
+    #[test]
+    fn googles_stated_daily_limit_is_read_from_the_429() {
+        let err = r#"Gemini API error (429 Too Many Requests): { "error": { "code": 429, "message": "You exceeded your current quota", "details": [ { "@type": "type.googleapis.com/google.rpc.QuotaFailure", "violations": [ { "quotaMetric": "generativelanguage.googleapis.com/generate_content_free_tier_requests", "quotaId": "GenerateRequestsPerDayPerProjectPerModel-FreeTier", "quotaDimensions": { "model": "gemini-3.8-flash", "location": "global" }, "quotaValue": "20" } ] }, { "@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "18145s" } ] } }"#;
+        assert_eq!(stated_daily_limit(err), Some(20));
+        // A per-minute limit is not the daily one.
+        let minute = r#"{"quotaId": "GenerateRequestsPerMinutePerProjectPerModel-FreeTier", "quotaValue": "5"}"#;
+        assert_eq!(stated_daily_limit(minute), None);
+        assert_eq!(stated_daily_limit("429 Too Many Requests"), None);
     }
 
     #[test]

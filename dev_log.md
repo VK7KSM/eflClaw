@@ -8194,3 +8194,31 @@ cctv 走中转的调用记为 `provider = antigravity`。
 - 验证：
   - `cargo test --lib` 4287 个通过，0 失败；
   - clippy 在改动行上没有新告警。
+
+## 2026-10-28 官方 3.8 超时把每天额度烧光：超时后整个模型歇 10 分钟；推送显示 Google 给的真实上限
+
+用户问：反代的 Gemini 不能用时，官方 key 为什么先用了 3.6 而不是 3.8？最近几次推送生成失败，怀疑 3.6 性能不行。
+
+查明（K5 日志、实测）：
+- elfClaw 一直是先试 3.8 的（链：反代 3.8 → 官方 3.8 ×6 → 官方 3.6 ×6 → Sonnet → lite → GPT-OSS）。
+- 10-27 到 10-28 官方 3.8 的尝试：
+  - 429 共 234 次；
+  - 不回应、120 秒超时共 120 次；
+  - 503（Google 说 high demand）共 69 次；
+  - 成功的只有 19 次。
+- 额度重置（太平洋时间零点 = 悉尼 18:00）后，3.8 的请求大多挂满 120 秒才超时，而且一个 key 超时后还会接着试下一个 key。例如 07:39 那次，一条消息光在 3.8 上就卡了 12 分钟。
+- 实测 6 个 key 的 429 原文：`GenerateRequestsPerDayPerProjectPerModel-FreeTier`，`quotaValue` 是 20，3.8 和 3.6 都一样，每个 key 每天 20 次。超时的请求在 Google 那边照样计数，所以一天成功 11 次，4 个 key 的 3.8 额度就已用完；另外 2 个 key 返回 503。
+- cctv 当天没用官方 Gemini（全是 Sonnet，另有 7 次走中转的 gemini-4-argon 失败）。
+- 结论：不是 3.6 性能不行，是 3.8 卡死时 elfClaw 傻等、还把它的额度耗光了。cron 记录里新闻任务都是 ok，但耗时常常几分钟到二十分钟。
+
+修复：
+- `providers/reliable.rs`：
+  - 新增 `is_timeout()`：错误链里有 reqwest 的超时，或者文字里有 timed out / timeout。
+  - 官方 key 请求超时后：这个模型在所有 key 上都歇 10 分钟（`TIMED_OUT_MODEL_REST`），这一轮剩下的 key 也不再试它，直接换下一个模型。
+  - 反代不受这条影响，它有自己的休息规则。
+  - 120 秒的请求上限没改，免得长输出的正常请求被切断。
+- `providers/quota.rs`：新增 `stated_daily_limit()`，从 429 里读出 Google 写明的每天上限（`…PerDay…` 后面的 `quotaValue`），存成该模型的上限。推送末尾的"单 key 约 N"以后显示真实的 20，不再是根据调用次数估出来的 33 / 38。
+- 新增单测：`a_timed_out_model_is_rested_on_every_key`、`timeouts_are_told_apart_from_other_failures`、`googles_stated_daily_limit_is_read_from_the_429`。
+- 验证：
+  - `cargo test --lib` 4290 个通过，0 失败；
+  - clippy 在改动行上没有新告警。

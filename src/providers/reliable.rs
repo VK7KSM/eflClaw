@@ -142,6 +142,28 @@ fn is_server_overload(err: &anyhow::Error) -> bool {
 // elfClaw: minimum backoff for server overload (503) — Gemini needs ~5-30s to recover
 const OVERLOAD_BACKOFF_FLOOR_MS: u64 = 5_000;
 
+/// elfClaw 2026-10-28: a request that got no answer before the client gave
+/// up. Measured on K5 (10-27/28): free-tier gemini-3.8-flash hung for the
+/// full 120 s on one key after another — once 12 minutes on 3.8 alone for a
+/// single message — and the hung requests still counted against each key's
+/// 20 a day, so the quota was gone with 11 answers to show for it.
+fn is_timeout(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(reqwest::Error::is_timeout)
+            || {
+                let msg = cause.to_string().to_lowercase();
+                msg.contains("timed out") || msg.contains("timeout")
+            }
+    })
+}
+
+/// How long a model that timed out is left alone, on every key: it is the
+/// model that is stuck (another key does not help), and each further try
+/// costs two minutes and a request of the day's quota.
+const TIMED_OUT_MODEL_REST: Duration = Duration::from_secs(600);
+
 /// Check if a 429 is a business/quota-plan error that retries cannot fix.
 ///
 /// Examples:
@@ -666,6 +688,11 @@ impl ReliableProvider {
                             // The calls this key made today become the observed
                             // daily limit — nothing hardcodes Google's numbers.
                             crate::providers::quota::record_exhausted(provider_name, sent_model);
+                            if let Some(limit) =
+                                crate::providers::quota::stated_daily_limit(&e.to_string())
+                            {
+                                crate::providers::quota::record_stated_limit(sent_model, limit);
+                            }
                         }
                         if let Some(cooldown) = quota_cooldown(&e, chrono::Utc::now()) {
                             tracing::info!(
@@ -715,6 +742,26 @@ impl ReliableProvider {
                                 "Non-retryable error, skipping this entry from now on"
                             );
                             skipped[index] = true;
+                        } else if provider_name != GEMINI_PROXY_PROVIDER && is_timeout(&e) {
+                            // Rest this model on every key, now and for the
+                            // next requests; the chain moves on to the next
+                            // model at once.
+                            let until = Instant::now() + TIMED_OUT_MODEL_REST;
+                            let mut cooldowns = self.cooldowns.lock();
+                            for (i, &(other, _, other_model)) in entries.iter().enumerate() {
+                                if other_model == sent_model && other != GEMINI_PROXY_PROVIDER {
+                                    skipped[i] = true;
+                                    cooldowns.insert(
+                                        (other.to_string(), other_model.to_string()),
+                                        until,
+                                    );
+                                }
+                            }
+                            tracing::warn!(
+                                model = sent_model,
+                                rest_secs = TIMED_OUT_MODEL_REST.as_secs(),
+                                "Model timed out; resting it on every key"
+                            );
                         } else {
                             if is_server_overload(&e) {
                                 overloaded_models.insert(sent_model);
@@ -2615,6 +2662,66 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result, "direct");
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_model_is_rested_on_every_key() {
+        let timeout = "error sending request for url (https://x/v1beta/models/m-a:generateContent): operation timed out";
+        let key_a = Arc::new(ScriptedModelMock {
+            script: [
+                ("m-a", vec![Err(timeout)]),
+                ("m-b", vec![Ok("b via key a")]),
+            ]
+            .into_iter()
+            .collect(),
+            seen: parking_lot::Mutex::new(Vec::new()),
+        });
+        let key_b = Arc::new(ScriptedModelMock {
+            script: [("m-a", vec![Ok("unused")]), ("m-b", vec![Ok("unused")])]
+                .into_iter()
+                .collect(),
+            seen: parking_lot::Mutex::new(Vec::new()),
+        });
+        let mut fallbacks = HashMap::new();
+        fallbacks.insert("m-a".to_string(), vec!["m-b".to_string()]);
+        let provider = ReliableProvider::new(
+            vec![
+                (
+                    "gemini".into(),
+                    Box::new(key_a.clone()) as Box<dyn Provider>,
+                ),
+                (
+                    "gemini#2".into(),
+                    Box::new(key_b.clone()) as Box<dyn Provider>,
+                ),
+            ],
+            2,
+            1,
+        )
+        .with_model_fallbacks(fallbacks);
+        let result = provider.simple_chat("hi", "m-a", 0.0).await.unwrap();
+        assert_eq!(result, "b via key a");
+        assert!(
+            key_b.seen.lock().is_empty(),
+            "the second key is not made to wait on m-a too"
+        );
+        // The next request skips m-a on both keys.
+        let result = provider.simple_chat("hi", "m-a", 0.0).await.unwrap();
+        assert_eq!(result, "b via key a");
+        assert_eq!(*key_a.seen.lock(), vec!["m-a", "m-b", "m-b"]);
+    }
+
+    #[test]
+    fn timeouts_are_told_apart_from_other_failures() {
+        assert!(is_timeout(&anyhow::anyhow!(
+            "error sending request for url (https://x): operation timed out"
+        )));
+        assert!(!is_timeout(&anyhow::anyhow!(
+            "Gemini API error (503 Service Unavailable): high demand"
+        )));
+        assert!(!is_timeout(&anyhow::anyhow!(
+            "Gemini API error (429 Too Many Requests): quota"
+        )));
     }
 
     #[test]
