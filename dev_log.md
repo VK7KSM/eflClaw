@@ -8259,3 +8259,7 @@ cctv 改为院子里一看到没认出的人就先推（level 2、`provisional =
   - 不带工具的文字调用（新闻、摘要等）先走 elfgate。
 - 没改：`gemini.rs` 里给反代上 Claude / GPT 补 id 的代码和 `with_endpoint` 现在用不到了，但不影响运行，没动。
 - 测试：新增 elfgate 模型挑选、system 合并、图片、tools 不服务、错误码歇多久、NotServed 不歇、工具支持看后面条目。providers + cctv 共 710 个测试通过，改动行 clippy 无告警。
+
+## 2026-10-28 K5 回退链 Sonnet 4.6 → 5.5（只改 K5 配置）
+
+用户要求。20:54 起 elfgate 接了用户的 Claude Max 账号，`/v1/models` 多了 claude-sonnet-5-5 等。K5 `config.toml` 的 `[reliability.model_fallbacks]` 中 `claude-sonnet-4-6` 改为 `claude-sonnet-5-5`，备份 `config.toml.bak-20261028-sonnet55`，20:59:32 重启生效。代码没改（`claude-` 开头的模型本来就只走 elfgate）。只影响不带工具的文字调用。
