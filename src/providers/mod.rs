@@ -22,6 +22,7 @@ pub mod bedrock;
 pub mod compatible;
 pub mod copilot;
 pub mod cursor;
+pub mod elfgate;
 pub mod gemini;
 pub mod health;
 pub mod ollama;
@@ -1530,43 +1531,21 @@ fn expand_primary_provider_keys(
     Ok(providers)
 }
 
-/// elfClaw 2026-10-12: the Gemini-compatible proxy entry that goes ahead of
-/// the official keys (`reliability.gemini_proxy_url` + `GEMINI_PROXY_API_KEY`).
-/// Only for a Gemini primary; missing URL or key → no proxy, nothing else
-/// changes.
-fn gemini_proxy_provider(
-    primary_name: &str,
+/// elfClaw 2026-10-28: the elfgate entry that goes ahead of the official
+/// keys (`reliability.elfgate_url`); no URL → no entry, nothing else changes.
+fn elfgate_provider(
     reliability: &crate::config::ReliabilityConfig,
     options: &ProviderRuntimeOptions,
 ) -> Option<Box<dyn Provider>> {
-    if !matches!(primary_name, "gemini" | "google" | "google-gemini") {
+    let url = reliability.elfgate_url.as_deref()?.trim();
+    if url.is_empty() {
         return None;
     }
-    let url = reliability.gemini_proxy_url.as_deref()?.trim();
-    let key = std::env::var(GEMINI_PROXY_KEY_ENV).ok()?;
-    if url.is_empty() || key.trim().is_empty() {
-        return None;
-    }
-    let state_dir = options.zeroclaw_dir.clone().unwrap_or_else(|| {
-        directories::UserDirs::new().map_or_else(
-            || PathBuf::from(".zeroclaw"),
-            |dirs| dirs.home_dir().join(".zeroclaw"),
-        )
-    });
-    let auth_service = AuthService::new(&state_dir, options.secrets_encrypt);
-    Some(Box::new(
-        gemini::GeminiProvider::new_with_auth(
-            Some(key.trim()),
-            auth_service,
-            None,
-            options.reasoning_level,
-        )
-        .with_endpoint(url),
-    ))
+    Some(Box::new(elfgate::ElfgateProvider::new(
+        url,
+        options.reasoning_level,
+    )))
 }
-
-/// Environment variable holding the Gemini proxy's API key.
-pub const GEMINI_PROXY_KEY_ENV: &str = "GEMINI_PROXY_API_KEY";
 
 /// Create provider chain with retry/fallback behavior and auth runtime options.
 pub fn create_resilient_provider_with_options(
@@ -1583,8 +1562,8 @@ pub fn create_resilient_provider_with_options(
         &reliability.api_keys,
         options,
     )?;
-    if let Some(proxy) = gemini_proxy_provider(primary_name, reliability, options) {
-        providers.insert(0, (reliable::GEMINI_PROXY_PROVIDER.to_string(), proxy));
+    if let Some(gate) = elfgate_provider(reliability, options) {
+        providers.insert(0, (reliable::ELFGATE_PROVIDER.to_string(), gate));
     }
 
     for fallback in &reliability.fallback_providers {
@@ -2955,7 +2934,7 @@ mod tests {
             ],
             api_keys: Vec::new(),
             model_fallbacks: std::collections::HashMap::new(),
-            gemini_proxy_url: None,
+            elfgate_url: None,
             channel_initial_backoff_secs: 2,
             channel_max_backoff_secs: 60,
             scheduler_poll_secs: 15,
@@ -2995,7 +2974,7 @@ mod tests {
             fallback_providers: vec!["lmstudio".into(), "ollama".into()],
             api_keys: Vec::new(),
             model_fallbacks: std::collections::HashMap::new(),
-            gemini_proxy_url: None,
+            elfgate_url: None,
             channel_initial_backoff_secs: 2,
             channel_max_backoff_secs: 60,
             scheduler_poll_secs: 15,
@@ -3018,7 +2997,7 @@ mod tests {
             fallback_providers: vec!["custom:http://host.docker.internal:1234/v1".into()],
             api_keys: Vec::new(),
             model_fallbacks: std::collections::HashMap::new(),
-            gemini_proxy_url: None,
+            elfgate_url: None,
             channel_initial_backoff_secs: 2,
             channel_max_backoff_secs: 60,
             scheduler_poll_secs: 15,
@@ -3045,7 +3024,7 @@ mod tests {
             ],
             api_keys: Vec::new(),
             model_fallbacks: std::collections::HashMap::new(),
-            gemini_proxy_url: None,
+            elfgate_url: None,
             channel_initial_backoff_secs: 2,
             channel_max_backoff_secs: 60,
             scheduler_poll_secs: 15,
@@ -3078,7 +3057,7 @@ mod tests {
             fallback_providers: vec!["osaurus".into(), "lmstudio".into()],
             api_keys: Vec::new(),
             model_fallbacks: std::collections::HashMap::new(),
-            gemini_proxy_url: None,
+            elfgate_url: None,
             channel_initial_backoff_secs: 2,
             channel_max_backoff_secs: 60,
             scheduler_poll_secs: 15,
@@ -3549,7 +3528,7 @@ mod tests {
             fallback_providers: vec!["openai-codex:second".into()],
             api_keys: Vec::new(),
             model_fallbacks: std::collections::HashMap::new(),
-            gemini_proxy_url: None,
+            elfgate_url: None,
             channel_initial_backoff_secs: 2,
             channel_max_backoff_secs: 60,
             scheduler_poll_secs: 15,
@@ -3579,7 +3558,7 @@ mod tests {
             ],
             api_keys: Vec::new(),
             model_fallbacks: std::collections::HashMap::new(),
-            gemini_proxy_url: None,
+            elfgate_url: None,
             channel_initial_backoff_secs: 2,
             channel_max_backoff_secs: 60,
             scheduler_poll_secs: 15,

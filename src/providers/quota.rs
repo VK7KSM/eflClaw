@@ -204,9 +204,10 @@ impl QuotaStore {
     }
 }
 
-/// Label the Gemini proxy's calls are recorded under. It has no daily quota
-/// of Google's, so it is counted but kept out of the official figures.
-const PROXY_LABEL: &str = crate::providers::reliable::GEMINI_PROXY_PROVIDER;
+/// Label elfgate's calls are recorded under (before 2026-10-28 the Gemini
+/// proxy's). It has no daily quota of Google's, so it is counted but kept
+/// out of the official figures.
+const PROXY_LABEL: &str = crate::providers::reliable::ELFGATE_PROVIDER;
 
 fn store() -> Option<Arc<QuotaStore>> {
     STORE
@@ -348,7 +349,7 @@ fn render_summary(
     }];
 
     for (model, calls) in proxy.iter().take(MAX_MODELS_SHOWN) {
-        lines.push(format!("• 反代 {} 已用 {calls} 次", short(model)));
+        lines.push(format!("• elfgate {} 已用 {calls} 次", short(model)));
     }
     for u in usage.iter().take(MAX_MODELS_SHOWN) {
         let mut line = format!("• {official}{} 已用 {} 次", short(&u.model), u.calls);
@@ -724,7 +725,7 @@ mod tests {
         )
         .unwrap();
         assert!(out.contains("🔑 今日用量（官方额度 17:00 重置）"), "{out}");
-        assert!(out.contains("• 反代 3.8-flash 已用 12 次"), "{out}");
+        assert!(out.contains("• elfgate 3.8-flash 已用 12 次"), "{out}");
         assert!(
             out.contains("• 官方 3.6-flash 已用 1 次，6 个 key 都还能用"),
             "{out}"
@@ -735,7 +736,7 @@ mod tests {
 
         // Proxy only, nothing official yet: still a note.
         let only = render_summary(&[], &proxy, &[], 6, now, "Australia/Sydney").unwrap();
-        assert!(only.contains("• 反代 3.8-flash 已用 12 次"), "{only}");
+        assert!(only.contains("• elfgate 3.8-flash 已用 12 次"), "{only}");
     }
 
     #[test]

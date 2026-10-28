@@ -4069,14 +4069,16 @@ pub struct ReliabilityConfig {
     /// as provider-scoped remap chains during provider fallback.
     #[serde(default)]
     pub model_fallbacks: std::collections::HashMap<String, Vec<String>>,
-    /// elfClaw 2026-10-12: a Gemini-compatible endpoint (e.g. a local
-    /// Antigravity Tools proxy, `http://127.0.0.1:8045`) tried before the
-    /// official API, for the model the caller asked for only. Its key comes
-    /// from the `GEMINI_PROXY_API_KEY` environment variable; without the key
-    /// the proxy is not used. Any failure sends the request on to the official
-    /// API and rests the proxy for a while.
+    /// elfClaw 2026-10-28: elfgate, the OpenAI-compatible gateway on the same
+    /// host (e.g. `http://127.0.0.1:8460/v1`, no key), tried before the
+    /// official API for the model the caller asked for, and alone for the
+    /// Claude / GPT-OSS models of the fallback chain — for requests without
+    /// tools only (elfgate has no function calling). Any failure sends the
+    /// request on to the official API and rests elfgate for a while. Replaces
+    /// `gemini_proxy_url` (the Antigravity Tools proxy, uninstalled), which is
+    /// now ignored.
     #[serde(default)]
-    pub gemini_proxy_url: Option<String>,
+    pub elfgate_url: Option<String>,
     /// Initial backoff for channel/daemon restarts.
     #[serde(default = "default_channel_backoff_secs")]
     pub channel_initial_backoff_secs: u64,
@@ -4123,7 +4125,7 @@ impl Default for ReliabilityConfig {
             fallback_providers: Vec::new(),
             api_keys: Vec::new(),
             model_fallbacks: std::collections::HashMap::new(),
-            gemini_proxy_url: None,
+            elfgate_url: None,
             channel_initial_backoff_secs: default_channel_backoff_secs(),
             channel_max_backoff_secs: default_channel_backoff_max_secs(),
             scheduler_poll_secs: default_scheduler_poll_secs(),

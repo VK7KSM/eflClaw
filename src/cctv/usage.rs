@@ -32,19 +32,32 @@ enum Counted<'a> {
     Exhausted(&'a str, &'a str, DateTime<Utc>),
 }
 
+/// elfgate's Gemini names carry the thinking level (`-low/-medium/-high`);
+/// elfClaw records the chain's name.
+fn chain_model(model: &str) -> &str {
+    if !model.starts_with("gemini-") {
+        return model;
+    }
+    ["-low", "-medium", "-high"]
+        .iter()
+        .find_map(|s| model.strip_suffix(s))
+        .unwrap_or(model)
+}
+
 fn counted(r: &UsageRecord, now: DateTime<Utc>) -> Option<Counted<'_>> {
     let at = Utc.timestamp_millis_opt(r.t_ms).single()?;
     if now - at > MAX_AGE {
         return None;
     }
-    // 2026-10-20: cctv-ai also calls the Antigravity proxy (`antigravity`);
-    // its calls join elfClaw's own proxy count. The proxy has no Google
-    // daily quota of ours, so only successes count there.
-    if r.provider == "antigravity" {
+    // 2026-10-28: cctv-ai calls elfgate first (`elfgate`; until then the
+    // Antigravity proxy); its calls join elfClaw's own elfgate count, under
+    // the chain's model name (cctv asks for `gemini-3.8-flash-medium`).
+    // No Google daily quota of ours, so only successes count there.
+    if r.provider == "elfgate" {
         return r.ok.then(|| {
             Counted::Call(
-                crate::providers::reliable::GEMINI_PROXY_PROVIDER,
-                &r.model,
+                crate::providers::reliable::ELFGATE_PROVIDER,
+                chain_model(&r.model),
                 at,
             )
         });
@@ -136,15 +149,29 @@ mod tests {
         );
         assert_eq!(counted(&rec("anthropic", true, None, t), now), None);
         assert_eq!(counted(&rec("gemini_proxy", true, None, t), now), None);
-        // The proxy: successes only, under elfClaw's proxy label.
+        // elfgate: successes only, under elfClaw's elfgate label and the
+        // chain's model name.
+        let medium = UsageRecord {
+            model: "gemini-3.8-flash-medium".into(),
+            ..rec("elfgate", true, None, t)
+        };
         assert_eq!(
-            counted(&rec("antigravity", true, None, t), now),
-            Some(Counted::Call("gemini-proxy", "gemini-3.8-flash", at))
+            counted(&medium, now),
+            Some(Counted::Call("elfgate", "gemini-3.8-flash", at))
+        );
+        let gpt = UsageRecord {
+            model: "gpt-oss-120b-medium".into(),
+            ..rec("elfgate", true, None, t)
+        };
+        assert_eq!(
+            counted(&gpt, now),
+            Some(Counted::Call("elfgate", "gpt-oss-120b-medium", at))
         );
         assert_eq!(
-            counted(&rec("antigravity", false, Some("quota_day: x"), t), now),
+            counted(&rec("elfgate", false, Some("quota_low"), t), now),
             None
         );
+        assert_eq!(counted(&rec("antigravity", true, None, t), now), None);
     }
 
     #[test]

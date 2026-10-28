@@ -8235,3 +8235,27 @@ cctv 改为院子里一看到没认出的人就先推（level 2、`provisional =
   - `provisional` 时不放「🏷 标注」（首推记 NOTAG，结论 `provisional = false` 到了再查有没有人/车，有就补上按钮）；
   - 升级：原消息照旧改成最新状态，另回复一条"⬆️ 升级"（level 3 响铃，打电话只看 `call`）；降级改原消息、只改描述静默改原消息，沿用原逻辑。
 - 测试：`provisional_pushes_say_they_will_be_updated`、`newer_rev` 断言、provisional 不出标注按钮断言。cctv 模块 38 个测试全过，改动行 clippy 无警告。
+
+## 2026-10-28 移除 Antigravity 反代，改接 elfgate
+
+用户要求（cctv 转达）：K5 上的 Antigravity Tools 反代（127.0.0.1:8045）已卸载，改接 elfcode 做的 elfgate（K5 本机 `http://127.0.0.1:8460/v1`，OpenAI 兼容，不要 key；说明 `C:\Dev\elfCode\elfgate\elfgate.md`）。
+
+- `src/providers/elfgate.rs`（新）：`ElfgateProvider`。
+  - 模型名每 5 分钟从 `GET /v1/models` 读，不写死：同名直接用；否则按 `reasoning_level` 选思考档（0/1 → `-low`，2 或未设 → `-medium`，3/4 → `-high`；K5 是 1，即用户 10-12 要的 3.8 低思考）；再不行取任意一档；列表里没有就不走 elfgate。
+  - elfgate 不支持函数调用：带 tools 的请求、带 tool 结果的历史、不是 `data:` URL 的图片，一律返回 `NotServed`，链上直接跳过，不算失败、不让 elfgate 歇。
+  - 不发 system 消息：elfgate 按 system 提示词预热进程、要求它固定，而 elfClaw 的 system 带日期和上下文，所以把 system 文字放在第一条 user 前面（elfgate 本来就把整段对话压成一段提示词）。
+  - 每个请求带 `X-Elfgate-Timeout-Ms: 110000`，本地超时 120 秒，免得 elfgate 默认 300 秒占着和 cctv、flight 共用的 4 个并发名额。直连，不走配置的 HTTP 代理。
+- `src/providers/reliable.rs`：
+  - `GEMINI_PROXY_PROVIDER` 改成 `ELFGATE_PROVIDER = "elfgate"`；
+  - `NotServed` 静默跳过；
+  - 歇多久按 elfgate 错误码：`busy` 30 秒，`content_filtered` 不歇（只跟这条内容有关），`backend_error` 或超时 2 分钟，`quota_low`、连不上等 10 分钟（去掉 Antigravity 的 "Wait Ns" 解析）；
+  - `supports_native_tools()` 改为看 elfgate 后面的第一个条目。原来看第一个条目，elfgate 排第一时会把整个对话切成提示词工具模式。
+- `src/providers/mod.rs`：`gemini_proxy_provider` 和 `GEMINI_PROXY_API_KEY` 删掉，改为 `elfgate_provider`（有 `reliability.elfgate_url` 才加）。
+- `src/config/schema.rs`：`reliability.gemini_proxy_url` 换成 `elfgate_url`，旧键忽略。
+- `src/providers/quota.rs`：用量显示"反代 X 已用 N 次"改成"elfgate X 已用 N 次"。
+- `src/cctv/usage.rs`：cctv 的 `elfgate` 调用（原来是 `antigravity`）算进 elfClaw 的 elfgate 用量，模型名去掉思考档后缀（`gemini-3.8-flash-medium` → `gemini-3.8-flash`）。
+- 影响：
+  - 对话（带工具）不再能用 Claude / GPT-OSS，链变成官方 3.8 → 3.6 → 3.5-flash-lite；
+  - 不带工具的文字调用（新闻、摘要等）先走 elfgate。
+- 没改：`gemini.rs` 里给反代上 Claude / GPT 补 id 的代码和 `with_endpoint` 现在用不到了，但不影响运行，没动。
+- 测试：新增 elfgate 模型挑选、system 合并、图片、tools 不服务、错误码歇多久、NotServed 不歇、工具支持看后面条目。providers + cctv 共 710 个测试通过，改动行 clippy 无告警。

@@ -421,33 +421,42 @@ fn until_next_pacific_midnight(now: chrono::DateTime<chrono::Utc>) -> Duration {
 // gives operators a complete diagnostic trail; each attempt is also written to
 // the elfClaw log as it happens.
 
-/// elfClaw 2026-10-12: chain entry name of the Gemini-compatible proxy
-/// (`reliability.gemini_proxy_url`). It is tried first, for the requested
-/// model only; any failure rests it (see `proxy_rest`) and the request moves
-/// on to the official keys at once — its errors say nothing about the
-/// official API, so they neither mark a model overloaded nor touch the
-/// official quota records (its successful calls are counted under its own
-/// label, see `quota`).
-pub const GEMINI_PROXY_PROVIDER: &str = "gemini-proxy";
+/// elfClaw 2026-10-12: chain entry name of the gateway ahead of the official
+/// keys — since 2026-10-28 elfgate (`reliability.elfgate_url`, see
+/// `providers::elfgate`; before that the Antigravity Tools proxy). It is
+/// tried first, for the requested model only; a request it cannot take
+/// (`NotServed`: tools, an unlisted model) skips it quietly, any failure
+/// rests it (see `elfgate_rest`), and the request moves on to the official
+/// keys at once — its errors say nothing about the official API, so they
+/// neither mark a model overloaded nor touch the official quota records (its
+/// successful calls are counted under its own label, see `quota`).
+pub const ELFGATE_PROVIDER: &str = "elfgate";
 
-/// elfClaw 2026-10-20: models only the proxy serves — Antigravity Tools also
-/// offers Claude and GPT-OSS, which Google's API has never heard of. In the
-/// fallback chain such a model goes to the proxy alone (whatever its place),
-/// and the official keys are not asked for it.
+/// elfClaw 2026-10-20: models only elfgate serves — Claude and GPT-OSS,
+/// which Google's API has never heard of. In the fallback chain such a model
+/// goes to elfgate alone (whatever its place), and the official keys are not
+/// asked for it.
 pub(crate) fn proxy_only_model(model: &str) -> bool {
     model.starts_with("claude-") || model.starts_with("gpt-")
 }
 
-/// How long the proxy is left alone after a failure. Antigravity Tools
-/// reports how long its accounts are limited ("... Wait 62033s"); otherwise
-/// ten minutes. Capped at six hours.
-fn proxy_rest(err: &anyhow::Error) -> Duration {
+/// How long elfgate is left alone after a failure, by its error code
+/// (elfgate.md §6): `busy` (its 4 slots, shared with cctv and flight, are
+/// full) half a minute; `content_filtered` concerns this request only, no
+/// rest; agy errors and timeouts two minutes; out of quota, not reachable
+/// and the rest ten minutes.
+fn elfgate_rest(err: &anyhow::Error) -> Option<Duration> {
     let msg = err.to_string();
-    let waited = msg.find("Wait ").map(|i| &msg[i + 5..]).and_then(|rest| {
-        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
-        digits.parse::<u64>().ok()
-    });
-    Duration::from_secs(waited.unwrap_or(600).clamp(60, 6 * 3600))
+    let secs = if msg.contains("content_filtered") {
+        return None;
+    } else if msg.contains("\"busy\"") {
+        30
+    } else if msg.contains("backend_error") || msg.contains("\"timeout\"") || is_timeout(err) {
+        120
+    } else {
+        600
+    };
+    Some(Duration::from_secs(secs))
 }
 
 /// Provider wrapper with retry, fallback, and model failover. Multi-key
@@ -570,11 +579,11 @@ impl ReliableProvider {
         let has_proxy = self
             .providers
             .iter()
-            .any(|(name, _)| name == GEMINI_PROXY_PROVIDER);
+            .any(|(name, _)| name == ELFGATE_PROVIDER);
         for current_model in self.model_chain(model) {
             let proxy_only = has_proxy && proxy_only_model(current_model);
             for (provider_index, (provider_name, provider)) in self.providers.iter().enumerate() {
-                let is_proxy = provider_name == GEMINI_PROXY_PROVIDER;
+                let is_proxy = provider_name == ELFGATE_PROVIDER;
                 if is_proxy && current_model != model && !proxy_only {
                     continue;
                 }
@@ -639,20 +648,30 @@ impl ReliableProvider {
                         }
                         return Ok(resp);
                     }
-                    Err(e) if provider_name == GEMINI_PROXY_PROVIDER => {
-                        let rest = proxy_rest(&e);
+                    Err(e)
+                        if provider_name == ELFGATE_PROVIDER
+                            && e.downcast_ref::<super::elfgate::NotServed>().is_some() =>
+                    {
+                        // Not elfgate's kind of request (tools…): no failure.
+                        tracing::debug!(model = sent_model, "{e}");
+                        skipped[index] = true;
+                    }
+                    Err(e) if provider_name == ELFGATE_PROVIDER => {
+                        let rest = elfgate_rest(&e);
                         let error_detail = compact_error_detail(&e);
                         let status = http_status(&e);
                         tracing::warn!(
                             model = sent_model,
-                            rest_secs = rest.as_secs(),
+                            rest_secs = rest.map_or(0, |r| r.as_secs()),
                             error = %error_detail,
-                            "Gemini proxy failed; moving on down the chain"
+                            "elfgate failed; moving on down the chain"
                         );
-                        self.cooldowns.lock().insert(
-                            (provider_name.to_string(), sent_model.to_string()),
-                            Instant::now() + rest,
-                        );
+                        if let Some(rest) = rest {
+                            self.cooldowns.lock().insert(
+                                (provider_name.to_string(), sent_model.to_string()),
+                                Instant::now() + rest,
+                            );
+                        }
                         skipped[index] = true;
                         all_rate_limited = all_rate_limited && is_rate_limited(&e);
                         push_failure(
@@ -742,14 +761,14 @@ impl ReliableProvider {
                                 "Non-retryable error, skipping this entry from now on"
                             );
                             skipped[index] = true;
-                        } else if provider_name != GEMINI_PROXY_PROVIDER && is_timeout(&e) {
+                        } else if provider_name != ELFGATE_PROVIDER && is_timeout(&e) {
                             // Rest this model on every key, now and for the
                             // next requests; the chain moves on to the next
                             // model at once.
                             let until = Instant::now() + TIMED_OUT_MODEL_REST;
                             let mut cooldowns = self.cooldowns.lock();
                             for (i, &(other, _, other_model)) in entries.iter().enumerate() {
-                                if other_model == sent_model && other != GEMINI_PROXY_PROVIDER {
+                                if other_model == sent_model && other != ELFGATE_PROVIDER {
                                     skipped[i] = true;
                                     cooldowns.insert(
                                         (other.to_string(), other_model.to_string()),
@@ -839,8 +858,11 @@ impl Provider for ReliableProvider {
     }
 
     fn supports_native_tools(&self) -> bool {
+        // elfgate has no function calling but is never sent tools (it
+        // declines them): the chain's tool support is that of the rest.
         self.providers
-            .first()
+            .iter()
+            .find(|(name, _)| name != ELFGATE_PROVIDER)
             .map(|(_, p)| p.supports_native_tools())
             .unwrap_or(false)
     }
@@ -2481,7 +2503,7 @@ mod tests {
         let provider = ReliableProvider::new(
             vec![
                 (
-                    GEMINI_PROXY_PROVIDER.into(),
+                    ELFGATE_PROVIDER.into(),
                     Box::new(proxy.clone()) as Box<dyn Provider>,
                 ),
                 (
@@ -2541,7 +2563,7 @@ mod tests {
         let provider = ReliableProvider::new(
             vec![
                 (
-                    GEMINI_PROXY_PROVIDER.into(),
+                    ELFGATE_PROVIDER.into(),
                     Box::new(proxy_dead.clone()) as Box<dyn Provider>,
                 ),
                 (
@@ -2603,7 +2625,7 @@ mod tests {
         let provider = ReliableProvider::new(
             vec![
                 (
-                    GEMINI_PROXY_PROVIDER.into(),
+                    ELFGATE_PROVIDER.into(),
                     Box::new(proxy.clone()) as Box<dyn Provider>,
                 ),
                 (
@@ -2725,13 +2747,99 @@ mod tests {
     }
 
     #[test]
-    fn proxy_rest_follows_the_wait_it_reports() {
-        let wait = anyhow::anyhow!("503: 【网关调度受限】 All accounts limited. Wait 62033s");
-        assert_eq!(proxy_rest(&wait), Duration::from_secs(6 * 3600), "capped");
-        let short = anyhow::anyhow!("All accounts limited. Wait 900s");
-        assert_eq!(proxy_rest(&short), Duration::from_secs(900));
-        let other = anyhow::anyhow!("connection refused");
-        assert_eq!(proxy_rest(&other), Duration::from_secs(600));
+    fn elfgate_rest_follows_its_error_code() {
+        let err = |body: &str| anyhow::anyhow!("elfgate API error ({body}");
+        let busy = err(
+            r#"429 Too Many Requests): {"error":{"message":"queue full","type":"rate_limit","code":"busy"}}"#,
+        );
+        assert_eq!(elfgate_rest(&busy), Some(Duration::from_secs(30)));
+        let filtered = err(r#"502 Bad Gateway): {"error":{"code":"content_filtered"}}"#);
+        assert_eq!(elfgate_rest(&filtered), None, "this request only");
+        let backend = err(r#"502 Bad Gateway): {"error":{"code":"backend_error"}}"#);
+        assert_eq!(elfgate_rest(&backend), Some(Duration::from_secs(120)));
+        let quota = err(r#"429 Too Many Requests): {"error":{"code":"quota_low"}}"#);
+        assert_eq!(elfgate_rest(&quota), Some(Duration::from_secs(600)));
+        let down = anyhow::anyhow!("error sending request: connection refused");
+        assert_eq!(elfgate_rest(&down), Some(Duration::from_secs(600)));
+    }
+
+    /// elfgate declining every request (as it does tools).
+    struct DecliningMock {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Provider for DecliningMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(crate::providers::elfgate::NotServed("tools").into())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_request_elfgate_declines_goes_on_without_resting_it() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let key_a = Arc::new(ScriptedModelMock {
+            script: [("m-a", vec![Ok("one"), Ok("two")])].into_iter().collect(),
+            seen: parking_lot::Mutex::new(Vec::new()),
+        });
+        let provider = ReliableProvider::new(
+            vec![
+                (
+                    ELFGATE_PROVIDER.into(),
+                    Box::new(DecliningMock {
+                        calls: calls.clone(),
+                    }) as Box<dyn Provider>,
+                ),
+                (
+                    "gemini".into(),
+                    Box::new(key_a.clone()) as Box<dyn Provider>,
+                ),
+            ],
+            2,
+            1,
+        );
+        assert_eq!(provider.simple_chat("hi", "m-a", 0.0).await.unwrap(), "one");
+        assert_eq!(provider.simple_chat("hi", "m-a", 0.0).await.unwrap(), "two");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "asked again: declining is not a failure"
+        );
+    }
+
+    #[test]
+    fn tool_support_is_that_of_the_entries_behind_elfgate() {
+        let provider = ReliableProvider::new(
+            vec![
+                (
+                    ELFGATE_PROVIDER.into(),
+                    Box::new(crate::providers::elfgate::ElfgateProvider::new(
+                        "http://127.0.0.1:9/v1",
+                        None,
+                    )) as Box<dyn Provider>,
+                ),
+                (
+                    "gemini".into(),
+                    Box::new(NativeToolMock {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        fail_until_attempt: 0,
+                        response_text: "ok",
+                        tool_calls: Vec::new(),
+                        error: "",
+                    }) as Box<dyn Provider>,
+                ),
+            ],
+            0,
+            1,
+        );
+        assert!(provider.supports_native_tools());
     }
 
     #[tokio::test]
