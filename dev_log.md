@@ -8222,3 +8222,16 @@ cctv 走中转的调用记为 `provider = antigravity`。
 - 验证：
   - `cargo test --lib` 4290 个通过，0 失败；
   - clippy 在改动行上没有新告警。
+
+## 2026-10-28 cctv 先推后改（接口 v1.15.22 §5.1）
+
+cctv 改为院子里一看到没认出的人就先推（level 2、`provisional = true`），之后同一个 event_id 会升级、改判、出结论。按之前和 cctv 商定的 a–d 处理：
+
+- `src/cctv/api.rs`：`Event` 加 `provisional`（布尔）、`rev`（同一事件第几条）。
+- `src/cctv/format.rs`：`provisional` 时正文多一行"（识别中，结果出来会更新这条）"；新增 `upgrade()`，升级回复里这行改成"（还在识别，结果会更新在上面那条）"（回复本身不会再改）。
+- `src/cctv/store.rs`：新表 `revs`，`newer_rev(id, rev)` 只放行比已处理过的更新的 rev（14 天清理）。
+- `src/cctv/worker.rs`：
+  - alarm/system/recovery 先查 rev，旧的或重复的直接丢弃；
+  - `provisional` 时不放「🏷 标注」（首推记 NOTAG，结论 `provisional = false` 到了再查有没有人/车，有就补上按钮）；
+  - 升级：原消息照旧改成最新状态，另回复一条"⬆️ 升级"（level 3 响铃，打电话只看 `call`）；降级改原消息、只改描述静默改原消息，沿用原逻辑。
+- 测试：`provisional_pushes_say_they_will_be_updated`、`newer_rev` 断言、provisional 不出标注按钮断言。cctv 模块 38 个测试全过，改动行 clippy 无警告。

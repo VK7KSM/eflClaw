@@ -72,6 +72,11 @@ impl Store {
                  report_id INTEGER PRIMARY KEY,
                  at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
              );
+             CREATE TABLE IF NOT EXISTS revs (
+                 event_id INTEGER PRIMARY KEY,
+                 rev INTEGER NOT NULL,
+                 at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+             );
              CREATE TABLE IF NOT EXISTS jobs (
                  job_id TEXT PRIMARY KEY,
                  chat TEXT NOT NULL,
@@ -283,6 +288,18 @@ impl Store {
     }
 
     /// Forget events older than two weeks (their clips are long gone).
+    /// Is `rev` newer than any update of event `id` handled so far? Records
+    /// it when it is (contract v1.15.22: an older update arriving late is
+    /// dropped).
+    pub fn newer_rev(&self, event_id: i64, rev: i64) -> Result<bool> {
+        let changed = self.conn.lock().execute(
+            "INSERT INTO revs (event_id, rev) VALUES (?1, ?2)
+             ON CONFLICT(event_id) DO UPDATE SET rev = ?2 WHERE rev < ?2",
+            params![event_id, rev],
+        )?;
+        Ok(changed > 0)
+    }
+
     pub fn prune(&self) -> Result<()> {
         self.conn.lock().execute_batch(
             "DELETE FROM messages WHERE event_id IN
@@ -291,6 +308,7 @@ impl Store {
              DELETE FROM reports WHERE at < datetime('now', '-14 days');
              DELETE FROM replies WHERE at < datetime('now', '-14 days');
              DELETE FROM flags WHERE at < datetime('now', '-14 days');
+             DELETE FROM revs WHERE at < datetime('now', '-14 days');
              DELETE FROM jobs WHERE at < datetime('now', '-2 days');",
         )?;
         Ok(())
@@ -308,6 +326,12 @@ mod tests {
         assert_eq!(s.get("cursor").unwrap(), None);
         s.set("cursor", "10240").unwrap();
         assert_eq!(s.get("cursor").unwrap().as_deref(), Some("10240"));
+
+        assert!(s.newer_rev(7, 1).unwrap());
+        assert!(s.newer_rev(7, 3).unwrap());
+        assert!(!s.newer_rev(7, 2).unwrap(), "an older update is dropped");
+        assert!(!s.newer_rev(7, 3).unwrap(), "so is the same one again");
+        assert!(s.newer_rev(8, 1).unwrap());
 
         assert_eq!(s.pushed(7).unwrap(), None);
         let p = Pushed {

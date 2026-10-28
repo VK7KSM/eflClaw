@@ -20,6 +20,12 @@
 //!   used to be deleted, which read as "pushed, then vanished"); one that
 //!   rang the phone keeps its feedback buttons and is marked as a likely
 //!   false alarm;
+//! - "先推后改" (v1.15.22 §5.1, agreed 2026-10-28): someone in the yard is
+//!   pushed at once as a provisional level 2 and the same push follows the
+//!   AI — a rise edits it and replies "⬆️ 升级", a drop or a new description
+//!   edits it silently; while provisional it says so and has no "🏷 标注"
+//!   (added with the conclusion). Updates older than one handled (`rev`)
+//!   are dropped;
 //! - a chat that sent `/cctv_off` gets none of this until `/cctv_on`, except
 //!   the alarms that also ring the phone (confirmed intrusion, cameras down).
 
@@ -281,7 +287,15 @@ async fn monitoring_down(ctx: &Ctx, calls: bool) -> Vec<Sent> {
 
 async fn handle(ctx: &Ctx, store: &Store, e: Event) -> Result<()> {
     match e.kind.as_str() {
-        "alarm" | "system" | "recovery" => handle_event(ctx, store, &e).await,
+        "alarm" | "system" | "recovery" => {
+            if let (Some(id), Some(rev)) = (e.event_id, e.rev) {
+                if !store.newer_rev(id, rev)? {
+                    tracing::debug!(event = id, rev, "stale CCTV update dropped");
+                    return Ok(());
+                }
+            }
+            handle_event(ctx, store, &e).await
+        }
         "report" => handle_report(ctx, store, &e).await,
         "clip_ready" => {
             if let Some(job) = e.job_id.as_deref() {
@@ -335,7 +349,9 @@ async fn handle_event(ctx: &Ctx, store: &Store, e: &Event) -> Result<()> {
         let silent = e.kind == "recovery" || (e.level == 2 && quiet);
         let caption = format::caption(e, false);
         let started = Instant::now();
-        let taggable = e.kind == "alarm" && has_targets(ctx, id).await;
+        // While provisional the people are not known yet: "标注" comes
+        // with the conclusion.
+        let taggable = e.kind == "alarm" && !e.provisional && has_targets(ctx, id).await;
         if !taggable {
             store.set_flag(id, NOTAG)?;
         }
@@ -430,7 +446,7 @@ async fn handle_event(ctx: &Ctx, store: &Store, e: &Event) -> Result<()> {
         if phone {
             store.set_flag(id, CALLED)?;
         }
-        let text = format!("⬆️ 升级：{}", format::caption(e, false));
+        let text = format::upgrade(e);
         let buttons = push_buttons(
             e,
             &key,
@@ -488,6 +504,7 @@ async fn handle_event(ctx: &Ctx, store: &Store, e: &Event) -> Result<()> {
     // An alarm the AI timed out on is pushed before its people and vehicles
     // are saved; they come with a later update — then "标注" is added.
     let tag_added = e.kind == "alarm"
+        && !e.provisional
         && store.has_flag(id, NOTAG)
         && has_targets(ctx, id).await
         && store.clear_flag(id, NOTAG).is_ok();
@@ -530,7 +547,7 @@ fn push_buttons(e: &Event, key: &str, taggable: bool, called: bool, answered: bo
     if called && !answered {
         rows.push(feedback_row(key));
     }
-    rows.extend(plain_buttons(camera, taggable, !called));
+    rows.extend(plain_buttons(camera, taggable && !e.provisional, !called));
     rows
 }
 
@@ -901,6 +918,15 @@ mod tests {
         assert_eq!(
             labels(&push_buttons(&alarm, "e7", false, false, false)),
             ["🏠 我在家"]
+        );
+        let early = Event {
+            provisional: true,
+            ..alarm.clone()
+        };
+        assert_eq!(
+            labels(&push_buttons(&early, "e7", true, false, false)),
+            ["🏠 我在家"],
+            "no 标注 while the AI is still looking"
         );
         assert!(
             plain_buttons(None, true, true).is_empty(),

@@ -118,6 +118,13 @@ pub struct Event {
     /// is off); `None` otherwise.
     #[serde(default)]
     pub call_blocked: Option<String>,
+    /// v1.15.22 §5.1: an early push or a mid-way update — the AI is still
+    /// looking, its conclusion follows as a later update (`false`).
+    #[serde(default)]
+    pub provisional: bool,
+    /// v1.15.22: the how-manieth stream entry of this event_id (from 1).
+    #[serde(default)]
+    pub rev: Option<i64>,
     /// `kind = "report"` (v1.8): cctv's own summary of a period — no
     /// event id, snapshot or clip; deduplicated by `report_id`.
     #[serde(default)]

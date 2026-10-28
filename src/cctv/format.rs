@@ -35,6 +35,11 @@ fn target_zh(target: Option<&str>) -> Option<&'static str> {
 
 const MAX_DESCRIPTION: usize = 800;
 
+/// Under a push while cctv's AI is still looking (v1.15.22 §5.1).
+const PROVISIONAL_NOTE: &str = "（识别中，结果出来会更新这条）";
+/// The same under the "⬆️ 升级" reply, which is not updated itself.
+const PROVISIONAL_UPGRADE_NOTE: &str = "（还在识别，结果会更新在上面那条）";
+
 /// The caption of an event push. `false_alarm` adds the AI's verdict.
 pub fn caption(e: &Event, false_alarm: bool) -> String {
     let what = e
@@ -69,6 +74,9 @@ pub fn caption(e: &Event, false_alarm: bool) -> String {
     } else if let Some(t) = target_zh(e.target.as_deref()) {
         lines.push(t.to_string());
     }
+    if e.provisional {
+        lines.push(PROVISIONAL_NOTE.to_string());
+    }
     if let Some(n) = e.offline_cameras.filter(|n| *n > 0) {
         lines.push(format!("现在共 {n} 台摄像头连不上"));
     }
@@ -85,6 +93,12 @@ pub fn caption(e: &Event, false_alarm: bool) -> String {
         lines.push(url.to_string());
     }
     lines.join("\n")
+}
+
+/// The reply pushed when an event's level rises; the push it answers is
+/// edited to the same state.
+pub fn upgrade(e: &Event) -> String {
+    format!("⬆️ 升级：{}", caption(e, false)).replace(PROVISIONAL_NOTE, PROVISIONAL_UPGRADE_NOTE)
 }
 
 /// Longest report text pushed (a Telegram message holds 4096 characters).
@@ -205,6 +219,31 @@ mod tests {
             web_url: Some("https://cctv.example/#/events/1".into()),
             ..Event::default()
         }
+    }
+
+    #[test]
+    fn provisional_pushes_say_they_will_be_updated() {
+        let early = Event {
+            level: 2,
+            provisional: true,
+            description: Some("院子里有人，正在识别是谁".into()),
+            ..alarm()
+        };
+        let c = caption(&early, false);
+        assert!(c.contains("院子里有人，正在识别是谁\n（识别中，结果出来会更新这条）"));
+        let up = upgrade(&Event {
+            level: 3,
+            ..early.clone()
+        });
+        assert!(up.starts_with("⬆️ 升级：🚨"));
+        assert!(up.contains("（还在识别，结果会更新在上面那条）"));
+        assert!(!up.contains("更新这条"));
+        let done = Event {
+            provisional: false,
+            description: Some("1 个陌生人（看不到脸）".into()),
+            ..early
+        };
+        assert!(!caption(&done, false).contains("识别中"));
     }
 
     #[test]
