@@ -84,16 +84,38 @@ impl Ctx {
     }
 }
 
-/// Does this event call for the phone? Since v1.15 cctv says so in
-/// `call`; older events fall back to the user's rule as inferred before.
+/// Does this event call for the phone? Only cctv's `call` decides (v1.15);
+/// since v1.15.21 it is also `false` while the owner's call switch is off.
+/// An event without it never rings: no inference of our own (2026-10-28,
+/// "打电话的警报不要轻易启用").
 pub fn needs_phone(e: &Event) -> bool {
-    if let Some(call) = e.call {
-        return call;
+    e.call == Some(true)
+}
+
+/// kv key: the call switch as last read from cctv ("on" / "off").
+const CALL_SWITCH: &str = "call_switch";
+
+/// Remember the call switch (panel presses, periodic reads), so that the
+/// one call elfClaw decides itself — cctv unreachable — follows it too.
+pub(super) fn remember_call_switch(store: &Store, enabled: bool) {
+    let _ = store.set(CALL_SWITCH, if enabled { "on" } else { "off" });
+}
+
+/// Calls are off unless cctv last said they are on (the owner's default).
+fn calls_enabled(store: &Store) -> bool {
+    store.get(CALL_SWITCH).ok().flatten().as_deref() == Some("on")
+}
+
+/// Keep the remembered call switch current while cctv is reachable.
+async fn track_call_switch(api: CctvApi, workspace: std::path::PathBuf) {
+    loop {
+        if let (Ok(v), Ok(store)) = (api.call_switch().await, Store::open(&workspace)) {
+            if let Some(on) = v["enabled"].as_bool() {
+                remember_call_switch(&store, on);
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(300)).await;
     }
-    (e.kind == "alarm" && e.intrusion_confirmed)
-        || (e.kind == "system"
-            && e.cause.as_deref() == Some("Device offline")
-            && e.offline_cameras.is_some_and(|n| n >= 2))
 }
 
 pub async fn run(ctx: Arc<Ctx>, store: Store) -> Result<()> {
@@ -102,6 +124,7 @@ pub async fn run(ctx: Arc<Ctx>, store: Store) -> Result<()> {
     let mut down_notice: Vec<Sent> = Vec::new();
     let mut last_prune = Instant::now();
     tracing::info!(?cursor, "CCTV worker started");
+    tokio::spawn(track_call_switch(ctx.api.clone(), ctx.workspace.clone()));
     loop {
         if let Err(e) = morning_summary(&ctx, &store).await {
             tracing::warn!("CCTV morning summary failed: {e:#}");
@@ -164,7 +187,7 @@ pub async fn run(ctx: Arc<Ctx>, store: Store) -> Result<()> {
                 let since = *failing_since.get_or_insert_with(Instant::now);
                 tracing::warn!("CCTV stream failed: {e:#}");
                 if since.elapsed() >= DOWN_AFTER && down_notice.is_empty() {
-                    down_notice = monitoring_down(&ctx).await;
+                    down_notice = monitoring_down(&ctx, calls_enabled(&store)).await;
                 }
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
@@ -212,12 +235,18 @@ async fn broadcast(ctx: &Ctx, chats: &[String], text: &str, silent: bool) -> Vec
     sent
 }
 
-/// cctv-server unreachable: every camera is effectively down — a highest alarm.
-async fn monitoring_down(ctx: &Ctx) -> Vec<Sent> {
+/// cctv-server unreachable: every camera is effectively down — a highest
+/// alarm. It rings the phone only while the call switch was last seen on.
+async fn monitoring_down(ctx: &Ctx, calls: bool) -> Vec<Sent> {
     let key = format!("down{}", Utc::now().timestamp());
-    let text = "🚨 监控服务连不上已超过 3 分钟（所有摄像头都看不到了）";
+    let phone = calls && ctx.alarm.is_some();
+    let text = if calls {
+        "🚨 监控服务连不上已超过 3 分钟（所有摄像头都看不到了）"
+    } else {
+        "🚨 监控服务连不上已超过 3 分钟（所有摄像头都看不到了）\n📵 电话通知关着，没打电话"
+    };
     // The call this rings gets the same feedback as any other call.
-    let buttons = if ctx.alarm.is_some() {
+    let buttons = if phone {
         vec![feedback_row(&key)]
     } else {
         Vec::new()
@@ -239,7 +268,7 @@ async fn monitoring_down(ctx: &Ctx) -> Vec<Sent> {
             Err(e) => tracing::warn!("CCTV down notice not delivered: {e:#}"),
         }
     }
-    if let Some(line) = &ctx.alarm {
+    if let Some(line) = ctx.alarm.as_ref().filter(|_| phone) {
         alarm::start(
             line.clone(),
             key,
@@ -900,34 +929,32 @@ mod tests {
     }
 
     #[test]
-    fn only_confirmed_intrusions_and_multi_camera_outages_ring_the_phone() {
+    fn only_cctvs_call_rings_the_phone() {
         let alarm = Event {
             kind: "alarm".into(),
             level: 3,
             intrusion_confirmed: true,
             ..Event::default()
         };
-        assert!(needs_phone(&alarm));
-        assert!(!needs_phone(&Event {
-            intrusion_confirmed: false,
+        // No `call`: nothing of our own is inferred any more.
+        assert!(!needs_phone(&alarm));
+        assert!(needs_phone(&Event {
+            call: Some(true),
             ..alarm.clone()
         }));
-        let off = Event {
-            kind: "system".into(),
-            level: 3,
-            cause: Some("Device offline".into()),
-            offline_cameras: Some(2),
-            ..Event::default()
-        };
-        assert!(needs_phone(&off));
+        // The call switch off: cctv sends `call = false`.
         assert!(!needs_phone(&Event {
-            offline_cameras: Some(1),
-            ..off.clone()
+            call: Some(false),
+            call_blocked: Some("电话通知关着，没打电话：确认闯入".into()),
+            ..alarm
         }));
-        assert!(!needs_phone(&Event {
-            cause: Some("Disk error".into()),
-            ..off
-        }));
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        assert!(!calls_enabled(&store), "off until cctv says on");
+        remember_call_switch(&store, true);
+        assert!(calls_enabled(&store));
+        remember_call_switch(&store, false);
+        assert!(!calls_enabled(&store));
         assert_eq!(
             requested_secs(
                 Some("2026-10-14T14:00:00+11:00"),

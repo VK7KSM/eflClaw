@@ -74,7 +74,7 @@ fn alarm_line(
 
 pub const MUTE_REPLY: &str =
     "🔕 已停止向这个对话推送监控报警（摄像头照常布防、录像，cctv 自己的 ntfy 推送不受影响）。
-确认有人闯入、多台摄像头掉线这类会打电话的最高级报警仍然会推送。
+电话通知开着时，确认有人闯入这类会打电话的报警仍然会推送。
 恢复：/cctv_on";
 pub const UNMUTE_REPLY: &str = "🔔 已恢复向这个对话推送监控报警。";
 

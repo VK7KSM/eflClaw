@@ -8164,3 +8164,33 @@ cctv 走中转的调用记为 `provider = antigravity`。
   - cctv 单测 35 个通过；
   - `cargo test --lib` 只有偶发失败的 `message_dispatch_processes_messages_in_parallel` 失败一次，单独重跑通过；
   - clippy 在改动行上没有新告警。
+
+## 2026-10-28 底部面板：「📞 电话通知」开关、「🏠 在家/出门」（cctv 接口约定 v1.15.21 §15.1）
+
+用户原话（经 cctv 转达）："打电话的警报不要轻易启用，请在 telegram 输入框下面的按钮区新建一个'电话通知'按钮，替换目前的'我出门'按钮。将'我在家'按钮改为'在家/出门'，点击该按钮后生成消息选项，再设置出门和在家状态。……选了'关闭'后，即使有入侵类报警，也不打电话。且默认是关闭的。"
+
+开关存在 cctv 一侧，默认关闭，不会自己到期。关着时，事件流里所有事件都是 `call = false`；本来要打电话的会带 `call_blocked`，说明为什么没打。
+
+- `cctv/api.rs`：
+  - `Event` 加 `call_blocked`；
+  - 新增 `presence_state()`（GET /presence）、`call_switch()`（GET）、`set_call_switch(enabled, account)`（POST）。
+- `cctv/panel.rs`：
+  - 第 4 行按钮改为「🏠 在家/出门 | 📞 电话通知 | 📡 天线」；`PANEL_VERSION` 改为 2026-10-28，重启后给两个账号各重发一次新键盘。
+  - 旧的「🏠 我在家」「🚪 我出门」文字仍然能用，键盘没刷新前按了也不会交给模型。
+  - 「📞 电话通知」：显示当前状态（谁、从什么时候起），下面是「📞 启用 / 🔕 关闭」；选了就调 POST，把 cctv 的 `note` 和新状态改写在这条消息上。
+  - 「🔔 推送」的说明改为"电话通知开着时，会打电话的报警停了推送也照样推"。
+- `cctv/home.rs`：
+  - 「在家/出门」先显示 cctv 记录的当前状态（cctv 没响应时用 elfClaw 自己记的），再给「30 分钟 / 1 小时 / 2 小时 / 4 小时」和单独一行的「🚪 出门」。
+  - 新增回调 `cctv_away`；时长选项加了 1 小时。
+- `cctv/worker.rs`：
+  - `needs_phone` 只看 `call == Some(true)`，去掉自己根据 `intrusion_confirmed`、`offline_cameras` 的推断（cctv 要求"都只看 call"）。
+  - elfClaw 自己决定的那一路电话（cctv 连不上超过 3 分钟）也听开关：
+    - 后台每 5 分钟读一次 `call_switch` 存进 cctv.db；面板查看或切换时也会更新；
+    - 连不上时按最后一次读到的状态处理，从没读到过就按关闭；
+    - 关着时照样推送并响铃，但不打电话，消息里注明"📵 电话通知关着，没打电话"。
+- `cctv/format.rs`：推送里有 `call_blocked` 时加一行"📵 …"。
+- `cctv/mod.rs`：`/cctv_off` 的回复同步改写。
+- 新增单测：只看 `call`、开关记忆默认关、电话通知文字和按钮、在家 / 出门状态文字、4 个时长加出门、新键盘布局。
+- 验证：
+  - `cargo test --lib` 4287 个通过，0 失败；
+  - clippy 在改动行上没有新告警。

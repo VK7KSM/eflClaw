@@ -114,6 +114,10 @@ pub struct Event {
     pub call: Option<bool>,
     #[serde(default)]
     pub call_rule: Option<String>,
+    /// v1.15.21: why a call the rules wanted was not made (the call switch
+    /// is off); `None` otherwise.
+    #[serde(default)]
+    pub call_blocked: Option<String>,
     /// `kind = "report"` (v1.8): cctv's own summary of a period — no
     /// event id, snapshot or clip; deduplicated by `report_id`.
     #[serde(default)]
@@ -910,6 +914,27 @@ impl CctvApi {
     }
 
     /// "我出门": nobody home from now on (v1.14).
+    /// Who is home now, as cctv has it (v1.14 §15): `home`, `since`,
+    /// `until`, `by`, `account`, `away_since`.
+    pub async fn presence_state(&self) -> Result<serde_json::Value> {
+        self.get_json("presence", Duration::from_secs(10)).await
+    }
+
+    /// The call switch (v1.15.21 §15.1): `enabled`, `since`, `by`, `account`.
+    pub async fn call_switch(&self) -> Result<serde_json::Value> {
+        self.get_json("call_switch", Duration::from_secs(10)).await
+    }
+
+    /// Switch phone calls on or off; returns cctv's reply (`call_switch`,
+    /// `note` to pass on).
+    pub async fn set_call_switch(&self, enabled: bool, account: &str) -> Result<serde_json::Value> {
+        self.post_json(
+            "call_switch",
+            &who(serde_json::json!({ "enabled": enabled }), account),
+        )
+        .await
+    }
+
     pub async fn presence_away(&self, account: &str) -> Result<()> {
         let _: serde_json::Value = self
             .post_json(

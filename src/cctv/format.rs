@@ -75,6 +75,9 @@ pub fn caption(e: &Event, false_alarm: bool) -> String {
     if false_alarm {
         lines.push("（AI 判断可能是误报）".to_string());
     }
+    if let Some(b) = e.call_blocked.as_deref().filter(|b| !b.trim().is_empty()) {
+        lines.push(format!("📵 {}", b.trim()));
+    }
     if let Some(start) = e.start.as_deref() {
         lines.push(format!("时间 {}", clock(start)));
     }

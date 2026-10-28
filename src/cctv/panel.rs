@@ -8,7 +8,11 @@
 //!
 //! Camera buttons carry no icon: on an iPhone the names then fit on one
 //! line (owner's request 2026-10-20).
-//! | 🏠 我在家 | 🚪 我出门 | 📡 天线 |
+//! | 🏠 在家/出门 | 📞 电话通知 | 📡 天线 |
+//!
+//! 2026-10-28 (owner): "我出门" became "📞 电话通知" — phone calls are off
+//! unless switched on there (cctv keeps the switch) — and "我在家" became
+//! "🏠 在家/出门", one message offering both.
 //!
 //! - a camera button sends its live picture captioned first with cctv's own
 //!   one-line account of who and whose car is there (`/monitors/{id}/now`;
@@ -36,8 +40,12 @@ const STATUS: &str = "📊 状态";
 const ARM: &str = "🛡 布防";
 const PUSH: &str = "🔔 推送";
 const OTHER: &str = "其它摄像头";
-const HOME: &str = "🏠 我在家";
-const AWAY: &str = "🚪 我出门";
+const HOME: &str = "🏠 在家/出门";
+const CALL: &str = "📞 电话通知";
+/// The buttons these replaced, still answered for keyboards not yet
+/// refreshed.
+const OLD_HOME: &str = "🏠 我在家";
+const OLD_AWAY: &str = "🚪 我出门";
 const ANTENNA: &str = "📡 天线";
 /// The cameras with a button of their own (owner's choice).
 const KEY_CAMERAS: [&str; 5] = [
@@ -50,7 +58,7 @@ const KEY_CAMERAS: [&str; 5] = [
 /// Callback data prefix of the panel's inline buttons.
 const P: &str = "cctv_p:";
 /// Shown once to each account whenever this changes.
-const PANEL_VERSION: &str = "2026-10-20b";
+const PANEL_VERSION: &str = "2026-10-28";
 
 struct Panel {
     api: CctvApi,
@@ -73,7 +81,7 @@ pub fn keyboard() -> Vec<Vec<String>> {
         vec![STATUS.into(), ARM.into(), PUSH.into()],
         cams[..3].to_vec(),
         vec![cams[3].clone(), cams[4].clone(), OTHER.into()],
-        vec![HOME.into(), AWAY.into(), ANTENNA.into()],
+        vec![HOME.into(), CALL.into(), ANTENNA.into()],
     ]
 }
 
@@ -84,7 +92,11 @@ pub fn register_buttons(config: &crate::config::Config) {
         return;
     }
     let send_to = config.cctv.send_to.clone();
-    for text in keyboard().into_iter().flatten() {
+    let texts = keyboard()
+        .into_iter()
+        .flatten()
+        .chain([OLD_HOME.to_string(), OLD_AWAY.to_string()]);
+    for text in texts {
         let send_to = send_to.clone();
         let label = text.clone();
         crate::channels::telegram::register_text_command(
@@ -156,8 +168,8 @@ fn press(label: &str, chat: &str, sender: &str, send_to: &[String]) -> String {
         return "这个对话不接收监控推送。".into();
     }
     match label {
-        HOME => return super::home::menu_home(chat),
-        AWAY => return super::home::menu_away(chat, sender),
+        HOME | OLD_HOME => return super::home::menu_home(chat),
+        OLD_AWAY => return super::home::menu_away(chat, sender),
         _ => {}
     }
     let Some(p) = PANEL.get() else {
@@ -171,6 +183,7 @@ fn press(label: &str, chat: &str, sender: &str, send_to: &[String]) -> String {
             PUSH => show_push(p, &chat).await,
             OTHER => show_other(p, &chat).await,
             ANTENNA => show_antenna(p, &chat).await,
+            CALL => show_call(p, &chat).await,
             cam if KEY_CAMERAS.contains(&cam) => snap_by_name(p, &chat, cam).await,
             _ => Ok(()),
         };
@@ -194,6 +207,51 @@ fn quiet(buttons: Buttons) -> SendOpts {
 
 fn data(rest: &str) -> String {
     format!("{P}{rest}")
+}
+
+// ── 电话通知 ────────────────────────────────────────────────────────────
+
+/// The call switch (cctv v1.15.21 §15.1) in one message.
+fn call_text(v: &Value, tz: Tz) -> String {
+    let on = v["enabled"].as_bool() == Some(true);
+    let mut out = format!("📞 电话通知：现在{}", if on { "启用" } else { "关闭" });
+    let since = v["since"]
+        .as_str()
+        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+        .map(|t| t.with_timezone(&tz).format("%m-%d %H:%M").to_string());
+    match (since, v["account"].as_str().filter(|a| !a.is_empty())) {
+        (Some(t), Some(a)) => {
+            let _ = write!(out, "（{t} 起，{a} 设的）");
+        }
+        (Some(t), None) => {
+            let _ = write!(out, "（{t} 起）");
+        }
+        _ => out.push_str("（默认关闭）"),
+    }
+    out.push_str(if on {
+        "\n入侵类报警（确认有人闯入）会打电话。"
+    } else {
+        "\n关着时，即使有入侵类报警也不打电话，只在这里推送。"
+    });
+    out
+}
+
+fn call_buttons() -> Buttons {
+    vec![vec![
+        ("📞 启用".into(), data("call:on")),
+        ("🔕 关闭".into(), data("call:off")),
+    ]]
+}
+
+async fn show_call(p: &Panel, chat: &str) -> Result<()> {
+    let v = p.api.call_switch().await?;
+    if let (Some(on), Ok(store)) = (v["enabled"].as_bool(), Store::open(&p.workspace)) {
+        super::worker::remember_call_switch(&store, on);
+    }
+    p.bot
+        .send_text(chat, &call_text(&v, p.tz), &quiet(call_buttons()))
+        .await?;
+    Ok(())
 }
 
 // ── 状态 ────────────────────────────────────────────────────────────────
@@ -434,7 +492,9 @@ fn push_text(p: &Panel, chat: &str) -> String {
     for other in p.send_to.iter().filter(|c| c.trim() != chat) {
         let _ = write!(out, "\n另一个账号：{}", state(other.trim()));
     }
-    out.push_str("\n（会打电话的最高级报警，停了推送也照样推。）");
+    out.push_str(
+        "\n（电话通知开着时，会打电话的报警停了推送也照样推；电话通知在「📞 电话通知」里开关。）",
+    );
     out
 }
 
@@ -608,6 +668,7 @@ fn on_press(press: &CallbackPress<'_>) -> Option<CallbackAnswer> {
         "arm:on" | "arm:offok" => "正在设置…",
         "arm:cancel" => "已取消",
         "push:on" | "push:off" => "已设置",
+        "call:on" | "call:off" => "正在设置…",
         r if r.starts_with("snap:") => "正在取画面…",
         r if r.starts_with("clip:") => "开始录 15 秒…",
         r if r.starts_with("track:") => "正在设置…",
@@ -683,6 +744,23 @@ async fn handle(p: &Panel, rest: &str, chat: &str, message: i64, account: &str) 
                     &format!("已取消，布防不变。\n{}", arm_text(&v)),
                     false,
                     &arm_buttons(),
+                )
+                .await
+        }
+        "call:on" | "call:off" => {
+            let r = p.api.set_call_switch(rest == "call:on", account).await?;
+            let state = &r["call_switch"];
+            if let (Some(on), Ok(store)) = (state["enabled"].as_bool(), Store::open(&p.workspace)) {
+                super::worker::remember_call_switch(&store, on);
+            }
+            let note = r["note"].as_str().unwrap_or("已设置");
+            p.bot
+                .edit(
+                    chat,
+                    message,
+                    &format!("{note}\n\n{}", call_text(state, p.tz)),
+                    false,
+                    &call_buttons(),
                 )
                 .await
         }
@@ -772,7 +850,7 @@ mod tests {
         assert_eq!(k[0], ["📊 状态", "🛡 布防", "🔔 推送"]);
         assert_eq!(k[1], ["Garage front", "Front yard fix", "Front yard"]);
         assert_eq!(k[2], ["Garage Back", "Back yard", "其它摄像头"]);
-        assert_eq!(k[3], ["🏠 我在家", "🚪 我出门", "📡 天线"]);
+        assert_eq!(k[3], ["🏠 在家/出门", "📞 电话通知", "📡 天线"]);
         for (_, d) in arm_buttons()
             .iter()
             .flatten()
@@ -780,6 +858,22 @@ mod tests {
         {
             assert!(d.len() <= 64);
         }
+    }
+
+    #[test]
+    fn call_switch_reads_naturally() {
+        let tz: Tz = "Australia/Sydney".parse().unwrap();
+        let off = json!({"enabled": false, "since": null, "by": null, "account": null});
+        assert_eq!(
+            call_text(&off, tz),
+            "📞 电话通知：现在关闭（默认关闭）\n关着时，即使有入侵类报警也不打电话，只在这里推送。"
+        );
+        let on = json!({"enabled": true, "since": "2026-10-28T13:05:00+11:00", "by": "telegram", "account": "zeroclaw_user"});
+        assert_eq!(
+            call_text(&on, tz),
+            "📞 电话通知：现在启用（10-28 13:05 起，zeroclaw_user 设的）\n入侵类报警（确认有人闯入）会打电话。"
+        );
+        assert_eq!(call_buttons()[0][0].1, "cctv_p:call:on");
     }
 
     #[test]

@@ -10,6 +10,8 @@
 //!   phone) also deletes that push and its replies in every chat, and the
 //!   clips of alarms pushed before the press are not sent any more.
 //! - cctv is told (`/presence`, v1.14) and only records and shows it.
+//! - The panel's "🏠 在家/出门" (owner 2026-10-28) shows cctv's current
+//!   state and offers 30 minutes / 1 / 2 / 4 hours or "出门" in one message.
 
 use super::api::CctvApi;
 use super::store::Store;
@@ -28,7 +30,9 @@ const HOME_FOR_PREFIX: &str = "cctv_homefor:";
 /// Event flag: the owner dismissed this alarm.
 pub const DISMISSED: &str = "dismissed";
 /// The durations offered, in minutes; the first is the default.
-const CHOICES: [i64; 3] = [30, 120, 240];
+const CHOICES: [i64; 4] = [30, 60, 120, 240];
+/// Callback data of the "🚪 出门" choice.
+const AWAY_DATA: &str = "cctv_away";
 const MAX_MINUTES: i64 = 240;
 /// kv keys: until when someone is home (RFC 3339), who said so, when the
 /// last "我在家" was pressed (SQLite time, compared with `pushed.at`), and
@@ -60,6 +64,7 @@ pub fn register(api: CctvApi, bot: Bot, workspace: PathBuf, tz: Tz) {
     {
         crate::channels::telegram::register_callback_handler(HOME_PREFIX, Arc::new(on_press));
         crate::channels::telegram::register_callback_handler(HOME_FOR_PREFIX, Arc::new(on_choose));
+        crate::channels::telegram::register_callback_handler(AWAY_DATA, Arc::new(on_away));
     }
 }
 
@@ -117,6 +122,38 @@ fn duration_buttons() -> Buttons {
         .map(|m| (format!("🏠 {}", span(*m)), format!("{HOME_FOR_PREFIX}{m}")))
         .collect();
     vec![rows]
+}
+
+/// The durations, then "出门" on a row of its own.
+fn presence_buttons() -> Buttons {
+    let mut rows = duration_buttons();
+    rows.push(vec![("🚪 出门".to_string(), AWAY_DATA.to_string())]);
+    rows
+}
+
+/// cctv's presence (`GET /presence`) as one line.
+fn presence_line(tz: Tz, v: &serde_json::Value) -> String {
+    let at = |k: &str, fmt: &str| {
+        v[k].as_str()
+            .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
+            .map(|t| t.with_timezone(&tz).format(fmt).to_string())
+    };
+    let who = v["account"]
+        .as_str()
+        .filter(|a| !a.is_empty())
+        .map(|a| format!("，{a} 按的"))
+        .unwrap_or_default();
+    if v["home"].as_bool() == Some(true) {
+        match at("until", "%H:%M") {
+            Some(u) => format!("🏠 现在：在家，到 {u}{who}"),
+            None => format!("🏠 现在：在家{who}"),
+        }
+    } else {
+        match at("away_since", "%m-%d %H:%M") {
+            Some(t) => format!("🚪 现在：家里没人（{t} 按了出门{who}）"),
+            None => "🚪 现在：家里没人".to_string(),
+        }
+    }
 }
 
 fn span(minutes: i64) -> String {
@@ -179,7 +216,7 @@ fn on_choose(p: &CallbackPress<'_>) -> Option<CallbackAnswer> {
     let store = Store::open(&h.workspace).ok()?;
     let until = set_home(&store, minutes, &chat, Utc::now()).ok()?;
     let text = format!(
-        "🏠 已记为在家，到 {}（{}）。到时会提醒你；出门请按菜单 /cctv_away",
+        "🏠 已记为在家，到 {}（{}）。到时会提醒你；出门请按下面的「🏠 在家/出门」",
         clock(h, until),
         span(minutes.clamp(1, MAX_MINUTES))
     );
@@ -195,28 +232,54 @@ fn on_choose(p: &CallbackPress<'_>) -> Option<CallbackAnswer> {
     })
 }
 
-/// Menu `/cctv_home`: ask how long. Answered by its own message (buttons),
-/// so the menu reply itself is empty.
+/// The panel's "🏠 在家/出门" and menu `/cctv_home`: the current state,
+/// then how long at home, or away. Answered by its own message (buttons),
+/// so the reply itself is empty.
 pub fn menu_home(chat: &str) -> String {
     let Some(h) = HOME.get() else {
         return "监控还没连上，稍后再试".into();
     };
     let chat = chat.to_string();
     tokio::spawn(async move {
+        let state = match h.api.presence_state().await {
+            Ok(v) => presence_line(h.tz, &v),
+            // cctv not answering: what elfClaw itself recorded.
+            Err(_) => match open_store().and_then(|s| until(&s).filter(|u| *u > Utc::now())) {
+                Some(u) => format!("🏠 现在：在家，到 {}", clock(h, u)),
+                None => "🚪 现在：家里没人".to_string(),
+            },
+        };
         let opts = SendOpts {
             silent: true,
             parent: None,
-            buttons: duration_buttons(),
+            buttons: presence_buttons(),
         };
-        if let Err(e) = h
-            .bot
-            .send_text(&chat, "🏠 在家多久？（最长 4 小时，到时会提醒你）", &opts)
-            .await
-        {
+        let text = format!("{state}\n在家多久？（最长 4 小时，到时会提醒你）或者按出门：");
+        if let Err(e) = h.bot.send_text(&chat, &text, &opts).await {
             tracing::warn!("home choice not sent: {e:#}");
         }
     });
     String::new()
+}
+
+/// "🚪 出门" under the "在家/出门" message.
+fn on_away(p: &CallbackPress<'_>) -> Option<CallbackAnswer> {
+    let h = HOME.get()?;
+    let (chat, message) = (p.chat_id?.to_string(), p.message_id?);
+    let user = account(p.user, &chat);
+    let store = Store::open(&h.workspace).ok()?;
+    set_away(&store, Utc::now()).ok()?;
+    tokio::spawn(async move {
+        tell_cctv(h, None, &user).await;
+        let text = "🚪 已记为出门：现在按家里没人处理，cctv 只认人脸或车牌认出的家人。";
+        if let Err(e) = h.bot.edit(&chat, message, text, false, &Vec::new()).await {
+            tracing::warn!("away confirmation not shown: {e:#}");
+        }
+    });
+    Some(CallbackAnswer {
+        toast: "已记为出门".into(),
+        clear_buttons: false,
+    })
 }
 
 /// Menu `/cctv_away`: nobody home from now on (any account).
@@ -295,8 +358,31 @@ mod tests {
     fn durations_read_naturally() {
         assert_eq!(span(30), "30 分钟");
         assert_eq!(span(120), "2 小时");
+        assert_eq!(span(60), "1 小时");
         let b = duration_buttons();
-        assert_eq!(b[0].len(), 3);
-        assert_eq!(b[0][2].1, "cctv_homefor:240");
+        assert_eq!(b[0].len(), 4);
+        assert_eq!(b[0][3].1, "cctv_homefor:240");
+        let p = presence_buttons();
+        assert_eq!(p[1][0], ("🚪 出门".to_string(), "cctv_away".to_string()));
+    }
+
+    #[test]
+    fn presence_reads_naturally() {
+        let tz: Tz = "Australia/Sydney".parse().unwrap();
+        let home = serde_json::json!({"home": true, "since": "2026-10-28T15:20:00+11:00",
+            "until": "2026-10-28T15:50:00+11:00", "by": "telegram", "account": "zeroclaw_user", "away_since": null});
+        assert_eq!(
+            presence_line(tz, &home),
+            "🏠 现在：在家，到 15:50，zeroclaw_user 按的"
+        );
+        let away = serde_json::json!({"home": false, "since": null, "until": null, "by": "telegram",
+            "account": "zeroclaw_user", "away_since": "2026-10-28T08:05:00+11:00"});
+        assert_eq!(
+            presence_line(tz, &away),
+            "🚪 现在：家里没人（10-28 08:05 按了出门，zeroclaw_user 按的）"
+        );
+        let never = serde_json::json!({"home": false, "since": null, "until": null, "by": null,
+            "account": null, "away_since": null});
+        assert_eq!(presence_line(tz, &never), "🚪 现在：家里没人");
     }
 }
