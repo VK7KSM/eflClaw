@@ -1093,6 +1093,15 @@ impl GeminiProvider {
                     .bearer_auth(token)
             }
             _ => {
+                // elfClaw 2026-10-28: the endpoint is elfgate — have it give
+                // up before our 120 s client timeout, so a request we have
+                // dropped does not hold one of its 4 slots (shared with cctv
+                // and flight) for its default 300 s.
+                let req = if self.endpoint.is_some() {
+                    req.header("X-Elfgate-Timeout-Ms", "110000")
+                } else {
+                    req
+                };
                 if auth.is_api_key() {
                     req.header("x-goog-api-key", auth.api_key_credential())
                 } else {

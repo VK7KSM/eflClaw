@@ -8263,3 +8263,23 @@ cctv 改为院子里一看到没认出的人就先推（level 2、`provisional =
 ## 2026-10-28 K5 回退链 Sonnet 4.6 → 5.5（只改 K5 配置）
 
 用户要求。20:54 起 elfgate 接了用户的 Claude Max 账号，`/v1/models` 多了 claude-sonnet-5-5 等。K5 `config.toml` 的 `[reliability.model_fallbacks]` 中 `claude-sonnet-4-6` 改为 `claude-sonnet-5-5`，备份 `config.toml.bak-20261028-sonnet55`，20:59:32 重启生效。代码没改（`claude-` 开头的模型本来就只走 elfgate）。只影响不带工具的文字调用。
+
+## 2026-10-28 elfgate 改走 Gemini 原生接口，对话（带工具）也走它
+
+用户同意切换。elfcode 在 K5 的 elfgate 上做了和 Gemini 官方一样的原生接口（`POST /v1beta/models/{model}:generateContent`，含 functionCall / functionResponse），先在本机经隧道实测：elfClaw 真实的 47 个工具定义 + 真实 system prompt，4 个场景（看前院 + 额度、查天气设提醒、两轮记事、闲聊）。3.8-flash、gemini-4-argon、claude-sonnet-5-5 的工具调用全部合法、多轮正常；Sonnet 5.5 每步 1.5–3.7 秒，3.8-flash 调工具 8–9 秒、总结约 3 秒；gpt-oss 慢（20–64 秒）且质量差，链上本来就排最后。
+
+- `src/providers/mod.rs`：`elfgate_provider` 改成建一个指向 elfgate 的 `GeminiProvider`（key 随便填 `elfgate`，`reasoning_level` 照传，elfgate 按 `thinkingLevel` 选 `-low/-medium/-high`）；和以前反代一样，只在默认 provider 是 Gemini 时加。新增 `elfgate_base`：`elfgate_url` 末尾的 `/v1`（原来 OpenAI 格式的写法）自动去掉。
+- `src/providers/elfgate.rs`：删除（OpenAI 格式的 `ElfgateProvider`、`NotServed` 不再需要）。
+- `src/providers/reliable.rs`：
+  - 去掉 `NotServed` 静默跳过分支；
+  - `elfgate_rest` 改认原生接口的错误写法（message 末尾的 `(busy)` 等）。新增 `bad_output`（模型把工具调用写坏、elfgate 重试后仍失败）歇 2 分钟；
+  - `supports_native_tools()` 改回看第一个条目（elfgate 现在支持工具）；
+  - 删掉对应的两个测试。
+- `src/providers/gemini.rs`：自定义 endpoint（即 elfgate）的请求带 `X-Elfgate-Timeout-Ms: 110000`。原 `ElfgateProvider` 也这么做，免得我们 120 秒超时放弃后，elfgate 还占着和 cctv、flight 共用的 4 个名额到 300 秒。
+- `src/config/schema.rs`：`elfgate_url` 文档更新。
+- K5 `config.toml`：`elfgate_url` 改为 `http://127.0.0.1:8460`，注释更新，备份 `config.toml.bak-20261028-native`。
+- 影响：
+  - 对话先走 elfgate 的 3.8-flash，接着是官方 key 的 3.8 → 3.6 → Sonnet 5.5（只走 elfgate）→ 3.5-flash-lite → gpt-oss；
+  - 对话用的是用户 agy 账号的周额度（Gemini 组与 flight 听写共用）和 Claude Max，官方每天 20 次的 3.8 额度省下来；
+  - elfgate 忙（4 个名额满）时歇 30 秒，改走官方 key。
+- 测试：providers + cctv 共 705 个测试通过；新增 `elfgate_url_is_taken_with_or_without_v1`；`elfgate_rest` 测试改成原生错误格式。

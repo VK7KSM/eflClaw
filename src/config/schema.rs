@@ -4069,12 +4069,13 @@ pub struct ReliabilityConfig {
     /// as provider-scoped remap chains during provider fallback.
     #[serde(default)]
     pub model_fallbacks: std::collections::HashMap<String, Vec<String>>,
-    /// elfClaw 2026-10-28: elfgate, the OpenAI-compatible gateway on the same
-    /// host (e.g. `http://127.0.0.1:8460/v1`, no key), tried before the
-    /// official API for the model the caller asked for, and alone for the
-    /// Claude / GPT-OSS models of the fallback chain — for requests without
-    /// tools only (elfgate has no function calling). Any failure sends the
-    /// request on to the official API and rests elfgate for a while. Replaces
+    /// elfClaw 2026-10-28: elfgate, the gateway on the same host speaking
+    /// Gemini's native API with function calling (e.g.
+    /// `http://127.0.0.1:8460`, no key; a trailing `/v1` is dropped), tried
+    /// before the official API for the model the caller asked for, and alone
+    /// for the Claude / GPT-OSS models of the fallback chain; only when the
+    /// default provider is Gemini. Any failure sends the request on to the
+    /// official API and rests elfgate for a while. Replaces
     /// `gemini_proxy_url` (the Antigravity Tools proxy, uninstalled), which is
     /// now ignored.
     #[serde(default)]

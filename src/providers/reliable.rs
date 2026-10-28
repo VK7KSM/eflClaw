@@ -422,12 +422,10 @@ fn until_next_pacific_midnight(now: chrono::DateTime<chrono::Utc>) -> Duration {
 // the elfClaw log as it happens.
 
 /// elfClaw 2026-10-12: chain entry name of the gateway ahead of the official
-/// keys — since 2026-10-28 elfgate (`reliability.elfgate_url`, see
-/// `providers::elfgate`; before that the Antigravity Tools proxy). It is
-/// tried first, for the requested model only; a request it cannot take
-/// (`NotServed`: tools, an unlisted model) skips it quietly, any failure
-/// rests it (see `elfgate_rest`), and the request moves on to the official
-/// keys at once — its errors say nothing about the official API, so they
+/// keys — since 2026-10-28 elfgate (`reliability.elfgate_url`, Gemini's
+/// native API; before that the Antigravity Tools proxy). It is tried first,
+/// for the requested model only; any failure rests it (see `elfgate_rest`)
+/// and the request moves on to the official keys at once — its errors say nothing about the official API, so they
 /// neither mark a model overloaded nor touch the official quota records (its
 /// successful calls are counted under its own label, see `quota`).
 pub const ELFGATE_PROVIDER: &str = "elfgate";
@@ -440,18 +438,20 @@ pub(crate) fn proxy_only_model(model: &str) -> bool {
     model.starts_with("claude-") || model.starts_with("gpt-")
 }
 
-/// How long elfgate is left alone after a failure, by its error code
-/// (elfgate.md §6): `busy` (its 4 slots, shared with cctv and flight, are
-/// full) half a minute; `content_filtered` concerns this request only, no
-/// rest; agy errors and timeouts two minutes; out of quota, not reachable
-/// and the rest ten minutes.
+/// How long elfgate (and that model on it) is left alone after a failure, by
+/// the code it puts in its error message, `"... (busy)"` (elfgate.md §6):
+/// `busy` (its 4 slots, shared with cctv and flight, are full) half a minute;
+/// `content_filtered` concerns this request only, no rest; agy errors, a
+/// garbled tool call and timeouts two minutes; out of quota, unknown model,
+/// not reachable and the rest ten minutes.
 fn elfgate_rest(err: &anyhow::Error) -> Option<Duration> {
     let msg = err.to_string();
-    let secs = if msg.contains("content_filtered") {
+    let code = |c: &str| msg.contains(&format!("({c})"));
+    let secs = if code("content_filtered") {
         return None;
-    } else if msg.contains("\"busy\"") {
+    } else if code("busy") {
         30
-    } else if msg.contains("backend_error") || msg.contains("\"timeout\"") || is_timeout(err) {
+    } else if code("backend_error") || code("bad_output") || code("timeout") || is_timeout(err) {
         120
     } else {
         600
@@ -647,14 +647,6 @@ impl ReliableProvider {
                             );
                         }
                         return Ok(resp);
-                    }
-                    Err(e)
-                        if provider_name == ELFGATE_PROVIDER
-                            && e.downcast_ref::<super::elfgate::NotServed>().is_some() =>
-                    {
-                        // Not elfgate's kind of request (tools…): no failure.
-                        tracing::debug!(model = sent_model, "{e}");
-                        skipped[index] = true;
                     }
                     Err(e) if provider_name == ELFGATE_PROVIDER => {
                         let rest = elfgate_rest(&e);
@@ -858,11 +850,8 @@ impl Provider for ReliableProvider {
     }
 
     fn supports_native_tools(&self) -> bool {
-        // elfgate has no function calling but is never sent tools (it
-        // declines them): the chain's tool support is that of the rest.
         self.providers
-            .iter()
-            .find(|(name, _)| name != ELFGATE_PROVIDER)
+            .first()
             .map(|(_, p)| p.supports_native_tools())
             .unwrap_or(false)
     }
@@ -2748,98 +2737,24 @@ mod tests {
 
     #[test]
     fn elfgate_rest_follows_its_error_code() {
-        let err = |body: &str| anyhow::anyhow!("elfgate API error ({body}");
-        let busy = err(
-            r#"429 Too Many Requests): {"error":{"message":"queue full","type":"rate_limit","code":"busy"}}"#,
-        );
+        // Google-style errors, the code in brackets (elfgate gemini_api.rs).
+        let err = |status: &str, code: &str| {
+            anyhow::anyhow!(
+                r#"Gemini API error ({status}): {{"error":{{"code":0,"message":"x ({code})","status":"S"}}}}"#
+            )
+        };
+        let busy = err("429 Too Many Requests", "busy");
         assert_eq!(elfgate_rest(&busy), Some(Duration::from_secs(30)));
-        let filtered = err(r#"502 Bad Gateway): {"error":{"code":"content_filtered"}}"#);
+        let filtered = err("502 Bad Gateway", "content_filtered");
         assert_eq!(elfgate_rest(&filtered), None, "this request only");
-        let backend = err(r#"502 Bad Gateway): {"error":{"code":"backend_error"}}"#);
+        let backend = err("502 Bad Gateway", "backend_error");
         assert_eq!(elfgate_rest(&backend), Some(Duration::from_secs(120)));
-        let quota = err(r#"429 Too Many Requests): {"error":{"code":"quota_low"}}"#);
+        let garbled = err("502 Bad Gateway", "bad_output");
+        assert_eq!(elfgate_rest(&garbled), Some(Duration::from_secs(120)));
+        let quota = err("429 Too Many Requests", "quota_low");
         assert_eq!(elfgate_rest(&quota), Some(Duration::from_secs(600)));
         let down = anyhow::anyhow!("error sending request: connection refused");
         assert_eq!(elfgate_rest(&down), Some(Duration::from_secs(600)));
-    }
-
-    /// elfgate declining every request (as it does tools).
-    struct DecliningMock {
-        calls: Arc<AtomicUsize>,
-    }
-
-    #[async_trait]
-    impl Provider for DecliningMock {
-        async fn chat_with_system(
-            &self,
-            _system_prompt: Option<&str>,
-            _message: &str,
-            _model: &str,
-            _temperature: f64,
-        ) -> anyhow::Result<String> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            Err(crate::providers::elfgate::NotServed("tools").into())
-        }
-    }
-
-    #[tokio::test]
-    async fn a_request_elfgate_declines_goes_on_without_resting_it() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let key_a = Arc::new(ScriptedModelMock {
-            script: [("m-a", vec![Ok("one"), Ok("two")])].into_iter().collect(),
-            seen: parking_lot::Mutex::new(Vec::new()),
-        });
-        let provider = ReliableProvider::new(
-            vec![
-                (
-                    ELFGATE_PROVIDER.into(),
-                    Box::new(DecliningMock {
-                        calls: calls.clone(),
-                    }) as Box<dyn Provider>,
-                ),
-                (
-                    "gemini".into(),
-                    Box::new(key_a.clone()) as Box<dyn Provider>,
-                ),
-            ],
-            2,
-            1,
-        );
-        assert_eq!(provider.simple_chat("hi", "m-a", 0.0).await.unwrap(), "one");
-        assert_eq!(provider.simple_chat("hi", "m-a", 0.0).await.unwrap(), "two");
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            2,
-            "asked again: declining is not a failure"
-        );
-    }
-
-    #[test]
-    fn tool_support_is_that_of_the_entries_behind_elfgate() {
-        let provider = ReliableProvider::new(
-            vec![
-                (
-                    ELFGATE_PROVIDER.into(),
-                    Box::new(crate::providers::elfgate::ElfgateProvider::new(
-                        "http://127.0.0.1:9/v1",
-                        None,
-                    )) as Box<dyn Provider>,
-                ),
-                (
-                    "gemini".into(),
-                    Box::new(NativeToolMock {
-                        calls: Arc::new(AtomicUsize::new(0)),
-                        fail_until_attempt: 0,
-                        response_text: "ok",
-                        tool_calls: Vec::new(),
-                        error: "",
-                    }) as Box<dyn Provider>,
-                ),
-            ],
-            0,
-            1,
-        );
-        assert!(provider.supports_native_tools());
     }
 
     #[tokio::test]

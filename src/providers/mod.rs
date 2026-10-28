@@ -22,7 +22,6 @@ pub mod bedrock;
 pub mod compatible;
 pub mod copilot;
 pub mod cursor;
-pub mod elfgate;
 pub mod gemini;
 pub mod health;
 pub mod ollama;
@@ -1533,18 +1532,42 @@ fn expand_primary_provider_keys(
 
 /// elfClaw 2026-10-28: the elfgate entry that goes ahead of the official
 /// keys (`reliability.elfgate_url`); no URL → no entry, nothing else changes.
+/// elfgate speaks Gemini's native API (tools included), so the entry is a
+/// `GeminiProvider` aimed at it; it has no auth, any key will do, and it
+/// picks the `-low/-medium/-high` variant from `thinkingLevel`.
 fn elfgate_provider(
+    primary_name: &str,
     reliability: &crate::config::ReliabilityConfig,
     options: &ProviderRuntimeOptions,
 ) -> Option<Box<dyn Provider>> {
-    let url = reliability.elfgate_url.as_deref()?.trim();
-    if url.is_empty() {
+    if !matches!(primary_name, "gemini" | "google" | "google-gemini") {
         return None;
     }
-    Some(Box::new(elfgate::ElfgateProvider::new(
-        url,
-        options.reasoning_level,
-    )))
+    let url = elfgate_base(reliability.elfgate_url.as_deref()?)?;
+    let state_dir = options.zeroclaw_dir.clone().unwrap_or_else(|| {
+        directories::UserDirs::new().map_or_else(
+            || PathBuf::from(".zeroclaw"),
+            |dirs| dirs.home_dir().join(".zeroclaw"),
+        )
+    });
+    let auth_service = AuthService::new(&state_dir, options.secrets_encrypt);
+    Some(Box::new(
+        gemini::GeminiProvider::new_with_auth(
+            Some("elfgate"),
+            auth_service,
+            None,
+            options.reasoning_level,
+        )
+        .with_endpoint(url),
+    ))
+}
+
+/// The host part of `elfgate_url`: its OpenAI-style `/v1` (how the key was
+/// first written) is dropped, `GeminiProvider` adds `/v1beta`.
+fn elfgate_base(url: &str) -> Option<&str> {
+    let url = url.trim().trim_end_matches('/');
+    let url = url.strip_suffix("/v1").unwrap_or(url);
+    (!url.is_empty()).then_some(url)
 }
 
 /// Create provider chain with retry/fallback behavior and auth runtime options.
@@ -1562,7 +1585,7 @@ pub fn create_resilient_provider_with_options(
         &reliability.api_keys,
         options,
     )?;
-    if let Some(gate) = elfgate_provider(reliability, options) {
+    if let Some(gate) = elfgate_provider(primary_name, reliability, options) {
         providers.insert(0, (reliable::ELFGATE_PROVIDER.to_string(), gate));
     }
 
@@ -2062,6 +2085,19 @@ pub fn list_providers() -> Vec<ProviderInfo> {
 mod tests {
     use super::*;
     use std::sync::{Mutex, OnceLock};
+
+    #[test]
+    fn elfgate_url_is_taken_with_or_without_v1() {
+        assert_eq!(
+            elfgate_base("http://127.0.0.1:8460"),
+            Some("http://127.0.0.1:8460")
+        );
+        assert_eq!(
+            elfgate_base(" http://127.0.0.1:8460/v1/ "),
+            Some("http://127.0.0.1:8460")
+        );
+        assert_eq!(elfgate_base("  "), None);
+    }
 
     struct EnvGuard {
         key: &'static str,
