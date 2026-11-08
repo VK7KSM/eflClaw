@@ -600,6 +600,32 @@ impl CctvTool {
                 let _ = write!(out, "\n画面内容：{seen}");
                 Ok(out)
             }
+            "frame" => {
+                let m = link.camera(camera.as_deref(), false).await?;
+                let at = parse_time(
+                    &s("at").context("要给时刻 at（HH:MM:SS 或 YYYY-MM-DD HH:MM:SS）")?,
+                    link.tz,
+                    Utc::now(),
+                )?;
+                let jpeg = link.api.frame(m.id, &at.to_rfc3339()).await?;
+                let label = format!(
+                    "{} {} 的录像画面",
+                    m.name,
+                    at.with_timezone(&link.tz).format("%m-%d %H:%M:%S")
+                );
+                let mut out = label.clone();
+                if args.get("send").and_then(Value::as_bool) == Some(true) {
+                    if let Some(chat) = caller_chat() {
+                        link.send_photo(&chat, jpeg.clone(), &label).await?;
+                        out.push_str("，已发到对话里");
+                    }
+                }
+                let seen = link
+                    .look(&jpeg, &format!("家里监控 {label}"), question.as_deref())
+                    .await;
+                let _ = write!(out, "\n画面内容：{seen}");
+                Ok(out)
+            }
             "cameras" => {
                 let list = link.api.monitors().await?;
                 Ok(list
@@ -948,14 +974,22 @@ impl Tool for CctvTool {
          them, call cameras first if unsure. Pictures and videos are delivered by the tool itself. \
          snapshot, event_snapshot and ptz return what the picture shows (pass the user's question \
          as 'question'): answer from that description and never say you cannot see the picture. \
-         Event lines start with #event_id."
+         Event lines start with #event_id. To find WHEN something appeared, disappeared or happened \
+         (e.g. 'when did this ball blow into the yard', the user may send a photo of the scene): \
+         halve the time range with frame (camera + at: one picture of the NVR recording at that \
+         moment, at least 2 minutes ago, ~6 s each, one at a time; question = whether the thing is \
+         there; the caption clock in the picture is exact) until you have the last picture without \
+         it and the first with it, events of those cameras help pick the range; then tell the user \
+         that moment and offer clip_history of the minute or two around it. frame also answers \
+         'what did camera X look like at T'. This tool is always available for the user's own \
+         cameras: never tell the user it is missing or unmounted, call it."
     }
 
     fn parameters_schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "action": {"type": "string", "enum": ["cameras", "snapshot", "event_snapshot", "events", "clip_live", "clip_history", "ptz", "greet", "scene", "reports", "runlog", "sysload", "objects", "label", "unlabel", "names", "set_category", "groups", "group_label", "group_ignore", "memory_list", "memory_add", "memory_update", "memory_revoke", "alerts_off", "alerts_on"]},
+                "action": {"type": "string", "enum": ["cameras", "snapshot", "event_snapshot", "frame", "events", "clip_live", "clip_history", "ptz", "greet", "scene", "reports", "runlog", "sysload", "objects", "label", "unlabel", "names", "set_category", "groups", "group_label", "group_ignore", "memory_list", "memory_add", "memory_update", "memory_revoke", "alerts_off", "alerts_on"]},
                 "q": {"type": "string", "description": "memory_list: words to look for"},
                 "memory_id": {"type": "integer", "description": "memory_update / memory_revoke: the memory's number"},
                 "content": {"type": "string", "description": "memory_add / memory_update: the fact, in Chinese"},
@@ -971,10 +1005,11 @@ impl Tool for CctvTool {
                 "mode": {"type": "string", "enum": ["hello", "flash"], "description": "greet: speaker or light"},
                 "question": {"type": "string", "description": "What the user wants to know about the picture"},
                 "event_id": {"type": "integer", "description": "Alarm event id (event_snapshot, objects, label, unlabel)"},
-                "send": {"type": "boolean", "description": "event_snapshot: also post the picture"},
+                "send": {"type": "boolean", "description": "event_snapshot / frame: also post the picture"},
                 "camera": {"type": "string", "description": "Camera name (or number). For ptz it defaults to the PTZ camera."},
                 "from": {"type": "string", "description": "Start time: HH:MM (today) or YYYY-MM-DD HH:MM"},
                 "to": {"type": "string", "description": "End time, same format"},
+                "at": {"type": "string", "description": "frame: the moment, HH:MM:SS (today) or YYYY-MM-DD HH:MM:SS"},
                 "min_level": {"type": "integer", "minimum": 1, "maximum": 3},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 200},
                 "hours": {"type": "integer", "minimum": 1, "maximum": 720, "description": "sysload: how many past hours to summarise (default 3)"},

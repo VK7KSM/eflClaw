@@ -8283,3 +8283,52 @@ cctv 改为院子里一看到没认出的人就先推（level 2、`provisional =
   - 对话用的是用户 agy 账号的周额度（Gemini 组与 flight 听写共用）和 Claude Max，官方每天 20 次的 3.8 额度省下来；
   - elfgate 忙（4 个名额满）时歇 30 秒，改走官方 key。
 - 测试：providers + cctv 共 705 个测试通过；新增 `elfgate_url_is_taken_with_or_without_v1`；`elfgate_rest` 测试改成原生错误格式。
+
+## 2026-11-08 cctv 工具：加 frame（按时刻取 NVR 录像截图），写明"什么时候出现"的查法
+
+**起因**：用户在 Telegram 发了一张后院照片，问"充气大足球什么时候被风吹到前院的"。模型一次工具都没调用，就回答"cctv 工具没有挂载"。
+- 实际上工具一直在：K5 上用同样问题复测，模型调用了 cctv 工具，查事件正常。
+- 所以这是模型自己偷懒、瞎说。
+
+**cctv 配合**：cctv 新加了 `GET /cctv/v1/monitors/{id}/frame.jpg?at=`（v1.15.32），返回 NVR 录像里 at 那一刻的一帧。
+- K5 实测：第 6 路，约 6 秒返回，画面时刻和 at 差 1 秒；at 太新返回 400 too_recent。
+
+**改动**
+- `src/cctv/api.rs`：新增 `CctvApi::frame(monitor, at)`，超时 20 秒（cctv 端是 15 秒）。
+- `src/tools/cctv.rs`：
+  - 新动作 `frame`，参数 camera + at（HH:MM:SS 或 YYYY-MM-DD HH:MM:SS），send=true 时把图发到对话；
+  - 取到的图交给模型看，带上 question，用法和 event_snapshot 一样；
+  - 工具说明里写明"某样东西什么时候出现或消失"的查法：用 frame 一张一张按时间二分，找到"最后一张没有、第一张有"的那一刻，告诉用户，再主动提出取前后一两分钟的 clip_history 录像；
+  - 工具说明里写明 cctv 工具始终可用，不许说它没挂载。
+
+- `src/agent/loop_.rs`：新增 `offered_tool_claimed_missing()`。
+  - 部署后在 K5 带图复测，第一次模型仍然说 cctv 没挂载（不带图时会正常调用），说明只改工具说明不够；
+  - 现在的做法：模型没调用任何工具，回答里又点名了本轮提供的某个工具（如 cctv），并说它"没有挂载 / 不可用 / not available"时，程序补一句纠正（"这个工具就在你的工具列表里，现在调用它"），再让模型试一次；
+  - 和原来"嘴上说要做却没调用工具"的重试共用同一次重试机会，适用于所有工具，不只 cctv。
+- `src/agent/loop_.rs`：补充原有的"光说不做"检测（`looks_like_deferred_action_without_tool_call`）。
+  - 起因：再次带图复测时，模型回答"我现在用后院摄像头逐帧调取 NVR 历史录像来排查，查到了马上告诉你！"，却没调用工具，原来的词表没认出来；
+  - 开头的说法补了"我现在 / 我这就 / 现在就"，动作词补了"调取 / 排查 / 查询 / 查一下 / 翻查 / 回放"；
+  - 加了单测。
+
+**测试**：cctv、offered_tool_claimed、deferred_action 相关单测全部通过；clippy 的新警告都不在改动行。
+
+## 2026-11-08 修：一轮对话中途从 elfgate 切到官方 key 时，官方报"签名损坏"，6 个 key 全部失败
+
+**现象**：K5 上测试 cctv 的 frame 功能时发现，带工具的对话第一步由 elfgate 回答，第二步 elfgate 失败（502）后改走官方 Gemini key。
+- 官方 3.8、3.6 的 12 次尝试全部返回 400 "Corrupted thought signature"，最后靠 Sonnet 才答出来；
+- 今天 05:09 也出现过一次。
+
+**原因**
+- 走 Gemini 模型时，elfgate 会在工具调用上附带它自己生成的 thoughtSignature；
+- 同一轮里 elfClaw 把这条历史转发给官方接口，Google 认不出这个签名，直接拒绝；
+- K5 实测：编造的签名返回 400，Google 文档给的占位签名 `skip_thought_signature_validator` 返回 200。
+
+**改动**（`src/providers/gemini.rs`）
+- elfgate 返回的签名收到时加上 `elfgate:` 前缀做标记；
+- 回放历史时用新函数 `replayed_signature()` 处理：
+  - 发给 elfgate：去掉前缀，原样发回；
+  - 发给官方：换成占位签名 `skip_thought_signature_validator`；
+  - Google 自己的签名两边都原样发回；
+- 新增单测 `elfgate_signatures_go_to_google_as_the_skip_placeholder`。
+
+**影响**：只影响"工具调用历史里有 elfgate 生成的签名"这种情况；纯官方或纯 elfgate 的对话行为不变。

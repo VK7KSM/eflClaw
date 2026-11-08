@@ -338,12 +338,13 @@ static DEFERRED_ACTION_WITHOUT_TOOL_CALL_REGEX: LazyLock<Regex> = LazyLock::new(
 });
 
 /// CJK cue phrases: "让我" (let me), "我来" (I'll), "我会" (I will), etc.
-static CJK_DEFERRED_ACTION_CUE_REGEX: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(让我|我来|我会|我们来|我们会|我先|先让我|马上)").unwrap());
+static CJK_DEFERRED_ACTION_CUE_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(让我|我来|我会|我们来|我们会|我先|先让我|马上|我现在|我这就|现在就)").unwrap()
+});
 
 /// CJK action verbs that correspond to tool-backed operations.
 static CJK_DEFERRED_ACTION_VERB_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(查看|检查|搜索|查找|浏览|打开|读取|写入|运行|执行|调用|分析|验证|列出|获取|尝试|试试|继续|处理|修复|看看|看一看|看一下)").unwrap()
+    Regex::new(r"(查看|检查|搜索|查找|浏览|打开|读取|写入|运行|执行|调用|分析|验证|列出|获取|尝试|试试|继续|处理|修复|看看|看一看|看一下|调取|排查|查询|查一下|翻查|回放)").unwrap()
 });
 
 /// Fast pre-filter: any CJK script character (Han / Hiragana / Katakana / Hangul).
@@ -371,6 +372,34 @@ fn looks_like_deferred_action_without_tool_call(text: &str) -> bool {
     CJK_SCRIPT_REGEX.is_match(trimmed)
         && CJK_DEFERRED_ACTION_CUE_REGEX.is_match(trimmed)
         && CJK_DEFERRED_ACTION_VERB_REGEX.is_match(trimmed)
+}
+
+/// elfClaw 2026-11-08: the reply says a tool is not there ("没有挂载",
+/// "not available"…). Seen with a photo attached: "cctv 工具没有挂载" while
+/// it was offered, and no call was made.
+static TOOL_MISSING_CLAIM_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)(未挂载|没有挂载|没挂载|未加载|没有加载|没加载|未接入|没有接入|没接入|不可用|用不了|没有这个工具|not\s+(?:mounted|available|loaded|connected))",
+    )
+    .unwrap()
+});
+
+/// The tool an answer without a tool call claims is missing although it was
+/// offered this turn, if any: the reply names it (as written in the tool
+/// list) and says it is missing.
+fn offered_tool_claimed_missing<'a>(
+    text: &str,
+    tool_specs: &'a [crate::tools::ToolSpec],
+) -> Option<&'a str> {
+    if !TOOL_MISSING_CLAIM_REGEX.is_match(text) {
+        return None;
+    }
+    let lower = text.to_lowercase();
+    tool_specs
+        .iter()
+        .map(|s| s.name.as_str())
+        .filter(|name| name.len() >= 3)
+        .find(|name| lower.contains(&name.to_lowercase()))
 }
 
 #[derive(Debug)]
@@ -920,6 +949,24 @@ pub(crate) async fn run_tool_call_loop(
                     }),
                 );
                 continue; // retry this iteration with correction prompt
+            }
+
+            // elfClaw 2026-11-08: "the X tool is not mounted" while X was
+            // offered — tell the model so and let it try once more.
+            if !missing_tool_call_retry_used && iteration + 1 < max_iterations {
+                if let Some(name) = offered_tool_claimed_missing(&display_text, &turn_tool_specs) {
+                    missing_tool_call_retry_used = true;
+                    tracing::info!(
+                        tool = name,
+                        "reply claimed an offered tool is missing; retrying"
+                    );
+                    missing_tool_call_retry_prompt = Some(format!(
+                        "Internal correction: the `{name}` tool IS available in this conversation \
+                         (it is in your tool list). Do not tell the user it is missing, unmounted \
+                         or unavailable. Call it now to answer the user's request."
+                    ));
+                    continue;
+                }
             }
 
             runtime_trace::record_event(
@@ -4056,6 +4103,13 @@ Done."#;
     }
 
     #[test]
+    fn deferred_action_detects_now_fetching_promises() {
+        assert!(looks_like_deferred_action_without_tool_call(
+            "我现在用后院摄像头逐帧调取 NVR 历史录像来排查，查到了马上告诉你！"
+        ));
+    }
+
+    #[test]
     fn deferred_action_ignores_final_answers() {
         assert!(!looks_like_deferred_action_without_tool_call(
             "The latest update is already shown above."
@@ -4063,6 +4117,35 @@ Done."#;
         assert!(!looks_like_deferred_action_without_tool_call(
             "最新结果已经在上面整理完成。"
         ));
+    }
+
+    #[test]
+    fn offered_tool_claimed_missing_needs_name_and_claim() {
+        let specs = vec![crate::tools::ToolSpec {
+            name: "cctv".into(),
+            description: String::new(),
+            parameters: serde_json::json!({}),
+        }];
+        assert_eq!(
+            offered_tool_claimed_missing(
+                "实时监控查询接口（cctv 工具）没有挂载，无法调取回放",
+                &specs
+            ),
+            Some("cctv")
+        );
+        assert_eq!(
+            offered_tool_claimed_missing("The CCTV tool is not available here.", &specs),
+            Some("cctv")
+        );
+        // A claim about something that is not offered, or no claim at all.
+        assert_eq!(
+            offered_tool_claimed_missing("NVR 回放工具没有挂载", &specs),
+            None
+        );
+        assert_eq!(
+            offered_tool_claimed_missing("cctv 显示前院没人", &specs),
+            None
+        );
     }
 
     #[test]

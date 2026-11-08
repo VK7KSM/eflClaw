@@ -514,6 +514,17 @@ impl CctvApi {
         .context("no snapshot")
     }
 
+    /// One frame of the NVR recording from `at` on (v1.15.32; `at` at least
+    /// 2 minutes ago). cctv's 15 s timeout plus a little.
+    pub async fn frame(&self, monitor: u32, at: &str) -> Result<Vec<u8>> {
+        self.bytes(
+            &format!("monitors/{monitor}/frame.jpg?at={}", at.replace('+', "%2B")),
+            Duration::from_secs(20),
+        )
+        .await?
+        .context("no frame")
+    }
+
     /// Record `seconds` (5–20) of live video; returns the job id.
     pub async fn clip_live(&self, monitor: u32, seconds: u32, account: &str) -> Result<String> {
         let v: serde_json::Value = self

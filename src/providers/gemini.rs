@@ -435,6 +435,13 @@ const CLOUDCODE_PA_ENDPOINT: &str = "https://cloudcode-pa.googleapis.com/v1inter
 const LOAD_CODE_ASSIST_ENDPOINT: &str =
     "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist";
 
+/// elfClaw 2026-11-08: marks a thought signature made up by elfgate.
+const ELFGATE_SIGNATURE_PREFIX: &str = "elfgate:";
+
+/// Google's documented placeholder for a thought signature it did not issue
+/// (history from another model or gateway): skips its validation.
+const SKIP_SIGNATURE_VALIDATOR: &str = "skip_thought_signature_validator";
+
 /// Public API endpoint for API key users.
 const PUBLIC_API_ENDPOINT: &str = "https://generativelanguage.googleapis.com/v1beta";
 
@@ -697,6 +704,20 @@ impl GeminiProvider {
 
     /// Send API-key requests to `base` (e.g. `http://127.0.0.1:8045`) instead
     /// of the public API. `/v1beta` is appended when missing.
+    /// elfClaw 2026-11-08: a thought signature as sent back to this endpoint.
+    /// elfgate makes up its own signatures (tagged with
+    /// `ELFGATE_SIGNATURE_PREFIX` when received); Google rejects them ("Corrupted
+    /// thought signature") once a turn fails over from elfgate to the official
+    /// keys mid-way, so they go to Google as its documented
+    /// "skip validation" placeholder. Google's own signatures are kept.
+    fn replayed_signature<'a>(&self, sig: &'a str) -> &'a str {
+        match sig.strip_prefix(ELFGATE_SIGNATURE_PREFIX) {
+            Some(own) if self.endpoint.is_some() => own,
+            Some(_) => SKIP_SIGNATURE_VALIDATOR,
+            None => sig,
+        }
+    }
+
     pub fn with_endpoint(mut self, base: &str) -> Self {
         let base = base.trim().trim_end_matches('/');
         self.endpoint = Some(if base.ends_with("/v1beta") {
@@ -1462,10 +1483,17 @@ impl GeminiProvider {
 
         let candidate = result.candidates.and_then(|c| c.into_iter().next());
         let raw_stop_reason = candidate.as_ref().and_then(|c| c.finish_reason.clone());
-        let (text, tool_calls) = candidate
+        let (text, mut tool_calls) = candidate
             .and_then(|c| c.content)
             .map(|c| c.extract_tool_calls())
             .unwrap_or_else(|| (None, Vec::new()));
+        if self.endpoint.is_some() {
+            for call in &mut tool_calls {
+                if let Some(sig) = call.thought_signature.as_mut() {
+                    sig.insert_str(0, ELFGATE_SIGNATURE_PREFIX);
+                }
+            }
+        }
 
         // If no text and no tool calls, something is wrong
         if text.is_none() && tool_calls.is_empty() {
@@ -1667,7 +1695,8 @@ impl Provider for GeminiProvider {
                                 let sig_opt = tc
                                     .get("thought_signature")
                                     .and_then(|v| v.as_str())
-                                    .filter(|_| !foreign);
+                                    .filter(|_| !foreign)
+                                    .map(|sig| self.replayed_signature(sig));
                                 if let Some(sig) = sig_opt {
                                     parts.push(Part {
                                         text: Some(String::new()),
@@ -2705,6 +2734,22 @@ mod tests {
         let json = r#"{"candidates": [{"content": {"parts": [{"text": "Hello"}]}}]}"#;
         let resp: GenerateContentResponse = serde_json::from_str(json).unwrap();
         assert!(resp.usage_metadata.is_none());
+    }
+
+    #[test]
+    fn elfgate_signatures_go_to_google_as_the_skip_placeholder() {
+        let official = test_provider(Some(GeminiAuth::ExplicitKey("k".into())));
+        let gate = test_provider(Some(GeminiAuth::ExplicitKey("k".into())))
+            .with_endpoint("http://127.0.0.1:8460");
+        let made_up = format!("{ELFGATE_SIGNATURE_PREFIX}abc");
+        assert_eq!(
+            official.replayed_signature(&made_up),
+            SKIP_SIGNATURE_VALIDATOR
+        );
+        assert_eq!(gate.replayed_signature(&made_up), "abc");
+        // Google's own signatures are replayed as they came, to either.
+        assert_eq!(official.replayed_signature("real"), "real");
+        assert_eq!(gate.replayed_signature("real"), "real");
     }
 
     /// Validates that warmup() for ManagedOAuth requires auth_service.
