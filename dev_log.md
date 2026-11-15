@@ -8332,3 +8332,25 @@ cctv 改为院子里一看到没认出的人就先推（level 2、`provisional =
 - 新增单测 `elfgate_signatures_go_to_google_as_the_skip_placeholder`。
 
 **影响**：只影响"工具调用历史里有 elfgate 生成的签名"这种情况；纯官方或纯 elfgate 的对话行为不变。
+
+## 2026-11-16 监控面板：点摄像头按钮只发截图，不再附"院子里没人"的描述；记录取图和上传耗时
+
+**起因**：用户点 Telegram 面板的「Front yard」按钮，等了快 1 分钟才收到截图，图下还附了一句"现在院子里没人，也没看到车"。用户要求：
+- 只要截图，不要分析；
+- 如果一定要分析，先发图，再改消息补上；
+- 要用最快速度把截图发出来。
+
+**排查**
+- 当时的写法：同时向 cctv 取截图和取现场描述（`/monitors/{id}/now`），两个都回来后才发图；
+- 事后在 K5 单独测：monitors 50–290ms，snapshot.jpg 约 1.5 秒（286 KB），now 约 30ms，都不慢；
+- 当时每一步花了多久没有记录，查不出这 1 分钟具体耗在哪：可能是 K5 当时整机过载（cctv 取图慢），也可能是往 Telegram 上传慢。
+
+**改动**
+- `src/cctv/panel.rs` `snap()`：
+  - 不再取现场描述，只取截图；
+  - 图下只写"📷 摄像头名 时间"，"录 15 秒""再看一次"两个按钮照旧；
+  - 每次在 elfclaw-logs 记一条 "CCTV panel snapshot <摄像头>"，内容是 fetch_ms（向 cctv 取图）、upload_ms（发到 Telegram）、bytes、error。
+- `src/cctv/worker.rs`：`record()` 改成 `pub(super)`，给 panel 共用。
+- 模型用的 cctv 工具（snapshot 动作）不变，它仍然会拿 cctv 的现场描述来回答问题。
+
+**下次再慢怎么查**：在 elfclaw-logs.jsonl 里搜 "CCTV panel snapshot"，fetch_ms 大说明 cctv/K5 取图慢，upload_ms 大说明往 Telegram 上传慢。

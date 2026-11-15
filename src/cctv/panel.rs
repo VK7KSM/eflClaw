@@ -14,10 +14,11 @@
 //! unless switched on there (cctv keeps the switch) — and "我在家" became
 //! "🏠 在家/出门", one message offering both.
 //!
-//! - a camera button sends its live picture captioned first with cctv's own
-//!   one-line account of who and whose car is there (`/monitors/{id}/now`;
-//!   owner 2026-10-20: "简单明了…谁的车", no model describing pixels), with
-//!   "录 15 秒" and "再看一次" under it; "其它摄像头" lists the rest;
+//! - a camera button sends its live picture as fast as it can, captioned
+//!   with the camera and the time only (owner 2026-11-16: "我只想看截图",
+//!   it once took almost a minute; until then cctv's account of who was
+//!   there came with it), with "录 15 秒" and "再看一次" under it;
+//!   "其它摄像头" lists the rest;
 //! - 布防 / 推送 / 天线 show the state with buttons to change it; stopping
 //!   the arming asks once more (owner's rule); 推送 switches only the
 //!   presser's own account (owner's decision).
@@ -34,7 +35,7 @@ use serde_json::{json, Value};
 use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const STATUS: &str = "📊 状态";
 const ARM: &str = "🛡 布防";
@@ -547,7 +548,7 @@ async fn snap_by_id(p: &Panel, chat: &str, id: u32) -> Result<()> {
     snap(p, chat, m).await
 }
 
-/// The live picture, then (by editing its caption) what is in it.
+/// The live picture, nothing else; how long each step took is logged.
 async fn snap(p: &Panel, chat: &str, m: &Monitor) -> Result<()> {
     if let Some(why) = unavailable(m) {
         p.bot
@@ -555,20 +556,32 @@ async fn snap(p: &Panel, chat: &str, m: &Monitor) -> Result<()> {
             .await?;
         return Ok(());
     }
-    let (jpeg, summary) = tokio::join!(p.api.live_snapshot(m.id), p.api.now_summary(m.id));
+    let started = Instant::now();
+    let jpeg = p.api.live_snapshot(m.id).await;
+    let fetch_ms = started.elapsed().as_millis();
     let at = Utc::now()
         .with_timezone(&p.tz)
         .format("%H:%M:%S")
         .to_string();
-    let summary: String = summary.chars().take(900).collect();
-    let caption = format!("{summary}\n📷 {} {at}", m.name);
+    let caption = format!("📷 {} {at}", m.name);
     match jpeg {
         Ok(jpeg) => {
-            p.bot
+            let bytes = jpeg.len();
+            let sent = p
+                .bot
                 .send_photo(chat, jpeg, &caption, &quiet(cam_buttons(m.id)))
-                .await?;
+                .await;
+            super::worker::record(
+                &format!("CCTV panel snapshot {}", m.name),
+                json!({
+                    "fetch_ms": fetch_ms,
+                    "upload_ms": started.elapsed().as_millis() - fetch_ms,
+                    "bytes": bytes,
+                    "error": sent.as_ref().err().map(|e| format!("{e:#}")),
+                }),
+            );
+            sent?;
         }
-        // No picture: the account of who is there still helps.
         Err(e) => {
             p.bot
                 .send_text(

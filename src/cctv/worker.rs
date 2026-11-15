@@ -663,7 +663,7 @@ pub(super) async fn refresh_push(bot: &Bot, store: &Store, e: &Event) -> Result<
 
 /// A line in the elfClaw run log (`state/elfclaw-logs.jsonl`), so push
 /// delays and lost connections can be traced afterwards.
-fn record(message: &str, details: serde_json::Value) {
+pub(super) fn record(message: &str, details: serde_json::Value) {
     crate::elfclaw_log::log(crate::elfclaw_log::LogEntry {
         id: uuid::Uuid::new_v4().to_string(),
         timestamp: Utc::now().to_rfc3339(),
