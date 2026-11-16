@@ -14,11 +14,10 @@
 //! unless switched on there (cctv keeps the switch) — and "我在家" became
 //! "🏠 在家/出门", one message offering both.
 //!
-//! - a camera button sends its live picture as fast as it can, captioned
-//!   with the camera and the time only (owner 2026-11-16: "我只想看截图",
-//!   it once took almost a minute; until then cctv's account of who was
-//!   there came with it), with "录 15 秒" and "再看一次" under it;
-//!   "其它摄像头" lists the rest;
+//! - a camera button sends its live picture at once (owner 2026-11-16: it
+//!   once took almost a minute), then adds cctv's one-line account of who
+//!   and whose car is there to its caption, with "录 15 秒" and "再看一次"
+//!   under it; "其它摄像头" lists the rest;
 //! - 布防 / 推送 / 天线 show the state with buttons to change it; stopping
 //!   the arming asks once more (owner's rule); 推送 switches only the
 //!   presser's own account (owner's decision).
@@ -548,7 +547,10 @@ async fn snap_by_id(p: &Panel, chat: &str, id: u32) -> Result<()> {
     snap(p, chat, m).await
 }
 
-/// The live picture, nothing else; how long each step took is logged.
+/// The live picture first, then cctv's own account of who and whose car is
+/// there (`/monitors/{id}/now`, its local AI) added by editing the caption —
+/// the owner's order (2026-11-16): the picture must not wait for anything.
+/// How long each step took is logged.
 async fn snap(p: &Panel, chat: &str, m: &Monitor) -> Result<()> {
     if let Some(why) = unavailable(m) {
         p.bot
@@ -580,7 +582,17 @@ async fn snap(p: &Panel, chat: &str, m: &Monitor) -> Result<()> {
                     "error": sent.as_ref().err().map(|e| format!("{e:#}")),
                 }),
             );
-            sent?;
+            let message_id = sent?;
+            let summary: String = p.api.now_summary(m.id).await.chars().take(900).collect();
+            p.bot
+                .edit(
+                    chat,
+                    message_id,
+                    &format!("{summary}\n{caption}"),
+                    true,
+                    &cam_buttons(m.id),
+                )
+                .await?;
         }
         Err(e) => {
             p.bot

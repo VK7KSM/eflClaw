@@ -4,6 +4,7 @@
 //! inline buttons ("已看到", "标注", names). Plain text only — no parse mode
 //! to escape for.
 
+use super::r2::R2;
 use anyhow::{bail, Context, Result};
 use reqwest::multipart::{Form, Part};
 use std::time::Duration;
@@ -12,6 +13,8 @@ use std::time::Duration;
 pub struct Bot {
     token: String,
     http: reqwest::Client,
+    /// Pictures go through R2 when it is set up (see `r2`).
+    r2: Option<R2>,
 }
 
 /// Inline buttons, row by row: (label, callback data).
@@ -45,6 +48,7 @@ impl Bot {
                 .timeout(Duration::from_secs(120))
                 .build()
                 .unwrap_or_default(),
+            r2: R2::from_env(),
         }
     }
 
@@ -132,6 +136,20 @@ impl Bot {
         caption: &str,
         opts: &SendOpts,
     ) -> Result<i64> {
+        // Telegram fetches the picture from R2 itself; if anything on that
+        // way fails, the picture is uploaded as before.
+        if let Some(r2) = &self.r2 {
+            match self.send_photo_via_r2(r2, chat, &jpeg, caption, opts).await {
+                Ok(id) => return Ok(id),
+                Err(e) => {
+                    tracing::warn!("photo via R2 failed, uploading it instead: {e:#}");
+                    super::worker::record(
+                        "CCTV photo via R2 failed, uploaded instead",
+                        serde_json::json!({ "error": format!("{e:#}") }),
+                    );
+                }
+            }
+        }
         let form = Self::form(chat, opts)
             .text("caption", caption.to_string())
             .part(
@@ -147,6 +165,28 @@ impl Bot {
             .send()
             .await?;
         Self::finish(resp, "sendPhoto").await
+    }
+
+    async fn send_photo_via_r2(
+        &self,
+        r2: &R2,
+        chat: &str,
+        jpeg: &[u8],
+        caption: &str,
+        opts: &SendOpts,
+    ) -> Result<i64> {
+        let link = r2.put_jpeg(jpeg.to_vec()).await?;
+        let form = Self::form(chat, opts)
+            .text("caption", caption.to_string())
+            .text("photo", link);
+        let resp = self
+            .http
+            .post(self.url("sendPhoto"))
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Telegram sendPhoto: {}", e.without_url()))?;
+        Self::finish(resp, "sendPhoto by link").await
     }
 
     pub async fn send_video(

@@ -16,6 +16,7 @@ pub mod label;
 pub mod look;
 pub mod panel;
 pub mod pin;
+pub mod r2;
 pub mod store;
 pub mod tg;
 pub mod usage;

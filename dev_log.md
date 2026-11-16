@@ -8378,3 +8378,47 @@ cctv 改为院子里一看到没认出的人就先推（level 2、`provisional =
 **撤回的做法**：曾改成发图前缩到 1280 像素，用户明确不要缩图，已撤回，没有部署。
 
 **注意**：K5 上 elfgate、flightd、node_app 和部分 cloudflared 也是 BelowNormal。这些不归 elfClaw 管，没动，已告知用户。
+
+## 2026-11-16 监控照片改走 Cloudflare R2：先存 R2，再让 Telegram 按临时网址去拉原图
+
+**排查结论**（K5 实测，原图不缩小，这是用户要求）
+- 改成正常优先级后，面板截图仍然慢：Front yard fix 435 KB，取图 0.4 秒，上传 91.8 秒。CPU 也不是原因（用户指出当时 CPU 不满），代理没开，也没被系统限流（EcoQoS）；
+- 发给不存在的 chat 时，上传只要 2.7–4 秒；不管是 SSH 会话还是交互桌面会话里的计划任务，都是这个数；
+- 往用户的 chat 真实投递一张 445 KB 的图：
+  - 直接上传 16.1 秒；
+  - 先传 R2（0.9 秒），再让 Telegram 从临时网址拉取（3.1 秒），合计约 4 秒；
+- 结论：把整张图上传给 Telegram 这一步慢（Telegram 收图、处理、投递），而 Cloudflare 到 Telegram 很快。elfClaw 进程里的 64–92 秒比单独测试的 16 秒还慢，原因还没完全查清，改走 R2 后可以从日志里看出来。
+
+**R2 设置（用户在 Cloudflare 后台建的）**
+- 私有 bucket `cctv-snapshots`：不开公开访问，生命周期规则 1 天后自动删除；
+- R2 API token 只能读写这个 bucket；
+- K5 用户环境变量（用户同意由我设置，值从用户给的文件读取，过程中不显示）：R2_ACCESS_KEY_ID、R2_SECRET_ACCESS_KEY、R2_ENDPOINT。传到 K5 的临时 key 文件已删除；
+- `start_bot.vbs` 现读变量的列表里加了这三个，备份为 `start_bot.vbs.bak-20261116-r2`。
+
+**代码**
+- 新增 `src/cctv/r2.rs`：
+  - 环境变量齐全时 `R2::from_env()` 才启用；
+  - `put_jpeg()` 用 S3 SigV4 预签名网址 PUT 一个随机文件名，再返回 5 分钟有效的 GET 预签名网址；
+  - 签名只用已有的 hmac/sha2/hex，没加新依赖；
+  - 单测用开发机实测能被 R2 接受的 Python 签名器算出固定值，逐字核对。
+- `src/cctv/tg.rs` `Bot::send_photo()`：配置了 R2 就先存 R2，再用 sendPhoto 的 photo=网址发送；R2 或 Telegram 拉取任何一步失败，就记一条日志，回到原来的直接上传。
+  - 监控模块经这个 Bot 发出的所有照片都走这条路（面板截图、标注目标图等）；
+  - 预签名网址里有 key id 和签名，所以出错信息去掉了 URL，不写进日志。
+- 开发机上用户给的 key 文件 `cctv-snapshots_R2API.txt` 在仓库目录里，已加进 `.git/info/exclude`，不会被提交。
+
+## 2026-11-16 R2 实测通过；面板截图先发图，再把 cctv 本地识别结果改进说明里
+
+**实测**（部署后，用户点了几路摄像头，手机上约 6 秒收到）：
+
+| 摄像头 | 大小 | 取图 | 发到 Telegram |
+|---|---|---|---|
+| Garage Back | 327 KB | 0.6 秒 | 2.8 秒 |
+| Back yard | 250 KB | 1.1 秒 | 1.9 秒 |
+| Front yard | 281 KB | 1.0 秒 | 2.3 秒 |
+
+对比改之前：64–92 秒。日志里没有出现过 "CCTV photo via R2 failed"，说明都走了 R2。
+
+**用户追问"本地图片识别分析为什么没有了"**：是上一步按"只要截图"去掉的。用户之前说过"一定要分析，就先发图，再修改消息补上"，现在按这个做：
+- `src/cctv/panel.rs` `snap()`：截图照样立即发出；
+- 发出后取 cctv 的 `/monitors/{id}/now` 现场描述（cctv 本地 AI 给出的谁、谁的车，约 30ms）；
+- 用 editMessageCaption 改成"描述 + 📷 摄像头 时间"，并重新带上"录 15 秒""再看一次"两个按钮（不重新带，Telegram 会把按钮去掉）。
