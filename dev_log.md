@@ -8354,3 +8354,27 @@ cctv 改为院子里一看到没认出的人就先推（level 2、`provisional =
 - 模型用的 cctv 工具（snapshot 动作）不变，它仍然会拿 cctv 的现场描述来回答问题。
 
 **下次再慢怎么查**：在 elfclaw-logs.jsonl 里搜 "CCTV panel snapshot"，fetch_ms 大说明 cctv/K5 取图慢，upload_ms 大说明往 Telegram 上传慢。
+
+## 2026-11-16 根因：K5 上 elfClaw 进程优先级是"低于正常"，CPU 满载时上传截图被拖到 64 秒；计划任务改成正常优先级
+
+**现象**：面板点「Garage front」，计时日志显示向 cctv 取图 2.1 秒，发到 Telegram 64.5 秒（852 KB）。
+
+**排查**
+- K5 没走代理。curl 从 K5 往 Telegram 上传 870 KB 只要 3.5–6.5 秒，HTTP/1.1，和程序用的协议一样；
+- 写了个临时测试程序，用和 `src/cctv/tg.rs` 一模一样的 reqwest 客户端，带真实 token、发给不存在的 chat：400 KB 用 2.7–3.6 秒，和 curl 一样。所以上传代码本身没问题；
+- K5 的 CPU 这两小时几乎一直满载（每分钟平均 82–100%），但测试程序在满载下照样很快；
+- 区别在进程优先级：zeroclaw 是 BelowNormal（6），而 OBS、cloudflared、cctv 是 Normal，dump1090 是 AboveNormal。
+  - 计划任务没写 Priority 时默认是 7，启动的程序就是"低于正常"；
+  - CPU 满载时，elfClaw 的线程（TLS 加密、发送）排不上，上传被拖慢 10 倍以上；
+  - SSH 里跑的测试程序是正常优先级，所以不慢。
+
+**改动（K5 系统配置，不改代码）**
+- 计划任务 `elfClaw_Workspace` 的 Settings 加上 `<Priority>5</Priority>`（正常），用 Register-ScheduledTask -Xml 重新注册；
+  - 备份：`C:\K5-DEV\elfClaw\elfClaw_Workspace.task.bak-20261116-prio.xml`；
+  - 回退：用这份备份重新注册即可；
+- 正在运行的 zeroclaw（pid 12108）当场改为 Normal，不用重启；
+- 看门狗（schtasks /run）和 deploy_exe.ps1（Start-ScheduledTask）都通过这个任务启动，以后每次重启都是正常优先级。
+
+**撤回的做法**：曾改成发图前缩到 1280 像素，用户明确不要缩图，已撤回，没有部署。
+
+**注意**：K5 上 elfgate、flightd、node_app 和部分 cloudflared 也是 BelowNormal。这些不归 elfClaw 管，没动，已告知用户。
