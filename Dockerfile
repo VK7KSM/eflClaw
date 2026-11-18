@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7
 
 # ── Stage 1: Build ────────────────────────────────────────────
-FROM rust:1.93-slim@sha256:7e6fa79cf81be23fd45d857f75f583d80cfdbb11c91fa06180fd747fda37a61d AS builder
+FROM rust:1.99-slim@sha256:f6c4a35d21dbb3c89d7a8d056c193e94fc09037f2b58dd858b09c39a47dd02d7 AS builder
 
 WORKDIR /app
 ARG ZEROCLAW_CARGO_FEATURES=""
